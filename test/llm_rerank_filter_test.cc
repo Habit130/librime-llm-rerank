@@ -25,6 +25,7 @@ class TranslationFixture : public Translation {
   bool Next() {
     if (exhausted())
       return false;
+    ++next_count_;
     if (++cursor_ >= candies_.size())
       set_exhausted(true);
     return true;
@@ -33,12 +34,18 @@ class TranslationFixture : public Translation {
   an<Candidate> Peek() {
     if (exhausted())
       return nullptr;
+    ++peek_count_;
     return candies_[cursor_];
   }
+
+  size_t peek_count() const { return peek_count_; }
+  size_t next_count() const { return next_count_; }
 
  private:
   vector<of<Candidate>> candies_;
   size_t cursor_;
+  size_t peek_count_ = 0;
+  size_t next_count_ = 0;
 };
 
 TEST(LlmRerankFilterTest, IdentityEmission) {
@@ -81,6 +88,42 @@ TEST(LlmRerankFilterTest, EmptyTranslation) {
   ASSERT_TRUE(bool(filtered));
   EXPECT_TRUE(filtered->exhausted());
   EXPECT_FALSE(bool(filtered->Peek()));
+}
+
+// Regression: the filter sits after uniquifier, whose dedup window is the
+// menu's already-emitted candidate list. Pulling upstream faster than the
+// consumer pulls (e.g. draining at construction) defeats that dedup and
+// leaks post-simplification duplicates. The wrapper must stay lazy: no pull
+// at construction, exactly one upstream candidate per on-demand replenish.
+TEST(LlmRerankFilterTest, LazyPullTiming) {
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  auto fixture = New<TranslationFixture>();
+  auto* upstream = fixture.get();
+  CandidateList candidates;
+  auto filtered = filter.Apply(fixture, &candidates);
+  ASSERT_TRUE(bool(filtered));
+
+  // Construction must not pull anything.
+  EXPECT_EQ(0, upstream->peek_count());
+  EXPECT_EQ(0, upstream->next_count());
+  EXPECT_FALSE(filtered->exhausted());
+
+  // First Peek pulls exactly one candidate; repeated Peek pulls no more.
+  ASSERT_TRUE(bool(filtered->Peek()));
+  EXPECT_EQ("你好", filtered->Peek()->text());
+  EXPECT_EQ(1, upstream->peek_count());
+  EXPECT_EQ(1, upstream->next_count());
+  filtered->Peek();
+  EXPECT_EQ(1, upstream->peek_count());
+
+  // After Next, the next Peek pulls exactly one more.
+  filtered->Next();
+  ASSERT_TRUE(bool(filtered->Peek()));
+  EXPECT_EQ("尼好", filtered->Peek()->text());
+  EXPECT_EQ(2, upstream->peek_count());
+  EXPECT_EQ(2, upstream->next_count());
 }
 
 // Minimal main: unlike librime's rime_test_main.cc, this test needs no rime

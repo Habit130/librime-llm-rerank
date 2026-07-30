@@ -61,10 +61,28 @@ are foreign to the codebase. Concrete precedents to copy:
   `if (!ticket.schema) return;`, then read via
   `config->Get*(ticket.name_space + "/key", &member_)`. All parameters come
   from the schema config under the component's own namespace, so the existing
-  `.custom.yaml` patch mechanism can override them per machine.
+  `.custom.yaml` patch mechanism can override them per machine. Note the
+  engine hands an unaliased filter the generic namespace `"filter"`; fall back
+  to the component's own name like `Simplifier` and `ReverseLookupFilter` do.
 - **Subscribing to engine notifiers** — copy
   `librime/src/rime/gear/memory.cc:84-94`: connect in the constructor and
   `disconnect()` every connection in the destructor.
+
+### Chain-end pull timing (hard-won)
+
+This filter sits at the **end of the filter chain, after uniquifier**.
+`UniquifiedTranslation` dedups against the menu's *already-emitted* candidate
+list, so any buffering between uniquifier and the menu defeats that dedup:
+candidates pulled into the buffer are checked against a stale (empty or
+short) window, and post-simplification duplicates leak through (observed with
+`zh_hans` on: extra rare duplicate chars deep in the candidate list).
+Consequences:
+
+- Never prefetch at construction time. Pull upstream on demand
+  (`PrefetchTranslation::Replenish()`), no faster than the consumer pulls.
+- Later tickets that materialize a rerank window of N candidates will
+  intentionally break this timing for the N buffered candidates; the window
+  must be deduped by text inside this filter before scoring.
 
 ## Build rule (the one that bites)
 

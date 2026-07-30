@@ -16,29 +16,30 @@ namespace rime {
 // Identity rerank translation (T1 tracer bullet): emits candidates in exactly
 // the order received. The PrefetchTranslation + cache_.splice shape follows
 // SingleCharFilter (librime gear/single_char_filter.cc); the grouping and
-// rescoring logic of later tickets plugs into Rearrange().
+// rescoring logic of later tickets plugs into Replenish().
+//
+// Pull timing must stay 1:1 with the downstream consumer: this filter sits at
+// the end of the chain, after uniquifier, whose dedup window is the menu's
+// already-emitted candidate list. Prefetching faster than the consumer pulls
+// (e.g. draining the upstream in the constructor) would let uniquifier's
+// duplicates leak through — observed as extra post-simplification duplicate
+// candidates with zh_hans on.
 class LlmRerankTranslation : public PrefetchTranslation {
  public:
-  explicit LlmRerankTranslation(an<Translation> translation);
+  explicit LlmRerankTranslation(an<Translation> translation)
+      : PrefetchTranslation(translation) {}
 
- private:
-  bool Rearrange();
+ protected:
+  virtual bool Replenish();
 };
 
-LlmRerankTranslation::LlmRerankTranslation(an<Translation> translation)
-    : PrefetchTranslation(translation) {
-  Rearrange();
-}
-
-bool LlmRerankTranslation::Rearrange() {
-  if (exhausted()) {
+bool LlmRerankTranslation::Replenish() {
+  if (translation_->exhausted()) {
     return false;
   }
   CandidateQueue reranked;
-  while (!translation_->exhausted()) {
-    reranked.push_back(translation_->Peek());
-    translation_->Next();
-  }
+  reranked.push_back(translation_->Peek());
+  translation_->Next();
   cache_.splice(cache_.end(), reranked);
   return !cache_.empty();
 }
