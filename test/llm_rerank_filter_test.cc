@@ -82,3 +82,10 @@ TEST(LlmRerankFilterTest, EmptyTranslation) {
   EXPECT_TRUE(filtered->exhausted());
   EXPECT_FALSE(bool(filtered->Peek()));
 }
+
+// Minimal main: unlike librime's rime_test_main.cc, this test needs no rime
+// service (no engine, no dictionary, no deployed data directory).
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
