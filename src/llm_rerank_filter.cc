@@ -44,10 +44,16 @@ bool LlmRerankTranslation::Rearrange() {
 }
 
 LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
+  // An unaliased filter gets the generic namespace "filter" from the engine;
+  // fall back to the component's own name, as Simplifier and
+  // ReverseLookupFilter do (gear/simplifier.cc, gear/reverse_lookup_filter.cc).
+  if (name_space_ == "filter") {
+    name_space_ = "llm_rerank";
+  }
   if (!ticket.schema)
     return;
   if (Config* config = ticket.schema->config()) {
-    config->GetBool(ticket.name_space + "/enable", &enabled_);
+    config->GetBool(name_space_ + "/enable", &enabled_);
   }
 }
 
