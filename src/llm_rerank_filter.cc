@@ -4,6 +4,7 @@
 //
 
 #include <rime/candidate.h>
+#include <rime/common.h>
 #include <rime/config.h>
 #include <rime/schema.h>
 #include <rime/ticket.h>
@@ -56,6 +57,7 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   if (Config* config = ticket.schema->config()) {
     config->GetBool(name_space_ + "/enable", &enabled_);
   }
+  LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false");
 }
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
