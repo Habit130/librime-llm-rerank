@@ -21,16 +21,26 @@
 
 namespace rime {
 
+// System- vs user-dictionary word candidates. table_translator emits
+// "table"/"user_table"; script_translator (pinyin) emits "phrase"/"user_phrase".
+static bool IsSysWordType(const string& type) {
+  return type == "table" || type == "phrase";
+}
+
+static bool IsUsrWordType(const string& type) {
+  return type == "user_table" || type == "user_phrase";
+}
+
 bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
   auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(cand));
   if (!phrase)
     return false;
   double coeff;
   const char* source;
-  if (phrase->type() == "table") {
+  if (IsSysWordType(phrase->type())) {
     coeff = sys_coeff_;
     source = "sys";
-  } else if (phrase->type() == "user_table") {
+  } else if (IsUsrWordType(phrase->type())) {
     coeff = usr_coeff_;
     source = "usr";
   } else {
@@ -47,7 +57,7 @@ bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
 }
 
 static string CategoryOf(const string& type) {
-  if (type == "table" || type == "user_table")
+  if (IsSysWordType(type) || IsUsrWordType(type))
     return "word";
   return type;
 }

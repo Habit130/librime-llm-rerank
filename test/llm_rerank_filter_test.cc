@@ -485,6 +485,29 @@ TEST(WeightScorerTest, CoefficientsReadFromConfig) {
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
+// --- script_translator (pinyin) emits "phrase"/"user_phrase" ---
+
+TEST(WeightScorerTest, ScoresScriptTranslatorPhraseTypes) {
+  WeightScorer scorer(2.0, 0.5);
+  double score = 0;
+  ASSERT_TRUE(scorer.Score(MakePhrase("phrase", 0, 2, "甲", 3.0), &score));
+  EXPECT_DOUBLE_EQ(6.0, score);  // sys: 2.0 * 3.0
+  ASSERT_TRUE(scorer.Score(MakePhrase("user_phrase", 0, 2, "乙", 3.0), &score));
+  EXPECT_DOUBLE_EQ(1.5, score);  // usr: 0.5 * 3.0
+}
+
+TEST(LlmRerankFilterTest, GroupingKeyPhraseAndUserPhraseSameGroup) {
+  auto scorer =
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("phrase", 0, 2, "甲"),
+      MakePhrase("user_phrase", 0, 2, "乙"),
+      MakePhrase("sentence", 0, 2, "丙"),
+  });
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
