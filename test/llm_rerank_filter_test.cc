@@ -485,7 +485,7 @@ TEST(WeightScorerTest, CoefficientsReadFromConfig) {
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
-// --- script_translator (pinyin) emits "phrase"/"user_phrase" ---
+// --- T3 follow-up: script_translator (pinyin) emits "phrase"/"user_phrase" ---
 
 TEST(WeightScorerTest, ScoresScriptTranslatorPhraseTypes) {
   WeightScorer scorer(2.0, 0.5);
@@ -506,6 +506,209 @@ TEST(LlmRerankFilterTest, GroupingKeyPhraseAndUserPhraseSameGroup) {
       MakePhrase("sentence", 0, 2, "丙"),
   });
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+// --- T5: context-personalization term (evidence strength) ---
+
+class FakeCounter : public ContextCounter {
+ public:
+  void SetPair(const string& prev, const string& cand, int n) {
+    pair_[prev + "\t" + cand] = n;
+  }
+  void SetTotal(const string& prev, int n) { total_[prev] = n; }
+
+  int PairCount(const string& prev, const string& cand) override {
+    auto it = pair_.find(prev + "\t" + cand);
+    return it == pair_.end() ? 0 : it->second;
+  }
+  int TotalCount(const string& prev) override {
+    auto it = total_.find(prev);
+    return it == total_.end() ? 0 : it->second;
+  }
+
+ private:
+  map<string, int> pair_;
+  map<string, int> total_;
+};
+
+static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
+                                         double gamma,
+                                         double saturate_k,
+                                         const string& prev_word,
+                                         double sys_coeff = 1.0,
+                                         double usr_coeff = 1.0) {
+  auto ctx = New<ContextScorer>(counter, gamma, saturate_k);
+  ctx->set_prev_word(prev_word);
+  auto weight = New<WeightScorer>(sys_coeff, usr_coeff);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(New<CompositeScorer>(weight, ctx));
+  return filter;
+}
+
+TEST(ContextScorerTest, EvidenceMissIsZero) {
+  EXPECT_DOUBLE_EQ(0.0, ContextScorer::EvidenceStrength(0, 0, 3.0));
+  EXPECT_DOUBLE_EQ(0.0, ContextScorer::EvidenceStrength(0, 5, 3.0));
+}
+
+TEST(ContextScorerTest, EvidenceSingleObservationNotAtBound) {
+  // pair=1, total=1, k=3 -> relative preference 1 * saturate 1/(1+3) = 0.25.
+  double s = ContextScorer::EvidenceStrength(1, 1, 3.0);
+  EXPECT_DOUBLE_EQ(0.25, s);
+  EXPECT_LT(s, 1.0);
+}
+
+TEST(ContextScorerTest, EvidenceBoundedBelowOne) {
+  double s = ContextScorer::EvidenceStrength(10000, 10000, 3.0);
+  EXPECT_LT(s, 1.0);
+  EXPECT_GT(s, 0.9);
+}
+
+TEST(ContextScorerTest, EvidenceScalesWithRelativePreference) {
+  // pair=1, total=4, k=3 -> (1/4) * (1/4) = 0.0625.
+  EXPECT_DOUBLE_EQ(0.0625, ContextScorer::EvidenceStrength(1, 4, 3.0));
+}
+
+TEST(ContextScorerTest, EvidenceMonotonicInCount) {
+  double a = ContextScorer::EvidenceStrength(1, 1, 3.0);
+  double b = ContextScorer::EvidenceStrength(5, 5, 3.0);
+  double c = ContextScorer::EvidenceStrength(50, 50, 3.0);
+  EXPECT_LT(a, b);
+  EXPECT_LT(b, c);
+}
+
+TEST(ContextScorerTest, SaturateKControlsSaturationSpeed) {
+  EXPECT_DOUBLE_EQ(0.5, ContextScorer::EvidenceStrength(1, 1, 1.0));
+  EXPECT_DOUBLE_EQ(0.1, ContextScorer::EvidenceStrength(1, 1, 9.0));
+}
+
+TEST(ContextScorerTest, GammaScalesTerm) {
+  FakeCounter counter;
+  counter.SetTotal("w", 2);
+  counter.SetPair("w", "乙", 2);
+  auto ctx1 = New<ContextScorer>(&counter, 1.0, 3.0);
+  ctx1->set_prev_word("w");
+  auto ctx5 = New<ContextScorer>(&counter, 5.0, 3.0);
+  ctx5->set_prev_word("w");
+  double s1 = 0, s5 = 0;
+  ctx1->Score(MakePhrase("table", 0, 2, "乙", 0.0), &s1);
+  ctx5->Score(MakePhrase("table", 0, 2, "乙", 0.0), &s5);
+  EXPECT_DOUBLE_EQ(0.4, s1);   // (2/2) * (2/5)
+  EXPECT_DOUBLE_EQ(2.0, s5);   // 5 * 0.4
+}
+
+TEST(ContextScorerTest, EmptyPrevWordScoresZero) {
+  FakeCounter counter;
+  counter.SetTotal("w", 2);
+  counter.SetPair("w", "乙", 2);
+  auto ctx = New<ContextScorer>(&counter, 10.0, 3.0);  // no prev_word set
+  double s = -1;
+  EXPECT_TRUE(ctx->Score(MakePhrase("table", 0, 2, "乙", 0.0), &s));
+  EXPECT_DOUBLE_EQ(0.0, s);
+}
+
+TEST(CompositeScorerTest, RejectsWeightlessCandidate) {
+  FakeCounter counter;
+  counter.SetTotal("w", 3);
+  counter.SetPair("w", "，", 3);
+  auto ctx = New<ContextScorer>(&counter, 10.0, 3.0);
+  ctx->set_prev_word("w");
+  auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
+  double score = 0;
+  EXPECT_FALSE(comp->Score(New<SimpleCandidate>("punct", 0, 2, "，"), &score));
+  EXPECT_TRUE(comp->Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
+}
+
+TEST(CompositeScorerTest, SumsWeightAndContext) {
+  FakeCounter counter;
+  counter.SetTotal("w", 4);
+  counter.SetPair("w", "甲", 4);
+  auto ctx = New<ContextScorer>(&counter, 10.0, 3.0);
+  ctx->set_prev_word("w");
+  auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
+  double score = 0;
+  ASSERT_TRUE(comp->Score(MakePhrase("table", 0, 2, "甲", 2.0), &score));
+  EXPECT_NEAR(2.0 + 10.0 * (4.0 / 7.0), score, 1e-9);
+}
+
+TEST(ContextRerankTest, MissLeavesOrderUnchanged) {
+  FakeCounter counter;  // no observations
+  auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 3.0),
+      MakePhrase("table", 0, 2, "乙", 1.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+TEST(ContextRerankTest, HitPromotesCandidate) {
+  FakeCounter counter;
+  counter.SetTotal("发起", 5);
+  counter.SetPair("发起", "乙", 5);
+  auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 3.0),
+      MakePhrase("table", 0, 2, "乙", 1.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  // 乙 = 1 + 10*(5/5)*(5/8) = 7.25 > 甲 = 3.
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+TEST(ContextRerankTest, PromotesScriptTranslatorPhrase) {
+  // Mirrors the luna_pinyin E2E: candidates carry the script_translator type
+  // "phrase"; a recorded (发起 -> 公鸡) observation promotes 公鸡 over the
+  // higher-weight 攻击.
+  FakeCounter counter;
+  counter.SetTotal("发起", 5);
+  counter.SetPair("发起", "公鸡", 5);
+  auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("phrase", 0, 6, "攻击", 3.0),
+      MakePhrase("phrase", 0, 6, "公鸡", 1.0),
+      MakePhrase("phrase", 0, 4, "丙", 0.0),
+  });
+  EXPECT_EQ((vector<string>{"公鸡", "攻击", "丙"}), CollectTexts(filtered));
+}
+
+TEST(ContextRerankTest, OrderTracksCountState) {
+  auto cands = [] {
+    return vector<an<Candidate>>{
+        MakePhrase("table", 0, 2, "甲", 1.0),
+        MakePhrase("table", 0, 2, "乙", 2.0),
+        MakePhrase("table", 0, 4, "丙", 0.0),
+    };
+  };
+  FakeCounter favors甲;
+  favors甲.SetTotal("上文", 4);
+  favors甲.SetPair("上文", "甲", 4);
+  auto f1 = MakeContextFilter(&favors甲, 10.0, 3.0, "上文");
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}),
+            CollectTexts(ApplyFilter(f1, cands())));
+
+  FakeCounter favors乙;
+  favors乙.SetTotal("上文", 4);
+  favors乙.SetPair("上文", "乙", 4);
+  auto f2 = MakeContextFilter(&favors乙, 10.0, 3.0, "上文");
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}),
+            CollectTexts(ApplyFilter(f2, cands())));
+}
+
+TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
+  // One observation gives s = 1/(1+k) = 0.25; with gamma=2 the boost is 0.5,
+  // far short of a weight gap of 10. A single mis-pick cannot pin the order.
+  FakeCounter counter;
+  counter.SetTotal("上文", 1);
+  counter.SetPair("上文", "乙", 1);
+  auto filter = MakeContextFilter(&counter, 2.0, 3.0, "上文");
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 10.0),
+      MakePhrase("table", 0, 2, "乙", 0.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
 int main(int argc, char** argv) {
