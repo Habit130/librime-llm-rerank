@@ -21,16 +21,30 @@
 
 namespace rime {
 
-class FakeScorer : public Scorer {
- public:
-  bool Score(const Candidate& cand, double* score) override {
-    double s = 0;
-    for (unsigned char c : cand.text())
-      s += c;
-    *score = -s;
-    return true;
+bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
+  auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(cand));
+  if (!phrase)
+    return false;
+  double coeff;
+  const char* source;
+  if (phrase->type() == "table") {
+    coeff = sys_coeff_;
+    source = "sys";
+  } else if (phrase->type() == "user_table") {
+    coeff = usr_coeff_;
+    source = "usr";
+  } else {
+    return false;
   }
-};
+  double weight = phrase->weight();
+  *score = coeff * weight;
+  if (verbose_) {
+    LOG(INFO) << "llm_rerank weight: text=" << phrase->text()
+              << " source=" << source << " weight=" << weight
+              << " coeff=" << coeff << " score=" << *score;
+  }
+  return true;
+}
 
 static string CategoryOf(const string& type) {
   if (type == "table" || type == "user_table")
@@ -127,7 +141,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   for (int i = 0; i < n; i++) {
     if (!slots[i].is_word || slots[i].group_id == last_word_group)
       continue;
-    if (!scorer_->Score(*buffer[i], &scores[i]))
+    if (!scorer_->Score(buffer[i], &scores[i]))
       return false;
   }
 
@@ -171,10 +185,15 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   if (Config* config = ticket.schema->config()) {
     config->GetBool(name_space_ + "/enable", &enabled_);
     config->GetInt(name_space_ + "/window", &window_);
+    config->GetDouble(name_space_ + "/sys_coeff", &sys_coeff_);
+    config->GetDouble(name_space_ + "/usr_coeff", &usr_coeff_);
+    config->GetBool(name_space_ + "/verbose", &verbose_);
   }
-  scorer_ = New<FakeScorer>();
+  scorer_ = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
   LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false")
-            << ", window = " << window_;
+            << ", window = " << window_ << ", sys_coeff = " << sys_coeff_
+            << ", usr_coeff = " << usr_coeff_
+            << ", verbose = " << (verbose_ ? "true" : "false");
 }
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
