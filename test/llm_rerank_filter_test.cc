@@ -19,8 +19,8 @@ using namespace rime;
 class TableScorer : public Scorer {
  public:
   explicit TableScorer(map<string, double> table) : table_(table) {}
-  bool Score(const Candidate& cand, double* score) override {
-    auto it = table_.find(cand.text());
+  bool Score(const an<Candidate>& cand, double* score) override {
+    auto it = table_.find(cand->text());
     if (it == table_.end())
       return false;
     *score = it->second;
@@ -33,7 +33,7 @@ class TableScorer : public Scorer {
 
 class FailingScorer : public Scorer {
  public:
-  bool Score(const Candidate&, double*) override { return false; }
+  bool Score(const an<Candidate>&, double*) override { return false; }
 };
 
 static an<Phrase> MakePhrase(const string& type,
@@ -379,6 +379,110 @@ TEST(LlmRerankFilterTest, NoCandidatesLostAfterRerank) {
   set<string> input_set{"甲", "乙", "丙", "丁", "戊", "，"};
   EXPECT_EQ(input_set, emitted_set);
   EXPECT_EQ(6u, emitted.size());
+}
+
+// --- T3: weight scorer ---
+
+TEST(WeightScorerTest, ScoreEqualsCoeffTimesWeight) {
+  WeightScorer scorer(2.0, 0.5);
+  double score = 0;
+  ASSERT_TRUE(scorer.Score(MakePhrase("table", 0, 2, "甲", 3.0), &score));
+  EXPECT_DOUBLE_EQ(6.0, score);  // sys: 2.0 * 3.0
+  ASSERT_TRUE(scorer.Score(MakePhrase("user_table", 0, 2, "乙", 3.0), &score));
+  EXPECT_DOUBLE_EQ(1.5, score);  // usr: 0.5 * 3.0
+}
+
+TEST(WeightScorerTest, NonDictionaryCandidateReturnsFalse) {
+  WeightScorer scorer(1.0, 1.0);
+  double score = 0;
+  EXPECT_FALSE(scorer.Score(MakePhrase("sentence", 0, 2, "甲", 5.0), &score));
+  EXPECT_FALSE(
+      scorer.Score(New<SimpleCandidate>("punct", 0, 2, "，"), &score));
+}
+
+TEST(WeightScorerTest, WithinGroupOrderByWeightDescending) {
+  auto filter = MakeFilter(New<WeightScorer>(1.0, 1.0));
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 1.0),
+      MakePhrase("table", 0, 2, "乙", 3.0),
+      MakePhrase("table", 0, 2, "丙", 2.0),
+      MakePhrase("table", 0, 4, "丁", 0.0),
+  });
+  // (0,2,word)={甲,乙,丙} complete; weight desc: 乙(3)>丙(2)>甲(1).
+  EXPECT_EQ((vector<string>{"乙", "丙", "甲", "丁"}), CollectTexts(filtered));
+}
+
+TEST(WeightScorerTest, UnwrapShadowToGetWeight) {
+  auto filter = MakeFilter(New<WeightScorer>(1.0, 1.0));
+  auto shadow_a =
+      New<ShadowCandidate>(MakePhrase("table", 0, 2, "甲", 1.0), "table");
+  auto shadow_b =
+      New<ShadowCandidate>(MakePhrase("table", 0, 2, "乙", 3.0), "table");
+  auto filtered = ApplyFilter(filter, {
+      shadow_a,
+      shadow_b,
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  // Shadows unwrap to the underlying phrases; weight desc: 乙(3)>甲(1).
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+TEST(WeightScorerTest, UserCoeffLiftsUserCandidate) {
+  auto filter = MakeFilter(New<WeightScorer>(/*sys=*/1.0, /*usr=*/3.0));
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 5.0),
+      MakePhrase("user_table", 0, 2, "乙", 2.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  // sys 甲 = 1.0*5 = 5; usr 乙 = 3.0*2 = 6 → 乙 > 甲.
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+TEST(WeightScorerTest, SysCoeffLiftsSystemCandidate) {
+  auto filter = MakeFilter(New<WeightScorer>(/*sys=*/4.0, /*usr=*/1.0));
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("user_table", 0, 2, "甲", 3.0),
+      MakePhrase("table", 0, 2, "乙", 1.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  // usr 甲 = 1.0*3 = 3; sys 乙 = 4.0*1 = 4 → 乙 > 甲.
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+TEST(WeightScorerTest, SelfCheckUnitCoeffsPreserveMergeOrder) {
+  // Self-check slice: with both coefficients = 1 the score equals the raw
+  // weight, and the engine's merge order already ranks a same-span word group
+  // by quality, which is monotonic in weight. Feeding a group in that natural
+  // (weight-descending) order must therefore come out unchanged.
+  auto filter = MakeFilter(New<WeightScorer>(1.0, 1.0));
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 9.0),
+      MakePhrase("user_table", 0, 2, "乙", 7.0),
+      MakePhrase("table", 0, 2, "丙", 5.0),
+      MakePhrase("user_table", 0, 2, "丁", 3.0),
+      MakePhrase("table", 0, 4, "戊", 1.0),
+  });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁", "戊"}),
+            CollectTexts(filtered));
+}
+
+TEST(WeightScorerTest, CoefficientsReadFromConfig) {
+  auto* config = new Config;
+  config->SetDouble("llm_rerank/sys_coeff", 1.0);
+  config->SetDouble("llm_rerank/usr_coeff", 3.0);
+  Schema schema("test", config);
+  Ticket ticket;
+  ticket.schema = &schema;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 5.0),
+      MakePhrase("user_table", 0, 2, "乙", 2.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  // sys 甲 = 5; usr 乙 = 3*2 = 6 → 乙 first.
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
 int main(int argc, char** argv) {
