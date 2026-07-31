@@ -124,7 +124,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
   virtual bool Replenish();
 
  private:
-  bool RerankWindow(const vector<an<Candidate>>& buffer, CandidateQueue* out);
+  bool RerankWindow(const vector<an<Candidate>>& buffer,
+                    bool truncated,
+                    CandidateQueue* out);
 
   an<Scorer> scorer_;
   int window_;
@@ -149,8 +151,9 @@ bool LlmRerankTranslation::Replenish() {
   if (buffer.empty())
     return false;
 
+  bool truncated = (int)buffer.size() >= window_ && !translation_->exhausted();
   CandidateQueue result;
-  if (!scorer_ || !RerankWindow(buffer, &result)) {
+  if (!scorer_ || !RerankWindow(buffer, truncated, &result)) {
     for (auto& c : buffer)
       result.push_back(c);
   }
@@ -159,6 +162,7 @@ bool LlmRerankTranslation::Replenish() {
 }
 
 bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
+                                        bool truncated,
                                         CandidateQueue* out) {
   int n = (int)buffer.size();
 
@@ -198,16 +202,22 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     return true;
   }
 
+  // The last word group is only possibly incomplete when the window cut off a
+  // still-running translation; exclude it (keep original order) only then. A
+  // complete window (translation exhausted) scores every group, including the
+  // last one — otherwise a single-group window would never be scored at all.
+  int excluded_group = truncated ? last_word_group : -1;
+
   vector<double> scores(n, 0.0);
   vector<string> texts;
   for (int i = 0; i < n; i++) {
-    if (!slots[i].is_word || slots[i].group_id == last_word_group)
+    if (!slots[i].is_word || slots[i].group_id == excluded_group)
       continue;
     texts.push_back(buffer[i]->text());
   }
   scorer_->Prepare(texts);
   for (int i = 0; i < n; i++) {
-    if (!slots[i].is_word || slots[i].group_id == last_word_group)
+    if (!slots[i].is_word || slots[i].group_id == excluded_group)
       continue;
     if (!scorer_->Score(buffer[i], &scores[i]))
       return false;
@@ -215,7 +225,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
 
   vector<int> word_order;
   for (int gid = 0; gid < (int)group_keys.size(); gid++) {
-    if (gid == last_word_group)
+    if (gid == excluded_group)
       continue;
     vector<int> members;
     for (int i = 0; i < n; i++)
@@ -226,7 +236,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     word_order.insert(word_order.end(), members.begin(), members.end());
   }
   for (int i = 0; i < n; i++)
-    if (slots[i].is_word && slots[i].group_id == last_word_group)
+    if (slots[i].is_word && slots[i].group_id == excluded_group)
       word_order.push_back(i);
 
   set<int> nonword_positions;
