@@ -214,8 +214,9 @@ TEST(LlmRerankFilterTest, GroupingKeyTableAndUserTableSameGroup) {
       MakePhrase("user_table", 0, 2, "乙"),
       MakePhrase("sentence", 0, 2, "丙"),
   });
-  // table+user_table form one group (complete); sentence group is incomplete (last word cand).
-  // word group sorted by score: 乙(3) > 甲(1).
+  // table+user_table form one (0,2,word) group; 丙 is a (0,2,sentence) group.
+  // Translation exhausted → nothing excluded. word group sorted 乙(3) > 甲(1),
+  // then the sentence group 丙(2) by first appearance.
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
@@ -230,9 +231,8 @@ TEST(LlmRerankFilterTest, GroupingKeySentenceAndCompletionSeparate) {
       MakePhrase("table", 0, 2, "丁"),
   });
   // Groups: sentence={甲,丙} first@0, completion={乙} first@1, table={丁} first@3.
-  // Last word cand 丁 → incomplete group = table.
-  // Complete: sentence sorted 丙(5)>甲(1); completion 乙(3).
-  // Group order by first appearance: sentence, completion.
+  // Not truncated → nothing excluded; groups scored in first-appearance order:
+  // sentence sorted 丙(5)>甲(1); completion 乙(3); table 丁(2).
   EXPECT_EQ((vector<string>{"丙", "甲", "乙", "丁"}), CollectTexts(filtered));
 }
 
@@ -248,8 +248,8 @@ TEST(LlmRerankFilterTest, WithinGroupSortByScoreDescending) {
       MakePhrase("table", 0, 2, "丙"),
       MakePhrase("table", 0, 4, "丁"),
   });
-  // (0,2,word)={甲,乙,丙} complete; (0,4,word)={丁} incomplete.
-  // Sort (0,2): 乙(3) > 丙(2) > 甲(1).
+  // Not truncated → both groups scored. (0,2)={甲,乙,丙} sorts 乙(3) > 丙(2) >
+  // 甲(1); (0,4)={丁} (0) follows by first appearance.
   EXPECT_EQ((vector<string>{"乙", "丙", "甲", "丁"}), CollectTexts(filtered));
 }
 
@@ -266,8 +266,8 @@ TEST(LlmRerankFilterTest, BetweenGroupOrderByFirstAppearance) {
       MakePhrase("table", 0, 6, "丁"),
   });
   // Groups: (0,2)={甲,丙} first@0, (0,4)={乙} first@1, (0,6)={丁} first@3.
-  // Incomplete: (0,6). Complete in first-appearance order: (0,2) then (0,4).
-  // Sort (0,2): 丙(2) > 甲(1). (0,4): 乙(5).
+  // Not truncated → all scored in first-appearance order: (0,2), (0,4), (0,6).
+  // Sort (0,2): 丙(2) > 甲(1). (0,4): 乙(5). (0,6): 丁(0).
   EXPECT_EQ((vector<string>{"丙", "甲", "乙", "丁"}), CollectTexts(filtered));
 }
 
@@ -289,8 +289,8 @@ TEST(LlmRerankFilterTest, WindowSizeReadFromConfig) {
       MakePhrase("table", 0, 2, "乙"),
       MakePhrase("table", 0, 2, "丙"),
   });
-  // window=2: window1=[甲,乙] same group → incomplete → no reorder.
-  // window2=[丙] → incomplete → no reorder.
+  // window=2: window1=[甲,乙] is full with 丙 still upstream → truncated → the
+  // same group is held at the cutoff → no reorder. window2=[丙] alone.
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
@@ -300,13 +300,31 @@ TEST(LlmRerankFilterTest, IncompleteGroupAtCutoffKeepsOriginalOrder) {
   auto scorer = New<TableScorer>(
       map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
   auto filter = MakeFilter(scorer);
+  filter.set_window(2);
   auto filtered = ApplyFilter(filter, {
       MakePhrase("table", 0, 2, "甲"),
       MakePhrase("table", 0, 2, "乙"),
       MakePhrase("table", 0, 2, "丙"),
   });
-  // All in (0,2,word); last word cand 丙 → entire group incomplete → no reorder.
+  // window=2: window1=[甲,乙] is full while 丙 is still upstream (translation
+  // not exhausted) → truncated → the (0,2,word) group may be incomplete at the
+  // cutoff and keeps its original order. window2=[丙] alone.
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+TEST(LlmRerankFilterTest, SingleCompleteGroupSortedWhenNotTruncated) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 2, "丙"),
+  });
+  // window=32 (default) > 3 candidates: the translation is exhausted, so the
+  // single (0,2,word) group is complete and must be scored, not skipped.
+  // Sort: 乙(3) > 丙(2) > 甲(1).
+  EXPECT_EQ((vector<string>{"乙", "丙", "甲"}), CollectTexts(filtered));
 }
 
 // --- T2: non-word candidates stay in place ---
@@ -323,8 +341,8 @@ TEST(LlmRerankFilterTest, NonWordCandidateStaysInPlace) {
       MakePhrase("table", 0, 4, "丙"),
   });
   // Non-word "，" at pos1 stays. Word cands: 甲(pos0), 乙(pos2), 丙(pos3).
-  // (0,2,word)={甲,乙} complete; (0,4,word)={丙} incomplete.
-  // Sort (0,2): 乙(3) > 甲(1). word_order=[乙,甲,丙].
+  // Not truncated → both groups scored. Sort (0,2): 乙(3) > 甲(1); (0,4): 丙(2).
+  // word_order=[乙,甲,丙].
   // Output: pos0=乙, pos1=，, pos2=甲, pos3=丙.
   EXPECT_EQ((vector<string>{"乙", "，", "甲", "丙"}), CollectTexts(filtered));
 }
@@ -343,8 +361,7 @@ TEST(LlmRerankFilterTest, UnwrapShadowCandidateToGetWeight) {
       MakePhrase("table", 0, 4, "丙"),
   });
   // ShadowCandidates unwrap to Phrase → treated as word candidates.
-  // (0,2,word)={甲,乙} complete; (0,4,word)={丙} incomplete.
-  // Sort: 乙(3) > 甲(1).
+  // Not truncated → both groups scored. Sort (0,2): 乙(3) > 甲(1); (0,4): 丙(0).
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 

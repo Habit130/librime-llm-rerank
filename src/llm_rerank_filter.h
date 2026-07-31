@@ -102,6 +102,7 @@ class LlmRerankFilter : public Filter {
                         CandidateList* candidates) override;
 
   void set_scorer(an<Scorer> scorer) { scorer_ = scorer; }
+  void set_window(int window) { window_ = window; }
 
  private:
   void OnCommit(Context* ctx);
