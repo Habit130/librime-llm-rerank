@@ -109,7 +109,7 @@ class LlmRerankFilter : public Filter {
 
   bool enabled_ = true;
   int window_ = 32;
-  double alpha_ = 1.0;
+  double alpha_ = 2.0;
   double sys_coeff_ = 1.0;
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;
