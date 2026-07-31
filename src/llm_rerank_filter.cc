@@ -12,14 +12,27 @@
 #include <rime/candidate.h>
 #include <rime/common.h>
 #include <rime/config.h>
+#include <rime/context.h>
+#include <rime/engine.h>
 #include <rime/schema.h>
 #include <rime/ticket.h>
 #include <rime/translation.h>
+#include <rime/dict/db.h>
 #include <rime/gear/translator_commons.h>
 
 #include "llm_rerank_filter.h"
 
 namespace rime {
+
+// System- vs user-dictionary word candidates. table_translator emits
+// "table"/"user_table"; script_translator (pinyin) emits "phrase"/"user_phrase".
+static bool IsSysWordType(const string& type) {
+  return type == "table" || type == "phrase";
+}
+
+static bool IsUsrWordType(const string& type) {
+  return type == "user_table" || type == "user_phrase";
+}
 
 bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
   auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(cand));
@@ -27,10 +40,10 @@ bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
     return false;
   double coeff;
   const char* source;
-  if (phrase->type() == "table") {
+  if (IsSysWordType(phrase->type())) {
     coeff = sys_coeff_;
     source = "sys";
-  } else if (phrase->type() == "user_table") {
+  } else if (IsUsrWordType(phrase->type())) {
     coeff = usr_coeff_;
     source = "usr";
   } else {
@@ -46,8 +59,46 @@ bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
   return true;
 }
 
+double ContextScorer::EvidenceStrength(int pair_count,
+                                       int total_count,
+                                       double saturate_k) {
+  if (total_count <= 0 || pair_count <= 0)
+    return 0.0;
+  double relative_preference = (double)pair_count / (double)total_count;
+  double evidence = (double)pair_count / ((double)pair_count + saturate_k);
+  return relative_preference * evidence;
+}
+
+bool ContextScorer::Score(const an<Candidate>& cand, double* score) {
+  *score = 0.0;
+  if (!counter_ || prev_word_.empty())
+    return true;
+  const string& text = cand->text();
+  int pair_count = counter_->PairCount(prev_word_, text);
+  int total_count = counter_->TotalCount(prev_word_);
+  double s = EvidenceStrength(pair_count, total_count, saturate_k_);
+  *score = gamma_ * s;
+  if (verbose_) {
+    LOG(INFO) << "llm_rerank context: prev_word=" << prev_word_
+              << " text=" << text << " pair=" << pair_count
+              << " total=" << total_count << " s=" << s << " score=" << *score;
+  }
+  return true;
+}
+
+bool CompositeScorer::Score(const an<Candidate>& cand, double* score) {
+  double weight_score;
+  if (!weight_->Score(cand, &weight_score))
+    return false;
+  double context_score = 0.0;
+  if (context_)
+    context_->Score(cand, &context_score);
+  *score = weight_score + context_score;
+  return true;
+}
+
 static string CategoryOf(const string& type) {
-  if (type == "table" || type == "user_table")
+  if (IsSysWordType(type) || IsUsrWordType(type))
     return "word";
   return type;
 }
@@ -176,6 +227,14 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   return true;
 }
 
+static bool HasNonAscii(const string& text) {
+  for (char c : text) {
+    if ((unsigned char)c >= 0x80)
+      return true;
+  }
+  return false;
+}
+
 LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   if (name_space_ == "filter") {
     name_space_ = "llm_rerank";
@@ -187,19 +246,65 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     config->GetInt(name_space_ + "/window", &window_);
     config->GetDouble(name_space_ + "/sys_coeff", &sys_coeff_);
     config->GetDouble(name_space_ + "/usr_coeff", &usr_coeff_);
+    config->GetDouble(name_space_ + "/gamma", &gamma_);
+    config->GetDouble(name_space_ + "/saturate_k", &saturate_k_);
     config->GetBool(name_space_ + "/verbose", &verbose_);
   }
-  scorer_ = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
+  auto weight_scorer = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
+  scorer_ = weight_scorer;
+  if (engine_) {
+    an<Db> db;
+    if (auto component = Db::Require("userdb")) {
+      string db_name = ticket.schema->schema_id() + ".llm_rerank";
+      Db* raw = component->Create(db_name);
+      if (raw && raw->Open()) {
+        raw->CreateMetadata();
+        db.reset(raw);
+      } else {
+        delete raw;
+      }
+    }
+    if (db) {
+      memory_.reset(new ContextMemory(db));
+      context_scorer_ =
+          New<ContextScorer>(memory_.get(), gamma_, saturate_k_, verbose_);
+      scorer_ = New<CompositeScorer>(weight_scorer, context_scorer_);
+      Context* ctx = engine_->context();
+      commit_connection_ = ctx->commit_notifier().connect(
+          [this](Context* c) { OnCommit(c); });
+    } else {
+      LOG(WARNING) << name_space_
+                   << ": failed to open user db; context term disabled";
+    }
+  }
   LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false")
             << ", window = " << window_ << ", sys_coeff = " << sys_coeff_
-            << ", usr_coeff = " << usr_coeff_
+            << ", usr_coeff = " << usr_coeff_ << ", gamma = " << gamma_
+            << ", saturate_k = " << saturate_k_
             << ", verbose = " << (verbose_ ? "true" : "false");
+}
+
+LlmRerankFilter::~LlmRerankFilter() {
+  commit_connection_.disconnect();
+}
+
+void LlmRerankFilter::OnCommit(Context* ctx) {
+  if (!memory_ || !ctx)
+    return;
+  string selected = ctx->GetCommitText();
+  if (selected.empty() || !HasNonAscii(selected))
+    return;
+  memory_->Record(last_word_, selected);
+  last_word_ = selected;
 }
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
                                        CandidateList* candidates) {
   if (!enabled_) {
     return translation;
+  }
+  if (context_scorer_) {
+    context_scorer_->set_prev_word(last_word_);
   }
   return New<LlmRerankTranslation>(translation, scorer_, window_);
 }
