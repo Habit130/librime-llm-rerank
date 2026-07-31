@@ -12,11 +12,13 @@
 namespace rime {
 
 class Context;
+class LlmScorer;
 
 class Scorer {
  public:
   virtual ~Scorer() = default;
   virtual bool Score(const an<Candidate>& cand, double* score) = 0;
+  virtual void Prepare(const vector<string>& candidate_texts) {}
 };
 
 // Scores a candidate by its dictionary weight (log space) scaled by a
@@ -70,19 +72,23 @@ class ContextScorer : public Scorer {
   bool verbose_;
 };
 
-// Sums a weight score and a context score. Candidates the weight scorer rejects
-// (no dictionary weight) are rejected outright so non-word candidates keep
-// their place; the context term only ever adds to an accepted candidate.
+// Sums a weight score, an optional LLM score, and a context score. Candidates
+// the weight scorer rejects (no dictionary weight) are rejected outright so
+// non-word candidates keep their place; the LLM and context terms only ever add
+// to an accepted candidate. When the LLM scorer fails (daemon unavailable),
+// its term is simply omitted.
 class CompositeScorer : public Scorer {
  public:
-  CompositeScorer(an<Scorer> weight, an<Scorer> context)
-      : weight_(weight), context_(context) {}
+  CompositeScorer(an<Scorer> weight, an<Scorer> context, an<Scorer> llm = nullptr)
+      : weight_(weight), context_(context), llm_(llm) {}
 
   bool Score(const an<Candidate>& cand, double* score) override;
+  void Prepare(const vector<string>& candidate_texts) override;
 
  private:
   an<Scorer> weight_;
   an<Scorer> context_;
+  an<Scorer> llm_;
 };
 
 class LlmRerankFilter : public Filter {
@@ -99,16 +105,20 @@ class LlmRerankFilter : public Filter {
 
  private:
   void OnCommit(Context* ctx);
+  string BuildContext();
 
   bool enabled_ = true;
   int window_ = 32;
+  double alpha_ = 1.0;
   double sys_coeff_ = 1.0;
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
   bool verbose_ = false;
+  string socket_path_;
   an<Scorer> scorer_;
   an<ContextScorer> context_scorer_;
+  an<LlmScorer> llm_scorer_;
   the<ContextMemory> memory_;
   connection commit_connection_;
   string last_word_;

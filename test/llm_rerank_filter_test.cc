@@ -13,6 +13,7 @@
 #include <rime/gear/translator_commons.h>
 
 #include "llm_rerank_filter.h"
+#include "llm_scorer.h"
 
 using namespace rime;
 
@@ -709,6 +710,49 @@ TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
       MakePhrase("table", 0, 4, "丙", 0.0),
   });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+// --- T4: LlmScorer failure paths ---
+
+TEST(LlmScorerTest, DaemonUnavailableReturnsFalse) {
+  LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
+  scorer.set_context("发起");
+  scorer.Prepare({"攻击", "公鸡"});
+  double score = 0;
+  EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "攻击", 1.0), &score));
+}
+
+TEST(LlmScorerTest, DaemonUnavailablePassthroughOrder) {
+  auto llm = New<LlmScorer>("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
+  llm->set_context("发起");
+  auto weight = New<WeightScorer>(1.0, 1.0);
+  auto comp = New<CompositeScorer>(weight, nullptr, llm);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(comp);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲", 3.0),
+      MakePhrase("table", 0, 2, "乙", 1.0),
+      MakePhrase("table", 0, 4, "丙", 0.0),
+  });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+TEST(LlmScorerTest, MalformedResponseReturnsFalse) {
+  LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
+  scorer.set_context("test");
+  scorer.Prepare({"甲"});
+  double score = 0;
+  EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
+}
+
+TEST(LlmScorerTest, EmptyPrepareAllowsScore) {
+  LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
+  scorer.set_context("");
+  scorer.Prepare({});
+  double score = 0;
+  EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
 
 int main(int argc, char** argv) {

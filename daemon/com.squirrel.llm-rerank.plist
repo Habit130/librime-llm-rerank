@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.squirrel.llm-rerank</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/habit/Developer/squirrel/librime/plugins/llm-rerank/daemon/.venv/bin/python3</string>
+		<string>/Users/habit/Developer/squirrel/librime/plugins/llm-rerank/daemon/server.py</string>
+		<string>--serve</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/llm-rerank-daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/llm-rerank-daemon.err</string>
+</dict>
+</plist>

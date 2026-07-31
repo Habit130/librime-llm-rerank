@@ -17,10 +17,12 @@
 #include <rime/schema.h>
 #include <rime/ticket.h>
 #include <rime/translation.h>
+#include <rime/commit_history.h>
 #include <rime/dict/db.h>
 #include <rime/gear/translator_commons.h>
 
 #include "llm_rerank_filter.h"
+#include "llm_scorer.h"
 
 namespace rime {
 
@@ -93,8 +95,16 @@ bool CompositeScorer::Score(const an<Candidate>& cand, double* score) {
   double context_score = 0.0;
   if (context_)
     context_->Score(cand, &context_score);
-  *score = weight_score + context_score;
+  double llm_score = 0.0;
+  if (llm_)
+    llm_->Score(cand, &llm_score);
+  *score = weight_score + context_score + llm_score;
   return true;
+}
+
+void CompositeScorer::Prepare(const vector<string>& candidate_texts) {
+  if (llm_)
+    llm_->Prepare(candidate_texts);
 }
 
 static string CategoryOf(const string& type) {
@@ -189,6 +199,13 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   }
 
   vector<double> scores(n, 0.0);
+  vector<string> texts;
+  for (int i = 0; i < n; i++) {
+    if (!slots[i].is_word || slots[i].group_id == last_word_group)
+      continue;
+    texts.push_back(buffer[i]->text());
+  }
+  scorer_->Prepare(texts);
   for (int i = 0; i < n; i++) {
     if (!slots[i].is_word || slots[i].group_id == last_word_group)
       continue;
@@ -244,14 +261,26 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   if (Config* config = ticket.schema->config()) {
     config->GetBool(name_space_ + "/enable", &enabled_);
     config->GetInt(name_space_ + "/window", &window_);
+    config->GetDouble(name_space_ + "/alpha", &alpha_);
     config->GetDouble(name_space_ + "/sys_coeff", &sys_coeff_);
     config->GetDouble(name_space_ + "/usr_coeff", &usr_coeff_);
     config->GetDouble(name_space_ + "/gamma", &gamma_);
     config->GetDouble(name_space_ + "/saturate_k", &saturate_k_);
     config->GetBool(name_space_ + "/verbose", &verbose_);
+    config->GetString(name_space_ + "/socket_path", &socket_path_);
+  }
+  if (socket_path_.empty()) {
+    const char* home = getenv("HOME");
+    if (home) {
+      socket_path_ = string(home) +
+                     "/Library/Application Support/Squirrel/llm-rerank.sock";
+    }
   }
   auto weight_scorer = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
   scorer_ = weight_scorer;
+  if (alpha_ > 0.0 && !socket_path_.empty()) {
+    llm_scorer_ = New<LlmScorer>(socket_path_, alpha_, verbose_);
+  }
   if (engine_) {
     an<Db> db;
     if (auto component = Db::Require("userdb")) {
@@ -268,17 +297,21 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
       memory_.reset(new ContextMemory(db));
       context_scorer_ =
           New<ContextScorer>(memory_.get(), gamma_, saturate_k_, verbose_);
-      scorer_ = New<CompositeScorer>(weight_scorer, context_scorer_);
+      scorer_ = New<CompositeScorer>(weight_scorer, context_scorer_, llm_scorer_);
       Context* ctx = engine_->context();
       commit_connection_ = ctx->commit_notifier().connect(
           [this](Context* c) { OnCommit(c); });
     } else {
       LOG(WARNING) << name_space_
                    << ": failed to open user db; context term disabled";
+      if (llm_scorer_) {
+        scorer_ = New<CompositeScorer>(weight_scorer, nullptr, llm_scorer_);
+      }
     }
   }
   LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false")
-            << ", window = " << window_ << ", sys_coeff = " << sys_coeff_
+            << ", window = " << window_ << ", alpha = " << alpha_
+            << ", sys_coeff = " << sys_coeff_
             << ", usr_coeff = " << usr_coeff_ << ", gamma = " << gamma_
             << ", saturate_k = " << saturate_k_
             << ", verbose = " << (verbose_ ? "true" : "false");
@@ -298,6 +331,24 @@ void LlmRerankFilter::OnCommit(Context* ctx) {
   last_word_ = selected;
 }
 
+string LlmRerankFilter::BuildContext() {
+  if (!engine_)
+    return "";
+  Context* ctx = engine_->context();
+  if (!ctx)
+    return "";
+  const CommitHistory& history = ctx->commit_history();
+  string result;
+  for (const auto& record : history) {
+    if (record.text.empty())
+      continue;
+    if (!HasNonAscii(record.text))
+      continue;
+    result += record.text;
+  }
+  return result;
+}
+
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
                                        CandidateList* candidates) {
   if (!enabled_) {
@@ -305,6 +356,9 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   }
   if (context_scorer_) {
     context_scorer_->set_prev_word(last_word_);
+  }
+  if (llm_scorer_) {
+    llm_scorer_->set_context(BuildContext());
   }
   return New<LlmRerankTranslation>(translation, scorer_, window_);
 }
