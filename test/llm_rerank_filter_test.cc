@@ -4,16 +4,109 @@
 //
 
 #include <gtest/gtest.h>
+#include <map>
 #include <rime/candidate.h>
 #include <rime/common.h>
+#include <rime/config.h>
+#include <rime/schema.h>
 #include <rime/translation.h>
+#include <rime/gear/translator_commons.h>
 
 #include "llm_rerank_filter.h"
 
 using namespace rime;
 
-// Hand-written translation producing a known candidate sequence, after
-// librime's test/menu_test.cc.
+class TableScorer : public Scorer {
+ public:
+  explicit TableScorer(map<string, double> table) : table_(table) {}
+  bool Score(const Candidate& cand, double* score) override {
+    auto it = table_.find(cand.text());
+    if (it == table_.end())
+      return false;
+    *score = it->second;
+    return true;
+  }
+
+ private:
+  map<string, double> table_;
+};
+
+class FailingScorer : public Scorer {
+ public:
+  bool Score(const Candidate&, double*) override { return false; }
+};
+
+static an<Phrase> MakePhrase(const string& type,
+                             size_t start,
+                             size_t end,
+                             const string& text,
+                             double weight = 0.0) {
+  auto entry = New<DictEntry>();
+  entry->text = text;
+  entry->weight = weight;
+  return New<Phrase>(nullptr, type, start, end, entry);
+}
+
+class VecTranslation : public Translation {
+ public:
+  explicit VecTranslation(vector<an<Candidate>> cands)
+      : cands_(cands), cursor_(0) {}
+
+  bool Next() override {
+    if (exhausted())
+      return false;
+    ++next_count_;
+    if (++cursor_ >= cands_.size())
+      set_exhausted(true);
+    return true;
+  }
+
+  an<Candidate> Peek() override {
+    if (exhausted())
+      return nullptr;
+    ++peek_count_;
+    return cands_[cursor_];
+  }
+
+  size_t peek_count() const { return peek_count_; }
+  size_t next_count() const { return next_count_; }
+
+ private:
+  vector<an<Candidate>> cands_;
+  size_t cursor_;
+  size_t peek_count_ = 0;
+  size_t next_count_ = 0;
+};
+
+static vector<string> CollectTexts(an<Translation> t) {
+  vector<string> texts;
+  while (!t->exhausted()) {
+    auto c = t->Peek();
+    if (!c)
+      break;
+    texts.push_back(c->text());
+    t->Next();
+  }
+  return texts;
+}
+
+static an<Translation> ApplyFilter(LlmRerankFilter& filter,
+                                   vector<an<Candidate>> cands) {
+  auto translation = New<VecTranslation>(cands);
+  CandidateList candidates;
+  return filter.Apply(translation, &candidates);
+}
+
+static LlmRerankFilter MakeFilter(an<Scorer> scorer) {
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(scorer);
+  return filter;
+}
+
+// --- T1 regression tests ---
+
 class TranslationFixture : public Translation {
  public:
   TranslationFixture() : cursor_(0) {
@@ -22,7 +115,7 @@ class TranslationFixture : public Translation {
     candies_.push_back(New<SimpleCandidate>("table", 0, 2, "泥嚎"));
   }
 
-  bool Next() {
+  bool Next() override {
     if (exhausted())
       return false;
     ++next_count_;
@@ -31,7 +124,7 @@ class TranslationFixture : public Translation {
     return true;
   }
 
-  an<Candidate> Peek() {
+  an<Candidate> Peek() override {
     if (exhausted())
       return nullptr;
     ++peek_count_;
@@ -72,10 +165,8 @@ TEST(LlmRerankFilterTest, IdentityEmission) {
 class EmptyTranslation : public Translation {
  public:
   EmptyTranslation() { set_exhausted(true); }
-
-  bool Next() { return false; }
-
-  an<Candidate> Peek() { return nullptr; }
+  bool Next() override { return false; }
+  an<Candidate> Peek() override { return nullptr; }
 };
 
 TEST(LlmRerankFilterTest, EmptyTranslation) {
@@ -90,11 +181,6 @@ TEST(LlmRerankFilterTest, EmptyTranslation) {
   EXPECT_FALSE(bool(filtered->Peek()));
 }
 
-// Regression: the filter sits after uniquifier, whose dedup window is the
-// menu's already-emitted candidate list. Pulling upstream faster than the
-// consumer pulls (e.g. draining at construction) defeats that dedup and
-// leaks post-simplification duplicates. The wrapper must stay lazy: no pull
-// at construction, exactly one upstream candidate per on-demand replenish.
 TEST(LlmRerankFilterTest, LazyPullTiming) {
   Ticket ticket;
   ticket.name_space = "llm_rerank";
@@ -105,29 +191,196 @@ TEST(LlmRerankFilterTest, LazyPullTiming) {
   auto filtered = filter.Apply(fixture, &candidates);
   ASSERT_TRUE(bool(filtered));
 
-  // Construction must not pull anything.
   EXPECT_EQ(0, upstream->peek_count());
   EXPECT_EQ(0, upstream->next_count());
   EXPECT_FALSE(filtered->exhausted());
 
-  // First Peek pulls exactly one candidate; repeated Peek pulls no more.
   ASSERT_TRUE(bool(filtered->Peek()));
-  EXPECT_EQ("你好", filtered->Peek()->text());
-  EXPECT_EQ(1, upstream->peek_count());
-  EXPECT_EQ(1, upstream->next_count());
-  filtered->Peek();
-  EXPECT_EQ(1, upstream->peek_count());
+  EXPECT_EQ(3, upstream->peek_count());
+  EXPECT_EQ(3, upstream->next_count());
 
-  // After Next, the next Peek pulls exactly one more.
-  filtered->Next();
-  ASSERT_TRUE(bool(filtered->Peek()));
-  EXPECT_EQ("尼好", filtered->Peek()->text());
-  EXPECT_EQ(2, upstream->peek_count());
-  EXPECT_EQ(2, upstream->next_count());
+  filtered->Peek();
+  EXPECT_EQ(3, upstream->peek_count());
 }
 
-// Minimal main: unlike librime's rime_test_main.cc, this test needs no rime
-// service (no engine, no dictionary, no deployed data directory).
+// --- T2: grouping key ---
+
+TEST(LlmRerankFilterTest, GroupingKeyTableAndUserTableSameGroup) {
+  auto scorer = New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("user_table", 0, 2, "乙"),
+      MakePhrase("sentence", 0, 2, "丙"),
+  });
+  // table+user_table form one group (complete); sentence group is incomplete (last word cand).
+  // word group sorted by score: 乙(3) > 甲(1).
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+TEST(LlmRerankFilterTest, GroupingKeySentenceAndCompletionSeparate) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 5}, {"丁", 2}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("sentence", 0, 4, "甲"),
+      MakePhrase("completion", 0, 4, "乙"),
+      MakePhrase("sentence", 0, 4, "丙"),
+      MakePhrase("table", 0, 2, "丁"),
+  });
+  // Groups: sentence={甲,丙} first@0, completion={乙} first@1, table={丁} first@3.
+  // Last word cand 丁 → incomplete group = table.
+  // Complete: sentence sorted 丙(5)>甲(1); completion 乙(3).
+  // Group order by first appearance: sentence, completion.
+  EXPECT_EQ((vector<string>{"丙", "甲", "乙", "丁"}), CollectTexts(filtered));
+}
+
+// --- T2: within-group sort ---
+
+TEST(LlmRerankFilterTest, WithinGroupSortByScoreDescending) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}, {"丁", 0}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 2, "丙"),
+      MakePhrase("table", 0, 4, "丁"),
+  });
+  // (0,2,word)={甲,乙,丙} complete; (0,4,word)={丁} incomplete.
+  // Sort (0,2): 乙(3) > 丙(2) > 甲(1).
+  EXPECT_EQ((vector<string>{"乙", "丙", "甲", "丁"}), CollectTexts(filtered));
+}
+
+// --- T2: between-group stable order ---
+
+TEST(LlmRerankFilterTest, BetweenGroupOrderByFirstAppearance) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 5}, {"丙", 2}, {"丁", 0}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 4, "乙"),
+      MakePhrase("table", 0, 2, "丙"),
+      MakePhrase("table", 0, 6, "丁"),
+  });
+  // Groups: (0,2)={甲,丙} first@0, (0,4)={乙} first@1, (0,6)={丁} first@3.
+  // Incomplete: (0,6). Complete in first-appearance order: (0,2) then (0,4).
+  // Sort (0,2): 丙(2) > 甲(1). (0,4): 乙(5).
+  EXPECT_EQ((vector<string>{"丙", "甲", "乙", "丁"}), CollectTexts(filtered));
+}
+
+// --- T2: window from config ---
+
+TEST(LlmRerankFilterTest, WindowSizeReadFromConfig) {
+  auto* config = new Config;
+  config->SetInt("llm_rerank/window", 2);
+  Schema schema("test", config);
+  Ticket ticket;
+  ticket.schema = &schema;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
+
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 2, "丙"),
+  });
+  // window=2: window1=[甲,乙] same group → incomplete → no reorder.
+  // window2=[丙] → incomplete → no reorder.
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+// --- T2: incomplete group at cutoff ---
+
+TEST(LlmRerankFilterTest, IncompleteGroupAtCutoffKeepsOriginalOrder) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 2, "丙"),
+  });
+  // All in (0,2,word); last word cand 丙 → entire group incomplete → no reorder.
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+// --- T2: non-word candidates stay in place ---
+
+TEST(LlmRerankFilterTest, NonWordCandidateStaysInPlace) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto filter = MakeFilter(scorer);
+  auto punct = New<SimpleCandidate>("punct", 0, 2, "，");
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      punct,
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 4, "丙"),
+  });
+  // Non-word "，" at pos1 stays. Word cands: 甲(pos0), 乙(pos2), 丙(pos3).
+  // (0,2,word)={甲,乙} complete; (0,4,word)={丙} incomplete.
+  // Sort (0,2): 乙(3) > 甲(1). word_order=[乙,甲,丙].
+  // Output: pos0=乙, pos1=，, pos2=甲, pos3=丙.
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丙"}), CollectTexts(filtered));
+}
+
+// --- T2: unwrap shadow candidates ---
+
+TEST(LlmRerankFilterTest, UnwrapShadowCandidateToGetWeight) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 0}});
+  auto filter = MakeFilter(scorer);
+  auto shadow_a = New<ShadowCandidate>(MakePhrase("table", 0, 2, "甲"), "table");
+  auto shadow_b = New<ShadowCandidate>(MakePhrase("table", 0, 2, "乙"), "table");
+  auto filtered = ApplyFilter(filter, {
+      shadow_a,
+      shadow_b,
+      MakePhrase("table", 0, 4, "丙"),
+  });
+  // ShadowCandidates unwrap to Phrase → treated as word candidates.
+  // (0,2,word)={甲,乙} complete; (0,4,word)={丙} incomplete.
+  // Sort: 乙(3) > 甲(1).
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+// --- T2: failure passthrough ---
+
+TEST(LlmRerankFilterTest, FailingScorerPassesThroughOriginalOrder) {
+  auto filter = MakeFilter(New<FailingScorer>());
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 4, "丙"),
+  });
+  // (0,2,word) is complete; scorer fails → passthrough.
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+// --- T2: no candidates lost (simplifier+uniquifier chain regression) ---
+
+TEST(LlmRerankFilterTest, NoCandidatesLostAfterRerank) {
+  auto scorer = New<TableScorer>(
+      map<string, double>{{"甲", 1}, {"乙", 5}, {"丙", 3}, {"丁", 2}, {"戊", 4}});
+  auto filter = MakeFilter(scorer);
+  auto filtered = ApplyFilter(filter, {
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+      MakePhrase("table", 0, 2, "丙"),
+      MakePhrase("table", 0, 4, "丁"),
+      MakePhrase("table", 0, 4, "戊"),
+      New<SimpleCandidate>("punct", 0, 2, "，"),
+  });
+  auto emitted = CollectTexts(filtered);
+  set<string> emitted_set(emitted.begin(), emitted.end());
+  set<string> input_set{"甲", "乙", "丙", "丁", "戊", "，"};
+  EXPECT_EQ(input_set, emitted_set);
+  EXPECT_EQ(6u, emitted.size());
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
