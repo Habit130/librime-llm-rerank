@@ -20,6 +20,8 @@ import sys
 import threading
 import time
 
+import mlx.core as mx
+
 SOCKET_PATH = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock"
 )
@@ -27,6 +29,7 @@ MODEL_PATH = "/Users/habit/Models/Qwen/Qwen3-0.6B-Base"
 IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
+CACHE_LIMIT_MB = 512  # MLX allocator cache cap; 0 = unlimited (default MLX behavior)
 
 
 def window_context(context, context_window):
@@ -204,7 +207,10 @@ def handle_request(state, data):
         return {"error": f"inference failed: {e}"}
 
 
-def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, test_mode=False):
+def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, test_mode=False):
+    if cache_limit_mb > 0:
+        mx.set_cache_limit(cache_limit_mb * 10**6)
+
     state = ModelState(model_path, context_window)
     last_activity = time.time()
     lock = threading.Lock()
@@ -363,6 +369,12 @@ if __name__ == "__main__":
         default=CONTEXT_WINDOW,
         help="chars of 上文 tail to condition on (ADR-0002)",
     )
+    parser.add_argument(
+        "--cache-limit-mb",
+        type=int,
+        default=CACHE_LIMIT_MB,
+        help="MLX allocator cache cap in MB; 0 = unlimited",
+    )
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
@@ -370,10 +382,13 @@ if __name__ == "__main__":
     if args.context_window < 1:
         parser.error("--context-window must be >= 1")
 
+    if args.cache_limit_mb < 0:
+        parser.error("--cache-limit-mb must be >= 0")
+
     if args.test:
         ok = self_test(args.socket, args.model)
         sys.exit(0 if ok else 1)
     else:
         run_server(
-            args.socket, args.model, args.context_window, test_mode=True
+            args.socket, args.model, args.context_window, args.cache_limit_mb, test_mode=True
         )
