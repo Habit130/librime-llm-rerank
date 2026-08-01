@@ -8,7 +8,7 @@ Drives score() with VARIED request shapes (random candidate counts and lengths)
 for several dozen iterations. With mx.metal.set_cache_limit() set, asserts:
   - mx.get_cache_memory() stays bounded (near/under the limit, not growing)
   - mx.get_active_memory() stays roughly constant (model weights only)
-  - average latency stays in budget (~50 ms)
+  - average latency stays in budget (~60 ms in-process; ~50 ms over socket)
 
 A uniform-shape test will NOT reproduce the bug; sizes MUST vary.
 """
@@ -64,7 +64,7 @@ def make_varied_candidates(rng):
 def main():
     iterations = 40
     cache_limit_mb = CACHE_LIMIT_MB
-    latency_budget_ms = 80.0
+    latency_budget_ms = 60.0
 
     print(f"model: {MODEL_PATH}")
     print(f"cache limit: {cache_limit_mb} MB")
