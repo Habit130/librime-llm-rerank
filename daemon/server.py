@@ -26,19 +26,27 @@ SOCKET_PATH = os.path.expanduser(
 MODEL_PATH = "/Users/habit/Models/Qwen/Qwen3-0.6B-Base"
 IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
+CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
+
+
+def window_context(context, context_window):
+    """Truncate context to its last `context_window` characters (ADR-0002)."""
+    return context[-context_window:]
 
 
 class ModelState:
-    """Holds the loaded model, tokenizer, and prefix KV cache."""
+    """Holds the loaded model and tokenizer.
 
-    def __init__(self, model_path):
+    Scoring is stateless (ADR-0002): the prefix KV cache is built fresh inside
+    each score() call as local state, so nothing accumulates across requests.
+    """
+
+    def __init__(self, model_path, context_window=CONTEXT_WINDOW):
         self.model_path = model_path
+        self.context_window = context_window
         self.model = None
         self.tokenizer = None
         self.pad_id = None
-        self._prefix_text = ""
-        self._prefix_cache = None
-        self._prefix_last_lp = None
 
     def load(self):
         if self.model is not None:
@@ -51,18 +59,12 @@ class ModelState:
         self.pad_id = self.tokenizer.pad_token_id
         if self.pad_id is None:
             self.pad_id = self.tokenizer.eos_token_id
-        self._prefix_text = ""
-        self._prefix_cache = None
-        self._prefix_last_lp = None
 
     def unload(self):
         import mlx.core as mx
 
         self.model = None
         self.tokenizer = None
-        self._prefix_cache = None
-        self._prefix_last_lp = None
-        self._prefix_text = None
         try:
             mx.clear_cache()
         except Exception:
@@ -90,16 +92,25 @@ class ModelState:
     def score(self, context, candidates):
         """Score candidates via teacher-forced log-prob accumulation.
 
-        Tokenize strategy (#12):
+        Window (ADR-0002): condition on the last `context_window` chars only.
+        Stateless: the prefix KV cache is built fresh per request as local
+        state, shared across the candidate batch, and freed on return.
+
+        Tokenize strategy (#12), applied to the windowed string:
           - prefix = context[:-TAIL_CHARS], tokenized once, KV cached
           - per candidate: tokenize context[-TAIL_CHARS:] + candidate as tail
           - batched forward, sum log probs of candidate tokens
         """
         import mlx.core as mx
         import mlx.nn as nn
-        from mlx_lm.models.cache import KVCache
 
         self.load()
+
+        n = len(candidates)
+        if n == 0:
+            return []
+
+        context = window_context(context, self.context_window)
 
         if len(context) > TAIL_CHARS:
             prefix_text = context[:-TAIL_CHARS]
@@ -108,20 +119,12 @@ class ModelState:
             prefix_text = ""
             tail_text = context
 
-        if prefix_text != self._prefix_text:
-            prefix_ids = (
-                self.tokenizer.encode(prefix_text, add_special_tokens=False)
-                if prefix_text
-                else []
-            )
-            self._prefix_cache, self._prefix_last_lp = self._build_prefix_cache(
-                prefix_ids
-            )
-            self._prefix_text = prefix_text
-
-        n = len(candidates)
-        if n == 0:
-            return []
+        prefix_ids = (
+            self.tokenizer.encode(prefix_text, add_special_tokens=False)
+            if prefix_text
+            else []
+        )
+        prefix_cache, prefix_last_lp = self._build_prefix_cache(prefix_ids)
 
         tail_ids_per_cand = []
         for c in candidates:
@@ -133,9 +136,9 @@ class ModelState:
         padded = [t + [self.pad_id] * (max_tail - len(t)) for t in tail_ids_per_cand]
         suffix = mx.array(padded)
 
-        has_prefix = self._prefix_last_lp is not None
+        has_prefix = prefix_last_lp is not None
         if has_prefix:
-            score_cache = self._expand_cache(self._prefix_cache, n, max_tail)
+            score_cache = self._expand_cache(prefix_cache, n, max_tail)
         else:
             score_cache = None
 
@@ -147,7 +150,7 @@ class ModelState:
             tail_ids = tail_ids_per_cand[i]
             total = 0.0
             if has_prefix and tail_ids:
-                total += float(self._prefix_last_lp[tail_ids[0]])
+                total += float(prefix_last_lp[tail_ids[0]])
             for t in range(len(tail_ids) - 1):
                 total += float(lp[i, t, tail_ids[t + 1]])
             scores.append(total)
@@ -201,8 +204,8 @@ def handle_request(state, data):
         return {"error": f"inference failed: {e}"}
 
 
-def run_server(sock_path, model_path, test_mode=False):
-    state = ModelState(model_path)
+def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, test_mode=False):
+    state = ModelState(model_path, context_window)
     last_activity = time.time()
     lock = threading.Lock()
 
@@ -354,12 +357,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM rerank daemon")
     parser.add_argument("--socket", default=SOCKET_PATH)
     parser.add_argument("--model", default=MODEL_PATH)
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=CONTEXT_WINDOW,
+        help="chars of 上文 tail to condition on (ADR-0002)",
+    )
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
+
+    if args.context_window < 1:
+        parser.error("--context-window must be >= 1")
 
     if args.test:
         ok = self_test(args.socket, args.model)
         sys.exit(0 if ok else 1)
     else:
-        run_server(args.socket, args.model, test_mode=True)
+        run_server(
+            args.socket, args.model, args.context_window, test_mode=True
+        )
