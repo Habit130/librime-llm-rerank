@@ -20,11 +20,12 @@ using namespace rime;
 class TableScorer : public Scorer {
  public:
   explicit TableScorer(map<string, double> table) : table_(table) {}
-  bool Score(const an<Candidate>& cand, double* score) override {
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override {
     auto it = table_.find(cand->text());
     if (it == table_.end())
       return false;
-    *score = it->second;
+    score->base_score = it->second;
+    score->retrieval_evidence = 0.0;
     return true;
   }
 
@@ -34,7 +35,7 @@ class TableScorer : public Scorer {
 
 class FailingScorer : public Scorer {
  public:
-  bool Score(const an<Candidate>&, double*) override { return false; }
+  bool Score(const an<Candidate>&, ScoreComponents*) override { return false; }
 };
 
 static an<Phrase> MakePhrase(const string& type,
@@ -103,6 +104,8 @@ static LlmRerankFilter MakeFilter(an<Scorer> scorer) {
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
   filter.set_scorer(scorer);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
   return filter;
 }
 
@@ -207,33 +210,33 @@ TEST(LlmRerankFilterTest, LazyPullTiming) {
 // --- T2: grouping key ---
 
 TEST(LlmRerankFilterTest, GroupingKeyTableAndUserTableSameGroup) {
-  auto scorer = New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto scorer =
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
   auto filter = MakeFilter(scorer);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("user_table", 0, 2, "乙"),
-      MakePhrase("sentence", 0, 2, "丙"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("user_table", 0, 2, "乙"),
+                                          MakePhrase("sentence", 0, 2, "丙"),
+                                      });
   // table+user_table form one (0,2,word) group; 丙 is a (0,2,sentence) group.
   // Translation exhausted → nothing excluded. word group sorted 乙(3) > 甲(1),
   // then the sentence group 丙(2) by first appearance.
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
-TEST(LlmRerankFilterTest, GroupingKeySentenceAndCompletionSeparate) {
+TEST(LlmRerankFilterTest, SentenceAndCompletionCandidatesStayInPlace) {
   auto scorer = New<TableScorer>(
       map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 5}, {"丁", 2}});
   auto filter = MakeFilter(scorer);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("sentence", 0, 4, "甲"),
-      MakePhrase("completion", 0, 4, "乙"),
-      MakePhrase("sentence", 0, 4, "丙"),
-      MakePhrase("table", 0, 2, "丁"),
-  });
-  // Groups: sentence={甲,丙} first@0, completion={乙} first@1, table={丁} first@3.
-  // Not truncated → nothing excluded; groups scored in first-appearance order:
-  // sentence sorted 丙(5)>甲(1); completion 乙(3); table 丁(2).
-  EXPECT_EQ((vector<string>{"丙", "甲", "乙", "丁"}), CollectTexts(filtered));
+                                          MakePhrase("sentence", 0, 4, "甲"),
+                                          MakePhrase("completion", 0, 4, "乙"),
+                                          MakePhrase("sentence", 0, 4, "丙"),
+                                          MakePhrase("table", 0, 2, "丁"),
+                                      });
+  // Only word candidates are rerankable. Sentence and completion candidates
+  // retain their original positions, and the lone word candidate cannot move.
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁"}), CollectTexts(filtered));
 }
 
 // --- T2: within-group sort ---
@@ -243,11 +246,11 @@ TEST(LlmRerankFilterTest, WithinGroupSortByScoreDescending) {
       map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}, {"丁", 0}});
   auto filter = MakeFilter(scorer);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 2, "丙"),
-      MakePhrase("table", 0, 4, "丁"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                          MakePhrase("table", 0, 4, "丁"),
+                                      });
   // Not truncated → both groups scored. (0,2)={甲,乙,丙} sorts 乙(3) > 丙(2) >
   // 甲(1); (0,4)={丁} (0) follows by first appearance.
   EXPECT_EQ((vector<string>{"乙", "丙", "甲", "丁"}), CollectTexts(filtered));
@@ -260,11 +263,11 @@ TEST(LlmRerankFilterTest, BetweenGroupOrderByFirstAppearance) {
       map<string, double>{{"甲", 1}, {"乙", 5}, {"丙", 2}, {"丁", 0}});
   auto filter = MakeFilter(scorer);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 4, "乙"),
-      MakePhrase("table", 0, 2, "丙"),
-      MakePhrase("table", 0, 6, "丁"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 4, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                          MakePhrase("table", 0, 6, "丁"),
+                                      });
   // Groups: (0,2)={甲,丙} first@0, (0,4)={乙} first@1, (0,6)={丁} first@3.
   // Not truncated → all scored in first-appearance order: (0,2), (0,4), (0,6).
   // Sort (0,2): 丙(2) > 甲(1). (0,4): 乙(5). (0,6): 丁(0).
@@ -281,14 +284,15 @@ TEST(LlmRerankFilterTest, WindowSizeReadFromConfig) {
   ticket.schema = &schema;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
-  filter.set_scorer(New<TableScorer>(
-      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
+  filter.set_input("abcdef");
+  filter.set_scorer(
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
 
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 2, "丙"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                      });
   // window=2: window1=[甲,乙] is full with 丙 still upstream → truncated → the
   // same group is held at the cutoff → no reorder. window2=[丙] alone.
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
@@ -297,15 +301,15 @@ TEST(LlmRerankFilterTest, WindowSizeReadFromConfig) {
 // --- T2: incomplete group at cutoff ---
 
 TEST(LlmRerankFilterTest, IncompleteGroupAtCutoffKeepsOriginalOrder) {
-  auto scorer = New<TableScorer>(
-      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto scorer =
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
   auto filter = MakeFilter(scorer);
   filter.set_window(2);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 2, "丙"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                      });
   // window=2: window1=[甲,乙] is full while 丙 is still upstream (translation
   // not exhausted) → truncated → the (0,2,word) group may be incomplete at the
   // cutoff and keeps its original order. window2=[丙] alone.
@@ -313,14 +317,14 @@ TEST(LlmRerankFilterTest, IncompleteGroupAtCutoffKeepsOriginalOrder) {
 }
 
 TEST(LlmRerankFilterTest, SingleCompleteGroupSortedWhenNotTruncated) {
-  auto scorer = New<TableScorer>(
-      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto scorer =
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
   auto filter = MakeFilter(scorer);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 2, "丙"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                      });
   // window=32 (default) > 3 candidates: the translation is exhausted, so the
   // single (0,2,word) group is complete and must be scored, not skipped.
   // Sort: 乙(3) > 丙(2) > 甲(1).
@@ -330,38 +334,40 @@ TEST(LlmRerankFilterTest, SingleCompleteGroupSortedWhenNotTruncated) {
 // --- T2: non-word candidates stay in place ---
 
 TEST(LlmRerankFilterTest, NonWordCandidateStaysInPlace) {
-  auto scorer = New<TableScorer>(
-      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
+  auto scorer =
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
   auto filter = MakeFilter(scorer);
   auto punct = New<SimpleCandidate>("punct", 0, 2, "，");
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      punct,
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 4, "丙"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          punct,
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 4, "丙"),
+                                      });
   // Non-word "，" at pos1 stays. Word cands: 甲(pos0), 乙(pos2), 丙(pos3).
-  // Not truncated → both groups scored. Sort (0,2): 乙(3) > 甲(1); (0,4): 丙(2).
-  // word_order=[乙,甲,丙].
-  // Output: pos0=乙, pos1=，, pos2=甲, pos3=丙.
+  // Not truncated → both groups scored. Sort (0,2): 乙(3) > 甲(1); (0,4):
+  // 丙(2). word_order=[乙,甲,丙]. Output: pos0=乙, pos1=，, pos2=甲, pos3=丙.
   EXPECT_EQ((vector<string>{"乙", "，", "甲", "丙"}), CollectTexts(filtered));
 }
 
 // --- T2: unwrap shadow candidates ---
 
 TEST(LlmRerankFilterTest, UnwrapShadowCandidateToGetWeight) {
-  auto scorer = New<TableScorer>(
-      map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 0}});
+  auto scorer =
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 0}});
   auto filter = MakeFilter(scorer);
-  auto shadow_a = New<ShadowCandidate>(MakePhrase("table", 0, 2, "甲"), "table");
-  auto shadow_b = New<ShadowCandidate>(MakePhrase("table", 0, 2, "乙"), "table");
+  auto shadow_a =
+      New<ShadowCandidate>(MakePhrase("table", 0, 2, "甲"), "table");
+  auto shadow_b =
+      New<ShadowCandidate>(MakePhrase("table", 0, 2, "乙"), "table");
   auto filtered = ApplyFilter(filter, {
-      shadow_a,
-      shadow_b,
-      MakePhrase("table", 0, 4, "丙"),
-  });
+                                          shadow_a,
+                                          shadow_b,
+                                          MakePhrase("table", 0, 4, "丙"),
+                                      });
   // ShadowCandidates unwrap to Phrase → treated as word candidates.
-  // Not truncated → both groups scored. Sort (0,2): 乙(3) > 甲(1); (0,4): 丙(0).
+  // Not truncated → both groups scored. Sort (0,2): 乙(3) > 甲(1); (0,4):
+  // 丙(0).
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
@@ -370,10 +376,10 @@ TEST(LlmRerankFilterTest, UnwrapShadowCandidateToGetWeight) {
 TEST(LlmRerankFilterTest, FailingScorerPassesThroughOriginalOrder) {
   auto filter = MakeFilter(New<FailingScorer>());
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 4, "丙"),
-  });
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 4, "丙"),
+                                      });
   // (0,2,word) is complete; scorer fails → passthrough.
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
@@ -381,17 +387,18 @@ TEST(LlmRerankFilterTest, FailingScorerPassesThroughOriginalOrder) {
 // --- T2: no candidates lost (simplifier+uniquifier chain regression) ---
 
 TEST(LlmRerankFilterTest, NoCandidatesLostAfterRerank) {
-  auto scorer = New<TableScorer>(
-      map<string, double>{{"甲", 1}, {"乙", 5}, {"丙", 3}, {"丁", 2}, {"戊", 4}});
+  auto scorer = New<TableScorer>(map<string, double>{
+      {"甲", 1}, {"乙", 5}, {"丙", 3}, {"丁", 2}, {"戊", 4}});
   auto filter = MakeFilter(scorer);
-  auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲"),
-      MakePhrase("table", 0, 2, "乙"),
-      MakePhrase("table", 0, 2, "丙"),
-      MakePhrase("table", 0, 4, "丁"),
-      MakePhrase("table", 0, 4, "戊"),
-      New<SimpleCandidate>("punct", 0, 2, "，"),
-  });
+  auto filtered =
+      ApplyFilter(filter, {
+                              MakePhrase("table", 0, 2, "甲"),
+                              MakePhrase("table", 0, 2, "乙"),
+                              MakePhrase("table", 0, 2, "丙"),
+                              MakePhrase("table", 0, 4, "丁"),
+                              MakePhrase("table", 0, 4, "戊"),
+                              New<SimpleCandidate>("punct", 0, 2, "，"),
+                          });
   auto emitted = CollectTexts(filtered);
   set<string> emitted_set(emitted.begin(), emitted.end());
   set<string> input_set{"甲", "乙", "丙", "丁", "戊", "，"};
@@ -403,29 +410,28 @@ TEST(LlmRerankFilterTest, NoCandidatesLostAfterRerank) {
 
 TEST(WeightScorerTest, ScoreEqualsCoeffTimesWeight) {
   WeightScorer scorer(2.0, 0.5);
-  double score = 0;
+  ScoreComponents score;
   ASSERT_TRUE(scorer.Score(MakePhrase("table", 0, 2, "甲", 3.0), &score));
-  EXPECT_DOUBLE_EQ(6.0, score);  // sys: 2.0 * 3.0
+  EXPECT_DOUBLE_EQ(6.0, score.base_score);  // sys: 2.0 * 3.0
   ASSERT_TRUE(scorer.Score(MakePhrase("user_table", 0, 2, "乙", 3.0), &score));
-  EXPECT_DOUBLE_EQ(1.5, score);  // usr: 0.5 * 3.0
+  EXPECT_DOUBLE_EQ(1.5, score.base_score);  // usr: 0.5 * 3.0
 }
 
 TEST(WeightScorerTest, NonDictionaryCandidateReturnsFalse) {
   WeightScorer scorer(1.0, 1.0);
-  double score = 0;
+  ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("sentence", 0, 2, "甲", 5.0), &score));
-  EXPECT_FALSE(
-      scorer.Score(New<SimpleCandidate>("punct", 0, 2, "，"), &score));
+  EXPECT_FALSE(scorer.Score(New<SimpleCandidate>("punct", 0, 2, "，"), &score));
 }
 
 TEST(WeightScorerTest, WithinGroupOrderByWeightDescending) {
   auto filter = MakeFilter(New<WeightScorer>(1.0, 1.0));
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 1.0),
-      MakePhrase("table", 0, 2, "乙", 3.0),
-      MakePhrase("table", 0, 2, "丙", 2.0),
-      MakePhrase("table", 0, 4, "丁", 0.0),
-  });
+                                          MakePhrase("table", 0, 2, "甲", 1.0),
+                                          MakePhrase("table", 0, 2, "乙", 3.0),
+                                          MakePhrase("table", 0, 2, "丙", 2.0),
+                                          MakePhrase("table", 0, 4, "丁", 0.0),
+                                      });
   // (0,2,word)={甲,乙,丙} complete; weight desc: 乙(3)>丙(2)>甲(1).
   EXPECT_EQ((vector<string>{"乙", "丙", "甲", "丁"}), CollectTexts(filtered));
 }
@@ -437,32 +443,34 @@ TEST(WeightScorerTest, UnwrapShadowToGetWeight) {
   auto shadow_b =
       New<ShadowCandidate>(MakePhrase("table", 0, 2, "乙", 3.0), "table");
   auto filtered = ApplyFilter(filter, {
-      shadow_a,
-      shadow_b,
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+                                          shadow_a,
+                                          shadow_b,
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
   // Shadows unwrap to the underlying phrases; weight desc: 乙(3)>甲(1).
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
 TEST(WeightScorerTest, UserCoeffLiftsUserCandidate) {
   auto filter = MakeFilter(New<WeightScorer>(/*sys=*/1.0, /*usr=*/3.0));
-  auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 5.0),
-      MakePhrase("user_table", 0, 2, "乙", 2.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+  auto filtered =
+      ApplyFilter(filter, {
+                              MakePhrase("table", 0, 2, "甲", 5.0),
+                              MakePhrase("user_table", 0, 2, "乙", 2.0),
+                              MakePhrase("table", 0, 4, "丙", 0.0),
+                          });
   // sys 甲 = 1.0*5 = 5; usr 乙 = 3.0*2 = 6 → 乙 > 甲.
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
 TEST(WeightScorerTest, SysCoeffLiftsSystemCandidate) {
   auto filter = MakeFilter(New<WeightScorer>(/*sys=*/4.0, /*usr=*/1.0));
-  auto filtered = ApplyFilter(filter, {
-      MakePhrase("user_table", 0, 2, "甲", 3.0),
-      MakePhrase("table", 0, 2, "乙", 1.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+  auto filtered =
+      ApplyFilter(filter, {
+                              MakePhrase("user_table", 0, 2, "甲", 3.0),
+                              MakePhrase("table", 0, 2, "乙", 1.0),
+                              MakePhrase("table", 0, 4, "丙", 0.0),
+                          });
   // usr 甲 = 1.0*3 = 3; sys 乙 = 4.0*1 = 4 → 乙 > 甲.
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
@@ -473,13 +481,14 @@ TEST(WeightScorerTest, SelfCheckUnitCoeffsPreserveMergeOrder) {
   // by quality, which is monotonic in weight. Feeding a group in that natural
   // (weight-descending) order must therefore come out unchanged.
   auto filter = MakeFilter(New<WeightScorer>(1.0, 1.0));
-  auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 9.0),
-      MakePhrase("user_table", 0, 2, "乙", 7.0),
-      MakePhrase("table", 0, 2, "丙", 5.0),
-      MakePhrase("user_table", 0, 2, "丁", 3.0),
-      MakePhrase("table", 0, 4, "戊", 1.0),
-  });
+  auto filtered =
+      ApplyFilter(filter, {
+                              MakePhrase("table", 0, 2, "甲", 9.0),
+                              MakePhrase("user_table", 0, 2, "乙", 7.0),
+                              MakePhrase("table", 0, 2, "丙", 5.0),
+                              MakePhrase("user_table", 0, 2, "丁", 3.0),
+                              MakePhrase("table", 0, 4, "戊", 1.0),
+                          });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁", "戊"}),
             CollectTexts(filtered));
 }
@@ -493,12 +502,14 @@ TEST(WeightScorerTest, CoefficientsReadFromConfig) {
   ticket.schema = &schema;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
+  filter.set_input("abcdef");
 
-  auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 5.0),
-      MakePhrase("user_table", 0, 2, "乙", 2.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+  auto filtered =
+      ApplyFilter(filter, {
+                              MakePhrase("table", 0, 2, "甲", 5.0),
+                              MakePhrase("user_table", 0, 2, "乙", 2.0),
+                              MakePhrase("table", 0, 4, "丙", 0.0),
+                          });
   // sys 甲 = 5; usr 乙 = 3*2 = 6 → 乙 first.
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
@@ -507,11 +518,11 @@ TEST(WeightScorerTest, CoefficientsReadFromConfig) {
 
 TEST(WeightScorerTest, ScoresScriptTranslatorPhraseTypes) {
   WeightScorer scorer(2.0, 0.5);
-  double score = 0;
+  ScoreComponents score;
   ASSERT_TRUE(scorer.Score(MakePhrase("phrase", 0, 2, "甲", 3.0), &score));
-  EXPECT_DOUBLE_EQ(6.0, score);  // sys: 2.0 * 3.0
+  EXPECT_DOUBLE_EQ(6.0, score.base_score);  // sys: 2.0 * 3.0
   ASSERT_TRUE(scorer.Score(MakePhrase("user_phrase", 0, 2, "乙", 3.0), &score));
-  EXPECT_DOUBLE_EQ(1.5, score);  // usr: 0.5 * 3.0
+  EXPECT_DOUBLE_EQ(1.5, score.base_score);  // usr: 0.5 * 3.0
 }
 
 TEST(LlmRerankFilterTest, GroupingKeyPhraseAndUserPhraseSameGroup) {
@@ -519,10 +530,10 @@ TEST(LlmRerankFilterTest, GroupingKeyPhraseAndUserPhraseSameGroup) {
       New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}});
   auto filter = MakeFilter(scorer);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("phrase", 0, 2, "甲"),
-      MakePhrase("user_phrase", 0, 2, "乙"),
-      MakePhrase("sentence", 0, 2, "丙"),
-  });
+                                          MakePhrase("phrase", 0, 2, "甲"),
+                                          MakePhrase("user_phrase", 0, 2, "乙"),
+                                          MakePhrase("sentence", 0, 2, "丙"),
+                                      });
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
@@ -555,13 +566,16 @@ static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
                                          const string& prev_word,
                                          double sys_coeff = 1.0,
                                          double usr_coeff = 1.0) {
-  auto ctx = New<ContextScorer>(counter, gamma, saturate_k);
+  auto ctx = New<ContextScorer>(counter, saturate_k);
   ctx->set_prev_word(prev_word);
   auto weight = New<WeightScorer>(sys_coeff, usr_coeff);
   Ticket ticket;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
   filter.set_scorer(New<CompositeScorer>(weight, ctx));
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+  filter.set_gamma(gamma);
   return filter;
 }
 
@@ -601,39 +615,36 @@ TEST(ContextScorerTest, SaturateKControlsSaturationSpeed) {
   EXPECT_DOUBLE_EQ(0.1, ContextScorer::EvidenceStrength(1, 1, 9.0));
 }
 
-TEST(ContextScorerTest, GammaScalesTerm) {
+TEST(ContextScorerTest, ReturnsUnscaledRetrievalEvidence) {
   FakeCounter counter;
   counter.SetTotal("w", 2);
   counter.SetPair("w", "乙", 2);
-  auto ctx1 = New<ContextScorer>(&counter, 1.0, 3.0);
-  ctx1->set_prev_word("w");
-  auto ctx5 = New<ContextScorer>(&counter, 5.0, 3.0);
-  ctx5->set_prev_word("w");
-  double s1 = 0, s5 = 0;
-  ctx1->Score(MakePhrase("table", 0, 2, "乙", 0.0), &s1);
-  ctx5->Score(MakePhrase("table", 0, 2, "乙", 0.0), &s5);
-  EXPECT_DOUBLE_EQ(0.4, s1);   // (2/2) * (2/5)
-  EXPECT_DOUBLE_EQ(2.0, s5);   // 5 * 0.4
+  auto ctx = New<ContextScorer>(&counter, 3.0);
+  ctx->set_prev_word("w");
+  ScoreComponents score;
+  ctx->Score(MakePhrase("table", 0, 2, "乙", 0.0), &score);
+  EXPECT_DOUBLE_EQ(0.0, score.base_score);
+  EXPECT_DOUBLE_EQ(0.4, score.retrieval_evidence);  // (2/2) * (2/5)
 }
 
 TEST(ContextScorerTest, EmptyPrevWordScoresZero) {
   FakeCounter counter;
   counter.SetTotal("w", 2);
   counter.SetPair("w", "乙", 2);
-  auto ctx = New<ContextScorer>(&counter, 10.0, 3.0);  // no prev_word set
-  double s = -1;
-  EXPECT_TRUE(ctx->Score(MakePhrase("table", 0, 2, "乙", 0.0), &s));
-  EXPECT_DOUBLE_EQ(0.0, s);
+  auto ctx = New<ContextScorer>(&counter, 3.0);  // no prev_word set
+  ScoreComponents score;
+  EXPECT_TRUE(ctx->Score(MakePhrase("table", 0, 2, "乙", 0.0), &score));
+  EXPECT_DOUBLE_EQ(0.0, score.retrieval_evidence);
 }
 
 TEST(CompositeScorerTest, RejectsWeightlessCandidate) {
   FakeCounter counter;
   counter.SetTotal("w", 3);
   counter.SetPair("w", "，", 3);
-  auto ctx = New<ContextScorer>(&counter, 10.0, 3.0);
+  auto ctx = New<ContextScorer>(&counter, 3.0);
   ctx->set_prev_word("w");
   auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
-  double score = 0;
+  ScoreComponents score;
   EXPECT_FALSE(comp->Score(New<SimpleCandidate>("punct", 0, 2, "，"), &score));
   EXPECT_TRUE(comp->Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
@@ -642,22 +653,23 @@ TEST(CompositeScorerTest, SumsWeightAndContext) {
   FakeCounter counter;
   counter.SetTotal("w", 4);
   counter.SetPair("w", "甲", 4);
-  auto ctx = New<ContextScorer>(&counter, 10.0, 3.0);
+  auto ctx = New<ContextScorer>(&counter, 3.0);
   ctx->set_prev_word("w");
   auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
-  double score = 0;
+  ScoreComponents score;
   ASSERT_TRUE(comp->Score(MakePhrase("table", 0, 2, "甲", 2.0), &score));
-  EXPECT_NEAR(2.0 + 10.0 * (4.0 / 7.0), score, 1e-9);
+  EXPECT_DOUBLE_EQ(2.0, score.base_score);
+  EXPECT_NEAR(4.0 / 7.0, score.retrieval_evidence, 1e-9);
 }
 
 TEST(ContextRerankTest, MissLeavesOrderUnchanged) {
   FakeCounter counter;  // no observations
   auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 3.0),
-      MakePhrase("table", 0, 2, "乙", 1.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+                                          MakePhrase("table", 0, 2, "甲", 3.0),
+                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
@@ -667,12 +679,26 @@ TEST(ContextRerankTest, HitPromotesCandidate) {
   counter.SetPair("发起", "乙", 5);
   auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 3.0),
-      MakePhrase("table", 0, 2, "乙", 1.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+                                          MakePhrase("table", 0, 2, "甲", 3.0),
+                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
   // 乙 = 1 + 10*(5/5)*(5/8) = 7.25 > 甲 = 3.
   EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+}
+
+TEST(ContextRerankTest, GammaZeroKeepsBaseScoreOrder) {
+  FakeCounter counter;
+  counter.SetTotal("发起", 5);
+  counter.SetPair("发起", "乙", 5);
+  auto filter = MakeContextFilter(&counter, 0.0, 3.0, "发起");
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲", 3.0),
+                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
+
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
 TEST(ContextRerankTest, PromotesScriptTranslatorPhrase) {
@@ -683,11 +709,12 @@ TEST(ContextRerankTest, PromotesScriptTranslatorPhrase) {
   counter.SetTotal("发起", 5);
   counter.SetPair("发起", "公鸡", 5);
   auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
-  auto filtered = ApplyFilter(filter, {
-      MakePhrase("phrase", 0, 6, "攻击", 3.0),
-      MakePhrase("phrase", 0, 6, "公鸡", 1.0),
-      MakePhrase("phrase", 0, 4, "丙", 0.0),
-  });
+  auto filtered =
+      ApplyFilter(filter, {
+                              MakePhrase("phrase", 0, 6, "攻击", 3.0),
+                              MakePhrase("phrase", 0, 6, "公鸡", 1.0),
+                              MakePhrase("phrase", 0, 4, "丙", 0.0),
+                          });
   EXPECT_EQ((vector<string>{"公鸡", "攻击", "丙"}), CollectTexts(filtered));
 }
 
@@ -722,10 +749,10 @@ TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
   counter.SetPair("上文", "乙", 1);
   auto filter = MakeContextFilter(&counter, 2.0, 3.0, "上文");
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 10.0),
-      MakePhrase("table", 0, 2, "乙", 0.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+                                          MakePhrase("table", 0, 2, "甲", 10.0),
+                                          MakePhrase("table", 0, 2, "乙", 0.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
@@ -735,7 +762,7 @@ TEST(LlmScorerTest, DaemonUnavailableReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   scorer.set_context("发起");
   scorer.Prepare({"攻击", "公鸡"});
-  double score = 0;
+  ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "攻击", 1.0), &score));
 }
 
@@ -749,10 +776,10 @@ TEST(LlmScorerTest, DaemonUnavailablePassthroughOrder) {
   LlmRerankFilter filter(ticket);
   filter.set_scorer(comp);
   auto filtered = ApplyFilter(filter, {
-      MakePhrase("table", 0, 2, "甲", 3.0),
-      MakePhrase("table", 0, 2, "乙", 1.0),
-      MakePhrase("table", 0, 4, "丙", 0.0),
-  });
+                                          MakePhrase("table", 0, 2, "甲", 3.0),
+                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
@@ -760,7 +787,7 @@ TEST(LlmScorerTest, MalformedResponseReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   scorer.set_context("test");
   scorer.Prepare({"甲"});
-  double score = 0;
+  ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
 
@@ -768,7 +795,7 @@ TEST(LlmScorerTest, EmptyPrepareAllowsScore) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   scorer.set_context("");
   scorer.Prepare({});
-  double score = 0;
+  ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
 

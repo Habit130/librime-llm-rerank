@@ -208,13 +208,14 @@ void LlmScorer::Prepare(const vector<string>& candidate_texts) {
   }
 }
 
-bool LlmScorer::Score(const an<Candidate>& cand, double* score) {
+bool LlmScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   if (!prepared_)
     return false;
   auto it = score_cache_.find(cand->text());
   if (it == score_cache_.end())
     return false;
-  *score = alpha_ * it->second;
+  score->base_score = alpha_ * it->second;
+  score->retrieval_evidence = 0.0;
   return true;
 }
 
