@@ -6,9 +6,24 @@
 #define RIME_CONTEXT_MEMORY_H_
 
 #include <rime/common.h>
-#include <rime/dict/db.h>
+
+namespace leveldb {
+class Status;
+}
 
 namespace rime {
+
+enum class ContextReadStatus { kFound, kMissing, kError };
+
+ContextReadStatus ClassifyLevelDbReadStatus(const leveldb::Status& status);
+
+// Preserves the storage status that librime's bool-valued Db::Fetch discards.
+class ContextStore {
+ public:
+  virtual ~ContextStore() = default;
+  virtual ContextReadStatus Fetch(const string& key, string* value) = 0;
+  virtual bool Update(const string& key, const string& value) = 0;
+};
 
 // Supplies the bigram counts behind the context-personalization term:
 // n(prev_word, candidate) and n(prev_word). Injectable so rerank behavior can
@@ -24,14 +39,16 @@ class ContextCounter {
   virtual bool TotalCount(const string& prev_word, int* count) = 0;
 };
 
-// Db-backed counter and recording layer. Records keep the raw text of the
+// Store-backed counter and recording layer. Records keep the raw text of the
 // preceding word and the selected candidate, decoupled from the scoring
 // granularity so a future granularity can be re-derived from them; the
 // pair/total counts are a derived index over those records. Values reuse the
 // engine's user-db format so entries survive backup and sync.
 class ContextMemory : public ContextCounter {
  public:
-  explicit ContextMemory(an<Db> db) : db_(db) {}
+  explicit ContextMemory(an<ContextStore> store) : store_(store) {}
+
+  static the<ContextMemory> OpenLevelDb(const path& file_path);
 
   bool PairCount(const string& prev_word,
                  const string& candidate,
@@ -46,7 +63,7 @@ class ContextMemory : public ContextCounter {
   bool FetchCount(const string& key, int* count);
   void BumpCount(const string& key);
 
-  an<Db> db_;
+  an<ContextStore> store_;
 };
 
 }  // namespace rime

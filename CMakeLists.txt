@@ -14,7 +14,7 @@ endif()
 
 set(plugin_name rime-llm-rerank PARENT_SCOPE)
 set(plugin_objs $<TARGET_OBJECTS:rime-llm-rerank-objs> PARENT_SCOPE)
-set(plugin_deps ${rime_library} PARENT_SCOPE)
+set(plugin_deps ${rime_library} ${LevelDb_LIBRARY} PARENT_SCOPE)
 set(plugin_modules "llm_rerank" PARENT_SCOPE)
 
 if(BUILD_TEST)

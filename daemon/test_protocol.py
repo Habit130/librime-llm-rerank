@@ -4,12 +4,20 @@
 import json
 import math
 import os
+import socket
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from server import PROTOCOL_VERSION, handle_request
+from server import (
+    MAX_REQUEST_BYTES,
+    PROTOCOL_VERSION,
+    handle_request,
+    read_request,
+)
 
 
 class FakeState:
@@ -37,6 +45,13 @@ def request(**overrides):
 
 def encode(value):
     return json.dumps(value, ensure_ascii=False)
+
+
+def encode_pairs(pairs):
+    return "{" + ",".join(
+        f"{json.dumps(key)}:{json.dumps(value, ensure_ascii=False)}"
+        for key, value in pairs
+    ) + "}"
 
 
 class ProtocolTest(unittest.TestCase):
@@ -95,6 +110,88 @@ class ProtocolTest(unittest.TestCase):
                     handle_request(FakeState(), encode(request(**{field: value}))),
                     "invalid_request",
                 )
+
+    def test_duplicate_request_fields_are_rejected(self):
+        fields = list(request().items())
+        for key, value in fields:
+            with self.subTest(key=key):
+                response = handle_request(
+                    FakeState(), encode_pairs(fields + [(key, value)])
+                )
+                self.assert_protocol_error(response, "invalid_json")
+
+    def test_nested_duplicate_fields_are_rejected_before_type_validation(self):
+        fields = list(request().items())
+        context_index = next(
+            index for index, (key, _) in enumerate(fields) if key == "context"
+        )
+        encoded_fields = [
+            f"{json.dumps(key)}:{json.dumps(value, ensure_ascii=False)}"
+            for key, value in fields
+        ]
+        encoded_fields[context_index] = '"context":{"x":1,"x":2}'
+        response = handle_request(FakeState(), "{" + ",".join(encoded_fields) + "}")
+
+        self.assert_protocol_error(response, "invalid_json")
+
+    def test_trailing_payload_is_rejected(self):
+        for suffix in ("garbage", "\n" + encode(request())):
+            with self.subTest(suffix=suffix[:10]):
+                response = handle_request(FakeState(), encode(request()) + suffix)
+                self.assert_protocol_error(response, "invalid_json")
+
+    def test_split_trailing_payload_is_rejected_at_socket_framing(self):
+        reader, writer = socket.socketpair()
+
+        def send_split_request():
+            writer.sendall((encode(request()) + "\n").encode("utf-8"))
+            time.sleep(0.01)
+            writer.sendall(b"garbage")
+            writer.shutdown(socket.SHUT_WR)
+
+        thread = threading.Thread(target=send_split_request)
+        thread.start()
+        try:
+            with self.assertRaises(ValueError):
+                read_request(reader)
+        finally:
+            thread.join()
+            reader.close()
+            writer.close()
+
+    def test_single_terminal_lf_is_accepted_at_socket_framing(self):
+        reader, writer = socket.socketpair()
+        encoded = encode(request())
+        writer.sendall((encoded + "\n").encode("utf-8"))
+        writer.shutdown(socket.SHUT_WR)
+        try:
+            self.assertEqual(encoded, read_request(reader))
+        finally:
+            reader.close()
+            writer.close()
+
+    def test_oversized_request_is_rejected_at_socket_framing(self):
+        reader, writer = socket.socketpair()
+
+        def send_oversized_request():
+            writer.sendall(b"x" * (MAX_REQUEST_BYTES + 1))
+            writer.shutdown(socket.SHUT_WR)
+
+        thread = threading.Thread(target=send_oversized_request)
+        thread.start()
+        try:
+            with self.assertRaises(ValueError):
+                read_request(reader)
+        finally:
+            thread.join()
+            reader.close()
+            writer.close()
+
+    def test_extra_field_and_wrong_version_are_rejected(self):
+        for damaged in (request(extra=True), request(version=2)):
+            with self.subTest(damaged=damaged):
+                response = handle_request(FakeState(), encode(damaged))
+                self.assert_protocol_error(response, "invalid_request")
 
     def test_score_count_mismatch_is_not_emitted_as_success(self):
         response = handle_request(FakeState(result=[1.0]), encode(request()))

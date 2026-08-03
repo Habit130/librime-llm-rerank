@@ -35,6 +35,8 @@ TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
 CACHE_LIMIT_MB = 512  # MLX allocator cache cap; 0 = unlimited (default MLX behavior)
 PROTOCOL_VERSION = 1
+MAX_REQUEST_BYTES = 64 * 1024
+REQUEST_READ_DEADLINE = 5.0
 REQUEST_FIELDS = {
     "version",
     "request_id",
@@ -42,6 +44,15 @@ REQUEST_FIELDS = {
     "context",
     "candidates",
 }
+
+
+def reject_duplicate_object_fields(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object field")
+        value[key] = item
+    return value
 
 
 def window_context(context, context_window):
@@ -247,9 +258,33 @@ def make_request(request_id, plan_identity, context, candidates):
     }
 
 
+def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
+    chunks = []
+    size = 0
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request deadline exceeded")
+        conn.settimeout(remaining)
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_REQUEST_BYTES:
+            raise ValueError("request exceeds protocol size limit")
+        chunks.append(chunk)
+    framed = b"".join(chunks)
+    if not framed:
+        return None
+    if framed.count(b"\n") != 1 or not framed.endswith(b"\n"):
+        raise ValueError("request must be one JSON document followed by one LF")
+    return framed[:-1].decode("utf-8")
+
+
 def handle_request(state, data):
     try:
-        req = json.loads(data)
+        req = json.loads(data, object_pairs_hook=reject_duplicate_object_fields)
     except (json.JSONDecodeError, TypeError, ValueError):
         return protocol_error("invalid_json")
 
@@ -362,17 +397,9 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
             except socket.timeout:
                 continue
             try:
-                chunks = []
                 conn.settimeout(5.0)
-                while True:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    if b"\n" in chunk:
-                        break
-                data = b"".join(chunks).decode("utf-8").strip()
-                if data:
+                data = read_request(conn)
+                if data is not None:
                     with lock:
                         last_activity = time.time()
                     resp = handle_request(state, data)

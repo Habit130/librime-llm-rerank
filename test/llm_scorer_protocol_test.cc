@@ -39,8 +39,15 @@ string UniqueSocketPath() {
 
 class FakeDaemon {
  public:
-  explicit FakeDaemon(ResponseBuilder response_builder)
-      : path_(UniqueSocketPath()), response_builder_(response_builder) {
+  explicit FakeDaemon(ResponseBuilder response_builder,
+                      size_t connection_count = 1,
+                      std::chrono::milliseconds split_delay = {},
+                      std::chrono::milliseconds close_delay = {})
+      : path_(UniqueSocketPath()),
+        response_builder_(response_builder),
+        connection_count_(connection_count),
+        split_delay_(split_delay),
+        close_delay_(close_delay) {
     fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd_ < 0)
       throw std::runtime_error("socket failed");
@@ -57,7 +64,7 @@ class FakeDaemon {
       unlink(path_.c_str());
       throw std::runtime_error("bind or listen failed");
     }
-    thread_ = std::thread([this] { ServeOne(); });
+    thread_ = std::thread([this] { Serve(); });
   }
 
   ~FakeDaemon() {
@@ -70,8 +77,13 @@ class FakeDaemon {
   const string& path() const { return path_; }
 
  private:
+  void Serve() {
+    for (size_t i = 0; i < connection_count_; ++i)
+      ServeOne();
+  }
+
   void ServeOne() {
-    int connection = accept(fd_, nullptr, nullptr);
+    const int connection = accept(fd_, nullptr, nullptr);
     if (connection < 0)
       return;
 #ifdef SO_NOSIGPIPE
@@ -89,21 +101,38 @@ class FakeDaemon {
     }
     auto response = response_builder_(request);
     if (response) {
-      size_t sent = 0;
-      while (sent < response->size()) {
-        ssize_t size = send(connection, response->data() + sent,
-                            response->size() - sent, 0);
-        if (size <= 0)
-          break;
-        sent += size;
+      const size_t newline = response->find('\n');
+      if (split_delay_.count() > 0 && newline != string::npos &&
+          newline + 1 < response->size()) {
+        SendAll(connection, response->data(), newline + 1);
+        std::this_thread::sleep_for(split_delay_);
+        SendAll(connection, response->data() + newline + 1,
+                response->size() - newline - 1);
+      } else {
+        SendAll(connection, response->data(), response->size());
       }
     }
+    if (close_delay_.count() > 0)
+      std::this_thread::sleep_for(close_delay_);
     close(connection);
+  }
+
+  void SendAll(int connection, const char* data, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+      const ssize_t size = send(connection, data + sent, length - sent, 0);
+      if (size <= 0)
+        break;
+      sent += size;
+    }
   }
 
   int fd_ = -1;
   string path_;
   ResponseBuilder response_builder_;
+  size_t connection_count_;
+  std::chrono::milliseconds split_delay_;
+  std::chrono::milliseconds close_delay_;
   std::thread thread_;
 };
 
@@ -204,6 +233,55 @@ string Response(const string& request,
          scores + "}\n";
 }
 
+string ErrorObject(const string& fields = "") {
+  const string prefix =
+      "{\"code\":\"inference_failed\",\"message\":\"scoring failed\",";
+  const string suffix =
+      "\"occurred_at\":\"2026-08-03T00:00:00Z\",\"retryable\":false,"
+      "\"phase\":\"score\",\"remediation\":\"fix scorer\",\"cause\":null}";
+  return prefix + fields + suffix;
+}
+
+string BoundErrorResponse(const string& request,
+                          const string& error = ErrorObject()) {
+  return "{\"version\":1,\"request_id\":\"" +
+         ExtractStringField(request, "request_id") +
+         "\",\"plan_identity\":\"" +
+         ExtractStringField(request, "plan_identity") + "\",\"error\":" +
+         error + "}\n";
+}
+
+string DuplicateTopLevelResponse(const string& request, const string& field) {
+  const string request_id = ExtractStringField(request, "request_id");
+  const string plan_identity = ExtractStringField(request, "plan_identity");
+  if (field == "version") {
+    return "{\"version\":1,\"version\":1,\"request_id\":\"" + request_id +
+           "\",\"plan_identity\":\"" + plan_identity +
+           "\",\"scores\":[0,10,0,10]}\n";
+  }
+  if (field == "request_id") {
+    return "{\"version\":1,\"request_id\":\"" + request_id +
+           "\",\"request_id\":\"" + request_id +
+           "\",\"plan_identity\":\"" + plan_identity +
+           "\",\"scores\":[0,10,0,10]}\n";
+  }
+  if (field == "plan_identity") {
+    return "{\"version\":1,\"request_id\":\"" + request_id +
+           "\",\"plan_identity\":\"" + plan_identity +
+           "\",\"plan_identity\":\"" + plan_identity +
+           "\",\"scores\":[0,10,0,10]}\n";
+  }
+  if (field == "scores") {
+    return "{\"version\":1,\"request_id\":\"" + request_id +
+           "\",\"plan_identity\":\"" + plan_identity +
+           "\",\"scores\":[0,10,0,10],\"scores\":[0,10,0,10]}\n";
+  }
+  const string error = ErrorObject();
+  return "{\"version\":1,\"request_id\":\"" + request_id +
+         "\",\"plan_identity\":\"" + plan_identity + "\",\"error\":" +
+         error + ",\"error\":" + error + "}\n";
+}
+
 void ExpectFailure(ResponseBuilder response_builder) {
   FakeDaemon daemon(std::move(response_builder));
   EXPECT_EQ(kProtocolOriginalOrder, FilterWithDaemon(daemon.path()));
@@ -266,11 +344,136 @@ TEST(LlmScorerProtocolTest, MissingFieldPassesThroughWholeWindow) {
 
 TEST(LlmScorerProtocolTest, BoundDaemonErrorPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
-    return "{\"version\":1,\"request_id\":\"" +
-           ExtractStringField(request, "request_id") +
-           "\",\"plan_identity\":\"" +
-           ExtractStringField(request, "plan_identity") +
-           "\",\"error\":{\"code\":\"inference_failed\"}}\n";
+    return BoundErrorResponse(request);
+  });
+}
+
+TEST(LlmScorerProtocolTest, DuplicateTopLevelFieldsPassThroughWholeWindow) {
+  for (const string& field :
+       {"version", "request_id", "plan_identity", "scores", "error"}) {
+    SCOPED_TRACE(field);
+    ExpectFailure([field](const string& request) -> std::optional<string> {
+      return DuplicateTopLevelResponse(request, field);
+    });
+  }
+}
+
+TEST(LlmScorerProtocolTest, DuplicateNestedErrorFieldPassesThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    return BoundErrorResponse(
+        request,
+        ErrorObject("\"code\":\"duplicate\","));
+  });
+}
+
+TEST(LlmScorerProtocolTest, ExtraFieldsPassThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    string response = Response(request, "[0,10,0,10]");
+    response.replace(response.size() - 2, 1, ",\"extra\":true}");
+    return response;
+  });
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    return BoundErrorResponse(request,
+                              ErrorObject("\"extra\":true,"));
+  });
+}
+
+TEST(LlmScorerProtocolTest, TrailingPayloadPassesThroughWholeWindow) {
+  for (const string& suffix :
+       {"garbage", " ", "{\"version\":1}\n"}) {
+    SCOPED_TRACE(suffix);
+    ExpectFailure([suffix](const string& request) -> std::optional<string> {
+      return Response(request, "[0,10,0,10]") + suffix;
+    });
+  }
+}
+
+TEST(LlmScorerProtocolTest, SplitTrailingPayloadPassesThroughWholeWindow) {
+  FakeDaemon daemon(
+      [](const string& request) -> std::optional<string> {
+        return Response(request, "[0,10,0,10]") + "garbage";
+      },
+      1, std::chrono::milliseconds(30));
+
+  EXPECT_EQ(kProtocolOriginalOrder, FilterWithDaemon(daemon.path()));
+}
+
+TEST(LlmScorerProtocolTest, MissingEofBeforeDeadlinePassesThroughWholeWindow) {
+  FakeDaemon daemon(
+      [](const string& request) -> std::optional<string> {
+        return Response(request, "[0,10,0,10]");
+      },
+      1, std::chrono::milliseconds(0), std::chrono::milliseconds(300));
+  const auto started = std::chrono::steady_clock::now();
+
+  EXPECT_EQ(kProtocolOriginalOrder, FilterWithDaemon(daemon.path(), 20));
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  EXPECT_LT(elapsed, std::chrono::milliseconds(200));
+}
+
+TEST(LlmScorerProtocolTest, SuccessAndErrorTogetherPassThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    string response = BoundErrorResponse(request);
+    response.replace(response.size() - 2, 1,
+                     ",\"scores\":[0,10,0,10]}");
+    return response;
+  });
+}
+
+TEST(LlmScorerProtocolTest, WrongFieldTypesPassThroughWholeWindow) {
+  const vector<string> damaged_responses{
+      "{\"version\":\"1\",\"request_id\":\"%REQUEST%\","
+      "\"plan_identity\":\"%PLAN%\",\"scores\":[0,10,0,10]}\n",
+      "{\"version\":1,\"request_id\":1,\"plan_identity\":\"%PLAN%\","
+      "\"scores\":[0,10,0,10]}\n",
+      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "\"plan_identity\":false,\"scores\":[0,10,0,10]}\n",
+      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "\"plan_identity\":\"%PLAN%\",\"scores\":{}}\n",
+      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "\"plan_identity\":\"%PLAN%\",\"scores\":[0,\"10\",0,10]}\n",
+      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "\"plan_identity\":\"%PLAN%\",\"error\":\"failed\"}\n",
+  };
+  for (const string& damaged : damaged_responses) {
+    SCOPED_TRACE(damaged);
+    ExpectFailure([damaged](const string& request) -> std::optional<string> {
+      string response = damaged;
+      const string request_id = ExtractStringField(request, "request_id");
+      const string plan_identity = ExtractStringField(request, "plan_identity");
+      size_t position;
+      while ((position = response.find("%REQUEST%")) != string::npos)
+        response.replace(position, 9, request_id);
+      while ((position = response.find("%PLAN%")) != string::npos)
+        response.replace(position, 6, plan_identity);
+      return response;
+    });
+  }
+}
+
+TEST(LlmScorerProtocolTest, WrongNestedErrorTypesPassThroughWholeWindow) {
+  for (const string& field : {"retryable", "cause"}) {
+    SCOPED_TRACE(field);
+    ExpectFailure([field](const string& request) -> std::optional<string> {
+      string error = ErrorObject();
+      if (field == "retryable") {
+        error.replace(error.find("\"retryable\":false"), 17,
+                      "\"retryable\":\"false\"");
+      } else {
+        error.replace(error.find("\"cause\":null"), 12,
+                      "\"cause\":\"details\"");
+      }
+      return BoundErrorResponse(request, error);
+    });
+  }
+}
+
+TEST(LlmScorerProtocolTest, WrongVersionPassesThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    string response = Response(request, "[0,10,0,10]");
+    response.replace(response.find("\"version\":1"), 11, "\"version\":2");
+    return response;
   });
 }
 
@@ -296,4 +499,21 @@ TEST(LlmScorerProtocolTest, PlanIdentityMismatchPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
     return Response(request, "[0,10,0,10]", std::nullopt, "wrong-plan");
   });
+}
+
+TEST(LlmScorerProtocolTest, StaleResponseFromPriorRequestPassesThroughWindow) {
+  FakeDaemon daemon(
+      [first_request_id = string()](
+          const string& request) mutable -> std::optional<string> {
+        if (first_request_id.empty()) {
+          first_request_id = ExtractStringField(request, "request_id");
+          return Response(request, "[0,10,0,10]");
+        }
+        return Response(request, "[0,10,0,10]", first_request_id);
+      },
+      2);
+
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            FilterWithDaemon(daemon.path()));
+  EXPECT_EQ(kProtocolOriginalOrder, FilterWithDaemon(daemon.path()));
 }

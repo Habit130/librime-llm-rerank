@@ -3,9 +3,16 @@
 // Distributed under the BSD License
 //
 
-#include <gtest/gtest.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <filesystem>
 #include <limits>
 #include <map>
+#include <utility>
+
+#include <gtest/gtest.h>
+#include <leveldb/db.h>
 #include <rime/candidate.h>
 #include <rime/common.h>
 #include <rime/config.h>
@@ -647,6 +654,34 @@ class FailingCounter : public ContextCounter {
   bool TotalCount(const string&, int*) override { return false; }
 };
 
+class InjectedContextStore : public ContextStore {
+ public:
+  InjectedContextStore(ContextReadStatus data_status, string data_value = "")
+      : data_status_(data_status), data_value_(std::move(data_value)) {}
+
+  ContextReadStatus Fetch(const string& key, string* value) override {
+    if (!key.empty() && key.front() == '\x01') {
+      *value = "test-db";
+      return ContextReadStatus::kFound;
+    }
+    *value = data_value_;
+    return data_status_;
+  }
+
+  bool Update(const string&, const string&) override { return true; }
+
+ private:
+  ContextReadStatus data_status_;
+  string data_value_;
+};
+
+static path TemporaryContextDbPath() {
+  static std::atomic<unsigned int> sequence{0};
+  return std::filesystem::temp_directory_path() /
+         ("llm-rerank-context-" + std::to_string(getpid()) + "-" +
+          std::to_string(sequence++) + ".userdb");
+}
+
 static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
                                          double gamma,
                                          double saturate_k,
@@ -730,6 +765,76 @@ TEST(ContextScorerTest, CounterFailurePassesThroughWholeWindow) {
 
   EXPECT_EQ(kFailureWindowOriginalOrder,
             CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(ContextScorerTest, TargetReadErrorWithReadableMetadataPassesThroughWindow) {
+  auto store = New<InjectedContextStore>(ContextReadStatus::kError);
+  string metadata;
+  ASSERT_EQ(ContextReadStatus::kFound,
+            store->Fetch("\x01/db_name", &metadata));
+  ContextMemory memory(store);
+  auto filter = MakeContextFilter(&memory, 2.0, 3.0, "上文");
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(ContextScorerTest, RealLevelDbMissingKeyIsSuccessfulZeroEvidence) {
+  const path db_path = TemporaryContextDbPath();
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::DB* raw_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  delete raw_db;
+  auto memory = ContextMemory::OpenLevelDb(db_path);
+  ASSERT_TRUE(memory);
+
+  vector<string> emitted;
+  {
+    auto filter = MakeContextFilter(memory.get(), 10.0, 3.0, "上文");
+    emitted = CollectTexts(ApplyFilter(filter, {
+                                                   MakePhrase("table", 0, 2, "甲", 1.0),
+                                                   MakePhrase("table", 0, 2, "乙", 3.0),
+                                                   MakePhrase("table", 0, 4, "丙", 0.0),
+                                               }));
+  }
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), emitted);
+
+  memory->Record("上文", "乙");
+  int pair_count;
+  int total_count;
+  EXPECT_TRUE(memory->PairCount("上文", "乙", &pair_count));
+  EXPECT_TRUE(memory->TotalCount("上文", &total_count));
+  EXPECT_EQ(1, pair_count);
+  EXPECT_EQ(1, total_count);
+
+  memory.reset();
+  EXPECT_TRUE(leveldb::DestroyDB(db_path.string(), options).ok());
+}
+
+TEST(ContextMemoryTest, MissingOrMalformedCommitCountFails) {
+  const vector<string> invalid_values{
+      "d=0 t=0", "c=", "c=not-a-number d=0 t=0", "c=-1 d=0 t=0",
+      "c=1 c=2 d=0 t=0"};
+  for (const string& value : invalid_values) {
+    SCOPED_TRACE(value);
+    ContextMemory memory(
+        New<InjectedContextStore>(ContextReadStatus::kFound, value));
+    int count = 99;
+    EXPECT_FALSE(memory.PairCount("上文", "候选", &count));
+    EXPECT_EQ(99, count);
+  }
+}
+
+TEST(ContextMemoryTest, ProductionLevelDbStatusClassificationIsTriState) {
+  EXPECT_EQ(ContextReadStatus::kFound,
+            ClassifyLevelDbReadStatus(leveldb::Status::OK()));
+  EXPECT_EQ(ContextReadStatus::kMissing,
+            ClassifyLevelDbReadStatus(leveldb::Status::NotFound("missing")));
+  EXPECT_EQ(ContextReadStatus::kError,
+            ClassifyLevelDbReadStatus(leveldb::Status::IOError("read failed")));
+  EXPECT_EQ(ContextReadStatus::kError,
+            ClassifyLevelDbReadStatus(leveldb::Status::Corruption("damaged")));
 }
 
 TEST(CompositeScorerTest, RejectsWeightlessCandidate) {

@@ -17,6 +17,8 @@
 #include <rime/translation.h>
 #include <rime/commit_history.h>
 #include <rime/dict/db.h>
+#include <rime/dict/level_db.h>
+#include <rime/dict/user_db.h>
 #include <rime/gear/translator_commons.h>
 
 #include "llm_rerank_filter.h"
@@ -300,19 +302,18 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
         New<LlmScorer>(socket_path_, alpha_, verbose_, deadline_ms_);
   }
   if (engine_) {
-    an<Db> db;
-    if (auto component = Db::Require("userdb")) {
+    if (auto component = UserDb::Require("userdb")) {
       string db_name = ticket.schema->schema_id() + ".llm_rerank";
       Db* raw = component->Create(db_name);
-      if (raw && raw->Open()) {
-        raw->CreateMetadata();
-        db.reset(raw);
-      } else {
-        delete raw;
+      if (raw && dynamic_cast<LevelDb*>(raw) && raw->Open() &&
+          raw->CreateMetadata()) {
+        const path file_path = raw->file_path();
+        if (raw->Close())
+          memory_ = ContextMemory::OpenLevelDb(file_path);
       }
+      delete raw;
     }
-    if (db) {
-      memory_.reset(new ContextMemory(db));
+    if (memory_) {
       context_scorer_ =
           New<ContextScorer>(memory_.get(), saturate_k_, verbose_);
       scorer_ = New<CompositeScorer>(

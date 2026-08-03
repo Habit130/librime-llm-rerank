@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 #include <rapidjson/document.h>
 #include <rime/candidate.h>
@@ -115,6 +116,17 @@ static string BuildRequest(const string& context,
   return json;
 }
 
+bool HasExactMembers(const rapidjson::Value& object,
+                     std::initializer_list<const char*> names) {
+  if (!object.IsObject() || object.MemberCount() != names.size())
+    return false;
+  for (const char* name : names) {
+    if (!object.HasMember(name))
+      return false;
+  }
+  return true;
+}
+
 static bool ParseScores(const string& response,
                         const string& expected_request_id,
                         const string& expected_plan_identity,
@@ -122,16 +134,11 @@ static bool ParseScores(const string& response,
                         vector<double>* scores,
                         const char** error_code) {
   const size_t newline = response.find('\n');
-  if (newline == string::npos || newline == 0) {
+  // One terminal LF is the only framing byte allowed after the JSON document.
+  if (newline == string::npos || newline == 0 ||
+      newline != response.size() - 1) {
     *error_code = "invalid_protocol";
     return false;
-  }
-  for (size_t i = newline + 1; i < response.size(); ++i) {
-    if (response[i] != ' ' && response[i] != '\t' && response[i] != '\r' &&
-        response[i] != '\n') {
-      *error_code = "invalid_protocol";
-      return false;
-    }
   }
 
   rapidjson::Document document;
@@ -163,14 +170,27 @@ static bool ParseScores(const string& response,
     return false;
   }
   if (document.HasMember("error")) {
-    if (document.MemberCount() != 4 || !document["error"].IsObject()) {
+    if (!HasExactMembers(document,
+                         {"version", "request_id", "plan_identity", "error"})) {
+      *error_code = "invalid_protocol";
+      return false;
+    }
+    const auto& error = document["error"];
+    if (!HasExactMembers(error,
+                         {"code", "message", "occurred_at", "retryable",
+                          "phase", "remediation", "cause"}) ||
+        !error["code"].IsString() || !error["message"].IsString() ||
+        !error["occurred_at"].IsString() || !error["retryable"].IsBool() ||
+        !error["phase"].IsString() || !error["remediation"].IsString() ||
+        !error["cause"].IsNull()) {
       *error_code = "invalid_protocol";
       return false;
     }
     *error_code = "daemon_error";
     return false;
   }
-  if (document.MemberCount() != 4 || !document.HasMember("scores") ||
+  if (!HasExactMembers(
+          document, {"version", "request_id", "plan_identity", "scores"}) ||
       !document["scores"].IsArray()) {
     *error_code = "invalid_protocol";
     return false;
