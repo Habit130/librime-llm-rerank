@@ -24,7 +24,10 @@ class Scorer {
  public:
   virtual ~Scorer() = default;
   virtual bool Score(const an<Candidate>& cand, ScoreComponents* score) = 0;
-  virtual void Prepare(const vector<string>& candidate_texts) {}
+  virtual bool Prepare(const string& plan_identity,
+                       const vector<string>& candidate_texts) {
+    return true;
+  }
 };
 
 // Scores a candidate by its dictionary weight (log space) scaled by a
@@ -72,9 +75,8 @@ class ContextScorer : public Scorer {
   bool verbose_;
 };
 
-// Sums weight and optional LLM terms into the base score while keeping context
-// evidence separate. Candidates the weight scorer rejects are rejected; the
-// existing zero-contribution fallback remains for unavailable optional terms.
+// Sums every enabled term into a complete score while keeping context evidence
+// separate. A failure from any enabled term rejects the whole score.
 class CompositeScorer : public Scorer {
  public:
   CompositeScorer(an<Scorer> weight,
@@ -83,7 +85,8 @@ class CompositeScorer : public Scorer {
       : weight_(weight), context_(context), llm_(llm) {}
 
   bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-  void Prepare(const vector<string>& candidate_texts) override;
+  bool Prepare(const string& plan_identity,
+               const vector<string>& candidate_texts) override;
 
  private:
   an<Scorer> weight_;
@@ -119,6 +122,7 @@ class LlmRerankFilter : public Filter {
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
+  int deadline_ms_ = 200;
   bool verbose_ = false;
   string schema_id_;
   string input_;

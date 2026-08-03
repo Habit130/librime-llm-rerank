@@ -17,9 +17,11 @@ class ContextCounter {
  public:
   virtual ~ContextCounter() = default;
   // Times `candidate` was committed immediately after `prev_word`.
-  virtual int PairCount(const string& prev_word, const string& candidate) = 0;
+  virtual bool PairCount(const string& prev_word,
+                         const string& candidate,
+                         int* count) = 0;
   // Times anything was committed immediately after `prev_word`.
-  virtual int TotalCount(const string& prev_word) = 0;
+  virtual bool TotalCount(const string& prev_word, int* count) = 0;
 };
 
 // Db-backed counter and recording layer. Records keep the raw text of the
@@ -31,15 +33,17 @@ class ContextMemory : public ContextCounter {
  public:
   explicit ContextMemory(an<Db> db) : db_(db) {}
 
-  int PairCount(const string& prev_word, const string& candidate) override;
-  int TotalCount(const string& prev_word) override;
+  bool PairCount(const string& prev_word,
+                 const string& candidate,
+                 int* count) override;
+  bool TotalCount(const string& prev_word, int* count) override;
 
   // Records one observation: immediately after `prev_word` the user committed
   // `selected`. A no-op when either is empty (no bigram to record).
   void Record(const string& prev_word, const string& selected);
 
  private:
-  int FetchCount(const string& key);
+  bool FetchCount(const string& key, int* count);
   void BumpCount(const string& key);
 
   an<Db> db_;

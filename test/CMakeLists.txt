@@ -6,6 +6,7 @@ include_directories(../src)
 if(NOT (WIN32 AND BUILD_SHARED_LIBS))
   add_executable(llm_rerank_test
     llm_rerank_filter_test.cc
+    llm_scorer_protocol_test.cc
     rerank_plan_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
   target_link_libraries(llm_rerank_test

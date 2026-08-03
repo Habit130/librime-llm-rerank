@@ -2,9 +2,11 @@
 """LLM rerank daemon: MLX inference over a unix domain socket.
 
 Protocol (JSON, newline-delimited):
-  Request:  {"context": "<preceding text>", "candidates": ["c1", "c2", ...]}
-  Response: {"scores": [s1, s2, ...]}
-  Error:    {"error": "<message>"}
+  Request:  {"version": 1, "request_id": "...", "plan_identity": "...",
+             "context": "<preceding text>", "candidates": ["c1", "c2", ...]}
+  Response: {"version": 1, "request_id": "...", "plan_identity": "...",
+             "scores": [s1, s2, ...]}
+  Error:    {"version": 1, "error": {"code": "...", ...}}
 
 Lifecycle:
   - Model is lazy-loaded on first request (0.33 s cold start).
@@ -13,7 +15,9 @@ Lifecycle:
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
+import math
 import os
 import socket
 import sys
@@ -30,6 +34,14 @@ IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
 CACHE_LIMIT_MB = 512  # MLX allocator cache cap; 0 = unlimited (default MLX behavior)
+PROTOCOL_VERSION = 1
+REQUEST_FIELDS = {
+    "version",
+    "request_id",
+    "plan_identity",
+    "context",
+    "candidates",
+}
 
 
 def window_context(context, context_window):
@@ -189,22 +201,125 @@ class ModelState:
         return result
 
 
+def protocol_error(
+    code,
+    phase="validate",
+    retryable=False,
+    request_id=None,
+    plan_identity=None,
+):
+    messages = {
+        "invalid_json": "request is not valid JSON",
+        "invalid_request": "request does not match the scoring protocol",
+        "inference_failed": "scoring failed",
+        "invalid_score_result": "scorer returned an invalid result",
+        "score_count_mismatch": "score count does not match candidate count",
+        "non_finite_score": "scorer returned a non-finite score",
+        "server_error": "scoring transport failed",
+    }
+    response = {
+        "version": PROTOCOL_VERSION,
+        "error": {
+            "code": code,
+            "message": messages[code],
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "retryable": retryable,
+            "phase": phase,
+            "remediation": (
+                "retry the request" if retryable else "fix the request or scorer"
+            ),
+            "cause": None,
+        },
+    }
+    if request_id is not None and plan_identity is not None:
+        response["request_id"] = request_id
+        response["plan_identity"] = plan_identity
+    return response
+
+
+def make_request(request_id, plan_identity, context, candidates):
+    return {
+        "version": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "plan_identity": plan_identity,
+        "context": context,
+        "candidates": candidates,
+    }
+
+
 def handle_request(state, data):
     try:
         req = json.loads(data)
-    except (json.JSONDecodeError, ValueError) as e:
-        return {"error": f"invalid JSON: {e}"}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return protocol_error("invalid_json")
 
-    context = req.get("context", "")
-    candidates = req.get("candidates", [])
-    if not isinstance(candidates, list):
-        return {"error": "candidates must be a list"}
+    if (
+        not isinstance(req, dict)
+        or set(req) != REQUEST_FIELDS
+        or type(req["version"]) is not int
+        or req["version"] != PROTOCOL_VERSION
+        or not isinstance(req["request_id"], str)
+        or not req["request_id"]
+        or not isinstance(req["plan_identity"], str)
+        or not req["plan_identity"]
+        or not isinstance(req["context"], str)
+        or not isinstance(req["candidates"], list)
+        or any(
+            not isinstance(candidate, str) or not candidate
+            for candidate in req["candidates"]
+        )
+    ):
+        return protocol_error("invalid_request")
 
     try:
-        scores = state.score(context, candidates)
-        return {"scores": scores}
-    except Exception as e:
-        return {"error": f"inference failed: {e}"}
+        scores = state.score(req["context"], req["candidates"])
+    except TimeoutError:
+        return protocol_error(
+            "inference_failed",
+            phase="score",
+            retryable=True,
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+    except Exception:
+        return protocol_error(
+            "inference_failed",
+            phase="score",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+
+    if not isinstance(scores, list) or any(
+        isinstance(score, bool) or not isinstance(score, (int, float))
+        for score in scores
+    ):
+        return protocol_error(
+            "invalid_score_result",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+    if len(scores) != len(req["candidates"]):
+        return protocol_error(
+            "score_count_mismatch",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+    try:
+        has_non_finite_score = any(not math.isfinite(score) for score in scores)
+    except OverflowError:
+        has_non_finite_score = True
+    if has_non_finite_score:
+        return protocol_error(
+            "non_finite_score",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+    return {
+        "version": PROTOCOL_VERSION,
+        "request_id": req["request_id"],
+        "plan_identity": req["plan_identity"],
+        "scores": scores,
+    }
 
 
 def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, test_mode=False):
@@ -266,10 +381,34 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
                     conn.sendall(
                         (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
                     )
-            except Exception as e:
+            except socket.timeout:
                 try:
                     conn.sendall(
-                        (json.dumps({"error": str(e)}) + "\n").encode("utf-8")
+                        (
+                            json.dumps(
+                                protocol_error(
+                                    "server_error",
+                                    phase="transport",
+                                    retryable=True,
+                                )
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    conn.sendall(
+                        (
+                            json.dumps(
+                                protocol_error(
+                                    "server_error",
+                                    phase="transport",
+                                )
+                            )
+                            + "\n"
+                        ).encode("utf-8")
                     )
                 except Exception:
                     pass
@@ -317,14 +456,22 @@ def self_test(sock_path, model_path):
         return json.loads(data.decode("utf-8"))
 
     try:
-        resp = send({"context": "发起", "candidates": ["攻击", "公鸡"]})
+        resp = send(
+            make_request(
+                "self-test-1", "self-test-plan-1", "发起", ["攻击", "公鸡"]
+            )
+        )
         if "scores" not in resp or len(resp["scores"]) != 2:
             print(f"FAIL: unexpected response: {resp}", file=sys.stderr)
             ok = False
         else:
             print(f"PASS: scores = {resp['scores']}")
 
-        resp2 = send({"context": "今天", "candidates": ["攻击", "公鸡"]})
+        resp2 = send(
+            make_request(
+                "self-test-2", "self-test-plan-2", "今天", ["攻击", "公鸡"]
+            )
+        )
         if "scores" not in resp2 or len(resp2["scores"]) != 2:
             print(f"FAIL: unexpected response: {resp2}", file=sys.stderr)
             ok = False
@@ -335,14 +482,14 @@ def self_test(sock_path, model_path):
             else:
                 print("WARN: same scores for different contexts")
 
-        resp3 = send({"context": "", "candidates": []})
+        resp3 = send(make_request("self-test-3", "self-test-plan-3", "", []))
         if resp3.get("scores") != []:
             print(f"FAIL: empty candidates: {resp3}", file=sys.stderr)
             ok = False
         else:
             print("PASS: empty candidates returns empty scores")
 
-        resp4 = send({"context": "你好", "candidates": ["世界"]})
+        resp4 = send(make_request("self-test-4", "self-test-plan-4", "你好", ["世界"]))
         if "scores" not in resp4:
             print(f"FAIL: single candidate: {resp4}", file=sys.stderr)
             ok = False

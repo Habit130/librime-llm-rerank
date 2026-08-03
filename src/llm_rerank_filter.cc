@@ -3,6 +3,7 @@
 // Distributed under the BSD License
 //
 
+#include <cmath>
 #include <set>
 #include <utility>
 
@@ -22,6 +23,14 @@
 #include "llm_scorer.h"
 
 namespace rime {
+
+static void LogWindowFailure(const char* code,
+                             const char* phase,
+                             size_t candidate_count) {
+  LOG(WARNING) << "llm_rerank: code=" << code << " phase=" << phase
+               << " plan_version=" << kRerankPlanVersion
+               << " candidate_count=" << candidate_count;
+}
 
 // System- vs user-dictionary word candidates. table_translator emits
 // "table"/"user_table"; script_translator (pinyin) emits
@@ -53,8 +62,7 @@ bool WeightScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   score->base_score = coeff * weight;
   score->retrieval_evidence = 0.0;
   if (verbose_) {
-    LOG(INFO) << "llm_rerank weight: text=" << phrase->text()
-              << " source=" << source << " weight=" << weight
+    LOG(INFO) << "llm_rerank weight: source=" << source << " weight=" << weight
               << " coeff=" << coeff << " score=" << score->base_score;
   }
   return true;
@@ -75,14 +83,19 @@ bool ContextScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   score->retrieval_evidence = 0.0;
   if (!counter_ || prev_word_.empty())
     return true;
-  const string& text = cand->text();
-  int pair_count = counter_->PairCount(prev_word_, text);
-  int total_count = counter_->TotalCount(prev_word_);
+  int pair_count;
+  int total_count;
+  if (!counter_->PairCount(prev_word_, cand->text(), &pair_count) ||
+      !counter_->TotalCount(prev_word_, &total_count) || pair_count < 0 ||
+      total_count < 0 || pair_count > total_count) {
+    return false;
+  }
   double s = EvidenceStrength(pair_count, total_count, saturate_k_);
+  if (!std::isfinite(s) || s < 0.0 || s >= 1.0)
+    return false;
   score->retrieval_evidence = s;
   if (verbose_) {
-    LOG(INFO) << "llm_rerank context: prev_word=" << prev_word_
-              << " text=" << text << " pair=" << pair_count
+    LOG(INFO) << "llm_rerank context: pair=" << pair_count
               << " total=" << total_count << " evidence=" << s;
   }
   return true;
@@ -90,22 +103,24 @@ bool ContextScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
 
 bool CompositeScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   ScoreComponents weight_score;
-  if (!weight_->Score(cand, &weight_score))
+  if (!weight_ || !weight_->Score(cand, &weight_score))
     return false;
   ScoreComponents context_score;
-  if (context_)
-    context_->Score(cand, &context_score);
+  if (context_ && !context_->Score(cand, &context_score))
+    return false;
   ScoreComponents llm_score;
-  if (llm_)
-    llm_->Score(cand, &llm_score);
+  if (llm_ && !llm_->Score(cand, &llm_score))
+    return false;
   score->base_score = weight_score.base_score + llm_score.base_score;
   score->retrieval_evidence = context_score.retrieval_evidence;
   return true;
 }
 
-void CompositeScorer::Prepare(const vector<string>& candidate_texts) {
-  if (llm_)
-    llm_->Prepare(candidate_texts);
+bool CompositeScorer::Prepare(const string& plan_identity,
+                              const vector<string>& candidate_texts) {
+  return weight_ && weight_->Prepare(plan_identity, candidate_texts) &&
+         (!context_ || context_->Prepare(plan_identity, candidate_texts)) &&
+         (!llm_ || llm_->Prepare(plan_identity, candidate_texts));
 }
 
 static string CategoryOf(const string& type) {
@@ -168,7 +183,13 @@ bool LlmRerankTranslation::Replenish() {
 
   bool truncated = (int)buffer.size() >= window_ && !translation_->exhausted();
   CandidateQueue result;
-  if (!scorer_ || !RerankWindow(buffer, truncated, &result)) {
+  bool reranked = false;
+  if (!scorer_) {
+    LogWindowFailure("scoring_unavailable", "prepare", buffer.size());
+  } else {
+    reranked = RerankWindow(buffer, truncated, &result);
+  }
+  if (!reranked) {
     for (auto& c : buffer)
       result.push_back(c);
   }
@@ -194,6 +215,10 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   config.window = window_;
   RerankPlan plan = BuildRerankPlan(schema_id_, input_, preceding_text_, config,
                                     scoring_policy_, candidates, truncated);
+  if (!plan.identity || !plan.groups) {
+    LogWindowFailure("invalid_plan", "plan", buffer.size());
+    return false;
+  }
   vector<bool> scored_candidate(buffer.size(), false);
   vector<string> texts;
   for (const auto& group : *plan.groups) {
@@ -204,7 +229,10 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       texts.push_back(buffer[index]->text());
     }
   }
-  scorer_->Prepare(texts);
+  if (!scorer_->Prepare(*plan.identity, texts)) {
+    LogWindowFailure("scoring_prepare_failed", "prepare", buffer.size());
+    return false;
+  }
 
   RerankScoreResult result;
   result.version = kRerankScoreResultVersion;
@@ -213,15 +241,19 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   result.candidate_scores->reserve(buffer.size());
   for (size_t i = 0; i < buffer.size(); ++i) {
     ScoreComponents score;
-    if (scored_candidate[i] && !scorer_->Score(buffer[i], &score))
+    if (scored_candidate[i] && !scorer_->Score(buffer[i], &score)) {
+      LogWindowFailure("candidate_scoring_failed", "score", buffer.size());
       return false;
+    }
     result.candidate_scores->push_back(MakeRerankCandidateScore(
         score.base_score, score.retrieval_evidence, *scoring_policy_.gamma));
   }
 
   vector<size_t> emission_order;
-  if (!ReplayRerankPlan(plan, result, &emission_order))
+  if (!ReplayRerankPlan(plan, result, &emission_order)) {
+    LogWindowFailure("replay_validation_failed", "replay", buffer.size());
     return false;
+  }
   for (size_t index : emission_order)
     out->push_back(buffer[index]);
   return true;
@@ -250,6 +282,7 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     config->GetDouble(name_space_ + "/usr_coeff", &usr_coeff_);
     config->GetDouble(name_space_ + "/gamma", &gamma_);
     config->GetDouble(name_space_ + "/saturate_k", &saturate_k_);
+    config->GetInt(name_space_ + "/deadline_ms", &deadline_ms_);
     config->GetBool(name_space_ + "/verbose", &verbose_);
     config->GetString(name_space_ + "/socket_path", &socket_path_);
   }
@@ -263,7 +296,8 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   auto weight_scorer = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
   scorer_ = weight_scorer;
   if (alpha_ > 0.0 && !socket_path_.empty()) {
-    llm_scorer_ = New<LlmScorer>(socket_path_, alpha_, verbose_);
+    llm_scorer_ =
+        New<LlmScorer>(socket_path_, alpha_, verbose_, deadline_ms_);
   }
   if (engine_) {
     an<Db> db;
@@ -281,12 +315,14 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
       memory_.reset(new ContextMemory(db));
       context_scorer_ =
           New<ContextScorer>(memory_.get(), saturate_k_, verbose_);
-      scorer_ =
-          New<CompositeScorer>(weight_scorer, context_scorer_, llm_scorer_);
+      scorer_ = New<CompositeScorer>(
+          weight_scorer, gamma_ > 0.0 ? context_scorer_ : nullptr, llm_scorer_);
     } else {
       LOG(WARNING) << name_space_
-                   << ": failed to open user db; context term disabled";
-      if (llm_scorer_) {
+                   << ": failed to open user db; context scoring unavailable";
+      if (gamma_ > 0.0) {
+        scorer_.reset();
+      } else if (llm_scorer_) {
         scorer_ = New<CompositeScorer>(weight_scorer, nullptr, llm_scorer_);
       }
     }
@@ -306,10 +342,15 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     commit_text_connection_ = engine_->sink().connect(
         [this](const string& text) { OnCommitText(text); });
   }
+  if (alpha_ > 0.0 && !llm_scorer_) {
+    LOG(WARNING) << name_space_ << ": LLM scoring unavailable";
+    scorer_.reset();
+  }
   LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false")
             << ", window = " << window_ << ", alpha = " << alpha_
             << ", sys_coeff = " << sys_coeff_ << ", usr_coeff = " << usr_coeff_
             << ", gamma = " << gamma_ << ", saturate_k = " << saturate_k_
+            << ", deadline_ms = " << deadline_ms_
             << ", verbose = " << (verbose_ ? "true" : "false");
 }
 

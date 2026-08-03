@@ -4,6 +4,7 @@
 //
 
 #include <gtest/gtest.h>
+#include <limits>
 #include <map>
 #include <rime/candidate.h>
 #include <rime/common.h>
@@ -38,6 +39,32 @@ class FailingScorer : public Scorer {
   bool Score(const an<Candidate>&, ScoreComponents*) override { return false; }
 };
 
+class PrepareFailingScorer : public Scorer {
+ public:
+  bool Prepare(const string&, const vector<string>&) override { return false; }
+  bool Score(const an<Candidate>&, ScoreComponents*) override { return true; }
+};
+
+class LateFailingScorer : public Scorer {
+ public:
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override {
+    if (cand->text() == "丁")
+      return false;
+    score->base_score = 99.0;
+    score->retrieval_evidence = 0.0;
+    return true;
+  }
+};
+
+class NonFiniteScorer : public Scorer {
+ public:
+  bool Score(const an<Candidate>&, ScoreComponents* score) override {
+    score->base_score = std::numeric_limits<double>::quiet_NaN();
+    score->retrieval_evidence = 0.0;
+    return true;
+  }
+};
+
 static an<Phrase> MakePhrase(const string& type,
                              size_t start,
                              size_t end,
@@ -48,6 +75,20 @@ static an<Phrase> MakePhrase(const string& type,
   entry->weight = weight;
   return New<Phrase>(nullptr, type, start, end, entry);
 }
+
+static vector<an<Candidate>> FailureWindowCandidates() {
+  return {
+      MakePhrase("table", 0, 2, "甲", 1.0),
+      New<SimpleCandidate>("punct", 0, 2, "，"),
+      MakePhrase("user_table", 0, 2, "乙", 4.0),
+      MakePhrase("table", 2, 4, "丙", 1.0),
+      MakePhrase("user_table", 2, 4, "丁", 3.0),
+      MakePhrase("sentence", 0, 6, "整句", 9.0),
+  };
+}
+
+static const vector<string> kFailureWindowOriginalOrder{
+    "甲", "，", "乙", "丙", "丁", "整句"};
 
 class VecTranslation : public Translation {
  public:
@@ -384,6 +425,44 @@ TEST(LlmRerankFilterTest, FailingScorerPassesThroughOriginalOrder) {
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
 }
 
+TEST(LlmRerankFilterTest, PrepareFailurePassesThroughWholeWindow) {
+  auto filter = MakeFilter(New<PrepareFailingScorer>());
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(LlmRerankFilterTest, LateScoringFailureDiscardsAllPartialScores) {
+  auto filter = MakeFilter(New<LateFailingScorer>());
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(LlmRerankFilterTest, ReplayValidationFailurePassesThroughWholeWindow) {
+  auto filter = MakeFilter(New<NonFiniteScorer>());
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(LlmRerankFilterTest, FailurePassesThroughTruncatedBoundaryWindow) {
+  auto filter = MakeFilter(New<LateFailingScorer>());
+  filter.set_window(6);
+  vector<an<Candidate>> candidates = {
+      MakePhrase("table", 0, 2, "甲", 1.0),
+      New<SimpleCandidate>("punct", 0, 2, "，"),
+      MakePhrase("user_table", 0, 2, "乙", 4.0),
+      MakePhrase("table", 2, 4, "丙", 1.0),
+      MakePhrase("user_table", 2, 4, "丁", 3.0),
+      MakePhrase("table", 4, 6, "戊", 1.0),
+      MakePhrase("user_table", 4, 6, "己", 5.0),
+  };
+
+  EXPECT_EQ((vector<string>{"甲", "，", "乙", "丙", "丁", "戊", "己"}),
+            CollectTexts(ApplyFilter(filter, candidates)));
+}
+
 // --- T2: no candidates lost (simplifier+uniquifier chain regression) ---
 
 TEST(LlmRerankFilterTest, NoCandidatesLostAfterRerank) {
@@ -546,18 +625,26 @@ class FakeCounter : public ContextCounter {
   }
   void SetTotal(const string& prev, int n) { total_[prev] = n; }
 
-  int PairCount(const string& prev, const string& cand) override {
+  bool PairCount(const string& prev, const string& cand, int* count) override {
     auto it = pair_.find(prev + "\t" + cand);
-    return it == pair_.end() ? 0 : it->second;
+    *count = it == pair_.end() ? 0 : it->second;
+    return true;
   }
-  int TotalCount(const string& prev) override {
+  bool TotalCount(const string& prev, int* count) override {
     auto it = total_.find(prev);
-    return it == total_.end() ? 0 : it->second;
+    *count = it == total_.end() ? 0 : it->second;
+    return true;
   }
 
  private:
   map<string, int> pair_;
   map<string, int> total_;
+};
+
+class FailingCounter : public ContextCounter {
+ public:
+  bool PairCount(const string&, const string&, int*) override { return false; }
+  bool TotalCount(const string&, int*) override { return false; }
 };
 
 static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
@@ -637,6 +724,14 @@ TEST(ContextScorerTest, EmptyPrevWordScoresZero) {
   EXPECT_DOUBLE_EQ(0.0, score.retrieval_evidence);
 }
 
+TEST(ContextScorerTest, CounterFailurePassesThroughWholeWindow) {
+  FailingCounter counter;
+  auto filter = MakeContextFilter(&counter, 2.0, 3.0, "上文");
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
 TEST(CompositeScorerTest, RejectsWeightlessCandidate) {
   FakeCounter counter;
   counter.SetTotal("w", 3);
@@ -662,6 +757,51 @@ TEST(CompositeScorerTest, SumsWeightAndContext) {
   EXPECT_NEAR(4.0 / 7.0, score.retrieval_evidence, 1e-9);
 }
 
+TEST(CompositeScorerTest, EnabledContextFailurePassesThroughWholeWindow) {
+  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0),
+                                     New<FailingScorer>());
+  auto filter = MakeFilter(scorer);
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(CompositeScorerTest, EnabledWeightFailurePassesThroughWholeWindow) {
+  auto scorer =
+      New<CompositeScorer>(New<FailingScorer>(), nullptr, nullptr);
+  auto filter = MakeFilter(scorer);
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(CompositeScorerTest, EnabledPrepareFailurePassesThroughWholeWindow) {
+  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0),
+                                     New<PrepareFailingScorer>(), nullptr);
+  auto filter = MakeFilter(scorer);
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(CompositeScorerTest, EnabledLlmFailurePassesThroughWholeWindow) {
+  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), nullptr,
+                                     New<FailingScorer>());
+  auto filter = MakeFilter(scorer);
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(CompositeScorerTest, DisabledOptionalTermsDoNotFailScoring) {
+  auto scorer =
+      New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), nullptr, nullptr);
+  auto filter = MakeFilter(scorer);
+
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
 TEST(ContextRerankTest, MissLeavesOrderUnchanged) {
   FakeCounter counter;  // no observations
   auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
@@ -671,6 +811,18 @@ TEST(ContextRerankTest, MissLeavesOrderUnchanged) {
                                           MakePhrase("table", 0, 4, "丙", 0.0),
                                       });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
+}
+
+TEST(ContextRerankTest, ZeroEvidenceStillUsesCompleteBaseStrategy) {
+  FakeCounter counter;  // no observations is a successful zero-evidence result
+  auto filter = MakeContextFilter(&counter, 10.0, 3.0, "发起");
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲", 1.0),
+                                          MakePhrase("table", 0, 2, "乙", 3.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
+
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
 }
 
 TEST(ContextRerankTest, HitPromotesCandidate) {
@@ -761,7 +913,7 @@ TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
 TEST(LlmScorerTest, DaemonUnavailableReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   scorer.set_context("发起");
-  scorer.Prepare({"攻击", "公鸡"});
+  scorer.Prepare("plan", {"攻击", "公鸡"});
   ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "攻击", 1.0), &score));
 }
@@ -786,7 +938,7 @@ TEST(LlmScorerTest, DaemonUnavailablePassthroughOrder) {
 TEST(LlmScorerTest, MalformedResponseReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   scorer.set_context("test");
-  scorer.Prepare({"甲"});
+  scorer.Prepare("plan", {"甲"});
   ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
@@ -794,7 +946,7 @@ TEST(LlmScorerTest, MalformedResponseReturnsFalse) {
 TEST(LlmScorerTest, EmptyPrepareAllowsScore) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   scorer.set_context("");
-  scorer.Prepare({});
+  scorer.Prepare("plan", {});
   ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }

@@ -23,13 +23,22 @@ static string MakeKey(const string& code, const string& phrase) {
   return key;
 }
 
-int ContextMemory::FetchCount(const string& key) {
-  if (!db_)
-    return 0;
+bool ContextMemory::FetchCount(const string& key, int* count) {
+  if (!count || !db_ || !db_->loaded() || db_->disabled())
+    return false;
   string value;
-  if (!db_->Fetch(key, &value))
-    return 0;
-  return UserDbValue(value).commits;
+  if (!db_->Fetch(key, &value)) {
+    string db_name;
+    if (!db_->MetaFetch("/db_name", &db_name) || db_name != db_->name())
+      return false;
+    *count = 0;
+    return true;
+  }
+  UserDbValue parsed;
+  if (!parsed.Unpack(value))
+    return false;
+  *count = parsed.commits;
+  return *count >= 0;
 }
 
 void ContextMemory::BumpCount(const string& key) {
@@ -43,12 +52,14 @@ void ContextMemory::BumpCount(const string& key) {
   db_->Update(key, v.Pack());
 }
 
-int ContextMemory::PairCount(const string& prev_word, const string& candidate) {
-  return FetchCount(MakeKey("p " + prev_word, candidate));
+bool ContextMemory::PairCount(const string& prev_word,
+                              const string& candidate,
+                              int* count) {
+  return FetchCount(MakeKey("p " + prev_word, candidate), count);
 }
 
-int ContextMemory::TotalCount(const string& prev_word) {
-  return FetchCount(MakeKey("t " + prev_word, "*"));
+bool ContextMemory::TotalCount(const string& prev_word, int* count) {
+  return FetchCount(MakeKey("t " + prev_word, "*"), count);
 }
 
 void ContextMemory::Record(const string& prev_word, const string& selected) {

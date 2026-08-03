@@ -4,6 +4,8 @@ cmake_minimum_required(VERSION 3.10)
 aux_source_directory(src llm_rerank_src)
 
 add_library(rime-llm-rerank-objs OBJECT ${llm_rerank_src})
+target_include_directories(rime-llm-rerank-objs SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/deps/opencc/deps/rapidjson-1.1.0)
 if(BUILD_SHARED_LIBS)
   set_target_properties(rime-llm-rerank-objs
     PROPERTIES
