@@ -16,11 +16,11 @@ class LlmScorer : public Scorer {
   LlmScorer(const string& socket_path, double alpha, bool verbose = false)
       : socket_path_(socket_path), alpha_(alpha), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, double* score) override;
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
 
   void set_context(const string& context) { context_ = context; }
 
-  void Prepare(const vector<string>& candidate_texts);
+  void Prepare(const vector<string>& candidate_texts) override;
 
  private:
   bool SendRequest(const string& context,

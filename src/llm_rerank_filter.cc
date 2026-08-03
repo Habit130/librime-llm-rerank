@@ -3,10 +3,7 @@
 // Distributed under the BSD License
 //
 
-#include <algorithm>
-#include <map>
 #include <set>
-#include <tuple>
 #include <utility>
 
 #include <rime/candidate.h>
@@ -27,7 +24,8 @@
 namespace rime {
 
 // System- vs user-dictionary word candidates. table_translator emits
-// "table"/"user_table"; script_translator (pinyin) emits "phrase"/"user_phrase".
+// "table"/"user_table"; script_translator (pinyin) emits
+// "phrase"/"user_phrase".
 static bool IsSysWordType(const string& type) {
   return type == "table" || type == "phrase";
 }
@@ -36,7 +34,7 @@ static bool IsUsrWordType(const string& type) {
   return type == "user_table" || type == "user_phrase";
 }
 
-bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
+bool WeightScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(cand));
   if (!phrase)
     return false;
@@ -52,11 +50,12 @@ bool WeightScorer::Score(const an<Candidate>& cand, double* score) {
     return false;
   }
   double weight = phrase->weight();
-  *score = coeff * weight;
+  score->base_score = coeff * weight;
+  score->retrieval_evidence = 0.0;
   if (verbose_) {
     LOG(INFO) << "llm_rerank weight: text=" << phrase->text()
               << " source=" << source << " weight=" << weight
-              << " coeff=" << coeff << " score=" << *score;
+              << " coeff=" << coeff << " score=" << score->base_score;
   }
   return true;
 }
@@ -71,34 +70,36 @@ double ContextScorer::EvidenceStrength(int pair_count,
   return relative_preference * evidence;
 }
 
-bool ContextScorer::Score(const an<Candidate>& cand, double* score) {
-  *score = 0.0;
+bool ContextScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
+  score->base_score = 0.0;
+  score->retrieval_evidence = 0.0;
   if (!counter_ || prev_word_.empty())
     return true;
   const string& text = cand->text();
   int pair_count = counter_->PairCount(prev_word_, text);
   int total_count = counter_->TotalCount(prev_word_);
   double s = EvidenceStrength(pair_count, total_count, saturate_k_);
-  *score = gamma_ * s;
+  score->retrieval_evidence = s;
   if (verbose_) {
     LOG(INFO) << "llm_rerank context: prev_word=" << prev_word_
               << " text=" << text << " pair=" << pair_count
-              << " total=" << total_count << " s=" << s << " score=" << *score;
+              << " total=" << total_count << " evidence=" << s;
   }
   return true;
 }
 
-bool CompositeScorer::Score(const an<Candidate>& cand, double* score) {
-  double weight_score;
+bool CompositeScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
+  ScoreComponents weight_score;
   if (!weight_->Score(cand, &weight_score))
     return false;
-  double context_score = 0.0;
+  ScoreComponents context_score;
   if (context_)
     context_->Score(cand, &context_score);
-  double llm_score = 0.0;
+  ScoreComponents llm_score;
   if (llm_)
     llm_->Score(cand, &llm_score);
-  *score = weight_score + context_score + llm_score;
+  score->base_score = weight_score.base_score + llm_score.base_score;
+  score->retrieval_evidence = context_score.retrieval_evidence;
   return true;
 }
 
@@ -117,8 +118,18 @@ class LlmRerankTranslation : public PrefetchTranslation {
  public:
   LlmRerankTranslation(an<Translation> translation,
                        an<Scorer> scorer,
-                       int window)
-      : PrefetchTranslation(translation), scorer_(scorer), window_(window) {}
+                       int window,
+                       string schema_id,
+                       string input,
+                       string preceding_text,
+                       RerankScoringPolicy scoring_policy)
+      : PrefetchTranslation(translation),
+        scorer_(scorer),
+        window_(window),
+        schema_id_(std::move(schema_id)),
+        input_(std::move(input)),
+        preceding_text_(std::move(preceding_text)),
+        scoring_policy_(std::move(scoring_policy)) {}
 
  protected:
   virtual bool Replenish();
@@ -130,6 +141,10 @@ class LlmRerankTranslation : public PrefetchTranslation {
 
   an<Scorer> scorer_;
   int window_;
+  string schema_id_;
+  string input_;
+  string preceding_text_;
+  RerankScoringPolicy scoring_policy_;
 };
 
 bool LlmRerankTranslation::Replenish() {
@@ -164,93 +179,51 @@ bool LlmRerankTranslation::Replenish() {
 bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
                                         bool truncated,
                                         CandidateQueue* out) {
-  int n = (int)buffer.size();
-
-  struct Slot {
-    bool is_word;
-    int group_id;
-  };
-  vector<Slot> slots(n);
-  map<std::tuple<size_t, size_t, string>, int> group_map;
-  vector<std::tuple<size_t, size_t, string>> group_keys;
-  int last_word_group = -1;
-
-  for (int i = 0; i < n; i++) {
+  vector<RerankPlanCandidate> candidates;
+  candidates.reserve(buffer.size());
+  for (size_t i = 0; i < buffer.size(); ++i) {
     auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(buffer[i]));
-    if (!phrase) {
-      slots[i] = {false, -1};
-      continue;
-    }
-    auto key = std::make_tuple(buffer[i]->start(), buffer[i]->end(),
-                               CategoryOf(phrase->type()));
-    int gid;
-    auto it = group_map.find(key);
-    if (it == group_map.end()) {
-      gid = (int)group_keys.size();
-      group_map[key] = gid;
-      group_keys.push_back(key);
-    } else {
-      gid = it->second;
-    }
-    slots[i] = {true, gid};
-    last_word_group = gid;
+    const string source_type = phrase ? phrase->type() : buffer[i]->type();
+    const string category = CategoryOf(source_type);
+    candidates.push_back({i, buffer[i]->start(), buffer[i]->end(), category,
+                          source_type, buffer[i]->text(),
+                          phrase && category == "word"});
   }
 
-  if (last_word_group < 0) {
-    for (auto& c : buffer)
-      out->push_back(c);
-    return true;
-  }
-
-  // The last word group is only possibly incomplete when the window cut off a
-  // still-running translation; exclude it (keep original order) only then. A
-  // complete window (translation exhausted) scores every group, including the
-  // last one — otherwise a single-group window would never be scored at all.
-  int excluded_group = truncated ? last_word_group : -1;
-
-  vector<double> scores(n, 0.0);
+  RerankPlanConfig config = DefaultRerankPlanConfig();
+  config.window = window_;
+  RerankPlan plan = BuildRerankPlan(schema_id_, input_, preceding_text_, config,
+                                    scoring_policy_, candidates, truncated);
+  vector<bool> scored_candidate(buffer.size(), false);
   vector<string> texts;
-  for (int i = 0; i < n; i++) {
-    if (!slots[i].is_word || slots[i].group_id == excluded_group)
+  for (const auto& group : *plan.groups) {
+    if (!*group.complete)
       continue;
-    texts.push_back(buffer[i]->text());
+    for (size_t index : *group.candidate_indexes) {
+      scored_candidate[index] = true;
+      texts.push_back(buffer[index]->text());
+    }
   }
   scorer_->Prepare(texts);
-  for (int i = 0; i < n; i++) {
-    if (!slots[i].is_word || slots[i].group_id == excluded_group)
-      continue;
-    if (!scorer_->Score(buffer[i], &scores[i]))
+
+  RerankScoreResult result;
+  result.version = kRerankScoreResultVersion;
+  result.plan_identity = plan.identity;
+  result.candidate_scores = vector<RerankCandidateScore>();
+  result.candidate_scores->reserve(buffer.size());
+  for (size_t i = 0; i < buffer.size(); ++i) {
+    ScoreComponents score;
+    if (scored_candidate[i] && !scorer_->Score(buffer[i], &score))
       return false;
+    result.candidate_scores->push_back(MakeRerankCandidateScore(
+        score.base_score, score.retrieval_evidence, *scoring_policy_.gamma));
   }
 
-  vector<int> word_order;
-  for (int gid = 0; gid < (int)group_keys.size(); gid++) {
-    if (gid == excluded_group)
-      continue;
-    vector<int> members;
-    for (int i = 0; i < n; i++)
-      if (slots[i].is_word && slots[i].group_id == gid)
-        members.push_back(i);
-    stable_sort(members.begin(), members.end(),
-                [&](int a, int b) { return scores[a] > scores[b]; });
-    word_order.insert(word_order.end(), members.begin(), members.end());
-  }
-  for (int i = 0; i < n; i++)
-    if (slots[i].is_word && slots[i].group_id == excluded_group)
-      word_order.push_back(i);
-
-  set<int> nonword_positions;
-  for (int i = 0; i < n; i++)
-    if (!slots[i].is_word)
-      nonword_positions.insert(i);
-
-  int wi = 0;
-  for (int i = 0; i < n; i++) {
-    if (nonword_positions.count(i))
-      out->push_back(buffer[i]);
-    else
-      out->push_back(buffer[word_order[wi++]]);
-  }
+  vector<size_t> emission_order;
+  if (!ReplayRerankPlan(plan, result, &emission_order))
+    return false;
+  for (size_t index : emission_order)
+    out->push_back(buffer[index]);
   return true;
 }
 
@@ -268,6 +241,7 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   }
   if (!ticket.schema)
     return;
+  schema_id_ = ticket.schema->schema_id();
   if (Config* config = ticket.schema->config()) {
     config->GetBool(name_space_ + "/enable", &enabled_);
     config->GetInt(name_space_ + "/window", &window_);
@@ -306,11 +280,9 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     if (db) {
       memory_.reset(new ContextMemory(db));
       context_scorer_ =
-          New<ContextScorer>(memory_.get(), gamma_, saturate_k_, verbose_);
-      scorer_ = New<CompositeScorer>(weight_scorer, context_scorer_, llm_scorer_);
-      Context* ctx = engine_->context();
-      commit_connection_ = ctx->commit_notifier().connect(
-          [this](Context* c) { OnCommit(c); });
+          New<ContextScorer>(memory_.get(), saturate_k_, verbose_);
+      scorer_ =
+          New<CompositeScorer>(weight_scorer, context_scorer_, llm_scorer_);
     } else {
       LOG(WARNING) << name_space_
                    << ": failed to open user db; context term disabled";
@@ -318,45 +290,63 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
         scorer_ = New<CompositeScorer>(weight_scorer, nullptr, llm_scorer_);
       }
     }
+    Context* ctx = engine_->context();
+    if (ctx) {
+      for (const auto& record : ctx->commit_history())
+        preceding_text_ += record.text;
+      preceding_text_ = LastUnicodeCharacters(preceding_text_, 64);
+      commit_connection_ =
+          ctx->commit_notifier().connect([this](Context* c) { OnCommit(c); });
+    }
+    commit_text_connection_ = engine_->sink().connect(
+        [this](const string& text) { OnCommitText(text); });
   }
   LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false")
             << ", window = " << window_ << ", alpha = " << alpha_
-            << ", sys_coeff = " << sys_coeff_
-            << ", usr_coeff = " << usr_coeff_ << ", gamma = " << gamma_
-            << ", saturate_k = " << saturate_k_
+            << ", sys_coeff = " << sys_coeff_ << ", usr_coeff = " << usr_coeff_
+            << ", gamma = " << gamma_ << ", saturate_k = " << saturate_k_
             << ", verbose = " << (verbose_ ? "true" : "false");
 }
 
 LlmRerankFilter::~LlmRerankFilter() {
   commit_connection_.disconnect();
+  commit_text_connection_.disconnect();
 }
 
 void LlmRerankFilter::OnCommit(Context* ctx) {
-  if (!memory_ || !ctx)
+  if (!ctx)
     return;
   string selected = ctx->GetCommitText();
-  if (selected.empty() || !HasNonAscii(selected))
+  if (selected.empty())
+    return;
+  if (!memory_ || !HasNonAscii(selected))
     return;
   memory_->Record(last_word_, selected);
   last_word_ = selected;
 }
 
+void LlmRerankFilter::OnCommitText(const string& text) {
+  preceding_text_ = LastUnicodeCharacters(preceding_text_ + text, 64);
+}
+
 string LlmRerankFilter::BuildContext() {
-  if (!engine_)
-    return "";
-  Context* ctx = engine_->context();
-  if (!ctx)
-    return "";
-  const CommitHistory& history = ctx->commit_history();
-  string result;
-  for (const auto& record : history) {
-    if (record.text.empty())
+  string result = preceding_text_;
+  if (!engine_ || !engine_->context())
+    return result;
+  Context* context = engine_->context();
+  for (const Segment& segment : context->composition()) {
+    if (segment.status < Segment::kSelected)
       continue;
-    if (!HasNonAscii(record.text))
-      continue;
-    result += record.text;
+    auto candidate = segment.GetSelectedCandidate();
+    if (candidate) {
+      result += candidate->text();
+    } else if (segment.start <= segment.end &&
+               segment.end <= context->input().size()) {
+      result +=
+          context->input().substr(segment.start, segment.end - segment.start);
+    }
   }
-  return result;
+  return LastUnicodeCharacters(result, 64);
 }
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
@@ -367,10 +357,21 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   if (context_scorer_) {
     context_scorer_->set_prev_word(last_word_);
   }
+  const string preceding_text = BuildContext();
   if (llm_scorer_) {
-    llm_scorer_->set_context(BuildContext());
+    llm_scorer_->set_context(preceding_text);
   }
-  return New<LlmRerankTranslation>(translation, scorer_, window_);
+  RerankScoringPolicy scoring_policy = DefaultRerankScoringPolicy();
+  scoring_policy.alpha = alpha_;
+  scoring_policy.sys_coeff = sys_coeff_;
+  scoring_policy.usr_coeff = usr_coeff_;
+  scoring_policy.gamma = gamma_;
+  scoring_policy.saturate_k = saturate_k_;
+  string input = input_;
+  if (engine_ && engine_->context())
+    input = engine_->context()->input();
+  return New<LlmRerankTranslation>(translation, scorer_, window_, schema_id_,
+                                   input, preceding_text, scoring_policy);
 }
 
 }  // namespace rime

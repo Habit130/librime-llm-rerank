@@ -8,16 +8,22 @@
 #include <rime/filter.h>
 
 #include "context_memory.h"
+#include "rerank_plan.h"
 
 namespace rime {
 
 class Context;
 class LlmScorer;
 
+struct ScoreComponents {
+  double base_score = 0.0;
+  double retrieval_evidence = 0.0;
+};
+
 class Scorer {
  public:
   virtual ~Scorer() = default;
-  virtual bool Score(const an<Candidate>& cand, double* score) = 0;
+  virtual bool Score(const an<Candidate>& cand, ScoreComponents* score) = 0;
   virtual void Prepare(const vector<string>& candidate_texts) {}
 };
 
@@ -31,7 +37,7 @@ class WeightScorer : public Scorer {
   WeightScorer(double sys_coeff, double usr_coeff, bool verbose = false)
       : sys_coeff_(sys_coeff), usr_coeff_(usr_coeff), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, double* score) override;
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
 
  private:
   double sys_coeff_;
@@ -39,22 +45,17 @@ class WeightScorer : public Scorer {
   bool verbose_;
 };
 
-// Scores a candidate by the context-personalization term: gamma times a bounded
-// evidence strength s(prev_word, candidate) = relative preference * saturating
-// evidence. A miss (nothing recorded after prev_word) scores zero, so the
-// additive term falls back to the other terms with no extra branch or floor.
+// Produces the bounded context evidence s(prev_word, candidate) separately from
+// the frozen base score. The replay policy applies gamma only when it derives
+// the final comparison score.
 class ContextScorer : public Scorer {
  public:
   ContextScorer(ContextCounter* counter,
-                double gamma,
                 double saturate_k,
                 bool verbose = false)
-      : counter_(counter),
-        gamma_(gamma),
-        saturate_k_(saturate_k),
-        verbose_(verbose) {}
+      : counter_(counter), saturate_k_(saturate_k), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, double* score) override;
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
 
   void set_prev_word(const string& prev_word) { prev_word_ = prev_word; }
 
@@ -66,23 +67,22 @@ class ContextScorer : public Scorer {
 
  private:
   ContextCounter* counter_;
-  double gamma_;
   double saturate_k_;
   string prev_word_;
   bool verbose_;
 };
 
-// Sums a weight score, an optional LLM score, and a context score. Candidates
-// the weight scorer rejects (no dictionary weight) are rejected outright so
-// non-word candidates keep their place; the LLM and context terms only ever add
-// to an accepted candidate. When the LLM scorer fails (daemon unavailable),
-// its term is simply omitted.
+// Sums weight and optional LLM terms into the base score while keeping context
+// evidence separate. Candidates the weight scorer rejects are rejected; the
+// existing zero-contribution fallback remains for unavailable optional terms.
 class CompositeScorer : public Scorer {
  public:
-  CompositeScorer(an<Scorer> weight, an<Scorer> context, an<Scorer> llm = nullptr)
+  CompositeScorer(an<Scorer> weight,
+                  an<Scorer> context,
+                  an<Scorer> llm = nullptr)
       : weight_(weight), context_(context), llm_(llm) {}
 
-  bool Score(const an<Candidate>& cand, double* score) override;
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
   void Prepare(const vector<string>& candidate_texts) override;
 
  private:
@@ -103,9 +103,13 @@ class LlmRerankFilter : public Filter {
 
   void set_scorer(an<Scorer> scorer) { scorer_ = scorer; }
   void set_window(int window) { window_ = window; }
+  void set_gamma(double gamma) { gamma_ = gamma; }
+  void set_schema_id(const string& schema_id) { schema_id_ = schema_id; }
+  void set_input(const string& input) { input_ = input; }
 
  private:
   void OnCommit(Context* ctx);
+  void OnCommitText(const string& text);
   string BuildContext();
 
   bool enabled_ = true;
@@ -116,13 +120,17 @@ class LlmRerankFilter : public Filter {
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
   bool verbose_ = false;
+  string schema_id_;
+  string input_;
   string socket_path_;
   an<Scorer> scorer_;
   an<ContextScorer> context_scorer_;
   an<LlmScorer> llm_scorer_;
   the<ContextMemory> memory_;
   connection commit_connection_;
+  connection commit_text_connection_;
   string last_word_;
+  string preceding_text_;
 };
 
 }  // namespace rime
