@@ -80,7 +80,7 @@ struct RerankScoreResult {
 RerankPlanConfig DefaultRerankPlanConfig();
 RerankScoringPolicy DefaultRerankScoringPolicy();
 
-string LastUnicodeCharacters(const string& text, size_t limit);
+std::optional<string> LastUnicodeCharacters(const string& text, size_t limit);
 string CanonicalizeInput(const string& input);
 
 RerankPlan BuildRerankPlan(const string& schema_id,

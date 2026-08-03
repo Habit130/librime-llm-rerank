@@ -63,6 +63,20 @@ vector<RerankPlanCandidate> TwoGroupsWithPunctuation() {
   };
 }
 
+string Bytes(std::initializer_list<unsigned int> bytes) {
+  string result;
+  for (unsigned int byte : bytes)
+    result.push_back(static_cast<char>(byte));
+  return result;
+}
+
+string Repeat(const string& text, size_t count) {
+  string result;
+  for (size_t i = 0; i < count; ++i)
+    result += text;
+  return result;
+}
+
 }  // namespace
 
 TEST(RerankPlanTest, SameNormalizedContentsHaveStableIdentity) {
@@ -173,6 +187,82 @@ TEST(RerankPlanTest, StoresLast64UnicodeCharacters) {
 
   ASSERT_TRUE(plan.preceding_text.has_value());
   EXPECT_EQ(string(62, 'a') + "。末", *plan.preceding_text);
+}
+
+TEST(RerankPlanTest, InvalidUtf8PrecedingTextDoesNotGetIdentity) {
+  const vector<pair<string, string>> invalid_cases{
+      {"invalid leading byte", Bytes({0xff})},
+      {"stray continuation byte", Bytes({0x80})},
+      {"invalid continuation byte", Bytes({0xe2, 0x28, 0xa1})},
+      {"truncated multibyte sequence", Bytes({0xe4, 0xb8})},
+      {"two-byte overlong encoding", Bytes({0xc0, 0xaf})},
+      {"three-byte overlong encoding", Bytes({0xe0, 0x80, 0xaf})},
+      {"four-byte overlong encoding", Bytes({0xf0, 0x80, 0x80, 0xaf})},
+      {"surrogate encoding", Bytes({0xed, 0xa0, 0x80})},
+      {"above Unicode maximum", Bytes({0xf4, 0x90, 0x80, 0x80})},
+  };
+
+  for (const auto& [name, preceding_text] : invalid_cases) {
+    SCOPED_TRACE(name);
+    auto plan = BuildPlan(TwoGroupsWithPunctuation(), preceding_text);
+    EXPECT_FALSE(plan.identity.has_value());
+  }
+}
+
+TEST(RerankPlanTest, InvalidUtf8OutsideTruncatedSuffixStillFailsBuild) {
+  const string preceding_text =
+      string(64, 'a') + Bytes({0xff}) + string(64, 'b');
+  auto plan = BuildPlan(TwoGroupsWithPunctuation(), preceding_text);
+
+  EXPECT_FALSE(plan.identity.has_value());
+}
+
+TEST(RerankPlanTest, Utf8DecoderAcceptsUnicodeScalarBoundaries) {
+  const string valid =
+      Bytes({0x00, 0x7f, 0xc2, 0x80, 0xdf, 0xbf, 0xe0, 0xa0, 0x80,
+             0xed, 0x9f, 0xbf, 0xee, 0x80, 0x80, 0xef, 0xbf, 0xbf,
+             0xf0, 0x90, 0x80, 0x80, 0xf4, 0x8f, 0xbf, 0xbf});
+  auto decoded = LastUnicodeCharacters(valid, 10);
+
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(valid, *decoded);
+}
+
+TEST(RerankPlanTest, ZeroLimitStillValidatesUtf8) {
+  auto valid = LastUnicodeCharacters("界", 0);
+  auto invalid = LastUnicodeCharacters(Bytes({0xff}), 0);
+
+  ASSERT_TRUE(valid.has_value());
+  EXPECT_TRUE(valid->empty());
+  EXPECT_FALSE(invalid.has_value());
+}
+
+TEST(RerankPlanTest, StoresExactly64ValidMultibyteUnicodeScalars) {
+  const string preceding_text = Repeat("界", 64);
+  auto plan = BuildPlan(TwoGroupsWithPunctuation(), preceding_text);
+
+  ASSERT_TRUE(plan.identity.has_value());
+  ASSERT_TRUE(plan.preceding_text.has_value());
+  EXPECT_EQ(preceding_text, *plan.preceding_text);
+}
+
+TEST(RerankPlanTest, Truncates65ValidMultibyteUnicodeScalarsTo64) {
+  const string expected = Repeat("界", 64);
+  auto plan = BuildPlan(TwoGroupsWithPunctuation(), "甲" + expected);
+
+  ASSERT_TRUE(plan.identity.has_value());
+  ASSERT_TRUE(plan.preceding_text.has_value());
+  EXPECT_EQ(expected, *plan.preceding_text);
+}
+
+TEST(RerankPlanTest, ReplayRejectsInvalidUtf8PrecedingText) {
+  auto plan = BuildPlan(TwoGroupsWithPunctuation());
+  auto scores = Scores(plan, {{1, 0}, {0, 0}, {2, 0}, {3, 0}, {4, 0}});
+  plan.preceding_text = Bytes({0xff});
+  vector<size_t> emission_order{99};
+
+  EXPECT_FALSE(ReplayRerankPlan(plan, scores, &emission_order));
+  EXPECT_EQ((vector<size_t>{99}), emission_order);
 }
 
 TEST(RerankPlanTest, ReplaysExactOrderAcrossGroupsAndKeepsNonWordPosition) {

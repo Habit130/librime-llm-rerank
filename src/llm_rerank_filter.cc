@@ -294,7 +294,12 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     if (ctx) {
       for (const auto& record : ctx->commit_history())
         preceding_text_ += record.text;
-      preceding_text_ = LastUnicodeCharacters(preceding_text_, 64);
+      if (auto suffix = LastUnicodeCharacters(preceding_text_, 64)) {
+        preceding_text_ = *suffix;
+      } else {
+        preceding_text_.clear();
+        preceding_text_valid_ = false;
+      }
       commit_connection_ =
           ctx->commit_notifier().connect([this](Context* c) { OnCommit(c); });
     }
@@ -326,10 +331,20 @@ void LlmRerankFilter::OnCommit(Context* ctx) {
 }
 
 void LlmRerankFilter::OnCommitText(const string& text) {
-  preceding_text_ = LastUnicodeCharacters(preceding_text_ + text, 64);
+  if (!preceding_text_valid_)
+    return;
+  string updated = preceding_text_ + text;
+  if (auto suffix = LastUnicodeCharacters(updated, 64)) {
+    preceding_text_ = *suffix;
+  } else {
+    preceding_text_.clear();
+    preceding_text_valid_ = false;
+  }
 }
 
 string LlmRerankFilter::BuildContext() {
+  if (!preceding_text_valid_)
+    return string(1, static_cast<char>(0xff));
   string result = preceding_text_;
   if (!engine_ || !engine_->context())
     return result;
@@ -346,7 +361,8 @@ string LlmRerankFilter::BuildContext() {
           context->input().substr(segment.start, segment.end - segment.start);
     }
   }
-  return LastUnicodeCharacters(result, 64);
+  auto suffix = LastUnicodeCharacters(result, 64);
+  return suffix ? *suffix : result;
 }
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,

@@ -131,6 +131,7 @@ class LlmRerankFilter : public Filter {
   connection commit_text_connection_;
   string last_word_;
   string preceding_text_;
+  bool preceding_text_valid_ = true;
 };
 
 }  // namespace rime

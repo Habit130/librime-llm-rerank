@@ -169,8 +169,9 @@ bool ValidPlan(const RerankPlan& plan) {
       !plan.window_truncated || !plan.candidates || !plan.groups) {
     return false;
   }
-  if (LastUnicodeCharacters(*plan.preceding_text, kPrecedingTextCharacters) !=
-      *plan.preceding_text) {
+  auto preceding_text =
+      LastUnicodeCharacters(*plan.preceding_text, kPrecedingTextCharacters);
+  if (!preceding_text || *preceding_text != *plan.preceding_text) {
     return false;
   }
 
@@ -277,20 +278,55 @@ RerankScoringPolicy DefaultRerankScoringPolicy() {
   return policy;
 }
 
-string LastUnicodeCharacters(const string& text, size_t limit) {
-  if (limit == 0)
-    return "";
-  size_t position = text.size();
-  size_t characters = 0;
-  while (position > 0 && characters < limit) {
-    --position;
-    while (position > 0 &&
-           (static_cast<unsigned char>(text[position]) & 0xc0) == 0x80) {
-      --position;
+std::optional<string> LastUnicodeCharacters(const string& text, size_t limit) {
+  vector<size_t> scalar_starts;
+  size_t position = 0;
+  while (position < text.size()) {
+    scalar_starts.push_back(position);
+    const unsigned char leading = text[position];
+    size_t length;
+    uint32_t scalar;
+    uint32_t minimum;
+    if (leading <= 0x7f) {
+      length = 1;
+      scalar = leading;
+      minimum = 0;
+    } else if (leading >= 0xc2 && leading <= 0xdf) {
+      length = 2;
+      scalar = leading & 0x1f;
+      minimum = 0x80;
+    } else if (leading >= 0xe0 && leading <= 0xef) {
+      length = 3;
+      scalar = leading & 0x0f;
+      minimum = 0x800;
+    } else if (leading >= 0xf0 && leading <= 0xf4) {
+      length = 4;
+      scalar = leading & 0x07;
+      minimum = 0x10000;
+    } else {
+      return std::nullopt;
     }
-    ++characters;
+    if (length > text.size() - position)
+      return std::nullopt;
+    for (size_t i = 1; i < length; ++i) {
+      const unsigned char continuation = text[position + i];
+      if ((continuation & 0xc0) != 0x80)
+        return std::nullopt;
+      scalar = (scalar << 6) | (continuation & 0x3f);
+    }
+    if (scalar < minimum || (scalar >= 0xd800 && scalar <= 0xdfff) ||
+        scalar > 0x10ffff) {
+      return std::nullopt;
+    }
+    position += length;
   }
-  return text.substr(position);
+
+  if (limit == 0)
+    return string();
+  const size_t first = scalar_starts.size() > limit
+                           ? scalar_starts[scalar_starts.size() - limit]
+                           : 0;
+  return text.substr(first);
 }
 
 string CanonicalizeInput(const string& input) {
@@ -321,7 +357,7 @@ RerankPlan BuildRerankPlan(const string& schema_id,
   plan.candidates = candidates;
   plan.groups = vector<RerankPlanGroup>();
 
-  if (schema_id.empty() || !ValidConfig(config) ||
+  if (!plan.preceding_text || schema_id.empty() || !ValidConfig(config) ||
       !ValidScoringPolicy(scoring_policy)) {
     return plan;
   }
