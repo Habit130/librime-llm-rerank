@@ -133,7 +133,7 @@ string ComputePlanIdentity(const RerankPlan& plan) {
     AppendField(&canonical, "group_identity", *group.identity);
     AppendField(&canonical, "group_complete", *group.complete);
   }
-  return ContentIdentity("rerank-plan-v1", canonical);
+  return ContentIdentity("rerank-plan-v2", canonical);
 }
 
 bool ValidConfig(const RerankPlanConfig& config) {
@@ -166,9 +166,9 @@ bool ValidPlan(const RerankPlan& plan) {
       !plan.canonical_input ||
       *plan.canonical_input != CanonicalizeInput(*plan.canonical_input) ||
       !plan.preceding_text || !plan.previous_word || !plan.config ||
-      !ValidConfig(*plan.config) ||
-      !plan.scoring_policy || !ValidScoringPolicy(*plan.scoring_policy) ||
-      !plan.window_truncated || !plan.candidates || !plan.groups) {
+      !ValidConfig(*plan.config) || !plan.scoring_policy ||
+      !ValidScoringPolicy(*plan.scoring_policy) || !plan.window_truncated ||
+      !plan.candidates || !plan.groups) {
     return false;
   }
   auto preceding_text =

@@ -11,7 +11,7 @@
 
 namespace rime {
 
-constexpr int kRerankPlanVersion = 1;
+constexpr int kRerankPlanVersion = 2;
 constexpr int kRerankScoreResultVersion = 1;
 
 // Presence is part of the replay contract: decoded records keep missing fields

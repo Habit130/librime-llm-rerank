@@ -66,6 +66,10 @@ class ContextMemory : public ContextCounter {
   static the<ContextMemory> OpenLevelDb(
       const path& file_path,
       const ContextStoreIdentity& expected_identity);
+  static the<ContextMemory> OpenUserLevelDb(
+      const path& user_data_dir,
+      const string& db_name,
+      const ContextStoreIdentity& expected_identity);
   static the<ContextMemory> OpenBackendForTesting(
       the<ContextDbBackend> backend,
       const ContextStoreIdentity& expected_identity,

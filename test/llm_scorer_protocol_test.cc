@@ -44,9 +44,7 @@ class ScriptedConnectSyscalls : public ConnectSyscalls {
     std::chrono::milliseconds delay{};
   };
 
-  SocketCallResult Connect(int,
-                           const struct sockaddr*,
-                           socklen_t) override {
+  SocketCallResult Connect(int, const struct sockaddr*, socklen_t) override {
     if (connect_index_ >= connect_results.size())
       return {-1, EINVAL};
     return connect_results[connect_index_++];
@@ -106,14 +104,14 @@ class FakeDaemon {
     if (fd_ < 0)
       throw std::runtime_error("socket failed");
 
-    struct sockaddr_un address {};
+    struct sockaddr_un address{};
     address.sun_family = AF_UNIX;
     if (path_.size() >= sizeof(address.sun_path))
       throw std::runtime_error("socket path too long");
     std::copy(path_.begin(), path_.end(), address.sun_path);
     if (bind(fd_, reinterpret_cast<struct sockaddr*>(&address),
              sizeof(address)) < 0 ||
-        listen(fd_, 1) < 0) {
+        listen(fd_, static_cast<int>(connection_count_)) < 0) {
       close(fd_);
       unlink(path_.c_str());
       throw std::runtime_error("bind or listen failed");
@@ -212,8 +210,8 @@ vector<an<Candidate>> ProtocolCandidates() {
   };
 }
 
-const vector<string> kProtocolOriginalOrder{"甲", "，", "乙", "丙", "丁",
-                                            "整句"};
+const vector<string> kProtocolOriginalOrder{"甲", "，", "乙",
+                                            "丙", "丁", "整句"};
 
 class ProtocolTranslation : public Translation {
  public:
@@ -260,8 +258,8 @@ vector<string> FilterWithDaemon(const string& path, int deadline_ms = 200) {
   filter.set_input("abcdef");
   filter.set_preceding_text("敏感测试上文");
   CandidateList candidates;
-  return CollectProtocolTexts(
-      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
+  return CollectProtocolTexts(filter.Apply(
+      New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
 }
 
 string ExtractStringField(const string& json, const string& field) {
@@ -278,13 +276,13 @@ string Response(const string& request,
                 const string& scores,
                 const std::optional<string>& request_identity = std::nullopt,
                 const std::optional<string>& plan_identity = std::nullopt) {
-  const string request_id = request_identity.value_or(
-      ExtractStringField(request, "request_id"));
+  const string request_id =
+      request_identity.value_or(ExtractStringField(request, "request_id"));
   const string plan_id =
       plan_identity.value_or(ExtractStringField(request, "plan_identity"));
   return "{\"version\":1,\"request_id\":\"" + request_id +
-         "\",\"plan_identity\":\"" + plan_id + "\",\"scores\":" +
-         scores + "}\n";
+         "\",\"plan_identity\":\"" + plan_id + "\",\"scores\":" + scores +
+         "}\n";
 }
 
 string ErrorObject(const string& fields = "") {
@@ -299,10 +297,9 @@ string ErrorObject(const string& fields = "") {
 string BoundErrorResponse(const string& request,
                           const string& error = ErrorObject()) {
   return "{\"version\":1,\"request_id\":\"" +
-         ExtractStringField(request, "request_id") +
-         "\",\"plan_identity\":\"" +
-         ExtractStringField(request, "plan_identity") + "\",\"error\":" +
-         error + "}\n";
+         ExtractStringField(request, "request_id") + "\",\"plan_identity\":\"" +
+         ExtractStringField(request, "plan_identity") +
+         "\",\"error\":" + error + "}\n";
 }
 
 string DuplicateTopLevelResponse(const string& request, const string& field) {
@@ -315,9 +312,8 @@ string DuplicateTopLevelResponse(const string& request, const string& field) {
   }
   if (field == "request_id") {
     return "{\"version\":1,\"request_id\":\"" + request_id +
-           "\",\"request_id\":\"" + request_id +
-           "\",\"plan_identity\":\"" + plan_identity +
-           "\",\"scores\":[0,10,0,10]}\n";
+           "\",\"request_id\":\"" + request_id + "\",\"plan_identity\":\"" +
+           plan_identity + "\",\"scores\":[0,10,0,10]}\n";
   }
   if (field == "plan_identity") {
     return "{\"version\":1,\"request_id\":\"" + request_id +
@@ -332,8 +328,8 @@ string DuplicateTopLevelResponse(const string& request, const string& field) {
   }
   const string error = ErrorObject();
   return "{\"version\":1,\"request_id\":\"" + request_id +
-         "\",\"plan_identity\":\"" + plan_identity + "\",\"error\":" +
-         error + ",\"error\":" + error + "}\n";
+         "\",\"plan_identity\":\"" + plan_identity + "\",\"error\":" + error +
+         ",\"error\":" + error + "}\n";
 }
 
 void ExpectFailure(ResponseBuilder response_builder) {
@@ -398,8 +394,8 @@ TEST(LlmScorerProtocolTest, CppClientMatchesPythonProductionEofFraming) {
     _exit(127);
   }
 
-  for (int attempt = 0;
-       attempt < 200 && !std::filesystem::exists(ready_path); ++attempt) {
+  for (int attempt = 0; attempt < 200 && !std::filesystem::exists(ready_path);
+       ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   if (!std::filesystem::exists(ready_path)) {
@@ -451,12 +447,12 @@ TEST(LlmScorerProtocolTest, DeferredTranslationsSendTheirOwnContextSnapshot) {
 
   CandidateList candidates_a;
   filter.set_preceding_text("context-a");
-  auto translation_a =
-      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates_a);
+  auto translation_a = filter.Apply(
+      New<ProtocolTranslation>(ProtocolCandidates()), &candidates_a);
   CandidateList candidates_b;
   filter.set_preceding_text("context-b");
-  auto translation_b =
-      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates_b);
+  auto translation_b = filter.Apply(
+      New<ProtocolTranslation>(ProtocolCandidates()), &candidates_b);
 
   EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
             CollectProtocolTexts(translation_a));
@@ -466,6 +462,66 @@ TEST(LlmScorerProtocolTest, DeferredTranslationsSendTheirOwnContextSnapshot) {
   ASSERT_EQ(2u, plan_identities.size());
   EXPECT_FALSE(plan_identities[0].empty());
   EXPECT_NE(plan_identities[0], plan_identities[1]);
+}
+
+TEST(LlmScorerProtocolTest, DuplicateCandidateScoresRemainPositional) {
+  FakeDaemon daemon([](const string& request) -> std::optional<string> {
+    return Response(request, "[1,2]");
+  });
+  LlmScorer scorer(daemon.path(), 1.0);
+  vector<an<Candidate>> candidates{
+      MakeProtocolPhrase("table", 0, 2, "同", 1.0),
+      MakeProtocolPhrase("user_table", 0, 2, "同", 1.0),
+  };
+  vector<ScoreComponents> scores;
+
+  ASSERT_TRUE(scorer.ScoreBatch(
+      {"rerank-plan-v2:duplicate", "context", "", {"同", "同"}}, candidates,
+      &scores));
+  ASSERT_EQ(2u, scores.size());
+  EXPECT_DOUBLE_EQ(1.0, scores[0].base_score);
+  EXPECT_DOUBLE_EQ(2.0, scores[1].base_score);
+}
+
+TEST(LlmScorerProtocolTest, ConcurrentBatchesKeepTheirOwnResponses) {
+  FakeDaemon daemon(
+      [](const string& request) -> std::optional<string> {
+        return Response(
+            request, request.find("\"context\":\"context-a\"") != string::npos
+                         ? "[1]"
+                         : "[2]");
+      },
+      2);
+  LlmScorer scorer(daemon.path(), 1.0);
+  vector<an<Candidate>> candidates{
+      MakeProtocolPhrase("table", 0, 2, "同", 1.0)};
+  vector<ScoreComponents> scores_a;
+  vector<ScoreComponents> scores_b;
+  std::atomic<bool> start{false};
+  bool scored_a = false;
+  bool scored_b = false;
+  std::thread thread_a([&] {
+    while (!start.load())
+      std::this_thread::yield();
+    scored_a = scorer.ScoreBatch({"rerank-plan-v2:a", "context-a", "", {"同"}},
+                                 candidates, &scores_a);
+  });
+  std::thread thread_b([&] {
+    while (!start.load())
+      std::this_thread::yield();
+    scored_b = scorer.ScoreBatch({"rerank-plan-v2:b", "context-b", "", {"同"}},
+                                 candidates, &scores_b);
+  });
+  start = true;
+  thread_a.join();
+  thread_b.join();
+
+  ASSERT_TRUE(scored_a);
+  ASSERT_TRUE(scored_b);
+  ASSERT_EQ(1u, scores_a.size());
+  ASSERT_EQ(1u, scores_b.size());
+  EXPECT_DOUBLE_EQ(1.0, scores_a[0].base_score);
+  EXPECT_DOUBLE_EQ(2.0, scores_b[0].base_score);
 }
 
 TEST(LlmScorerProtocolTest, FailureFixtureWouldReorderWithWeightOnly) {
@@ -478,8 +534,8 @@ TEST(LlmScorerProtocolTest, FailureFixtureWouldReorderWithWeightOnly) {
   filter.set_input("abcdef");
   CandidateList candidates;
 
-  const vector<string> weight_only = CollectProtocolTexts(
-      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
+  const vector<string> weight_only = CollectProtocolTexts(filter.Apply(
+      New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
   EXPECT_NE(kProtocolOriginalOrder, weight_only);
   EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
             weight_only);
@@ -495,11 +551,10 @@ TEST(LlmScorerProtocolTest, DarwinInterruptedConnectCompletesViaPoll) {
   syscalls.socket_error_results = {{{0, 0}, 0}};
 
   EXPECT_EQ(NonBlockingConnectStatus::kConnected,
-            ConnectNonBlockingWithDeadline(
-                42, nullptr, 0,
-                std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(50),
-                &syscalls));
+            ConnectNonBlockingWithDeadline(42, nullptr, 0,
+                                           std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds(50),
+                                           &syscalls));
   ASSERT_EQ(2u, syscalls.poll_timeouts.size());
   EXPECT_LE(syscalls.poll_timeouts[1], syscalls.poll_timeouts[0]);
 }
@@ -511,11 +566,10 @@ TEST(LlmScorerProtocolTest, EagainAndEinprogressReachHealthyDaemon) {
   syscalls.socket_error_results = {{{0, 0}, 0}};
 
   EXPECT_EQ(NonBlockingConnectStatus::kConnected,
-            ConnectNonBlockingWithDeadline(
-                42, nullptr, 0,
-                std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(50),
-                &syscalls));
+            ConnectNonBlockingWithDeadline(42, nullptr, 0,
+                                           std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds(50),
+                                           &syscalls));
 }
 
 TEST(LlmScorerProtocolTest, RetryableConnectStatesShareAbsoluteDeadline) {
@@ -529,11 +583,10 @@ TEST(LlmScorerProtocolTest, RetryableConnectStatesShareAbsoluteDeadline) {
   const auto started = std::chrono::steady_clock::now();
 
   EXPECT_EQ(NonBlockingConnectStatus::kTimeout,
-            ConnectNonBlockingWithDeadline(
-                42, nullptr, 0,
-                std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(25),
-                &syscalls));
+            ConnectNonBlockingWithDeadline(42, nullptr, 0,
+                                           std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds(25),
+                                           &syscalls));
   const auto elapsed = std::chrono::steady_clock::now() - started;
   EXPECT_LT(elapsed, std::chrono::milliseconds(100));
   ASSERT_GE(syscalls.poll_timeouts.size(), 2u);
@@ -542,8 +595,7 @@ TEST(LlmScorerProtocolTest, RetryableConnectStatesShareAbsoluteDeadline) {
 }
 
 TEST(LlmScorerProtocolTest, ConnectionFailurePassesThroughWholeWindow) {
-  EXPECT_EQ(kProtocolOriginalOrder,
-            FilterWithDaemon(UniqueSocketPath()));
+  EXPECT_EQ(kProtocolOriginalOrder, FilterWithDaemon(UniqueSocketPath()));
 }
 
 TEST(LlmScorerProtocolTest, DeadlineTimeoutPassesThroughWholeWindow) {
@@ -560,15 +612,13 @@ TEST(LlmScorerProtocolTest, DeadlineTimeoutPassesThroughWholeWindow) {
 }
 
 TEST(LlmScorerProtocolTest, EmptyResponsePassesThroughWholeWindow) {
-  ExpectFailure([](const string&) -> std::optional<string> {
-    return std::nullopt;
-  });
+  ExpectFailure(
+      [](const string&) -> std::optional<string> { return std::nullopt; });
 }
 
 TEST(LlmScorerProtocolTest, InvalidJsonPassesThroughWholeWindow) {
-  ExpectFailure([](const string&) -> std::optional<string> {
-    return "not-json\n";
-  });
+  ExpectFailure(
+      [](const string&) -> std::optional<string> { return "not-json\n"; });
 }
 
 TEST(LlmScorerProtocolTest, MissingFieldPassesThroughWholeWindow) {
@@ -598,9 +648,7 @@ TEST(LlmScorerProtocolTest, DuplicateTopLevelFieldsPassThroughWholeWindow) {
 
 TEST(LlmScorerProtocolTest, DuplicateNestedErrorFieldPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
-    return BoundErrorResponse(
-        request,
-        ErrorObject("\"code\":\"duplicate\","));
+    return BoundErrorResponse(request, ErrorObject("\"code\":\"duplicate\","));
   });
 }
 
@@ -611,14 +659,12 @@ TEST(LlmScorerProtocolTest, ExtraFieldsPassThroughWholeWindow) {
     return response;
   });
   ExpectFailure([](const string& request) -> std::optional<string> {
-    return BoundErrorResponse(request,
-                              ErrorObject("\"extra\":true,"));
+    return BoundErrorResponse(request, ErrorObject("\"extra\":true,"));
   });
 }
 
 TEST(LlmScorerProtocolTest, TrailingPayloadPassesThroughWholeWindow) {
-  for (const string& suffix :
-       {"garbage", " ", "{\"version\":1}\n"}) {
+  for (const string& suffix : {"garbage", " ", "{\"version\":1}\n"}) {
     SCOPED_TRACE(suffix);
     ExpectFailure([suffix](const string& request) -> std::optional<string> {
       return Response(request, "[0,10,0,10]") + suffix;
@@ -626,7 +672,8 @@ TEST(LlmScorerProtocolTest, TrailingPayloadPassesThroughWholeWindow) {
   }
 }
 
-TEST(LlmScorerProtocolTest, WhitespaceBeforeTerminalLfPassesThroughWholeWindow) {
+TEST(LlmScorerProtocolTest,
+     WhitespaceBeforeTerminalLfPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
     string response = Response(request, "[0,10,0,10]");
     response.insert(response.size() - 1, " ");
@@ -642,7 +689,8 @@ TEST(LlmScorerProtocolTest, EmbeddedNulPayloadPassesThroughWholeWindow) {
   });
 }
 
-TEST(LlmScorerProtocolTest, SecondJsonBeforeTerminalLfPassesThroughWholeWindow) {
+TEST(LlmScorerProtocolTest,
+     SecondJsonBeforeTerminalLfPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
     string response = Response(request, "[0,10,0,10]");
     response.insert(response.size() - 1, "{\"version\":1}");
@@ -683,8 +731,7 @@ TEST(LlmScorerProtocolTest, MissingEofBeforeDeadlinePassesThroughWholeWindow) {
 TEST(LlmScorerProtocolTest, SuccessAndErrorTogetherPassThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
     string response = BoundErrorResponse(request);
-    response.replace(response.size() - 2, 1,
-                     ",\"scores\":[0,10,0,10]}");
+    response.replace(response.size() - 2, 1, ",\"scores\":[0,10,0,10]}");
     return response;
   });
 }
@@ -771,8 +818,8 @@ TEST(LlmScorerProtocolTest, PlanIdentityMismatchPassesThroughWholeWindow) {
 
 TEST(LlmScorerProtocolTest, StaleResponseFromPriorRequestPassesThroughWindow) {
   FakeDaemon daemon(
-      [first_request_id = string()](
-          const string& request) mutable -> std::optional<string> {
+      [first_request_id =
+           string()](const string& request) mutable -> std::optional<string> {
         if (first_request_id.empty()) {
           first_request_id = ExtractStringField(request, "request_id");
           return Response(request, "[0,10,0,10]");

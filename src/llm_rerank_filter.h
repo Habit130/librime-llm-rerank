@@ -30,8 +30,11 @@ struct ScoringRequest {
 class Scorer {
  public:
   virtual ~Scorer() = default;
-  virtual bool Score(const an<Candidate>& cand, ScoreComponents* score) = 0;
-  virtual bool Prepare(const ScoringRequest& request) { return true; }
+  // Scores one immutable request as a positional batch. Implementations must
+  // not retain request-specific state after this call returns.
+  virtual bool ScoreBatch(const ScoringRequest& request,
+                          const vector<an<Candidate>>& candidates,
+                          vector<ScoreComponents>* scores) = 0;
 };
 
 // Scores a candidate by its dictionary weight (log space) scaled by a
@@ -44,7 +47,10 @@ class WeightScorer : public Scorer {
   WeightScorer(double sys_coeff, double usr_coeff, bool verbose = false)
       : sys_coeff_(sys_coeff), usr_coeff_(usr_coeff), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
+  bool Score(const an<Candidate>& cand, ScoreComponents* score);
 
  private:
   double sys_coeff_;
@@ -62,8 +68,9 @@ class ContextScorer : public Scorer {
                 bool verbose = false)
       : counter_(counter), saturate_k_(saturate_k), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-  bool Prepare(const ScoringRequest& request) override;
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
 
   // Bounded evidence strength in [0, 1). Zero on a miss (total_count <= 0); a
   // single observation reaches only 1 / (1 + saturate_k), never the bound.
@@ -74,7 +81,6 @@ class ContextScorer : public Scorer {
  private:
   ContextCounter* counter_;
   double saturate_k_;
-  string prev_word_;
   bool verbose_;
 };
 
@@ -87,8 +93,9 @@ class CompositeScorer : public Scorer {
                   an<Scorer> llm = nullptr)
       : weight_(weight), context_(context), llm_(llm) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-  bool Prepare(const ScoringRequest& request) override;
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
 
  private:
   an<Scorer> weight_;

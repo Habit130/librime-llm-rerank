@@ -17,8 +17,6 @@
 #include <rime/ticket.h>
 #include <rime/translation.h>
 #include <rime/commit_history.h>
-#include <rime/dict/db.h>
-#include <rime/dict/level_db.h>
 #include <rime/dict/user_db.h>
 #include <rime/gear/translator_commons.h>
 
@@ -71,6 +69,25 @@ bool WeightScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   return true;
 }
 
+bool WeightScorer::ScoreBatch(const ScoringRequest& request,
+                              const vector<an<Candidate>>& candidates,
+                              vector<ScoreComponents>* scores) {
+  if (!scores || request.candidate_texts.size() != candidates.size())
+    return false;
+  vector<ScoreComponents> result;
+  result.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!candidates[i] || candidates[i]->text() != request.candidate_texts[i])
+      return false;
+    ScoreComponents score;
+    if (!Score(candidates[i], &score))
+      return false;
+    result.push_back(score);
+  }
+  *scores = std::move(result);
+  return true;
+}
+
 double ContextScorer::EvidenceStrength(int pair_count,
                                        int total_count,
                                        double saturate_k) {
@@ -81,53 +98,70 @@ double ContextScorer::EvidenceStrength(int pair_count,
   return relative_preference * evidence;
 }
 
-bool ContextScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
-  score->base_score = 0.0;
-  score->retrieval_evidence = 0.0;
-  if (!counter_ || prev_word_.empty())
-    return true;
-  int pair_count;
-  int total_count;
-  if (!counter_->PairCount(prev_word_, cand->text(), &pair_count) ||
-      !counter_->TotalCount(prev_word_, &total_count) || pair_count < 0 ||
-      total_count < 0 || pair_count > total_count) {
+bool ContextScorer::ScoreBatch(const ScoringRequest& request,
+                               const vector<an<Candidate>>& candidates,
+                               vector<ScoreComponents>* scores) {
+  if (!scores || request.candidate_texts.size() != candidates.size())
+    return false;
+  vector<ScoreComponents> result;
+  result.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!candidates[i] || candidates[i]->text() != request.candidate_texts[i])
+      return false;
+    ScoreComponents score;
+    if (counter_ && !request.previous_word.empty()) {
+      int pair_count;
+      int total_count;
+      if (!counter_->PairCount(request.previous_word, candidates[i]->text(),
+                               &pair_count) ||
+          !counter_->TotalCount(request.previous_word, &total_count) ||
+          pair_count < 0 || total_count < 0 || pair_count > total_count) {
+        return false;
+      }
+      double evidence = EvidenceStrength(pair_count, total_count, saturate_k_);
+      if (!std::isfinite(evidence) || evidence < 0.0 || evidence >= 1.0)
+        return false;
+      score.retrieval_evidence = evidence;
+      if (verbose_) {
+        LOG(INFO) << "llm_rerank context: pair=" << pair_count
+                  << " total=" << total_count << " evidence=" << evidence;
+      }
+    }
+    result.push_back(score);
+  }
+  *scores = std::move(result);
+  return true;
+}
+
+bool CompositeScorer::ScoreBatch(const ScoringRequest& request,
+                                 const vector<an<Candidate>>& candidates,
+                                 vector<ScoreComponents>* scores) {
+  if (!scores || !weight_)
+    return false;
+  vector<ScoreComponents> weight_scores;
+  if (!weight_->ScoreBatch(request, candidates, &weight_scores) ||
+      weight_scores.size() != candidates.size()) {
     return false;
   }
-  double s = EvidenceStrength(pair_count, total_count, saturate_k_);
-  if (!std::isfinite(s) || s < 0.0 || s >= 1.0)
+  vector<ScoreComponents> context_scores(candidates.size());
+  if (context_ &&
+      (!context_->ScoreBatch(request, candidates, &context_scores) ||
+       context_scores.size() != candidates.size())) {
     return false;
-  score->retrieval_evidence = s;
-  if (verbose_) {
-    LOG(INFO) << "llm_rerank context: pair=" << pair_count
-              << " total=" << total_count << " evidence=" << s;
   }
-  return true;
-}
-
-bool ContextScorer::Prepare(const ScoringRequest& request) {
-  prev_word_ = request.previous_word;
-  return true;
-}
-
-bool CompositeScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
-  ScoreComponents weight_score;
-  if (!weight_ || !weight_->Score(cand, &weight_score))
+  vector<ScoreComponents> llm_scores(candidates.size());
+  if (llm_ && (!llm_->ScoreBatch(request, candidates, &llm_scores) ||
+               llm_scores.size() != candidates.size())) {
     return false;
-  ScoreComponents context_score;
-  if (context_ && !context_->Score(cand, &context_score))
-    return false;
-  ScoreComponents llm_score;
-  if (llm_ && !llm_->Score(cand, &llm_score))
-    return false;
-  score->base_score = weight_score.base_score + llm_score.base_score;
-  score->retrieval_evidence = context_score.retrieval_evidence;
+  }
+  vector<ScoreComponents> result;
+  result.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    result.push_back({weight_scores[i].base_score + llm_scores[i].base_score,
+                      context_scores[i].retrieval_evidence});
+  }
+  *scores = std::move(result);
   return true;
-}
-
-bool CompositeScorer::Prepare(const ScoringRequest& request) {
-  return weight_ && weight_->Prepare(request) &&
-         (!context_ || context_->Prepare(request)) &&
-         (!llm_ || llm_->Prepare(request));
 }
 
 static string CategoryOf(const string& type) {
@@ -141,11 +175,11 @@ class LlmRerankTranslation : public PrefetchTranslation {
   LlmRerankTranslation(an<Translation> translation,
                        an<Scorer> scorer,
                        int window,
-                        string schema_id,
-                        string input,
-                        string preceding_text,
-                        string previous_word,
-                        RerankScoringPolicy scoring_policy)
+                       string schema_id,
+                       string input,
+                       string preceding_text,
+                       string previous_word,
+                       RerankScoringPolicy scoring_policy)
       : PrefetchTranslation(translation),
         scorer_(scorer),
         window_(window),
@@ -195,7 +229,7 @@ bool LlmRerankTranslation::Replenish() {
   CandidateQueue result;
   bool reranked = false;
   if (!scorer_) {
-    LogWindowFailure("scoring_unavailable", "prepare", buffer.size());
+    LogWindowFailure("scoring_unavailable", "score", buffer.size());
   } else {
     reranked = RerankWindow(buffer, truncated, &result);
   }
@@ -230,22 +264,29 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     LogWindowFailure("invalid_plan", "plan", buffer.size());
     return false;
   }
-  vector<bool> scored_candidate(buffer.size(), false);
+  vector<size_t> scored_indexes;
+  vector<an<Candidate>> scored_candidates;
   vector<string> texts;
   for (const auto& group : *plan.groups) {
     if (!*group.complete)
       continue;
     for (size_t index : *group.candidate_indexes) {
-      scored_candidate[index] = true;
+      scored_indexes.push_back(index);
+      scored_candidates.push_back(buffer[index]);
       texts.push_back(buffer[index]->text());
     }
   }
   ScoringRequest request{*plan.identity, *plan.preceding_text,
                          *plan.previous_word, std::move(texts)};
-  if (!scorer_->Prepare(request)) {
-    LogWindowFailure("scoring_prepare_failed", "prepare", buffer.size());
+  vector<ScoreComponents> batch_scores;
+  if (!scorer_->ScoreBatch(request, scored_candidates, &batch_scores) ||
+      batch_scores.size() != scored_candidates.size()) {
+    LogWindowFailure("batch_scoring_failed", "score", buffer.size());
     return false;
   }
+  vector<ScoreComponents> scores(buffer.size());
+  for (size_t i = 0; i < scored_indexes.size(); ++i)
+    scores[scored_indexes[i]] = batch_scores[i];
 
   RerankScoreResult result;
   result.version = kRerankScoreResultVersion;
@@ -253,13 +294,9 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   result.candidate_scores = vector<RerankCandidateScore>();
   result.candidate_scores->reserve(buffer.size());
   for (size_t i = 0; i < buffer.size(); ++i) {
-    ScoreComponents score;
-    if (scored_candidate[i] && !scorer_->Score(buffer[i], &score)) {
-      LogWindowFailure("candidate_scoring_failed", "score", buffer.size());
-      return false;
-    }
     result.candidate_scores->push_back(MakeRerankCandidateScore(
-        score.base_score, score.retrieval_evidence, *scoring_policy_.gamma));
+        scores[i].base_score, scores[i].retrieval_evidence,
+        *scoring_policy_.gamma));
   }
 
   vector<size_t> emission_order;
@@ -309,18 +346,16 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   auto weight_scorer = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
   scorer_ = weight_scorer;
   if (alpha_ > 0.0 && !socket_path_.empty()) {
-    llm_scorer_ =
-        New<LlmScorer>(socket_path_, alpha_, verbose_, deadline_ms_);
+    llm_scorer_ = New<LlmScorer>(socket_path_, alpha_, verbose_, deadline_ms_);
   }
   if (engine_) {
     if (auto component = UserDb::Require("userdb")) {
       string db_name = ticket.schema->schema_id() + ".llm_rerank";
-      Db* raw = component->Create(db_name);
-      if (raw && dynamic_cast<LevelDb*>(raw))
-        memory_ = ContextMemory::OpenLevelDb(
-            raw->file_path(),
+      if (component->extension() == ".userdb") {
+        memory_ = ContextMemory::OpenUserLevelDb(
+            Service::instance().deployer().user_data_dir, db_name,
             {db_name, "userdb", Service::instance().deployer().user_id});
-      delete raw;
+      }
     }
     if (memory_) {
       context_scorer_ =

@@ -44,7 +44,7 @@ class SystemConnectSyscalls : public ConnectSyscalls {
                         short events,
                         int timeout_ms,
                         short* returned_events) override {
-    struct pollfd poll_fd { fd, events, 0 };
+    struct pollfd poll_fd{fd, events, 0};
     const int result = poll(&poll_fd, 1, timeout_ms);
     if (returned_events)
       *returned_events = poll_fd.revents;
@@ -53,8 +53,8 @@ class SystemConnectSyscalls : public ConnectSyscalls {
 
   SocketCallResult GetSocketError(int fd, int* socket_error) override {
     socklen_t socket_error_size = sizeof(*socket_error);
-    const int result = getsockopt(fd, SOL_SOCKET, SO_ERROR, socket_error,
-                                  &socket_error_size);
+    const int result =
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, socket_error, &socket_error_size);
     return {result, result < 0 ? errno : 0};
   }
 };
@@ -66,8 +66,9 @@ WaitStatus WaitFor(int fd,
   if (!syscalls)
     return WaitStatus::kError;
   while (true) {
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        deadline - std::chrono::steady_clock::now());
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
     if (remaining.count() <= 0)
       return WaitStatus::kTimeout;
     short returned_events = 0;
@@ -90,9 +91,7 @@ SystemConnectSyscalls& DefaultConnectSyscalls() {
   return syscalls;
 }
 
-void LogFailure(const char* code,
-                const char* phase,
-                size_t candidate_count) {
+void LogFailure(const char* code, const char* phase, size_t candidate_count) {
   LOG(WARNING) << "llm_scorer: code=" << code << " phase=" << phase
                << " protocol_version=" << kLlmScoringProtocolVersion
                << " candidate_count=" << candidate_count;
@@ -135,8 +134,7 @@ static string BuildRequest(const string& context,
                            const vector<string>& candidates,
                            const string& request_id,
                            const string& plan_identity) {
-  string json = "{\"version\":" +
-                std::to_string(kLlmScoringProtocolVersion) +
+  string json = "{\"version\":" + std::to_string(kLlmScoringProtocolVersion) +
                 ",\"request_id\":\"" + JsonEscape(request_id) +
                 "\",\"plan_identity\":\"" + JsonEscape(plan_identity) +
                 "\",\"context\":\"";
@@ -187,8 +185,7 @@ static bool ParseScores(const string& response,
   }
   if (!document.HasMember("version") || !document["version"].IsInt() ||
       document["version"].GetInt() != kLlmScoringProtocolVersion ||
-      !document.HasMember("request_id") ||
-      !document["request_id"].IsString() ||
+      !document.HasMember("request_id") || !document["request_id"].IsString() ||
       !document.HasMember("plan_identity") ||
       !document["plan_identity"].IsString()) {
     *error_code = "invalid_protocol";
@@ -214,9 +211,8 @@ static bool ParseScores(const string& response,
       return false;
     }
     const auto& error = document["error"];
-    if (!HasExactMembers(error,
-                         {"code", "message", "occurred_at", "retryable",
-                          "phase", "remediation", "cause"}) ||
+    if (!HasExactMembers(error, {"code", "message", "occurred_at", "retryable",
+                                 "phase", "remediation", "cause"}) ||
         !error["code"].IsString() || !error["message"].IsString() ||
         !error["occurred_at"].IsString() || !error["retryable"].IsBool() ||
         !error["phase"].IsString() || !error["remediation"].IsString() ||
@@ -227,8 +223,8 @@ static bool ParseScores(const string& response,
     *error_code = "daemon_error";
     return false;
   }
-  if (!HasExactMembers(
-          document, {"version", "request_id", "plan_identity", "scores"}) ||
+  if (!HasExactMembers(document,
+                       {"version", "request_id", "plan_identity", "scores"}) ||
       !document["scores"].IsArray()) {
     *error_code = "invalid_protocol";
     return false;
@@ -292,8 +288,7 @@ NonBlockingConnectStatus ConnectNonBlockingWithDeadline(
 
     int socket_error = 0;
     while (true) {
-      const SocketCallResult call =
-          syscalls->GetSocketError(fd, &socket_error);
+      const SocketCallResult call = syscalls->GetSocketError(fd, &socket_error);
       if (call.result == 0)
         break;
       if (call.error != EINTR && call.error != EAGAIN &&
@@ -314,12 +309,12 @@ NonBlockingConnectStatus ConnectNonBlockingWithDeadline(
 }
 
 bool LlmScorer::SendRequest(const string& context,
-                             const vector<string>& candidates,
-                             const string& request_id,
-                             const string& plan_identity,
-                             string* response) {
+                            const vector<string>& candidates,
+                            const string& request_id,
+                            const string& plan_identity,
+                            string* response) {
   if (deadline_ms_ <= 0) {
-    LogFailure("deadline_invalid", "prepare", candidates.size());
+    LogFailure("deadline_invalid", "score", candidates.size());
     return false;
   }
   const auto deadline = std::chrono::steady_clock::now() +
@@ -364,16 +359,15 @@ bool LlmScorer::SendRequest(const string& context,
     return false;
   }
 
-  string request =
-      BuildRequest(context, candidates, request_id, plan_identity);
+  string request = BuildRequest(context, candidates, request_id, plan_identity);
   size_t sent = 0;
   while (sent < request.size()) {
     WaitStatus wait = WaitFor(fd, POLLOUT, deadline, &DefaultConnectSyscalls());
     if (wait != WaitStatus::kReady) {
       close(fd);
-      LogFailure(wait == WaitStatus::kTimeout ? "deadline_exceeded"
-                                              : "write_failed",
-                 "write", candidates.size());
+      LogFailure(
+          wait == WaitStatus::kTimeout ? "deadline_exceeded" : "write_failed",
+          "write", candidates.size());
       return false;
     }
     ssize_t size = send(fd, request.data() + sent, request.size() - sent, 0);
@@ -395,9 +389,9 @@ bool LlmScorer::SendRequest(const string& context,
     WaitStatus wait = WaitFor(fd, POLLIN, deadline, &DefaultConnectSyscalls());
     if (wait != WaitStatus::kReady) {
       close(fd);
-      LogFailure(wait == WaitStatus::kTimeout ? "deadline_exceeded"
-                                              : "read_failed",
-                 "read", candidates.size());
+      LogFailure(
+          wait == WaitStatus::kTimeout ? "deadline_exceeded" : "read_failed",
+          "read", candidates.size());
       return false;
     }
     ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
@@ -427,19 +421,23 @@ bool LlmScorer::SendRequest(const string& context,
   return true;
 }
 
-bool LlmScorer::Prepare(const ScoringRequest& request) {
-  score_cache_.clear();
-  prepared_ = false;
-
+bool LlmScorer::ScoreBatch(const ScoringRequest& request,
+                           const vector<an<Candidate>>& candidates,
+                           vector<ScoreComponents>* batch_scores) {
+  if (!batch_scores || request.candidate_texts.size() != candidates.size())
+    return false;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!candidates[i] || candidates[i]->text() != request.candidate_texts[i])
+      return false;
+  }
   if (request.candidate_texts.empty()) {
-    prepared_ = true;
+    batch_scores->clear();
     return true;
   }
 
   static std::atomic<uint64_t> next_request{0};
-  const string request_id = "llm-score-request-v1:" +
-                            std::to_string(getpid()) + ":" +
-                            std::to_string(next_request++);
+  const string request_id = "llm-score-request-v1:" + std::to_string(getpid()) +
+                            ":" + std::to_string(next_request++);
   string response;
   if (!SendRequest(request.preceding_text, request.candidate_texts, request_id,
                    request.plan_identity, &response))
@@ -453,24 +451,14 @@ bool LlmScorer::Prepare(const ScoringRequest& request) {
     return false;
   }
 
-  for (size_t i = 0; i < request.candidate_texts.size(); i++) {
-    score_cache_[request.candidate_texts[i]] = scores[i];
-  }
-  prepared_ = true;
+  vector<ScoreComponents> result;
+  result.reserve(scores.size());
+  for (double score : scores)
+    result.push_back({alpha_ * score, 0.0});
+  *batch_scores = std::move(result);
 
   if (verbose_)
     LOG(INFO) << "llm_scorer: scored candidate_count=" << scores.size();
-  return true;
-}
-
-bool LlmScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
-  if (!prepared_)
-    return false;
-  auto it = score_cache_.find(cand->text());
-  if (it == score_cache_.end())
-    return false;
-  score->base_score = alpha_ * it->second;
-  score->retrieval_evidence = 0.0;
   return true;
 }
 

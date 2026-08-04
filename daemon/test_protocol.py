@@ -35,7 +35,7 @@ def request(**overrides):
     value = {
         "version": PROTOCOL_VERSION,
         "request_id": "request-17",
-        "plan_identity": "rerank-plan-v1:sha1:0123456789abcdef",
+        "plan_identity": "rerank-plan-v2:sha1:0123456789abcdef",
         "context": "private context fixture",
         "candidates": ["candidate-a", "candidate-b"],
     }
@@ -65,7 +65,7 @@ class ProtocolTest(unittest.TestCase):
     def assert_bound_error(self, response):
         self.assertEqual("request-17", response["request_id"])
         self.assertEqual(
-            "rerank-plan-v1:sha1:0123456789abcdef",
+            "rerank-plan-v2:sha1:0123456789abcdef",
             response["plan_identity"],
         )
 
@@ -76,7 +76,7 @@ class ProtocolTest(unittest.TestCase):
             {
                 "version": PROTOCOL_VERSION,
                 "request_id": "request-17",
-                "plan_identity": "rerank-plan-v1:sha1:0123456789abcdef",
+                "plan_identity": "rerank-plan-v2:sha1:0123456789abcdef",
                 "scores": [1.25, -2.5],
             },
             response,

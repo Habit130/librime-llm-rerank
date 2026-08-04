@@ -53,9 +53,9 @@ class LlmScorer : public Scorer {
         verbose_(verbose),
         deadline_ms_(deadline_ms) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-
-  bool Prepare(const ScoringRequest& request) override;
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
 
  private:
   bool SendRequest(const string& context,
@@ -68,8 +68,6 @@ class LlmScorer : public Scorer {
   double alpha_;
   bool verbose_;
   int deadline_ms_;
-  map<string, double> score_cache_;
-  bool prepared_ = false;
 };
 
 }  // namespace rime

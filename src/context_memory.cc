@@ -3,7 +3,6 @@
 // Distributed under the BSD License
 //
 
-#include <charconv>
 #include <cmath>
 #include <filesystem>
 #include <functional>
@@ -11,6 +10,7 @@
 #include <locale>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <system_error>
 
@@ -37,56 +37,32 @@ string MetadataKey(const string& key) {
   return string(1, kMetadataPrefix) + key;
 }
 
-bool ParseInteger(const string& text, int* value) {
-  if (!value || text.empty())
+bool Consume(std::istream* input, const string& expected) {
+  if (!input)
     return false;
-  const char* first = text.data();
-  const char* last = first + text.size();
-  auto [parsed_end, error] = std::from_chars(first, last, *value);
-  return error == std::errc() && parsed_end == last;
+  for (char expected_character : expected) {
+    char actual_character;
+    if (!input->get(actual_character) || actual_character != expected_character)
+      return false;
+  }
+  return true;
 }
 
-bool ParseTick(const string& text, TickCount* value) {
-  if (!value || text.empty())
-    return false;
-  const char* first = text.data();
-  const char* last = first + text.size();
-  auto [parsed_end, error] = std::from_chars(first, last, *value);
-  return error == std::errc() && parsed_end == last;
-}
-
-bool ParseDouble(const string& text, double* value) {
-  if (!value || text.empty())
-    return false;
-  std::istringstream input(text);
-  input.imbue(std::locale::classic());
-  input >> std::noskipws >> *value;
-  return input && input.peek() == std::char_traits<char>::eof() &&
-         std::isfinite(*value);
-}
-
-// UserDbValue::Pack emits exactly "c=<int> d=<double> t=<uint64>". Validate
-// that complete grammar instead of relying on its intentionally permissive
-// migration parser, which ignores unknown and trailing tokens.
+// Match the exact current-locale representation emitted by UserDbValue::Pack.
+// Its migration parser is intentionally permissive, so a Pack round trip is
+// still required to reject unknown, reordered, or trailing fields.
 bool ParseUserDbValue(const string& value, UserDbValue* parsed) {
-  if (!parsed || value.compare(0, 2, "c=") != 0)
+  if (!parsed)
     return false;
-  const size_t commits_end = value.find(' ');
-  if (commits_end == string::npos ||
-      value.compare(commits_end, 3, " d=") != 0) {
-    return false;
-  }
-  const size_t dee_start = commits_end + 3;
-  const size_t dee_end = value.find(' ', dee_start);
-  if (dee_end == string::npos || value.compare(dee_end, 3, " t=") != 0 ||
-      value.find(' ', dee_end + 1) != string::npos) {
-    return false;
-  }
+  std::istringstream input(value);
+  input.imbue(std::locale());
+  input >> std::noskipws;
   UserDbValue result;
-  if (!ParseInteger(value.substr(2, commits_end - 2), &result.commits) ||
-      result.commits < 0 ||
-      !ParseDouble(value.substr(dee_start, dee_end - dee_start), &result.dee) ||
-      !ParseTick(value.substr(dee_end + 3), &result.tick)) {
+  if (!Consume(&input, "c=") || !(input >> result.commits) ||
+      !Consume(&input, " d=") || !(input >> result.dee) ||
+      !Consume(&input, " t=") || !(input >> result.tick) ||
+      input.rdbuf()->sgetc() != std::char_traits<char>::eof() ||
+      !std::isfinite(result.dee) || result.Pack() != value) {
     return false;
   }
   *parsed = result;
@@ -183,7 +159,7 @@ class LevelDbContextStore : public ContextStore {
       healthy_ = false;
       return false;
     }
-    *count = parsed.commits;
+    *count = (std::max)(0, parsed.commits);
     return true;
   }
 
@@ -207,6 +183,8 @@ class LevelDbContextStore : public ContextStore {
       healthy_ = false;
       return false;
     }
+    if (parsed.commits < 0)
+      parsed.commits = 0;
     ++parsed.commits;
     if (!backend_->Update(key, parsed.Pack()).ok()) {
       healthy_ = false;
@@ -243,6 +221,32 @@ string NormalizePath(const path& file_path) {
   return error ? string() : normalized.string();
 }
 
+std::optional<path> UserDbPath(const path& user_data_dir,
+                               const string& db_name) {
+  const path name(db_name);
+  if (user_data_dir.empty() || db_name.empty() || name.has_root_path() ||
+      name.has_parent_path() || name.filename() != name || name == "." ||
+      name == ".." || db_name.find('\0') != string::npos) {
+    return std::nullopt;
+  }
+  std::error_code error;
+  const path root = std::filesystem::weakly_canonical(
+      std::filesystem::absolute(user_data_dir, error), error);
+  if (error || !std::filesystem::is_directory(root, error) || error)
+    return std::nullopt;
+  const path requested = root / (db_name + ".userdb");
+  const auto status = std::filesystem::symlink_status(requested, error);
+  if (error && error != std::errc::no_such_file_or_directory)
+    return std::nullopt;
+  if (!error && std::filesystem::is_symlink(status))
+    return std::nullopt;
+  error.clear();
+  const path resolved = std::filesystem::weakly_canonical(requested, error);
+  if (error || resolved.parent_path() != root)
+    return std::nullopt;
+  return resolved;
+}
+
 struct ContextStoreRegistryState {
   struct Entry {
     std::weak_ptr<LevelDbContextStore> weak_store;
@@ -256,8 +260,7 @@ struct ContextStoreRegistryState {
 
 class ContextStoreLease : public ContextStore {
  public:
-  using Release =
-      std::function<void(an<LevelDbContextStore>* released_store)>;
+  using Release = std::function<void(an<LevelDbContextStore>* released_store)>;
 
   ContextStoreLease(an<LevelDbContextStore> store, Release release)
       : store_(std::move(store)), release_(std::move(release)) {}
@@ -268,9 +271,7 @@ class ContextStoreLease : public ContextStore {
     return store_->FetchCount(key, count);
   }
 
-  bool BumpCount(const string& key) override {
-    return store_->BumpCount(key);
-  }
+  bool BumpCount(const string& key) override { return store_->BumpCount(key); }
 
  private:
   an<LevelDbContextStore> store_;
@@ -317,8 +318,8 @@ class ContextStoreRegistry {
         leveldb::DB::Open(options, normalized_path, &db);
     if (!open_status.ok())
       return nullptr;
-    auto* raw_store = new LevelDbContextStore(
-        make_unique<OwnedLevelDbBackend>(db), identity);
+    auto* raw_store =
+        new LevelDbContextStore(make_unique<OwnedLevelDbBackend>(db), identity);
     if (!raw_store->InitializeAndValidate(initialize_new)) {
       delete raw_store;
       return nullptr;
@@ -384,6 +385,16 @@ the<ContextMemory> ContextMemory::OpenLevelDb(
   return make_unique<ContextMemory>(store);
 }
 
+the<ContextMemory> ContextMemory::OpenUserLevelDb(
+    const path& user_data_dir,
+    const string& db_name,
+    const ContextStoreIdentity& expected_identity) {
+  if (expected_identity.db_name != db_name)
+    return nullptr;
+  auto file_path = UserDbPath(user_data_dir, db_name);
+  return file_path ? OpenLevelDb(*file_path, expected_identity) : nullptr;
+}
+
 the<ContextMemory> ContextMemory::OpenBackendForTesting(
     the<ContextDbBackend> backend,
     const ContextStoreIdentity& expected_identity,
@@ -401,8 +412,8 @@ the<ContextMemory> ContextMemory::OpenBackendForTesting(
 bool ContextMemory::PairCount(const string& prev_word,
                               const string& candidate,
                               int* count) {
-  return store_ && store_->FetchCount(MakeKey("p " + prev_word, candidate),
-                                      count);
+  return store_ &&
+         store_->FetchCount(MakeKey("p " + prev_word, candidate), count);
 }
 
 bool ContextMemory::TotalCount(const string& prev_word, int* count) {
