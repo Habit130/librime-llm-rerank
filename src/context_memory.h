@@ -5,11 +5,8 @@
 #ifndef RIME_CONTEXT_MEMORY_H_
 #define RIME_CONTEXT_MEMORY_H_
 
+#include <leveldb/status.h>
 #include <rime/common.h>
-
-namespace leveldb {
-class Status;
-}
 
 namespace rime {
 
@@ -17,12 +14,30 @@ enum class ContextReadStatus { kFound, kMissing, kError };
 
 ContextReadStatus ClassifyLevelDbReadStatus(const leveldb::Status& status);
 
-// Preserves the storage status that librime's bool-valued Db::Fetch discards.
+struct ContextStoreIdentity {
+  string db_name;
+  string db_type;
+  string user_id;
+};
+
+// Raw status-preserving seam used by the production store and deterministic
+// fault injection. The production implementation owns one leveldb::DB handle.
+class ContextDbBackend {
+ public:
+  virtual ~ContextDbBackend() = default;
+  virtual leveldb::Status Fetch(const string& key, string* value) = 0;
+  virtual leveldb::Status Update(const string& key, const string& value) = 0;
+  virtual leveldb::Status WriteMetadata(
+      const vector<std::pair<string, string>>& entries) = 0;
+};
+
+// Count operations are synchronized by the shared production store so a
+// read-modify-write cannot lose increments from concurrent sessions.
 class ContextStore {
  public:
   virtual ~ContextStore() = default;
-  virtual ContextReadStatus Fetch(const string& key, string* value) = 0;
-  virtual bool Update(const string& key, const string& value) = 0;
+  virtual bool FetchCount(const string& key, int* count) = 0;
+  virtual bool BumpCount(const string& key) = 0;
 };
 
 // Supplies the bigram counts behind the context-personalization term:
@@ -48,7 +63,13 @@ class ContextMemory : public ContextCounter {
  public:
   explicit ContextMemory(an<ContextStore> store) : store_(store) {}
 
-  static the<ContextMemory> OpenLevelDb(const path& file_path);
+  static the<ContextMemory> OpenLevelDb(
+      const path& file_path,
+      const ContextStoreIdentity& expected_identity);
+  static the<ContextMemory> OpenBackendForTesting(
+      the<ContextDbBackend> backend,
+      const ContextStoreIdentity& expected_identity,
+      bool initialize_new);
 
   bool PairCount(const string& prev_word,
                  const string& candidate,
@@ -60,7 +81,6 @@ class ContextMemory : public ContextCounter {
   void Record(const string& prev_word, const string& selected);
 
  private:
-  bool FetchCount(const string& key, int* count);
   void BumpCount(const string& key);
 
   an<ContextStore> store_;

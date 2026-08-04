@@ -58,6 +58,7 @@ struct RerankPlan {
   std::optional<string> schema_id;
   std::optional<string> canonical_input;
   std::optional<string> preceding_text;
+  std::optional<string> previous_word;
   std::optional<RerankPlanConfig> config;
   std::optional<RerankScoringPolicy> scoring_policy;
   std::optional<bool> window_truncated;
@@ -86,6 +87,7 @@ string CanonicalizeInput(const string& input);
 RerankPlan BuildRerankPlan(const string& schema_id,
                            const string& input,
                            const string& preceding_text,
+                           const string& previous_word,
                            const RerankPlanConfig& config,
                            const RerankScoringPolicy& scoring_policy,
                            const vector<RerankPlanCandidate>& candidates,

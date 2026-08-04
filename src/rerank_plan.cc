@@ -121,6 +121,7 @@ string ComputePlanIdentity(const RerankPlan& plan) {
   AppendField(&canonical, "schema_id", *plan.schema_id);
   AppendField(&canonical, "canonical_input", *plan.canonical_input);
   AppendField(&canonical, "preceding_text", *plan.preceding_text);
+  AppendField(&canonical, "previous_word", *plan.previous_word);
   AppendConfig(&canonical, *plan.config);
   AppendScoringPolicy(&canonical, *plan.scoring_policy);
   AppendField(&canonical, "window_truncated", *plan.window_truncated);
@@ -164,7 +165,8 @@ bool ValidPlan(const RerankPlan& plan) {
       plan.identity->empty() || !plan.schema_id || plan.schema_id->empty() ||
       !plan.canonical_input ||
       *plan.canonical_input != CanonicalizeInput(*plan.canonical_input) ||
-      !plan.preceding_text || !plan.config || !ValidConfig(*plan.config) ||
+      !plan.preceding_text || !plan.previous_word || !plan.config ||
+      !ValidConfig(*plan.config) ||
       !plan.scoring_policy || !ValidScoringPolicy(*plan.scoring_policy) ||
       !plan.window_truncated || !plan.candidates || !plan.groups) {
     return false;
@@ -341,6 +343,7 @@ string CanonicalizeInput(const string& input) {
 RerankPlan BuildRerankPlan(const string& schema_id,
                            const string& input,
                            const string& preceding_text,
+                           const string& previous_word,
                            const RerankPlanConfig& config,
                            const RerankScoringPolicy& scoring_policy,
                            const vector<RerankPlanCandidate>& candidates,
@@ -351,6 +354,7 @@ RerankPlan BuildRerankPlan(const string& schema_id,
   plan.canonical_input = CanonicalizeInput(input);
   plan.preceding_text =
       LastUnicodeCharacters(preceding_text, kPrecedingTextCharacters);
+  plan.previous_word = previous_word;
   plan.config = config;
   plan.scoring_policy = scoring_policy;
   plan.window_truncated = window_truncated;

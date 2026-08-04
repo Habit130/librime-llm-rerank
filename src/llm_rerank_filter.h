@@ -20,14 +20,18 @@ struct ScoreComponents {
   double retrieval_evidence = 0.0;
 };
 
+struct ScoringRequest {
+  string plan_identity;
+  string preceding_text;
+  string previous_word;
+  vector<string> candidate_texts;
+};
+
 class Scorer {
  public:
   virtual ~Scorer() = default;
   virtual bool Score(const an<Candidate>& cand, ScoreComponents* score) = 0;
-  virtual bool Prepare(const string& plan_identity,
-                       const vector<string>& candidate_texts) {
-    return true;
-  }
+  virtual bool Prepare(const ScoringRequest& request) { return true; }
 };
 
 // Scores a candidate by its dictionary weight (log space) scaled by a
@@ -59,8 +63,7 @@ class ContextScorer : public Scorer {
       : counter_(counter), saturate_k_(saturate_k), verbose_(verbose) {}
 
   bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-
-  void set_prev_word(const string& prev_word) { prev_word_ = prev_word; }
+  bool Prepare(const ScoringRequest& request) override;
 
   // Bounded evidence strength in [0, 1). Zero on a miss (total_count <= 0); a
   // single observation reaches only 1 / (1 + saturate_k), never the bound.
@@ -85,8 +88,7 @@ class CompositeScorer : public Scorer {
       : weight_(weight), context_(context), llm_(llm) {}
 
   bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-  bool Prepare(const string& plan_identity,
-               const vector<string>& candidate_texts) override;
+  bool Prepare(const ScoringRequest& request) override;
 
  private:
   an<Scorer> weight_;
@@ -109,6 +111,8 @@ class LlmRerankFilter : public Filter {
   void set_gamma(double gamma) { gamma_ = gamma; }
   void set_schema_id(const string& schema_id) { schema_id_ = schema_id; }
   void set_input(const string& input) { input_ = input; }
+  void set_preceding_text(const string& text) { preceding_text_ = text; }
+  void set_last_word(const string& text) { last_word_ = text; }
 
  private:
   void OnCommit(Context* ctx);

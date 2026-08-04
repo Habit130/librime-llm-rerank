@@ -5,12 +5,17 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#include <poll.h>
+#include <signal.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -30,6 +35,55 @@ using namespace rime;
 namespace {
 
 using ResponseBuilder = std::function<std::optional<string>(const string&)>;
+
+class ScriptedConnectSyscalls : public ConnectSyscalls {
+ public:
+  struct PollResult {
+    SocketCallResult call;
+    short returned_events;
+    std::chrono::milliseconds delay{};
+  };
+
+  SocketCallResult Connect(int,
+                           const struct sockaddr*,
+                           socklen_t) override {
+    if (connect_index_ >= connect_results.size())
+      return {-1, EINVAL};
+    return connect_results[connect_index_++];
+  }
+
+  SocketCallResult Poll(int,
+                        short,
+                        int timeout_ms,
+                        short* returned_events) override {
+    poll_timeouts.push_back(timeout_ms);
+    if (poll_index_ >= poll_results.size())
+      return {-1, EINVAL};
+    const PollResult& scripted = poll_results[poll_index_++];
+    if (scripted.delay.count() > 0)
+      std::this_thread::sleep_for(scripted.delay);
+    *returned_events = scripted.returned_events;
+    return scripted.call;
+  }
+
+  SocketCallResult GetSocketError(int, int* socket_error) override {
+    if (socket_error_index_ >= socket_error_results.size())
+      return {-1, EINVAL};
+    const auto& [call, error] = socket_error_results[socket_error_index_++];
+    *socket_error = error;
+    return call;
+  }
+
+  vector<SocketCallResult> connect_results;
+  vector<PollResult> poll_results;
+  vector<std::pair<SocketCallResult, int>> socket_error_results;
+  vector<int> poll_timeouts;
+
+ private:
+  size_t connect_index_ = 0;
+  size_t poll_index_ = 0;
+  size_t socket_error_index_ = 0;
+};
 
 string UniqueSocketPath() {
   static std::atomic<unsigned int> sequence{0};
@@ -93,7 +147,7 @@ class FakeDaemon {
 #endif
     string request;
     char chunk[1024];
-    while (request.find('\n') == string::npos) {
+    while (true) {
       ssize_t size = recv(connection, chunk, sizeof(chunk), 0);
       if (size <= 0)
         break;
@@ -149,11 +203,11 @@ an<Phrase> MakeProtocolPhrase(const string& type,
 
 vector<an<Candidate>> ProtocolCandidates() {
   return {
-      MakeProtocolPhrase("table", 0, 2, "甲", 4.0),
+      MakeProtocolPhrase("table", 0, 2, "甲", 1.0),
       New<SimpleCandidate>("punct", 0, 2, "，"),
-      MakeProtocolPhrase("user_table", 0, 2, "乙", 1.0),
-      MakeProtocolPhrase("table", 2, 4, "丙", 3.0),
-      MakeProtocolPhrase("user_table", 2, 4, "丁", 1.0),
+      MakeProtocolPhrase("user_table", 0, 2, "乙", 4.0),
+      MakeProtocolPhrase("table", 2, 4, "丙", 1.0),
+      MakeProtocolPhrase("user_table", 2, 4, "丁", 3.0),
       MakeProtocolPhrase("sentence", 0, 6, "整句", 9.0),
   };
 }
@@ -197,7 +251,6 @@ vector<string> CollectProtocolTexts(an<Translation> translation) {
 
 vector<string> FilterWithDaemon(const string& path, int deadline_ms = 200) {
   auto llm = New<LlmScorer>(path, 1.0, false, deadline_ms);
-  llm->set_context("敏感测试上文");
   auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), nullptr, llm);
   Ticket ticket;
   ticket.name_space = "llm_rerank";
@@ -205,6 +258,7 @@ vector<string> FilterWithDaemon(const string& path, int deadline_ms = 200) {
   filter.set_scorer(scorer);
   filter.set_schema_id("test");
   filter.set_input("abcdef");
+  filter.set_preceding_text("敏感测试上文");
   CandidateList candidates;
   return CollectProtocolTexts(
       filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
@@ -303,6 +357,190 @@ TEST(LlmScorerProtocolTest, VersionedBoundResponseReranksCompleteGroups) {
             FilterWithDaemon(daemon.path()));
 }
 
+TEST(LlmScorerProtocolTest, ClientHalfCloseMatchesEofDelimitedServerContract) {
+  bool received_complete_request = false;
+  FakeDaemon daemon([&](const string& request) -> std::optional<string> {
+    received_complete_request =
+        !request.empty() && request.back() == '\n' &&
+        std::count(request.begin(), request.end(), '\n') == 1;
+    return Response(request, "[0,10,0,10]");
+  });
+
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            FilterWithDaemon(daemon.path()));
+  EXPECT_TRUE(received_complete_request);
+}
+
+TEST(LlmScorerProtocolTest, CppClientMatchesPythonProductionEofFraming) {
+  const string socket_path = UniqueSocketPath();
+  const string ready_path = socket_path + ".ready";
+  const char* script =
+      "import json, os, socket, sys\n"
+      "sys.path.insert(0, sys.argv[1])\n"
+      "from server import read_request\n"
+      "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+      "server.bind(sys.argv[2])\n"
+      "server.listen(1)\n"
+      "open(sys.argv[3], 'w').close()\n"
+      "connection, _ = server.accept()\n"
+      "request = json.loads(read_request(connection))\n"
+      "response = {'version': 1, 'request_id': request['request_id'], "
+      "'plan_identity': request['plan_identity'], 'scores': [0, 10, 0, 10]}\n"
+      "connection.sendall((json.dumps(response) + '\\n').encode())\n"
+      "connection.close()\n"
+      "server.close()\n";
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    execl(LLM_RERANK_PYTHON, LLM_RERANK_PYTHON, "-c", script,
+          LLM_RERANK_DAEMON_DIR, socket_path.c_str(), ready_path.c_str(),
+          nullptr);
+    _exit(127);
+  }
+
+  for (int attempt = 0;
+       attempt < 200 && !std::filesystem::exists(ready_path); ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!std::filesystem::exists(ready_path)) {
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    unlink(socket_path.c_str());
+    unlink(ready_path.c_str());
+    FAIL() << "Python protocol server did not become ready";
+  }
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            FilterWithDaemon(socket_path));
+
+  int status = 0;
+  pid_t waited = 0;
+  for (int attempt = 0; attempt < 200 && waited == 0; ++attempt) {
+    waited = waitpid(child, &status, WNOHANG);
+    if (waited == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (waited == 0) {
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+  }
+  EXPECT_EQ(child, waited);
+  EXPECT_TRUE(waited == child && WIFEXITED(status));
+  EXPECT_TRUE(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  unlink(socket_path.c_str());
+  unlink(ready_path.c_str());
+}
+
+TEST(LlmScorerProtocolTest, DeferredTranslationsSendTheirOwnContextSnapshot) {
+  vector<string> contexts;
+  vector<string> plan_identities;
+  FakeDaemon daemon(
+      [&](const string& request) -> std::optional<string> {
+        contexts.push_back(ExtractStringField(request, "context"));
+        plan_identities.push_back(ExtractStringField(request, "plan_identity"));
+        return Response(request, "[0,10,0,10]");
+      },
+      2);
+  auto llm = New<LlmScorer>(daemon.path(), 1.0);
+  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), nullptr, llm);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(scorer);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+
+  CandidateList candidates_a;
+  filter.set_preceding_text("context-a");
+  auto translation_a =
+      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates_a);
+  CandidateList candidates_b;
+  filter.set_preceding_text("context-b");
+  auto translation_b =
+      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates_b);
+
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            CollectProtocolTexts(translation_a));
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            CollectProtocolTexts(translation_b));
+  EXPECT_EQ((vector<string>{"context-a", "context-b"}), contexts);
+  ASSERT_EQ(2u, plan_identities.size());
+  EXPECT_FALSE(plan_identities[0].empty());
+  EXPECT_NE(plan_identities[0], plan_identities[1]);
+}
+
+TEST(LlmScorerProtocolTest, FailureFixtureWouldReorderWithWeightOnly) {
+  auto scorer = New<WeightScorer>(1.0, 1.0);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(scorer);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+  CandidateList candidates;
+
+  const vector<string> weight_only = CollectProtocolTexts(
+      filter.Apply(New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
+  EXPECT_NE(kProtocolOriginalOrder, weight_only);
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            weight_only);
+}
+
+TEST(LlmScorerProtocolTest, DarwinInterruptedConnectCompletesViaPoll) {
+  ScriptedConnectSyscalls syscalls;
+  syscalls.connect_results = {{-1, EINTR}};
+  syscalls.poll_results = {
+      {{-1, EINTR}, 0, std::chrono::milliseconds(2)},
+      {{1, 0}, POLLOUT},
+  };
+  syscalls.socket_error_results = {{{0, 0}, 0}};
+
+  EXPECT_EQ(NonBlockingConnectStatus::kConnected,
+            ConnectNonBlockingWithDeadline(
+                42, nullptr, 0,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(50),
+                &syscalls));
+  ASSERT_EQ(2u, syscalls.poll_timeouts.size());
+  EXPECT_LE(syscalls.poll_timeouts[1], syscalls.poll_timeouts[0]);
+}
+
+TEST(LlmScorerProtocolTest, EagainAndEinprogressReachHealthyDaemon) {
+  ScriptedConnectSyscalls syscalls;
+  syscalls.connect_results = {{-1, EAGAIN}, {-1, EINPROGRESS}};
+  syscalls.poll_results = {{{1, 0}, POLLOUT}, {{1, 0}, POLLOUT}};
+  syscalls.socket_error_results = {{{0, 0}, 0}};
+
+  EXPECT_EQ(NonBlockingConnectStatus::kConnected,
+            ConnectNonBlockingWithDeadline(
+                42, nullptr, 0,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(50),
+                &syscalls));
+}
+
+TEST(LlmScorerProtocolTest, RetryableConnectStatesShareAbsoluteDeadline) {
+  ScriptedConnectSyscalls syscalls;
+  syscalls.connect_results = {{-1, EINPROGRESS}};
+  syscalls.poll_results = {
+      {{-1, EINTR}, 0, std::chrono::milliseconds(10)},
+      {{-1, EINTR}, 0, std::chrono::milliseconds(10)},
+      {{-1, EINTR}, 0, std::chrono::milliseconds(10)},
+  };
+  const auto started = std::chrono::steady_clock::now();
+
+  EXPECT_EQ(NonBlockingConnectStatus::kTimeout,
+            ConnectNonBlockingWithDeadline(
+                42, nullptr, 0,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(25),
+                &syscalls));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_LT(elapsed, std::chrono::milliseconds(100));
+  ASSERT_GE(syscalls.poll_timeouts.size(), 2u);
+  for (size_t index = 1; index < syscalls.poll_timeouts.size(); ++index)
+    EXPECT_LT(syscalls.poll_timeouts[index], syscalls.poll_timeouts[index - 1]);
+}
+
 TEST(LlmScorerProtocolTest, ConnectionFailurePassesThroughWholeWindow) {
   EXPECT_EQ(kProtocolOriginalOrder,
             FilterWithDaemon(UniqueSocketPath()));
@@ -386,6 +624,36 @@ TEST(LlmScorerProtocolTest, TrailingPayloadPassesThroughWholeWindow) {
       return Response(request, "[0,10,0,10]") + suffix;
     });
   }
+}
+
+TEST(LlmScorerProtocolTest, WhitespaceBeforeTerminalLfPassesThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    string response = Response(request, "[0,10,0,10]");
+    response.insert(response.size() - 1, " ");
+    return response;
+  });
+}
+
+TEST(LlmScorerProtocolTest, EmbeddedNulPayloadPassesThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    string response = Response(request, "[0,10,0,10]");
+    response.insert(response.size() - 1, string("\0garbage", 8));
+    return response;
+  });
+}
+
+TEST(LlmScorerProtocolTest, SecondJsonBeforeTerminalLfPassesThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    string response = Response(request, "[0,10,0,10]");
+    response.insert(response.size() - 1, "{\"version\":1}");
+    return response;
+  });
+}
+
+TEST(LlmScorerProtocolTest, OversizedResponsePassesThroughWholeWindow) {
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    return Response(request, "[0,10,0,10]") + string(64 * 1024, 'x');
+  });
 }
 
 TEST(LlmScorerProtocolTest, SplitTrailingPayloadPassesThroughWholeWindow) {

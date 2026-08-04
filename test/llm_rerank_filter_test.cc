@@ -9,10 +9,12 @@
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <thread>
 #include <utility>
 
 #include <gtest/gtest.h>
 #include <leveldb/db.h>
+#include <leveldb/write_batch.h>
 #include <rime/candidate.h>
 #include <rime/common.h>
 #include <rime/config.h>
@@ -48,7 +50,7 @@ class FailingScorer : public Scorer {
 
 class PrepareFailingScorer : public Scorer {
  public:
-  bool Prepare(const string&, const vector<string>&) override { return false; }
+  bool Prepare(const ScoringRequest&) override { return false; }
   bool Score(const an<Candidate>&, ScoreComponents*) override { return true; }
 };
 
@@ -70,6 +72,22 @@ class NonFiniteScorer : public Scorer {
     score->retrieval_evidence = 0.0;
     return true;
   }
+};
+
+class CapturingRequestScorer : public Scorer {
+ public:
+  bool Prepare(const ScoringRequest& request) override {
+    requests.push_back(request);
+    return true;
+  }
+
+  bool Score(const an<Candidate>& cand, ScoreComponents* score) override {
+    score->base_score = cand->text() == "乙" ? 10.0 : 0.0;
+    score->retrieval_evidence = 0.0;
+    return true;
+  }
+
+  vector<ScoringRequest> requests;
 };
 
 static an<Phrase> MakePhrase(const string& type,
@@ -255,6 +273,33 @@ TEST(LlmRerankFilterTest, LazyPullTiming) {
   EXPECT_EQ(3, upstream->peek_count());
 }
 
+TEST(LlmRerankFilterTest, LazyTranslationsKeepTheirOwnScoringContext) {
+  auto scorer = New<CapturingRequestScorer>();
+  auto filter = MakeFilter(scorer);
+  filter.set_preceding_text("上文甲");
+  auto translation_a = ApplyFilter(filter, {
+                                               MakePhrase("table", 0, 2, "甲"),
+                                               MakePhrase("table", 0, 2, "乙"),
+                                           });
+  filter.set_preceding_text("上文乙");
+  auto translation_b = ApplyFilter(filter, {
+                                               MakePhrase("table", 0, 2, "甲"),
+                                               MakePhrase("table", 0, 2, "乙"),
+                                           });
+
+  EXPECT_EQ((vector<string>{"乙", "甲"}), CollectTexts(translation_a));
+  EXPECT_EQ((vector<string>{"乙", "甲"}), CollectTexts(translation_b));
+  ASSERT_EQ(2u, scorer->requests.size());
+  EXPECT_EQ("上文甲", scorer->requests[0].preceding_text);
+  EXPECT_EQ("上文乙", scorer->requests[1].preceding_text);
+  EXPECT_NE(scorer->requests[0].plan_identity,
+            scorer->requests[1].plan_identity);
+  EXPECT_EQ((vector<string>{"甲", "乙"}),
+            scorer->requests[0].candidate_texts);
+  EXPECT_EQ((vector<string>{"甲", "乙"}),
+            scorer->requests[1].candidate_texts);
+}
+
 // --- T2: grouping key ---
 
 TEST(LlmRerankFilterTest, GroupingKeyTableAndUserTableSameGroup) {
@@ -424,8 +469,8 @@ TEST(LlmRerankFilterTest, UnwrapShadowCandidateToGetWeight) {
 TEST(LlmRerankFilterTest, FailingScorerPassesThroughOriginalOrder) {
   auto filter = MakeFilter(New<FailingScorer>());
   auto filtered = ApplyFilter(filter, {
-                                          MakePhrase("table", 0, 2, "甲"),
-                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "甲", 1.0),
+                                          MakePhrase("table", 0, 2, "乙", 3.0),
                                           MakePhrase("table", 0, 4, "丙"),
                                       });
   // (0,2,word) is complete; scorer fails → passthrough.
@@ -654,32 +699,107 @@ class FailingCounter : public ContextCounter {
   bool TotalCount(const string&, int*) override { return false; }
 };
 
-class InjectedContextStore : public ContextStore {
+class InjectedContextDbBackend : public ContextDbBackend {
  public:
-  InjectedContextStore(ContextReadStatus data_status, string data_value = "")
-      : data_status_(data_status), data_value_(std::move(data_value)) {}
+  InjectedContextDbBackend(leveldb::Status data_status,
+                           string data_value = "",
+                           leveldb::Status metadata_status =
+                               leveldb::Status::OK(),
+                           leveldb::Status update_status = leveldb::Status::OK(),
+                           int fail_update_at = 1)
+      : data_status_(std::move(data_status)),
+        data_value_(std::move(data_value)),
+        metadata_status_(std::move(metadata_status)),
+        update_status_(std::move(update_status)),
+        fail_update_at_(fail_update_at) {}
 
-  ContextReadStatus Fetch(const string& key, string* value) override {
-    if (!key.empty() && key.front() == '\x01') {
-      *value = "test-db";
-      return ContextReadStatus::kFound;
+  leveldb::Status Fetch(const string& key, string* value) override {
+    if (key == "\x01/db_name") {
+      if (metadata_status_.ok())
+        *value = "test.llm_rerank";
+      return metadata_status_;
     }
-    *value = data_value_;
+    if (key == "\x01/db_type") {
+      if (metadata_status_.ok())
+        *value = "userdb";
+      return metadata_status_;
+    }
+    if (key == "\x01/user_id") {
+      if (metadata_status_.ok())
+        *value = "test-user";
+      return metadata_status_;
+    }
+    if (data_status_.ok())
+      *value = data_value_;
     return data_status_;
   }
 
-  bool Update(const string&, const string&) override { return true; }
+  leveldb::Status Update(const string&, const string&) override {
+    ++update_count_;
+    return !update_status_.ok() && update_count_ >= fail_update_at_
+               ? update_status_
+               : leveldb::Status::OK();
+  }
+
+  leveldb::Status WriteMetadata(
+      const vector<std::pair<string, string>>&) override {
+    return leveldb::Status::OK();
+  }
 
  private:
-  ContextReadStatus data_status_;
+  leveldb::Status data_status_;
   string data_value_;
+  leveldb::Status metadata_status_;
+  leveldb::Status update_status_;
+  int fail_update_at_;
+  int update_count_ = 0;
 };
+
+static ContextStoreIdentity TestContextIdentity() {
+  return {"test.llm_rerank", "userdb", "test-user"};
+}
+
+static string ContextPairKey(const string& previous, const string& candidate) {
+  return "p " + previous + " \t" + candidate;
+}
 
 static path TemporaryContextDbPath() {
   static std::atomic<unsigned int> sequence{0};
   return std::filesystem::temp_directory_path() /
          ("llm-rerank-context-" + std::to_string(getpid()) + "-" +
           std::to_string(sequence++) + ".userdb");
+}
+
+static void CreateContextDb(
+    const path& db_path,
+    const ContextStoreIdentity& identity,
+    const vector<std::pair<string, string>>& entries = {}) {
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::DB* raw_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  leveldb::WriteBatch batch;
+  batch.Put("\x01/db_name", identity.db_name);
+  batch.Put("\x01/db_type", identity.db_type);
+  batch.Put("\x01/user_id", identity.user_id);
+  for (const auto& [key, value] : entries)
+    batch.Put(key, value);
+  ASSERT_TRUE(raw_db->Write(leveldb::WriteOptions(), &batch).ok());
+  delete raw_db;
+}
+
+static void DestroyContextDb(const path& db_path) {
+  leveldb::Options options;
+  options.create_if_missing = false;
+  ASSERT_TRUE(leveldb::DestroyDB(db_path.string(), options).ok());
+}
+
+static void ExpectUnavailableMemoryPassesThrough(the<ContextMemory> memory) {
+  EXPECT_FALSE(memory);
+  auto filter = MakeFilter(nullptr);
+
+  EXPECT_EQ(kFailureWindowOriginalOrder,
+            CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
 }
 
 static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
@@ -689,7 +809,6 @@ static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
                                          double sys_coeff = 1.0,
                                          double usr_coeff = 1.0) {
   auto ctx = New<ContextScorer>(counter, saturate_k);
-  ctx->set_prev_word(prev_word);
   auto weight = New<WeightScorer>(sys_coeff, usr_coeff);
   Ticket ticket;
   ticket.name_space = "llm_rerank";
@@ -697,6 +816,7 @@ static LlmRerankFilter MakeContextFilter(ContextCounter* counter,
   filter.set_scorer(New<CompositeScorer>(weight, ctx));
   filter.set_schema_id("test");
   filter.set_input("abcdef");
+  filter.set_last_word(prev_word);
   filter.set_gamma(gamma);
   return filter;
 }
@@ -742,7 +862,7 @@ TEST(ContextScorerTest, ReturnsUnscaledRetrievalEvidence) {
   counter.SetTotal("w", 2);
   counter.SetPair("w", "乙", 2);
   auto ctx = New<ContextScorer>(&counter, 3.0);
-  ctx->set_prev_word("w");
+  ctx->Prepare({"plan", "", "w", {}});
   ScoreComponents score;
   ctx->Score(MakePhrase("table", 0, 2, "乙", 0.0), &score);
   EXPECT_DOUBLE_EQ(0.0, score.base_score);
@@ -754,6 +874,7 @@ TEST(ContextScorerTest, EmptyPrevWordScoresZero) {
   counter.SetTotal("w", 2);
   counter.SetPair("w", "乙", 2);
   auto ctx = New<ContextScorer>(&counter, 3.0);  // no prev_word set
+  ctx->Prepare({"plan", "", "", {}});
   ScoreComponents score;
   EXPECT_TRUE(ctx->Score(MakePhrase("table", 0, 2, "乙", 0.0), &score));
   EXPECT_DOUBLE_EQ(0.0, score.retrieval_evidence);
@@ -768,12 +889,12 @@ TEST(ContextScorerTest, CounterFailurePassesThroughWholeWindow) {
 }
 
 TEST(ContextScorerTest, TargetReadErrorWithReadableMetadataPassesThroughWindow) {
-  auto store = New<InjectedContextStore>(ContextReadStatus::kError);
-  string metadata;
-  ASSERT_EQ(ContextReadStatus::kFound,
-            store->Fetch("\x01/db_name", &metadata));
-  ContextMemory memory(store);
-  auto filter = MakeContextFilter(&memory, 2.0, 3.0, "上文");
+  auto memory = ContextMemory::OpenBackendForTesting(
+      make_unique<InjectedContextDbBackend>(
+          leveldb::Status::IOError("target read failed")),
+      TestContextIdentity(), false);
+  ASSERT_TRUE(memory);
+  auto filter = MakeContextFilter(memory.get(), 2.0, 3.0, "上文");
 
   EXPECT_EQ(kFailureWindowOriginalOrder,
             CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
@@ -781,12 +902,7 @@ TEST(ContextScorerTest, TargetReadErrorWithReadableMetadataPassesThroughWindow) 
 
 TEST(ContextScorerTest, RealLevelDbMissingKeyIsSuccessfulZeroEvidence) {
   const path db_path = TemporaryContextDbPath();
-  leveldb::Options options;
-  options.create_if_missing = true;
-  leveldb::DB* raw_db = nullptr;
-  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
-  delete raw_db;
-  auto memory = ContextMemory::OpenLevelDb(db_path);
+  auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
   ASSERT_TRUE(memory);
 
   vector<string> emitted;
@@ -809,20 +925,281 @@ TEST(ContextScorerTest, RealLevelDbMissingKeyIsSuccessfulZeroEvidence) {
   EXPECT_EQ(1, total_count);
 
   memory.reset();
-  EXPECT_TRUE(leveldb::DestroyDB(db_path.string(), options).ok());
+  DestroyContextDb(db_path);
 }
 
-TEST(ContextMemoryTest, MissingOrMalformedCommitCountFails) {
+TEST(ContextMemoryTest, ConcurrentOwnersReuseOneProductionLevelDbHandle) {
+  const path db_path = TemporaryContextDbPath();
+  const path aliased_path(std::filesystem::path(db_path).parent_path() / "." /
+                          db_path.filename());
+  auto first = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  auto second =
+      ContextMemory::OpenLevelDb(aliased_path, TestContextIdentity());
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  std::thread first_writer([&] {
+    for (int i = 0; i < 50; ++i)
+      first->Record("上文", "乙");
+  });
+  std::thread second_writer([&] {
+    for (int i = 0; i < 50; ++i)
+      second->Record("上文", "乙");
+  });
+  first_writer.join();
+  second_writer.join();
+
+  int first_count = 0;
+  int second_count = 0;
+  EXPECT_TRUE(first->PairCount("上文", "乙", &first_count));
+  EXPECT_TRUE(second->PairCount("上文", "乙", &second_count));
+  EXPECT_EQ(100, first_count);
+  EXPECT_EQ(first_count, second_count);
+
+  first.reset();
+  second.reset();
+  leveldb::Options options;
+  options.create_if_missing = false;
+  leveldb::DB* raw_db = nullptr;
+  EXPECT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  delete raw_db;
+  auto reopened = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(reopened);
+  EXPECT_TRUE(reopened->PairCount("上文", "乙", &first_count));
+  EXPECT_EQ(100, first_count);
+  reopened.reset();
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, WrongIdentityCannotReuseOrDisruptLiveStore) {
+  const path db_path = TemporaryContextDbPath();
+  auto owner = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(owner);
+
+  EXPECT_FALSE(ContextMemory::OpenLevelDb(
+      db_path, {"other-schema.llm_rerank", "userdb", "test-user"}));
+  owner->Record("上文", "乙");
+  int count = 0;
+  EXPECT_TRUE(owner->PairCount("上文", "乙", &count));
+  EXPECT_EQ(1, count);
+
+  owner.reset();
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, ConcurrentLastReleaseAndReopenNeverDoubleOpens) {
+  const path db_path = TemporaryContextDbPath();
+  auto owner = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(owner);
+
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    std::atomic<bool> start{false};
+    the<ContextMemory> reopened;
+    std::thread opener([&] {
+      while (!start.load())
+        std::this_thread::yield();
+      reopened = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+    });
+    start = true;
+    owner.reset();
+    opener.join();
+    ASSERT_TRUE(reopened) << "iteration " << iteration;
+    owner = std::move(reopened);
+  }
+
+  owner.reset();
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, ExistingDatabaseWithoutMetadataIsUnavailable) {
+  const path db_path = TemporaryContextDbPath();
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::DB* raw_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  delete raw_db;
+
+  ExpectUnavailableMemoryPassesThrough(
+      ContextMemory::OpenLevelDb(db_path, TestContextIdentity()));
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, NewDatabaseInitializesAndValidatesMetadata) {
+  const path db_path = TemporaryContextDbPath();
+  auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(memory);
+  memory.reset();
+
+  leveldb::Options options;
+  options.create_if_missing = false;
+  leveldb::DB* raw_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  string value;
+  EXPECT_TRUE(raw_db->Get(leveldb::ReadOptions(), "\x01/db_name", &value).ok());
+  EXPECT_EQ(TestContextIdentity().db_name, value);
+  EXPECT_TRUE(raw_db->Get(leveldb::ReadOptions(), "\x01/db_type", &value).ok());
+  EXPECT_EQ(TestContextIdentity().db_type, value);
+  EXPECT_TRUE(raw_db->Get(leveldb::ReadOptions(), "\x01/user_id", &value).ok());
+  EXPECT_EQ(TestContextIdentity().user_id, value);
+  delete raw_db;
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, HealthyExistingDatabaseIsAvailable) {
+  const path db_path = TemporaryContextDbPath();
+  CreateContextDb(db_path, TestContextIdentity());
+
+  auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(memory);
+  int count = 99;
+  EXPECT_TRUE(memory->PairCount("上文", "候选", &count));
+  EXPECT_EQ(0, count);
+  memory.reset();
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, HealthyExistingMetadataIsNotOverwritten) {
+  const path db_path = TemporaryContextDbPath();
+  CreateContextDb(db_path, TestContextIdentity(),
+                  {{"\x01/rime_version", "existing-version"}});
+
+  auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(memory);
+  memory.reset();
+
+  leveldb::Options options;
+  options.create_if_missing = false;
+  leveldb::DB* raw_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  string value;
+  EXPECT_TRUE(
+      raw_db->Get(leveldb::ReadOptions(), "\x01/rime_version", &value).ok());
+  EXPECT_EQ("existing-version", value);
+  delete raw_db;
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, WrongDatabaseIdentityIsUnavailable) {
+  for (const ContextStoreIdentity& actual :
+       {ContextStoreIdentity{"wrong.llm_rerank", "userdb", "test-user"},
+        ContextStoreIdentity{"test.llm_rerank", "wrong-type", "test-user"},
+        ContextStoreIdentity{"test.llm_rerank", "userdb", "wrong-user"}}) {
+    SCOPED_TRACE(actual.db_name + ":" + actual.db_type);
+    const path db_path = TemporaryContextDbPath();
+    CreateContextDb(db_path, actual);
+    ExpectUnavailableMemoryPassesThrough(
+        ContextMemory::OpenLevelDb(db_path, TestContextIdentity()));
+    DestroyContextDb(db_path);
+  }
+}
+
+TEST(ContextMemoryTest, MissingOrMalformedIdentityIsUnavailable) {
+  const vector<vector<std::pair<string, string>>> metadata_cases{
+      {{"\x01/db_name", "test.llm_rerank"}, {"\x01/user_id", "test-user"}},
+      {{"\x01/db_type", "userdb"}, {"\x01/user_id", "test-user"}},
+      {{"\x01/db_name", "test.llm_rerank"}, {"\x01/db_type", "userdb"}},
+      {{"\x01/db_name", ""},
+       {"\x01/db_type", "userdb"},
+       {"\x01/user_id", "test-user"}},
+      {{"\x01/db_name", string("test.llm_rerank\0replacement", 27)},
+       {"\x01/db_type", "userdb"},
+       {"\x01/user_id", "test-user"}},
+  };
+  for (const auto& metadata : metadata_cases) {
+    const path db_path = TemporaryContextDbPath();
+    leveldb::Options options;
+    options.create_if_missing = true;
+    leveldb::DB* raw_db = nullptr;
+    ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+    leveldb::WriteBatch batch;
+    for (const auto& [key, value] : metadata)
+      batch.Put(key, value);
+    ASSERT_TRUE(raw_db->Write(leveldb::WriteOptions(), &batch).ok());
+    delete raw_db;
+
+    ExpectUnavailableMemoryPassesThrough(
+        ContextMemory::OpenLevelDb(db_path, TestContextIdentity()));
+    DestroyContextDb(db_path);
+  }
+}
+
+TEST(ContextMemoryTest, MetadataReadErrorIsUnavailable) {
+  ExpectUnavailableMemoryPassesThrough(ContextMemory::OpenBackendForTesting(
+      make_unique<InjectedContextDbBackend>(
+          leveldb::Status::NotFound("data"), "",
+          leveldb::Status::IOError("metadata read failed")),
+      TestContextIdentity(), false));
+}
+
+TEST(ContextMemoryTest, ReplacementAtPathIsRejectedByFinalHandle) {
+  const path db_path = TemporaryContextDbPath();
+  const path original_path(db_path.string() + ".original");
+  CreateContextDb(db_path, TestContextIdentity());
+  std::filesystem::rename(db_path, original_path);
+  CreateContextDb(
+      db_path, {"replacement.llm_rerank", "userdb", "test-user"});
+
+  ExpectUnavailableMemoryPassesThrough(
+      ContextMemory::OpenLevelDb(db_path, TestContextIdentity()));
+  DestroyContextDb(db_path);
+  DestroyContextDb(original_path);
+}
+
+TEST(ContextMemoryTest, ValidProductionValueReturnsCommitCount) {
+  const path db_path = TemporaryContextDbPath();
+  CreateContextDb(db_path, TestContextIdentity(),
+                  {{ContextPairKey("上文", "候选"), "c=5 d=1.25 t=42"}});
+  auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(memory);
+  int count = 0;
+  EXPECT_TRUE(memory->PairCount("上文", "候选", &count));
+  EXPECT_EQ(5, count);
+  memory.reset();
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, MalformedProductionValuesFailClosed) {
   const vector<string> invalid_values{
       "d=0 t=0", "c=", "c=not-a-number d=0 t=0", "c=-1 d=0 t=0",
-      "c=1 c=2 d=0 t=0"};
+      "c=1 c=2 d=0 t=0", "c=5 d=broken t=0", "c=5 d=0 t=broken",
+      "c=5 d=0 t=0 trailing", "c=5 d=0 t=0x", "c=5 d=nan t=0",
+      "c=5 d=inf t=0", "c=5 d=0 t=18446744073709551616",
+      "c=2147483648 d=0 t=0", "c=5 d=0 t=0 unknown=1",
+      "c=5 d=0 d=1 t=0", "c=5 d=0 t=0 t=1", "d=0 c=5 t=0",
+      "c=5  d=0 t=0", "c=5 d=1e999 t=0", "c=5 d=0x t=0",
+      "c=5 d=0 t=-1", "c=5x d=0 t=0"};
   for (const string& value : invalid_values) {
     SCOPED_TRACE(value);
-    ContextMemory memory(
-        New<InjectedContextStore>(ContextReadStatus::kFound, value));
+    const path db_path = TemporaryContextDbPath();
+    CreateContextDb(db_path, TestContextIdentity(),
+                    {{ContextPairKey("上文", "甲"), value}});
+    auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+    ASSERT_TRUE(memory);
     int count = 99;
-    EXPECT_FALSE(memory.PairCount("上文", "候选", &count));
+    EXPECT_FALSE(memory->PairCount("上文", "甲", &count));
     EXPECT_EQ(99, count);
+    auto filter = MakeContextFilter(memory.get(), 2.0, 3.0, "上文");
+    EXPECT_EQ(kFailureWindowOriginalOrder,
+              CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+    memory.reset();
+    DestroyContextDb(db_path);
+  }
+}
+
+TEST(ContextMemoryTest, UpdateFailurePoisonsSubsequentScoringReads) {
+  for (int fail_update_at : {1, 2, 3}) {
+    SCOPED_TRACE(fail_update_at);
+    auto memory = ContextMemory::OpenBackendForTesting(
+        make_unique<InjectedContextDbBackend>(
+            leveldb::Status::NotFound("missing"), "", leveldb::Status::OK(),
+            leveldb::Status::IOError("write failed"), fail_update_at),
+        TestContextIdentity(), false);
+    ASSERT_TRUE(memory);
+    memory->Record("上文", "甲");
+    int count = 99;
+    EXPECT_FALSE(memory->PairCount("上文", "甲", &count));
+    auto filter = MakeContextFilter(memory.get(), 2.0, 3.0, "上文");
+    EXPECT_EQ(kFailureWindowOriginalOrder,
+              CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
   }
 }
 
@@ -842,7 +1219,7 @@ TEST(CompositeScorerTest, RejectsWeightlessCandidate) {
   counter.SetTotal("w", 3);
   counter.SetPair("w", "，", 3);
   auto ctx = New<ContextScorer>(&counter, 3.0);
-  ctx->set_prev_word("w");
+  ctx->Prepare({"plan", "", "w", {}});
   auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
   ScoreComponents score;
   EXPECT_FALSE(comp->Score(New<SimpleCandidate>("punct", 0, 2, "，"), &score));
@@ -854,7 +1231,7 @@ TEST(CompositeScorerTest, SumsWeightAndContext) {
   counter.SetTotal("w", 4);
   counter.SetPair("w", "甲", 4);
   auto ctx = New<ContextScorer>(&counter, 3.0);
-  ctx->set_prev_word("w");
+  ctx->Prepare({"plan", "", "w", {}});
   auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
   ScoreComponents score;
   ASSERT_TRUE(comp->Score(MakePhrase("table", 0, 2, "甲", 2.0), &score));
@@ -1017,24 +1394,23 @@ TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
 
 TEST(LlmScorerTest, DaemonUnavailableReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
-  scorer.set_context("发起");
-  scorer.Prepare("plan", {"攻击", "公鸡"});
+  scorer.Prepare({"plan", "发起", "", {"攻击", "公鸡"}});
   ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "攻击", 1.0), &score));
 }
 
 TEST(LlmScorerTest, DaemonUnavailablePassthroughOrder) {
   auto llm = New<LlmScorer>("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
-  llm->set_context("发起");
   auto weight = New<WeightScorer>(1.0, 1.0);
   auto comp = New<CompositeScorer>(weight, nullptr, llm);
   Ticket ticket;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
   filter.set_scorer(comp);
+  filter.set_preceding_text("发起");
   auto filtered = ApplyFilter(filter, {
-                                          MakePhrase("table", 0, 2, "甲", 3.0),
-                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 0, 2, "甲", 1.0),
+                                          MakePhrase("table", 0, 2, "乙", 3.0),
                                           MakePhrase("table", 0, 4, "丙", 0.0),
                                       });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
@@ -1042,16 +1418,14 @@ TEST(LlmScorerTest, DaemonUnavailablePassthroughOrder) {
 
 TEST(LlmScorerTest, MalformedResponseReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
-  scorer.set_context("test");
-  scorer.Prepare("plan", {"甲"});
+  scorer.Prepare({"plan", "test", "", {"甲"}});
   ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
 
 TEST(LlmScorerTest, EmptyPrepareAllowsScore) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
-  scorer.set_context("");
-  scorer.Prepare("plan", {});
+  scorer.Prepare({"plan", "", "", {}});
   ScoreComponents score;
   EXPECT_FALSE(scorer.Score(MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }

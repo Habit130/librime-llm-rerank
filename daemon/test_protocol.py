@@ -135,7 +135,7 @@ class ProtocolTest(unittest.TestCase):
         self.assert_protocol_error(response, "invalid_json")
 
     def test_trailing_payload_is_rejected(self):
-        for suffix in ("garbage", "\n" + encode(request())):
+        for suffix in (" ", "garbage", "\n" + encode(request())):
             with self.subTest(suffix=suffix[:10]):
                 response = handle_request(FakeState(), encode(request()) + suffix)
                 self.assert_protocol_error(response, "invalid_json")
@@ -169,6 +169,40 @@ class ProtocolTest(unittest.TestCase):
         finally:
             reader.close()
             writer.close()
+
+    def test_space_before_terminal_lf_is_rejected_end_to_end(self):
+        reader, writer = socket.socketpair()
+        writer.sendall((encode(request()) + " \n").encode("utf-8"))
+        writer.shutdown(socket.SHUT_WR)
+        try:
+            response = handle_request(FakeState(), read_request(reader))
+            self.assert_protocol_error(response, "invalid_json")
+        finally:
+            reader.close()
+            writer.close()
+
+    def test_request_read_uses_one_absolute_deadline(self):
+        reader, writer = socket.socketpair()
+
+        def drip_request():
+            try:
+                for _ in range(20):
+                    writer.sendall(b"x")
+                    time.sleep(0.01)
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=drip_request)
+        thread.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError):
+                read_request(reader, deadline_seconds=0.03)
+            self.assertLess(time.monotonic() - started, 0.15)
+        finally:
+            reader.close()
+            writer.close()
+            thread.join()
 
     def test_oversized_request_is_rejected_at_socket_framing(self):
         reader, writer = socket.socketpair()

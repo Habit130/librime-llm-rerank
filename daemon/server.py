@@ -24,8 +24,6 @@ import sys
 import threading
 import time
 
-import mlx.core as mx
-
 SOCKET_PATH = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock"
 )
@@ -284,7 +282,10 @@ def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
 
 def handle_request(state, data):
     try:
-        req = json.loads(data, object_pairs_hook=reject_duplicate_object_fields)
+        decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_object_fields)
+        req, parsed_end = decoder.raw_decode(data)
+        if parsed_end != len(data):
+            raise ValueError("trailing request payload")
     except (json.JSONDecodeError, TypeError, ValueError):
         return protocol_error("invalid_json")
 
@@ -358,6 +359,8 @@ def handle_request(state, data):
 
 
 def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, test_mode=False):
+    import mlx.core as mx
+
     if cache_limit_mb > 0:
         mx.set_cache_limit(cache_limit_mb * 10**6)
 

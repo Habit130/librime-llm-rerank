@@ -26,9 +26,10 @@ RerankPlan BuildPlan(vector<RerankPlanCandidate> candidates,
                      RerankPlanConfig config = DefaultRerankPlanConfig(),
                      RerankScoringPolicy policy = DefaultRerankScoringPolicy(),
                      bool truncated = false,
-                     const string& input = "gongji") {
-  return BuildRerankPlan("luna_pinyin", input, preceding_text, config, policy,
-                         candidates, truncated);
+                     const string& input = "gongji",
+                     const string& previous_word = "计划") {
+  return BuildRerankPlan("luna_pinyin", input, preceding_text, previous_word,
+                         config, policy, candidates, truncated);
 }
 
 RerankScoreResult Scores(
@@ -85,7 +86,7 @@ TEST(RerankPlanTest, SameNormalizedContentsHaveStableIdentity) {
 
   ASSERT_TRUE(first.identity.has_value());
   EXPECT_EQ(first.identity, second.identity);
-  EXPECT_EQ("rerank-plan-v1:sha1:11c5fea1dd15e4e27d0d5f5f9d9eef758640d536",
+  EXPECT_EQ("rerank-plan-v1:sha1:7f9317efb1e8844432dea7bf95765a5bcd60addc",
             *first.identity);
   ASSERT_EQ(2u, first.groups->size());
   EXPECT_EQ((*first.groups)[0].identity, (*second.groups)[0].identity);
@@ -125,6 +126,18 @@ TEST(RerankPlanTest, PrecedingTextChangeChangesIdentity) {
   EXPECT_NE(first.identity, changed.identity);
 }
 
+TEST(RerankPlanTest, PreviousWordChangeChangesIdentity) {
+  auto first = BuildPlan(TwoGroupsWithPunctuation(), "研究生",
+                         DefaultRerankPlanConfig(),
+                         DefaultRerankScoringPolicy(), false, "gongji",
+                         "研究生");
+  auto changed = BuildPlan(TwoGroupsWithPunctuation(), "研究生",
+                           DefaultRerankPlanConfig(),
+                           DefaultRerankScoringPolicy(), false, "gongji", "生");
+
+  EXPECT_NE(first.identity, changed.identity);
+}
+
 TEST(RerankPlanTest, CanonicalInputControlsIdentity) {
   auto uppercase =
       BuildPlan(TwoGroupsWithPunctuation(), "上文", DefaultRerankPlanConfig(),
@@ -147,11 +160,11 @@ TEST(RerankPlanTest, CanonicalInputControlsIdentity) {
 
 TEST(RerankPlanTest, SchemaChangeChangesIdentity) {
   auto candidates = TwoGroupsWithPunctuation();
-  auto first = BuildRerankPlan("luna_pinyin", "gongji", "上文",
+  auto first = BuildRerankPlan("luna_pinyin", "gongji", "上文", "上文",
                                DefaultRerankPlanConfig(),
                                DefaultRerankScoringPolicy(), candidates, false);
   auto changed = BuildRerankPlan(
-      "other_schema", "gongji", "上文", DefaultRerankPlanConfig(),
+      "other_schema", "gongji", "上文", "上文", DefaultRerankPlanConfig(),
       DefaultRerankScoringPolicy(), candidates, false);
 
   EXPECT_NE(first.identity, changed.identity);

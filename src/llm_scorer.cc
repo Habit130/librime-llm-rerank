@@ -31,26 +31,63 @@ constexpr size_t kMaximumResponseBytes = 64 * 1024;
 
 enum class WaitStatus { kReady, kTimeout, kError };
 
+class SystemConnectSyscalls : public ConnectSyscalls {
+ public:
+  SocketCallResult Connect(int fd,
+                           const struct sockaddr* address,
+                           socklen_t address_size) override {
+    const int result = connect(fd, address, address_size);
+    return {result, result < 0 ? errno : 0};
+  }
+
+  SocketCallResult Poll(int fd,
+                        short events,
+                        int timeout_ms,
+                        short* returned_events) override {
+    struct pollfd poll_fd { fd, events, 0 };
+    const int result = poll(&poll_fd, 1, timeout_ms);
+    if (returned_events)
+      *returned_events = poll_fd.revents;
+    return {result, result < 0 ? errno : 0};
+  }
+
+  SocketCallResult GetSocketError(int fd, int* socket_error) override {
+    socklen_t socket_error_size = sizeof(*socket_error);
+    const int result = getsockopt(fd, SOL_SOCKET, SO_ERROR, socket_error,
+                                  &socket_error_size);
+    return {result, result < 0 ? errno : 0};
+  }
+};
+
 WaitStatus WaitFor(int fd,
                    short events,
-                   std::chrono::steady_clock::time_point deadline) {
+                   std::chrono::steady_clock::time_point deadline,
+                   ConnectSyscalls* syscalls) {
+  if (!syscalls)
+    return WaitStatus::kError;
   while (true) {
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now());
     if (remaining.count() <= 0)
       return WaitStatus::kTimeout;
-    struct pollfd poll_fd { fd, events, 0 };
-    int result = poll(&poll_fd, 1, static_cast<int>(remaining.count()));
-    if (result > 0) {
-      if (poll_fd.revents & (events | POLLHUP | POLLERR))
+    short returned_events = 0;
+    const SocketCallResult call = syscalls->Poll(
+        fd, events, static_cast<int>(remaining.count()), &returned_events);
+    if (call.result > 0) {
+      if (returned_events & (events | POLLHUP | POLLERR))
         return WaitStatus::kReady;
       return WaitStatus::kError;
     }
-    if (result == 0)
+    if (call.result == 0)
       return WaitStatus::kTimeout;
-    if (errno != EINTR)
+    if (call.error != EINTR)
       return WaitStatus::kError;
   }
+}
+
+SystemConnectSyscalls& DefaultConnectSyscalls() {
+  static SystemConnectSyscalls syscalls;
+  return syscalls;
 }
 
 void LogFailure(const char* code,
@@ -136,7 +173,8 @@ static bool ParseScores(const string& response,
   const size_t newline = response.find('\n');
   // One terminal LF is the only framing byte allowed after the JSON document.
   if (newline == string::npos || newline == 0 ||
-      newline != response.size() - 1) {
+      newline != response.size() - 1 || response[newline - 1] != '}' ||
+      response.find('\0') < newline) {
     *error_code = "invalid_protocol";
     return false;
   }
@@ -216,6 +254,65 @@ static bool ParseScores(const string& response,
 
 }  // namespace
 
+NonBlockingConnectStatus ConnectNonBlockingWithDeadline(
+    int fd,
+    const struct sockaddr* address,
+    socklen_t address_size,
+    std::chrono::steady_clock::time_point deadline,
+    ConnectSyscalls* syscalls) {
+  if (!syscalls)
+    return NonBlockingConnectStatus::kError;
+  bool completion_pending = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!completion_pending) {
+      const SocketCallResult call =
+          syscalls->Connect(fd, address, address_size);
+      if (call.result == 0 || call.error == EISCONN)
+        return NonBlockingConnectStatus::kConnected;
+      if (call.error == EAGAIN || call.error == EWOULDBLOCK) {
+        const WaitStatus wait = WaitFor(fd, POLLOUT, deadline, syscalls);
+        if (wait == WaitStatus::kTimeout)
+          return NonBlockingConnectStatus::kTimeout;
+        if (wait == WaitStatus::kError)
+          return NonBlockingConnectStatus::kError;
+        continue;
+      }
+      if (call.error != EINTR && call.error != EINPROGRESS &&
+          call.error != EALREADY) {
+        return NonBlockingConnectStatus::kError;
+      }
+      completion_pending = true;
+    }
+
+    const WaitStatus wait = WaitFor(fd, POLLOUT, deadline, syscalls);
+    if (wait == WaitStatus::kTimeout)
+      return NonBlockingConnectStatus::kTimeout;
+    if (wait == WaitStatus::kError)
+      return NonBlockingConnectStatus::kError;
+
+    int socket_error = 0;
+    while (true) {
+      const SocketCallResult call =
+          syscalls->GetSocketError(fd, &socket_error);
+      if (call.result == 0)
+        break;
+      if (call.error != EINTR && call.error != EAGAIN &&
+          call.error != EWOULDBLOCK) {
+        return NonBlockingConnectStatus::kError;
+      }
+      if (std::chrono::steady_clock::now() >= deadline)
+        return NonBlockingConnectStatus::kTimeout;
+    }
+    if (socket_error == 0 || socket_error == EISCONN)
+      return NonBlockingConnectStatus::kConnected;
+    if (socket_error != EINPROGRESS && socket_error != EALREADY &&
+        socket_error != EAGAIN && socket_error != EWOULDBLOCK) {
+      return NonBlockingConnectStatus::kError;
+    }
+  }
+  return NonBlockingConnectStatus::kTimeout;
+}
+
 bool LlmScorer::SendRequest(const string& context,
                              const vector<string>& candidates,
                              const string& request_id,
@@ -254,36 +351,24 @@ bool LlmScorer::SendRequest(const string& context,
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
 #endif
 
-  if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-    if (errno != EINPROGRESS) {
-      close(fd);
-      LogFailure("connection_failed", "connect", candidates.size());
-      return false;
-    }
-    WaitStatus wait = WaitFor(fd, POLLOUT, deadline);
-    if (wait != WaitStatus::kReady) {
-      close(fd);
-      LogFailure(wait == WaitStatus::kTimeout ? "deadline_exceeded"
-                                              : "connection_failed",
-                 "connect", candidates.size());
-      return false;
-    }
-    int socket_error = 0;
-    socklen_t socket_error_size = sizeof(socket_error);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
-                   &socket_error_size) < 0 ||
-        socket_error != 0) {
-      close(fd);
-      LogFailure("connection_failed", "connect", candidates.size());
-      return false;
-    }
+  const NonBlockingConnectStatus connect_status =
+      ConnectNonBlockingWithDeadline(
+          fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr), deadline,
+          &DefaultConnectSyscalls());
+  if (connect_status != NonBlockingConnectStatus::kConnected) {
+    close(fd);
+    LogFailure(connect_status == NonBlockingConnectStatus::kTimeout
+                   ? "deadline_exceeded"
+                   : "connection_failed",
+               "connect", candidates.size());
+    return false;
   }
 
   string request =
       BuildRequest(context, candidates, request_id, plan_identity);
   size_t sent = 0;
   while (sent < request.size()) {
-    WaitStatus wait = WaitFor(fd, POLLOUT, deadline);
+    WaitStatus wait = WaitFor(fd, POLLOUT, deadline, &DefaultConnectSyscalls());
     if (wait != WaitStatus::kReady) {
       close(fd);
       LogFailure(wait == WaitStatus::kTimeout ? "deadline_exceeded"
@@ -307,7 +392,7 @@ bool LlmScorer::SendRequest(const string& context,
   string buf;
   char chunk[4096];
   while (true) {
-    WaitStatus wait = WaitFor(fd, POLLIN, deadline);
+    WaitStatus wait = WaitFor(fd, POLLIN, deadline, &DefaultConnectSyscalls());
     if (wait != WaitStatus::kReady) {
       close(fd);
       LogFailure(wait == WaitStatus::kTimeout ? "deadline_exceeded"
@@ -342,12 +427,11 @@ bool LlmScorer::SendRequest(const string& context,
   return true;
 }
 
-bool LlmScorer::Prepare(const string& plan_identity,
-                        const vector<string>& candidate_texts) {
+bool LlmScorer::Prepare(const ScoringRequest& request) {
   score_cache_.clear();
   prepared_ = false;
 
-  if (candidate_texts.empty()) {
+  if (request.candidate_texts.empty()) {
     prepared_ = true;
     return true;
   }
@@ -357,20 +441,20 @@ bool LlmScorer::Prepare(const string& plan_identity,
                             std::to_string(getpid()) + ":" +
                             std::to_string(next_request++);
   string response;
-  if (!SendRequest(context_, candidate_texts, request_id, plan_identity,
-                   &response))
+  if (!SendRequest(request.preceding_text, request.candidate_texts, request_id,
+                   request.plan_identity, &response))
     return false;
 
   vector<double> scores;
   const char* error_code = "invalid_protocol";
-  if (!ParseScores(response, request_id, plan_identity, candidate_texts.size(),
-                   &scores, &error_code)) {
-    LogFailure(error_code, "validate", candidate_texts.size());
+  if (!ParseScores(response, request_id, request.plan_identity,
+                   request.candidate_texts.size(), &scores, &error_code)) {
+    LogFailure(error_code, "validate", request.candidate_texts.size());
     return false;
   }
 
-  for (size_t i = 0; i < candidate_texts.size(); i++) {
-    score_cache_[candidate_texts[i]] = scores[i];
+  for (size_t i = 0; i < request.candidate_texts.size(); i++) {
+    score_cache_[request.candidate_texts[i]] = scores[i];
   }
   prepared_ = true;
 

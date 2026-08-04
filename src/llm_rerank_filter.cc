@@ -13,6 +13,7 @@
 #include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/schema.h>
+#include <rime/service.h>
 #include <rime/ticket.h>
 #include <rime/translation.h>
 #include <rime/commit_history.h>
@@ -103,6 +104,11 @@ bool ContextScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   return true;
 }
 
+bool ContextScorer::Prepare(const ScoringRequest& request) {
+  prev_word_ = request.previous_word;
+  return true;
+}
+
 bool CompositeScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   ScoreComponents weight_score;
   if (!weight_ || !weight_->Score(cand, &weight_score))
@@ -118,11 +124,10 @@ bool CompositeScorer::Score(const an<Candidate>& cand, ScoreComponents* score) {
   return true;
 }
 
-bool CompositeScorer::Prepare(const string& plan_identity,
-                              const vector<string>& candidate_texts) {
-  return weight_ && weight_->Prepare(plan_identity, candidate_texts) &&
-         (!context_ || context_->Prepare(plan_identity, candidate_texts)) &&
-         (!llm_ || llm_->Prepare(plan_identity, candidate_texts));
+bool CompositeScorer::Prepare(const ScoringRequest& request) {
+  return weight_ && weight_->Prepare(request) &&
+         (!context_ || context_->Prepare(request)) &&
+         (!llm_ || llm_->Prepare(request));
 }
 
 static string CategoryOf(const string& type) {
@@ -136,16 +141,18 @@ class LlmRerankTranslation : public PrefetchTranslation {
   LlmRerankTranslation(an<Translation> translation,
                        an<Scorer> scorer,
                        int window,
-                       string schema_id,
-                       string input,
-                       string preceding_text,
-                       RerankScoringPolicy scoring_policy)
+                        string schema_id,
+                        string input,
+                        string preceding_text,
+                        string previous_word,
+                        RerankScoringPolicy scoring_policy)
       : PrefetchTranslation(translation),
         scorer_(scorer),
         window_(window),
         schema_id_(std::move(schema_id)),
         input_(std::move(input)),
         preceding_text_(std::move(preceding_text)),
+        previous_word_(std::move(previous_word)),
         scoring_policy_(std::move(scoring_policy)) {}
 
  protected:
@@ -161,6 +168,7 @@ class LlmRerankTranslation : public PrefetchTranslation {
   string schema_id_;
   string input_;
   string preceding_text_;
+  string previous_word_;
   RerankScoringPolicy scoring_policy_;
 };
 
@@ -215,8 +223,9 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
 
   RerankPlanConfig config = DefaultRerankPlanConfig();
   config.window = window_;
-  RerankPlan plan = BuildRerankPlan(schema_id_, input_, preceding_text_, config,
-                                    scoring_policy_, candidates, truncated);
+  RerankPlan plan =
+      BuildRerankPlan(schema_id_, input_, preceding_text_, previous_word_,
+                      config, scoring_policy_, candidates, truncated);
   if (!plan.identity || !plan.groups) {
     LogWindowFailure("invalid_plan", "plan", buffer.size());
     return false;
@@ -231,7 +240,9 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       texts.push_back(buffer[index]->text());
     }
   }
-  if (!scorer_->Prepare(*plan.identity, texts)) {
+  ScoringRequest request{*plan.identity, *plan.preceding_text,
+                         *plan.previous_word, std::move(texts)};
+  if (!scorer_->Prepare(request)) {
     LogWindowFailure("scoring_prepare_failed", "prepare", buffer.size());
     return false;
   }
@@ -305,12 +316,10 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     if (auto component = UserDb::Require("userdb")) {
       string db_name = ticket.schema->schema_id() + ".llm_rerank";
       Db* raw = component->Create(db_name);
-      if (raw && dynamic_cast<LevelDb*>(raw) && raw->Open() &&
-          raw->CreateMetadata()) {
-        const path file_path = raw->file_path();
-        if (raw->Close())
-          memory_ = ContextMemory::OpenLevelDb(file_path);
-      }
+      if (raw && dynamic_cast<LevelDb*>(raw))
+        memory_ = ContextMemory::OpenLevelDb(
+            raw->file_path(),
+            {db_name, "userdb", Service::instance().deployer().user_id});
       delete raw;
     }
     if (memory_) {
@@ -412,13 +421,7 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   if (!enabled_) {
     return translation;
   }
-  if (context_scorer_) {
-    context_scorer_->set_prev_word(last_word_);
-  }
   const string preceding_text = BuildContext();
-  if (llm_scorer_) {
-    llm_scorer_->set_context(preceding_text);
-  }
   RerankScoringPolicy scoring_policy = DefaultRerankScoringPolicy();
   scoring_policy.alpha = alpha_;
   scoring_policy.sys_coeff = sys_coeff_;
@@ -429,7 +432,8 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   if (engine_ && engine_->context())
     input = engine_->context()->input();
   return New<LlmRerankTranslation>(translation, scorer_, window_, schema_id_,
-                                   input, preceding_text, scoring_policy);
+                                   input, preceding_text, last_word_,
+                                   scoring_policy);
 }
 
 }  // namespace rime
