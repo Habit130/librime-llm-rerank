@@ -276,8 +276,9 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       texts.push_back(buffer[index]->text());
     }
   }
-  ScoringRequest request{*plan.identity, *plan.preceding_text,
-                         *plan.previous_word, std::move(texts)};
+  ScoringRequest request{*plan.identity, *scoring_policy_.baseline_policy_id,
+                         *plan.preceding_text, *plan.previous_word,
+                         std::move(texts)};
   vector<ScoreComponents> batch_scores;
   if (!scorer_->ScoreBatch(request, scored_candidates, &batch_scores) ||
       batch_scores.size() != scored_candidates.size()) {

@@ -36,28 +36,24 @@ DEFAULT_CORPUS = REPO_ROOT / "eval" / "corpus" / "sentences.txt"
 DEFAULT_FIXTURE = REPO_ROOT / "eval" / "fixture.json"
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
-    ap.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
-    ap.add_argument("--dict", type=Path, required=True,
-                    help="fixture librime build's luna_pinyin.dict.yaml")
-    args = ap.parse_args()
-
+def verify_fixture(corpus, fixture, dict_path):
+    """Re-derive the fixture from corpus + dict and compare with the
+    committed fixture.json. Returns a list of failure strings (empty when
+    verification passes)."""
     failures = []
 
-    corpus_sha = sha256_file(args.corpus)
+    corpus_sha = sha256_file(corpus)
     if corpus_sha != CORPUS_SHA256:
         failures.append(
             f"corpus checksum mismatch: expected {CORPUS_SHA256}, got {corpus_sha}"
         )
 
-    fixture = json.loads(args.fixture.read_text(encoding="utf-8"))
-    committed_sentence_cases = fixture["sentence_cases"]
-    committed_word_cases = fixture["word_cases"]
+    fixture_data = json.loads(fixture.read_text(encoding="utf-8"))
+    committed_sentence_cases = fixture_data["sentence_cases"]
+    committed_word_cases = fixture_data["word_cases"]
 
-    dict_keys, char_readings = parse_dict(args.dict)
-    sentence_cases, _skipped = load_corpus(args.corpus, char_readings)
+    dict_keys, char_readings = parse_dict(dict_path)
+    sentence_cases, _skipped = load_corpus(corpus, char_readings)
 
     derived_sentences = [
         {"index": i, "sentence": sentence, "pinyin": "".join(syllables)}
@@ -98,15 +94,15 @@ def main():
     manifest_sha = hashlib.sha256(
         "\n".join(word_manifest_lines(word_cases)).encode("utf-8")
     ).hexdigest()
-    if manifest_sha != fixture["word_manifest_sha256"]:
+    if manifest_sha != fixture_data["word_manifest_sha256"]:
         failures.append(
             f"word manifest checksum mismatch: expected "
-            f"{fixture['word_manifest_sha256']}, re-derived {manifest_sha}"
+            f"{fixture_data['word_manifest_sha256']}, re-derived {manifest_sha}"
         )
 
-    if fixture["counts"]["words"] != 402:
+    if fixture_data["counts"]["words"] != 402:
         failures.append(
-            f"fixture word count is {fixture['counts']['words']}, expected 402"
+            f"fixture word count is {fixture_data['counts']['words']}, expected 402"
         )
     if len(committed_word_cases) != 402:
         failures.append(
@@ -114,17 +110,32 @@ def main():
             "expected 402"
         )
 
+    return failures
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
+    ap.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
+    ap.add_argument("--dict", type=Path, required=True,
+                    help="fixture librime build's luna_pinyin.dict.yaml")
+    args = ap.parse_args()
+
+    failures = verify_fixture(args.corpus, args.fixture, args.dict)
+
     if failures:
         print("FAIL: fixture verification failed:")
         for failure in failures:
             print(f"  - {failure}")
         return 1
 
+    fixture_data = json.loads(args.fixture.read_text(encoding="utf-8"))
+    corpus_sha = sha256_file(args.corpus)
     print(f"PASS: fixture verified")
     print(f"  corpus sha256:      {corpus_sha}")
-    print(f"  sentence cases:     {len(committed_sentence_cases)}")
-    print(f"  word cases:         {len(committed_word_cases)}")
-    print(f"  word manifest sha256: {manifest_sha}")
+    print(f"  sentence cases:     {len(fixture_data['sentence_cases'])}")
+    print(f"  word cases:         {len(fixture_data['word_cases'])}")
+    print(f"  word manifest sha256: {fixture_data['word_manifest_sha256']}")
     return 0
 
 

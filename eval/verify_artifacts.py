@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Read-only verifier for the committed calibration artifacts
+(Habit130/squirrel#46, PR #12 round 2).
+
+Checks, all from committed files (no model, no console run):
+
+1. **Fixture**: re-derives the 120/402 fixture from corpus + dict and
+   compares with fixture.json (corpus checksum, case sets, word-manifest
+   checksum).
+2. **Manifest checksum**: recomputes `manifest_sha256` as
+   `sha256(canonical_json(manifest minus manifest_sha256))` with the same
+   canonical rule calibrate.py uses, and compares with the committed value.
+3. **Results <-> manifest consistency**: every run's alpha/policy/lm_term/
+   metrics/schema-config identity match; the decision fields
+   (final_alpha, final_alpha_value, internal_optimum,
+   positive_alpha_qualified, final_alpha_rationale) are exactly what
+   `decide_final(results)` produces — i.e. nothing was hand-edited after the
+   run.
+4. **Baseline candidate manifest**: `baseline_candidate_manifest_sha256`
+   equals the canonical checksum of results.json's per-case ordered +
+   multiset candidate checksums (522 cases).
+5. **Summary**: regenerates SUMMARY.md with the same `write_summary` the
+   script uses and compares byte-for-byte with the committed file.
+6. **Distributions**: results.json carries the summarized score/token-count
+   distribution evidence.
+
+Exit 0 on verification, nonzero otherwise.
+
+Usage:
+  eval/.venv/bin/python eval/verify_artifacts.py \
+      --dict <fixture librime>/bin/luna_pinyin.dict.yaml
+"""
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EVAL_DIR = REPO_ROOT / "eval"
+
+
+def canonical_json(obj):
+    from calibrate import canonical_json as _canonical
+
+    return _canonical(obj)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dict", type=Path, required=True,
+                    help="fixture librime build's luna_pinyin.dict.yaml")
+    args = ap.parse_args()
+
+    sys.path.insert(0, str(EVAL_DIR))
+    from calibrate import decide_final, sha256_bytes, write_summary
+    from verify_fixture import verify_fixture
+
+    failures = []
+
+    corpus = EVAL_DIR / "corpus" / "sentences.txt"
+    fixture_path = EVAL_DIR / "fixture.json"
+    manifest_path = EVAL_DIR / "manifest.json"
+    results_path = EVAL_DIR / "results.json"
+    summary_path = EVAL_DIR / "SUMMARY.md"
+
+    if not all(p.exists() for p in
+               (corpus, fixture_path, manifest_path, results_path,
+                summary_path)):
+        failures.append("one or more committed artifacts are missing")
+
+    if failures:
+        print("FAIL:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+
+    # 1. Fixture.
+    for failure in verify_fixture(corpus, fixture_path, args.dict):
+        failures.append(f"fixture: {failure}")
+
+    # 2. Manifest checksum (canonical rule, self-hash field excluded).
+    committed_hash = manifest.get("manifest_sha256")
+    without_hash = {
+        key: value for key, value in manifest.items()
+        if key != "manifest_sha256"
+    }
+    recomputed_hash = sha256_bytes(
+        canonical_json(without_hash).encode("utf-8"))
+    if committed_hash != recomputed_hash:
+        failures.append(
+            f"manifest checksum mismatch: committed {committed_hash}, "
+            f"recomputed {recomputed_hash}")
+
+    # 3. Results <-> manifest consistency.
+    manifest_runs = manifest.get("runs", {})
+    for key, entry in results["runs"].items():
+        run_manifest = manifest_runs.get(key)
+        if run_manifest is None:
+            failures.append(f"manifest missing run {key}")
+            continue
+        for field in ("alpha", "policy", "lm_term"):
+            if run_manifest.get(field) != entry.get(field):
+                failures.append(
+                    f"run {key}: manifest {field}={run_manifest.get(field)} "
+                    f"!= results {field}={entry.get(field)}")
+        if run_manifest.get("metrics") != entry.get("metrics"):
+            failures.append(f"run {key}: metrics differ between artifacts")
+        if run_manifest.get("schema_config_sha256") != entry.get(
+                "config_identity"):
+            failures.append(
+                f"run {key}: schema config identity differs between artifacts")
+    for key in manifest_runs:
+        if key not in results["runs"]:
+            failures.append(f"manifest has unknown run {key}")
+
+    decision = decide_final(results)
+    for field in ("final_alpha", "final_alpha_value", "internal_optimum",
+                  "positive_alpha_qualified", "final_alpha_rationale"):
+        if manifest.get(field) != decision[field]:
+            failures.append(
+                f"decision field {field}: manifest "
+                f"{manifest.get(field)!r} != recomputed {decision[field]!r}")
+
+    # 4. Baseline candidate manifest.
+    baseline_checksums = results.get("baseline_candidate_checksums")
+    if not baseline_checksums:
+        failures.append("results.json missing baseline_candidate_checksums")
+    else:
+        expected_counts = {"sentence": 120, "word": 402}
+        for kind, count in expected_counts.items():
+            cases = baseline_checksums.get(kind)
+            if not isinstance(cases, list) or len(cases) != count:
+                failures.append(
+                    f"baseline_candidate_checksums[{kind}]: expected "
+                    f"{count} entries, got "
+                    f"{len(cases) if isinstance(cases, list) else 'missing'}")
+                continue
+            for i, entry in enumerate(cases, 1):
+                if not isinstance(entry, dict) or \
+                        "ordered_sha256" not in entry or \
+                        "multiset_sha256" not in entry:
+                    failures.append(
+                        f"baseline_candidate_checksums[{kind}] case {i}: "
+                        "missing ordered/multiset checksum")
+        expected_manifest_sha = sha256_bytes(
+            canonical_json(baseline_checksums).encode("utf-8"))
+        if manifest.get("baseline_candidate_manifest_sha256") != \
+                expected_manifest_sha:
+            failures.append(
+                f"baseline candidate manifest checksum mismatch: committed "
+                f"{manifest.get('baseline_candidate_manifest_sha256')}, "
+                f"recomputed {expected_manifest_sha}")
+
+    # 5. Summary regenerates byte-for-byte.
+    try:
+        regenerated = summary_path.with_name(
+            "SUMMARY.regenerated.md")
+        write_summary(regenerated, manifest, results)
+        if regenerated.read_text(encoding="utf-8") != \
+                summary_path.read_text(encoding="utf-8"):
+            failures.append(
+                "SUMMARY.md differs from what write_summary regenerates")
+        regenerated.unlink()
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"summary regeneration failed: {error}")
+
+    # 6. Distribution evidence.
+    distributions = results.get("distributions", {})
+    for field in ("requests", "samples", "token_count_histogram",
+                  "score_min", "score_max", "score_mean"):
+        if field not in distributions:
+            failures.append(f"distributions missing {field}")
+
+    if failures:
+        print("FAIL: artifact verification failed:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+
+    print("PASS: committed calibration artifacts are consistent and "
+          "regenerable")
+    print(f"  manifest sha256:        {manifest['manifest_sha256']}")
+    print(f"  final alpha:            {manifest['final_alpha_value']} "
+          f"(internal_optimum={manifest['internal_optimum']}, "
+          f"positive_alpha_qualified="
+          f"{manifest['positive_alpha_qualified']})")
+    print(f"  baseline candidate      "
+          f"{manifest['baseline_candidate_manifest_sha256']}")
+    print(f"  runs verified:          {len(results['runs'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

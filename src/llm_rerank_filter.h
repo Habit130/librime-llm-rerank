@@ -22,6 +22,7 @@ struct ScoreComponents {
 
 struct ScoringRequest {
   string plan_identity;
+  string baseline_policy_id;
   string preceding_text;
   string previous_word;
   vector<string> candidate_texts;
@@ -128,10 +129,11 @@ class LlmRerankFilter : public Filter {
 
   bool enabled_ = true;
   int window_ = 32;
-  // Calibrated in #46 on the canonical 120/402 fixture: least-harmful
-  // in-grid value; no internal optimum exists on that denominator (see
-  // eval/manifest.json).
-  double alpha_ = 0.5;
+  // Default alpha = 0 (owner decision, Habit130/squirrel#46): the canonical
+  // 120/402 calibration supports no positive alpha (see
+  // eval/manifest.json), so the LM term is disabled unless the schema
+  // explicitly sets a positive value.
+  double alpha_ = 0.0;
   double sys_coeff_ = 1.0;
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;

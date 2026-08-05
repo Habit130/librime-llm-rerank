@@ -32,13 +32,14 @@ IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
 CACHE_LIMIT_MB = 512  # MLX allocator cache cap; 0 = unlimited (default MLX behavior)
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 64 * 1024
 REQUEST_READ_DEADLINE = 5.0
 REQUEST_FIELDS = {
     "version",
     "request_id",
     "plan_identity",
+    "baseline_policy_id",
     "context",
     "candidates",
 }
@@ -52,6 +53,18 @@ REQUEST_FIELDS = {
 # duplicating scoring logic in the calibration tooling.
 SCORING_STRATEGY_MEAN_TOKEN = "mean_token"
 SCORING_STRATEGY_LEGACY_SUM = "legacy_sum"
+
+# Policy-id binding (Habit130/squirrel#46 acceptance, PR #12 round 2): each
+# daemon scoring mode accepts exactly one declared baseline_policy_id, so a
+# plan's declared normalization can never be silently served by a daemon
+# running a different algorithm. legacy_sum exists solely for calibration
+# and only accepts the old sum policy id.
+MEAN_TOKEN_POLICY_ID = "mean-token-lm-v1"
+LEGACY_SUM_POLICY_ID = "first-stage-base-v1"
+POLICY_ID_BY_STRATEGY = {
+    SCORING_STRATEGY_MEAN_TOKEN: MEAN_TOKEN_POLICY_ID,
+    SCORING_STRATEGY_LEGACY_SUM: LEGACY_SUM_POLICY_ID,
+}
 
 
 class TokenAttributionError(Exception):
@@ -85,18 +98,21 @@ def candidate_scoring_plan(tokenizer, tail_text, candidate):
     Attribution is by reconstruction (docs/token-attribution.md): the token
     boundary is located by decoding token-sequence prefixes and comparing
     them with the tail text. This is provably safe -- `decode(ids[:k]) ==
-    tail_text` proves tokens [0, k) cover exactly the tail characters, and
-    the round-trip precondition `decode(ids) == full` proves the remaining
-    tokens cover exactly the candidate characters. It also handles Qwen's
-    byte-level BPE fallback pairs (rare characters tokenize as two byte
-    tokens whose offset mappings are unreliable): the pair stays whole on
-    whichever side of the boundary it falls.
+    tail_text` proves tokens [0, k) cover exactly the tail characters, the
+    round-trip precondition `decode(ids) == full` proves the remaining
+    tokens cover exactly the candidate characters, and the suffix
+    precondition `decode(ids[k:]) == candidate` closes the loop without
+    relying on decoder composability. It also handles Qwen's byte-level BPE
+    fallback pairs (rare characters tokenize as two byte tokens whose
+    offset mappings are unreliable): the pair stays whole on whichever side
+    of the boundary it falls.
 
     Fail-closed conditions:
       - empty candidate;
       - lossy tokenization (decode of the full sequence != the input text);
       - a token spanning the tail/candidate boundary (no prefix k decodes
         to exactly the tail text);
+      - the candidate suffix does not decode back to the candidate text;
       - zero candidate tokens.
     """
     if not candidate:
@@ -108,11 +124,15 @@ def candidate_scoring_plan(tokenizer, tail_text, candidate):
     if tokenizer.decode(ids) != full:
         raise TokenAttributionError("lossy tokenization")
     if not tail_text:
+        if tokenizer.decode(ids) != candidate:
+            raise TokenAttributionError("candidate suffix mismatch")
         return ids, 0, len(ids)
     for k in range(1, len(ids) + 1):
         if tokenizer.decode(ids[:k]) == tail_text:
             if k == len(ids):
                 raise TokenAttributionError("no candidate tokens")
+            if tokenizer.decode(ids[k:]) != candidate:
+                raise TokenAttributionError("candidate suffix mismatch")
             return ids, k, len(ids) - k
     raise TokenAttributionError("token straddles text boundary")
 
@@ -401,6 +421,7 @@ def protocol_error(
         "score_count_mismatch": "score count does not match candidate count",
         "non_finite_score": "scorer returned a non-finite score",
         "token_attribution_failed": "candidate token attribution failed",
+        "policy_mismatch": "plan policy does not match the daemon scoring mode",
         "server_error": "scoring transport failed",
     }
     response = {
@@ -423,11 +444,13 @@ def protocol_error(
     return response
 
 
-def make_request(request_id, plan_identity, context, candidates):
+def make_request(request_id, plan_identity, context, candidates,
+                 baseline_policy_id=MEAN_TOKEN_POLICY_ID):
     return {
         "version": PROTOCOL_VERSION,
         "request_id": request_id,
         "plan_identity": plan_identity,
+        "baseline_policy_id": baseline_policy_id,
         "context": context,
         "candidates": candidates,
     }
@@ -442,7 +465,12 @@ def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
         if remaining <= 0:
             raise TimeoutError("request deadline exceeded")
         conn.settimeout(remaining)
-        chunk = conn.recv(65536)
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            # socket.timeout is only an alias of TimeoutError since
+            # Python 3.10; normalize so callers see one exception type.
+            raise TimeoutError("request deadline exceeded") from None
         if not chunk:
             break
         size += len(chunk)
@@ -475,6 +503,8 @@ def handle_request(state, data):
         or not req["request_id"]
         or not isinstance(req["plan_identity"], str)
         or not req["plan_identity"]
+        or not isinstance(req["baseline_policy_id"], str)
+        or not req["baseline_policy_id"]
         or not isinstance(req["context"], str)
         or not isinstance(req["candidates"], list)
         or any(
@@ -483,6 +513,19 @@ def handle_request(state, data):
         )
     ):
         return protocol_error("invalid_request")
+
+    # Policy binding: the declared baseline_policy_id must be the exact id
+    # of the daemon's scoring mode, otherwise the plan's declared
+    # normalization could be silently served by a different algorithm.
+    accepted_policy = POLICY_ID_BY_STRATEGY.get(
+        getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN))
+    if accepted_policy is None or req["baseline_policy_id"] != accepted_policy:
+        return protocol_error(
+            "policy_mismatch",
+            phase="validate",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
 
     try:
         scores = state.score(req["context"], req["candidates"])

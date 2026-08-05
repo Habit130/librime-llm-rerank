@@ -88,6 +88,33 @@ def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def canonical_json(obj):
+    """Canonical serialization for checksums and manifest hashing.
+
+    Fixed rule shared with eval/verify_artifacts.py: sort_keys, compact
+    separators, ensure_ascii=False. Never change this function without
+    changing the verifier — committed manifest hashes are computed with it.
+    """
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def candidate_checksums(candidate_texts):
+    """Stable checksums for one case's candidate list.
+
+    `ordered_sha256` hashes the candidate texts in emission order (the
+    original merge order as observed); `multiset_sha256` hashes the sorted
+    texts so duplicate candidates are not silently collapsed away by the
+    comparison.
+    """
+    return {
+        "ordered_sha256": sha256_bytes(
+            canonical_json(candidate_texts).encode("utf-8")),
+        "multiset_sha256": sha256_bytes(
+            canonical_json(sorted(candidate_texts)).encode("utf-8")),
+    }
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -273,16 +300,51 @@ class Daemon:
             os.unlink(self.socket_path)
 
 
-def tokenizer_identity(model_path):
-    digest = hashlib.sha256()
-    for name in ("tokenizer.json", "vocab.json", "merges.txt", "config.json"):
-        path = Path(model_path) / name
-        if path.exists():
-            digest.update(sha256_file(path).encode("ascii"))
-            digest.update(b"\n")
+def model_identity(model_path):
+    """Identity of the actual model weights and tokenizer files.
+
+    The absolute path is only a display convenience; the identity itself is
+    the set of (name, size, sha256) triples of the weight files (all shards,
+    e.g. *.safetensors / *.bin / *.gguf) and of the tokenizer files, plus a
+    combined sha256 over the canonical serialization of each set. Any change
+    of weights, sharding, or tokenizer files changes the identity.
+    """
+    model_path = Path(model_path)
+
+    def file_triples(names):
+        triples = []
+        for name in names:
+            path = model_path / name
+            if path.exists():
+                triples.append({
+                    "name": name,
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                })
+        return sorted(triples, key=lambda entry: entry["name"])
+
+    weights = file_triples(
+        sorted(name for name in os.listdir(model_path)
+               if name.endswith((".safetensors", ".bin", ".gguf"))))
+    tokenizer = file_triples([
+        "tokenizer.json", "vocab.json", "merges.txt", "config.json",
+        "tokenizer_config.json",
+    ])
+    if not weights:
+        raise ValueError(
+            f"no model weight files found under {model_path} "
+            "(expected *.safetensors / *.bin / *.gguf)"
+        )
     return {
-        "model": str(model_path),
-        "files_sha256": digest.hexdigest(),
+        "display_model_path": str(model_path),
+        "weights": {
+            "files": weights,
+            "sha256": sha256_bytes(canonical_json(weights).encode("utf-8")),
+        },
+        "tokenizer": {
+            "files": tokenizer,
+            "sha256": sha256_bytes(canonical_json(tokenizer).encode("utf-8")),
+        },
     }
 
 
@@ -311,6 +373,123 @@ def config_identity(template_dir, alpha, baseline_policy_id):
     return digest.hexdigest()
 
 
+def decide_final(results):
+    """Select the final alpha from the mean-token policy's candidate runs.
+
+    Selection criterion (pre-declared): word top-1 rate, then MRR, then the
+    smaller alpha as a stable tie-break. The selection domain is the
+    mean-token policy: the alpha=0 baseline run (LM term disabled) plus the
+    mean-token grid runs. The legacy sum run is background evidence for the
+    old policy and never participates in the mean-token alpha decision.
+    Returns a decision dict that the script itself writes into the manifest
+    and the summary; nothing is hand-edited afterwards.
+
+    Reported status flags:
+      - internal_optimum: the winner is an interior point of the pre-declared
+        grid (a boundary winner is not an internal optimum, and per the
+        pre-declared protocol no unique optimum is then declared);
+      - positive_alpha_qualified: some positive alpha beat alpha=0.
+    """
+    runs = [
+        (key, entry)
+        for key, entry in results["runs"].items()
+        if key == "baseline" or key.startswith("mean_alpha_")
+    ]
+    if not runs:
+        raise ValueError("no mean-token runs to select from")
+    best_key, best = max(
+        runs,
+        key=lambda kv: (
+            kv[1]["metrics"]["word"]["top1_rate"],
+            kv[1]["metrics"]["word"]["mrr"],
+            -kv[1]["alpha"],
+        ),
+    )
+    alpha = best["alpha"]
+    word = best["metrics"]["word"]
+    positive_runs = [
+        (key, entry["metrics"]["word"]["top1_rate"], entry["alpha"])
+        for key, entry in results["runs"].items()
+        if key.startswith("mean_alpha_") and "metrics" in entry
+    ]
+    best_positive = max(positive_runs, key=lambda t: (t[1], -t[2]),
+                        default=None)
+
+    if alpha == 0.0:
+        positive_note = (
+            f"no positive value qualified: the best positive grid point is "
+            f"alpha={best_positive[2]} with word top-1 {best_positive[1]:.4f}, "
+            "below alpha=0"
+            if best_positive is not None
+            else "the grid contains no positive values"
+        )
+        rationale = (
+            "The canonical 120/402 fixture supports no positive alpha: "
+            f"alpha=0 (word top-1 {word['top1_rate']:.4f}, "
+            f"MRR {word['mrr']:.4f}, {word['top1']}/{word['samples']}) beats "
+            f"every positive grid point {ALPHA_GRID[1:]} on top-1 and MRR; "
+            f"{positive_note}. The best grid point sits on the grid's lower "
+            "boundary and the pre-declared extension rule covers the upper "
+            "boundary only, so no internal optimum exists. The data-supported "
+            "boundary result is therefore alpha=0 (owner decision, "
+            "Habit130/squirrel#46): the LM term stays disabled by default "
+            "and the mean-token policy remains available via explicit schema "
+            "configuration. A future contextual fixture may re-calibrate."
+        )
+        return {
+            "final_alpha": "baseline",
+            "final_alpha_value": 0.0,
+            "internal_optimum": False,
+            "positive_alpha_qualified": False,
+            "final_alpha_rationale": rationale,
+        }
+
+    grid_interior = ALPHA_GRID[1:-1]
+    internal_optimum = alpha in grid_interior
+    if alpha == ALPHA_GRID[-1] and ALPHA_EXTENSION:
+        extension_note = (
+            f" the winner sits on the grid's upper boundary; per the "
+            f"pre-declared extension rule the grid extends to "
+            f"{ALPHA_EXTENSION[-1]} before an optimum is claimed"
+        )
+    elif not internal_optimum:
+        extension_note = (
+            " the winner sits on the grid's lower boundary; per the "
+            "pre-declared protocol no internal optimum is declared"
+        )
+    else:
+        extension_note = ""
+    rationale = (
+        f"Alpha={alpha} wins the canonical 120/402 fixture on word top-1 "
+        f"({word['top1_rate']:.4f}) and MRR ({word['mrr']:.4f}) and "
+        f"qualifies as the selected positive value.{extension_note}"
+    )
+    return {
+        "final_alpha": best_key,
+        "final_alpha_value": alpha,
+        "internal_optimum": internal_optimum,
+        "positive_alpha_qualified": True,
+        "final_alpha_rationale": rationale,
+    }
+
+
+def finalize_manifest(manifest, results, decision):
+    """Write the final manifest with a canonical, verifiable checksum.
+
+    manifest_sha256 = sha256(canonical_json(manifest minus manifest_sha256));
+    eval/verify_artifacts.py recomputes it with the same rule.
+    """
+    manifest.update(decision)
+    sync_manifest_runs(manifest, results)
+    without_hash = {
+        key: value for key, value in manifest.items()
+        if key != "manifest_sha256"
+    }
+    manifest["manifest_sha256"] = sha256_bytes(
+        canonical_json(without_hash).encode("utf-8"))
+    return manifest
+
+
 def sync_manifest_runs(manifest, results):
     for run_key in list(results["runs"].keys()):
         entry = results["runs"][run_key]
@@ -325,13 +504,8 @@ def sync_manifest_runs(manifest, results):
         }
 
 
-def checkpoint(results_dir, manifest, results, final_alpha=None):
+def checkpoint(results_dir, manifest, results):
     sync_manifest_runs(manifest, results)
-    if final_alpha is not None:
-        manifest["final_alpha"] = final_alpha
-        manifest["manifest_sha256"] = sha256_bytes(
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        )
     (results_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8")
@@ -384,7 +558,7 @@ def main():
         "fixture_librime_commit": FIXTURE_LIBRIME_COMMIT,
         "pinyin_dependency": "pypinyin==0.55.0",
         "context_protocol": "standalone word, preceding text empty",
-        "model_tokenizer": tokenizer_identity(args.model),
+        "model_identity": model_identity(args.model),
         "random_seed": RANDOM_SEED,
         "fixed_coefficients": FIXED_COEFFICIENTS,
         "deadline_ms": DEADLINE_MS,
@@ -406,6 +580,11 @@ def main():
         ),
         "runs": {},
         "final_alpha": None,
+        "final_alpha_value": None,
+        "internal_optimum": None,
+        "positive_alpha_qualified": None,
+        "final_alpha_rationale": None,
+        "baseline_candidate_manifest_sha256": None,
     }
     manifest_path = results_dir / "manifest.json"
     manifest_path.write_text(
@@ -425,11 +604,14 @@ def main():
         "candidate_set_frozen": {},
         "harmful_regressions": {},
         "distributions": {},
+        "baseline_candidate_checksums": {},
     }
 
     try:
         # Run 1: alpha=0 baseline (no LLM term). Freezes merge order and the
-        # candidate sets every later run must match.
+        # candidate sets every later run must match. The per-case ordered and
+        # multiset candidate checksums are committed so future reruns can
+        # prove the candidate sets and merge order are identical.
         baseline = run_single(
             args, script, sentence_targets, word_targets, all_pinyins,
             alpha=0.0, baseline_policy_id=NEW_BASELINE_POLICY_ID,
@@ -441,7 +623,10 @@ def main():
             "metrics": baseline["metrics"],
             "config_identity": baseline["config_identity"],
         }
-        baseline_candidate_sets = baseline["candidate_sets"]
+        baseline_candidate_checksums = baseline["candidate_checksums"]
+        results["baseline_candidate_checksums"] = baseline_candidate_checksums
+        manifest["baseline_candidate_manifest_sha256"] = sha256_bytes(
+            canonical_json(baseline_candidate_checksums).encode("utf-8"))
         checkpoint(results_dir, manifest, results)
 
         # Run 2: legacy sum policy at alpha=2.0 (old default).
@@ -457,7 +642,7 @@ def main():
             )
         finally:
             legacy_daemon.stop()
-        assert_frozen(legacy, baseline_candidate_sets,
+        assert_frozen(legacy, baseline_candidate_checksums,
                       f"legacy alpha=2.0", results)
         results["runs"]["legacy_sum_alpha_2.0"] = {
             "alpha": 2.0, "policy": OLD_BASELINE_POLICY_ID,
@@ -482,8 +667,8 @@ def main():
                     alpha=alpha, baseline_policy_id=NEW_BASELINE_POLICY_ID,
                     daemon=mean_daemon,
                 )
-                assert_frozen(run, baseline_candidate_sets, f"mean alpha={alpha}",
-                              results)
+                assert_frozen(run, baseline_candidate_checksums,
+                              f"mean alpha={alpha}", results)
                 results["runs"][f"mean_alpha_{alpha}"] = {
                     "alpha": alpha, "policy": NEW_BASELINE_POLICY_ID,
                     "lm_term": "mean token",
@@ -516,13 +701,17 @@ def main():
 
     results["distributions"] = load_distributions(telemetry_path)
 
-    final_key = pick_best_alpha(results)
-    checkpoint(results_dir, manifest, results, final_alpha=final_key)
+    decision = decide_final(results)
+    finalize_manifest(manifest, results, decision)
+    checkpoint(results_dir, manifest, results)
     write_summary(results_dir / "SUMMARY.md", manifest, results)
 
     print()
     print("manifests written: eval/manifest.json, eval/results.json, "
           "eval/SUMMARY.md")
+    print(f"final_alpha={decision['final_alpha_value']} "
+          f"internal_optimum={decision['internal_optimum']} "
+          f"positive_alpha_qualified={decision['positive_alpha_qualified']}")
     return 0
 
 
@@ -564,19 +753,28 @@ def run_single(args, script, sentence_targets, word_targets, all_pinyins,
             "word": word_metrics(word_ranks),
         },
         "ranks": {"sentence": sentence_ranks, "word": word_ranks},
-        "candidate_sets": {"sentence": sentence_sets, "word": word_sets},
+        "candidate_checksums": {
+            "sentence": [candidate_checksums(s) for s in sentence_sets],
+            "word": [candidate_checksums(w) for w in word_sets],
+        },
         "config_identity": config_identity(args.template_dir, alpha,
                                            baseline_policy_id),
     }
 
 
-def assert_frozen(run, baseline_candidate_sets, label, results):
+def assert_frozen(run, baseline_candidate_checksums, label, results):
+    """Verify every case's candidate multiset is identical to the baseline.
+
+    Compared by the committed multiset checksums (sorted text lists), so
+    duplicate candidates are never silently collapsed away.
+    """
     mismatches = []
     for kind in ("sentence", "word"):
         for i, (got, expected) in enumerate(
-            zip(run["candidate_sets"][kind], baseline_candidate_sets[kind]), 1
+            zip(run["candidate_checksums"][kind],
+                baseline_candidate_checksums[kind]), 1
         ):
-            if got != expected:
+            if got["multiset_sha256"] != expected["multiset_sha256"]:
                 mismatches.append(f"{kind} case {i}")
     if mismatches:
         sys.exit(
@@ -588,45 +786,46 @@ def assert_frozen(run, baseline_candidate_sets, label, results):
 
 
 def load_distributions(telemetry_path):
+    """Summarize the daemon telemetry (scores + token counts only).
+
+    The full per-request rows stay out of the committed artifacts; the
+    summary carries the acceptance-relevant distribution evidence.
+    """
     if not telemetry_path.exists():
-        return {"source": "daemon telemetry", "requests": 0, "scores": []}
+        return {"source": "daemon telemetry", "requests": 0, "samples": 0}
     rows = []
     for line in telemetry_path.read_text(encoding="utf-8").splitlines():
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    per_candidate = []
+    scores = []
+    count_histogram = {}
     for row in rows:
-        scores = row.get("scores", [])
         counts = row.get("counts")
-        for i, score in enumerate(scores):
-            per_candidate.append({
-                "score": score,
-                "token_count": counts[i] if counts else None,
-            })
+        for i, score in enumerate(row.get("scores", [])):
+            scores.append(score)
+            count = counts[i] if counts else None
+            if count is not None:
+                count_histogram[count] = count_histogram.get(count, 0) + 1
+    if not scores:
+        return {"source": "daemon telemetry", "requests": len(rows), "samples": 0}
     return {
         "source": "daemon telemetry",
         "requests": len(rows),
-        "per_candidate_scores": per_candidate,
+        "samples": len(scores),
+        "token_count_histogram": {
+            str(key): count_histogram[key]
+            for key in sorted(count_histogram)
+        },
+        "score_min": min(scores),
+        "score_max": max(scores),
+        "score_mean": sum(scores) / len(scores),
     }
 
 
-def pick_best_alpha(results):
-    word_runs = [
-        (key, entry["metrics"]["word"]["top1_rate"],
-         entry["metrics"]["word"]["mrr"], entry["alpha"])
-        for key, entry in results["runs"].items()
-        if key.startswith("mean_alpha_")
-    ]
-    if not word_runs:
-        return None
-    best_key, best_rate, best_mrr, best_alpha = max(
-        word_runs, key=lambda pair: (pair[1], pair[2], -pair[3]))
-    return best_key
-
-
 def write_summary(path, manifest, results):
+    model_identity = manifest["model_identity"]
     lines = [
         "# Mean-Token Scoring Calibration Summary",
         "",
@@ -636,8 +835,10 @@ def write_summary(path, manifest, results):
             CORPUS_SHA256),
         f"- Fixture librime: `{FIXTURE_LIBRIME_COMMIT}` (1.17.0)",
         f"- Word manifest SHA-256: `{manifest['word_manifest_sha256']}`",
-        f"- Model/tokenizer: {manifest['model_tokenizer']['model']} "
-        "(files SHA-256 `{}`)".format(manifest["model_tokenizer"]["files_sha256"]),
+        f"- Model weights: {len(model_identity['weights']['files'])} file(s), "
+        "SHA-256 `{}`".format(model_identity["weights"]["sha256"]),
+        f"- Tokenizer files: {len(model_identity['tokenizer']['files'])} file(s), "
+        "SHA-256 `{}`".format(model_identity["tokenizer"]["sha256"]),
         f"- Random seed: {manifest['random_seed']} (pipeline is deterministic)",
         f"- Fixed coefficients: beta_sys=beta_usr=1, gamma=0, saturate_k=3, "
         "window=32; grammar data: not installed (PR #24 fixture environment)",
@@ -671,16 +872,22 @@ def write_summary(path, manifest, results):
             f"{m['top1_rate']:.4f} |"
         )
     lines.append("")
-    lines.append(f"## Final alpha")
+    lines.append("## Final decision")
     lines.append("")
-    final = manifest["final_alpha"]
-    if final:
-        entry = results["runs"][final]
+    final_key = manifest["final_alpha"]
+    if final_key:
+        entry = results["runs"][final_key]
         lines.append(
-            f"- **final mean-token alpha = {entry['alpha']}** (run `{final}`); "
+            f"- **final alpha = {entry['alpha']}** (run `{final_key}`); "
             f"word top-1 {entry['metrics']['word']['top1_rate']:.4f}, "
             f"MRR {entry['metrics']['word']['mrr']:.4f}"
         )
+        lines.append(
+            f"- internal_optimum = {manifest['internal_optimum']}; "
+            f"positive_alpha_qualified = "
+            f"{manifest['positive_alpha_qualified']}"
+        )
+        lines.append(f"- Rationale: {manifest['final_alpha_rationale']}")
         baseline = results["runs"]["baseline"]
         legacy = results["runs"]["legacy_sum_alpha_2.0"]
         lines.append(
@@ -699,8 +906,13 @@ def write_summary(path, manifest, results):
         )
         lines.append(
             f"- Harmful regressions at final alpha: "
-            f"{results['harmful_regressions'].get(final, {'count': 0})['count']} cases "
+            f"{results['harmful_regressions'].get(final_key, {'count': 0})['count']} cases "
             "whose expected word dropped from rank 1"
+        )
+        lines.append(
+            f"- Baseline candidate manifest SHA-256: "
+            f"`{manifest['baseline_candidate_manifest_sha256']}` (per-case "
+            "ordered and multiset checksums in results.json)"
         )
         lines.append(
             f"- Historical 78-case numbers are background only and are NOT a "

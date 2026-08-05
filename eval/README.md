@@ -43,6 +43,12 @@ filter enabled and sweeps `alpha` over the pre-declared grid
 mean-token sweep on the full 402-case word denominator, with the 120
 sentence cases as a separate guard.
 
+The script generates **every** committed artifact itself — run metrics,
+per-case baseline candidate checksums (ordered + multiset), the decision
+fields (`final_alpha`, `final_alpha_value`, `internal_optimum`,
+`positive_alpha_qualified`, `final_alpha_rationale`), the manifest with its
+canonical checksum, and the summary. Nothing is hand-edited afterwards.
+
 ```sh
 # build the plugin first (Squirrel repo root):
 #   export BOOST_ROOT=/opt/homebrew/opt/boost MACOSX_DEPLOYMENT_TARGET=13.0
@@ -60,10 +66,37 @@ Requirements:
 - a quiet machine (latency-sensitive); total runtime is roughly 2 hours;
 - isolated disposable `rime_dir`s; `~/Library/Rime` is never touched.
 
-Outputs (committed): `manifest.json` (identities, pre-declared grid, final
-alpha), `results.json` (stable machine-readable metrics, per-case ranks,
-distributions), `SUMMARY.md` (short summary), `telemetry.jsonl` (daemon
-score/token-count telemetry; regenerated, not committed).
+Outputs (all committed): `manifest.json` (identities, pre-declared grid,
+decision fields, canonical checksum), `results.json` (metrics, per-case
+ranks, baseline candidate checksums, distribution summary), `SUMMARY.md`.
+`telemetry.jsonl` (daemon score/token-count telemetry) is regenerated and
+gitignored.
+
+### Artifact verifier (read-only)
+
+```sh
+eval/.venv/bin/python eval/verify_artifacts.py \
+    --dict <librime>/build/bin/luna_pinyin.dict.yaml
+```
+
+Checks the committed fixture, the manifest checksum (canonical rule:
+`sha256(canonical_json(manifest minus manifest_sha256))`), results<->manifest
+consistency including the recomputed decision fields, the baseline candidate
+manifest, and byte-for-byte summary regeneration. Must pass on the committed
+artifacts.
+
+## Model-free vs integration tests (daemon)
+
+- **Model-free gate** (clean Python, no transformers/MLX/model):
+  `python3 -m unittest discover -s daemon -p 'test_*.py'` — protocol, fake
+  tokenizer, fake logits, pure functions. Must pass without any model
+  dependency.
+- **Integration** (explicit opt-in, daemon venv; missing model or
+  transformers fails with an explicit configuration error):
+  `daemon/.venv/bin/python daemon/integration_tokenizer.py`,
+  `daemon/integration_prefix_invariant.py`,
+  `daemon/integration_cache_limit.py`, and an isolated daemon plus
+  `daemon/integration_memory.py --socket <sock> --pid <pid>`.
 
 ## Policy reference
 

@@ -1010,7 +1010,7 @@ TEST(ContextScorerTest, ReturnsUnscaledRetrievalEvidence) {
   counter.SetPair("w", "乙", 2);
   auto ctx = New<ContextScorer>(&counter, 3.0);
   ScoreComponents score;
-  ASSERT_TRUE(ScoreSingle(ctx.get(), {"plan", "", "w", {}},
+  ASSERT_TRUE(ScoreSingle(ctx.get(), {"plan", "mean-token-lm-v1", "", "w", {}},
                           MakePhrase("table", 0, 2, "乙", 0.0), &score));
   EXPECT_DOUBLE_EQ(0.0, score.base_score);
   EXPECT_DOUBLE_EQ(0.4, score.retrieval_evidence);  // (2/2) * (2/5)
@@ -1022,7 +1022,7 @@ TEST(ContextScorerTest, EmptyPrevWordScoresZero) {
   counter.SetPair("w", "乙", 2);
   auto ctx = New<ContextScorer>(&counter, 3.0);
   ScoreComponents score;
-  EXPECT_TRUE(ScoreSingle(ctx.get(), {"plan", "", "", {}},
+  EXPECT_TRUE(ScoreSingle(ctx.get(), {"plan", "mean-token-lm-v1", "", "", {}},
                           MakePhrase("table", 0, 2, "乙", 0.0), &score));
   EXPECT_DOUBLE_EQ(0.0, score.retrieval_evidence);
 }
@@ -1036,12 +1036,14 @@ TEST(ContextScorerTest, InterleavedRequestsDoNotReplacePreviousWord) {
   auto scorer = New<ContextScorer>(&counter, 3.0);
   ScoreComponents nested_score;
   counter.interleave_ = [&] {
-    ASSERT_TRUE(ScoreSingle(scorer.get(), {"plan-b", "", "context-b", {}},
+    ASSERT_TRUE(ScoreSingle(scorer.get(),
+                            {"plan-b", "mean-token-lm-v1", "", "context-b", {}},
                             MakePhrase("table", 0, 2, "甲"), &nested_score));
   };
   ScoreComponents score;
 
-  ASSERT_TRUE(ScoreSingle(scorer.get(), {"plan-a", "", "context-a", {}},
+  ASSERT_TRUE(ScoreSingle(scorer.get(),
+                          {"plan-a", "mean-token-lm-v1", "", "context-a", {}},
                           MakePhrase("table", 0, 2, "乙"), &score));
   EXPECT_DOUBLE_EQ(0.25, nested_score.retrieval_evidence);
   EXPECT_DOUBLE_EQ(0.25, score.retrieval_evidence);
@@ -1615,9 +1617,10 @@ TEST(CompositeScorerTest, RejectsWeightlessCandidate) {
   auto ctx = New<ContextScorer>(&counter, 3.0);
   auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
   ScoreComponents score;
-  EXPECT_FALSE(ScoreSingle(comp.get(), {"plan", "", "w", {}},
+  EXPECT_FALSE(ScoreSingle(comp.get(),
+                           {"plan", "mean-token-lm-v1", "", "w", {}},
                            New<SimpleCandidate>("punct", 0, 2, "，"), &score));
-  EXPECT_TRUE(ScoreSingle(comp.get(), {"plan", "", "w", {}},
+  EXPECT_TRUE(ScoreSingle(comp.get(), {"plan", "mean-token-lm-v1", "", "w", {}},
                           MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
 
@@ -1628,7 +1631,7 @@ TEST(CompositeScorerTest, SumsWeightAndContext) {
   auto ctx = New<ContextScorer>(&counter, 3.0);
   auto comp = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), ctx);
   ScoreComponents score;
-  ASSERT_TRUE(ScoreSingle(comp.get(), {"plan", "", "w", {}},
+  ASSERT_TRUE(ScoreSingle(comp.get(), {"plan", "mean-token-lm-v1", "", "w", {}},
                           MakePhrase("table", 0, 2, "甲", 2.0), &score));
   EXPECT_DOUBLE_EQ(2.0, score.base_score);
   EXPECT_NEAR(4.0 / 7.0, score.retrieval_evidence, 1e-9);
@@ -1789,7 +1792,8 @@ TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
 TEST(LlmScorerTest, DaemonUnavailableReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   ScoreComponents score;
-  EXPECT_FALSE(ScoreSingle(&scorer, {"plan", "发起", "", {}},
+  EXPECT_FALSE(ScoreSingle(&scorer,
+                           {"plan", "mean-token-lm-v1", "发起", "", {}},
                            MakePhrase("table", 0, 2, "攻击", 1.0), &score));
 }
 
@@ -1813,7 +1817,8 @@ TEST(LlmScorerTest, DaemonUnavailablePassthroughOrder) {
 TEST(LlmScorerTest, MalformedResponseReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   ScoreComponents score;
-  EXPECT_FALSE(ScoreSingle(&scorer, {"plan", "test", "", {}},
+  EXPECT_FALSE(ScoreSingle(&scorer,
+                           {"plan", "mean-token-lm-v1", "test", "", {}},
                            MakePhrase("table", 0, 2, "甲", 1.0), &score));
 }
 
@@ -1821,7 +1826,8 @@ TEST(LlmScorerTest, EmptyBatchReturnsNoScores) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   vector<ScoreComponents> scores{{1.0, 1.0}};
 
-  EXPECT_TRUE(scorer.ScoreBatch({"plan", "", "", {}}, {}, &scores));
+  EXPECT_TRUE(
+      scorer.ScoreBatch({"plan", "mean-token-lm-v1", "", "", {}}, {}, &scores));
   EXPECT_TRUE(scores.empty());
 }
 

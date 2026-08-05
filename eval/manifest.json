@@ -12,9 +12,48 @@
   "fixture_librime_commit": "33e78140250125871856cdc5b42ddc6a5fcd3cd4",
   "pinyin_dependency": "pypinyin==0.55.0",
   "context_protocol": "standalone word, preceding text empty",
-  "model_tokenizer": {
-    "model": "/Users/habit/Models/Qwen/Qwen3-0.6B-Base",
-    "files_sha256": "2d1e90580a12714176ec47d2e25aa4a4318acdefc91365538f914c8e707ad183"
+  "model_identity": {
+    "display_model_path": "/Users/habit/Models/Qwen/Qwen3-0.6B-Base",
+    "weights": {
+      "files": [
+        {
+          "name": "model.safetensors",
+          "size": 1192135096,
+          "sha256": "cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba"
+        }
+      ],
+      "sha256": "9966eb3eb9532e22e2e299ff98cb76829f92e98ec26edd878e8c762bc321322a"
+    },
+    "tokenizer": {
+      "files": [
+        {
+          "name": "config.json",
+          "size": 727,
+          "sha256": "504a6b58c4271583724e66584b6b7698aea18450209df6b2f7582df0e89cee59"
+        },
+        {
+          "name": "merges.txt",
+          "size": 1671853,
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "name": "tokenizer.json",
+          "size": 7031645,
+          "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+        },
+        {
+          "name": "tokenizer_config.json",
+          "size": 9678,
+          "sha256": "3c04ed3ca964ea2f6b2b5faf0dc4d31aec1cb1e8b4bcf63f402d295046b422b5"
+        },
+        {
+          "name": "vocab.json",
+          "size": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ],
+      "sha256": "649a1dc2b8ecad6180ee60b13353aafb88db6ba178c151140ba2a7db3c258460"
+    }
   },
   "random_seed": 42,
   "fixed_coefficients": {
@@ -73,11 +112,11 @@
           "mrr": 0.5130091682893657
         }
       },
+      "schema_config_sha256": "75e31cf048b1a84e114cde3eabaa1971236d6bc85539c91c250c769fbe81b93c",
       "harmful_regressions": {
         "count": 0,
         "case_indexes": []
-      },
-      "schema_config_sha256": "75e31cf048b1a84e114cde3eabaa1971236d6bc85539c91c250c769fbe81b93c"
+      }
     },
     "legacy_sum_alpha_2.0": {
       "alpha": 2.0,
@@ -103,11 +142,11 @@
           "mrr": 0.51319228050606
         }
       },
+      "schema_config_sha256": "8cfd8da77ecb9a7960a0661c2699609818d6cdeaf9ad329b11265586abd62fe7",
       "harmful_regressions": {
         "count": 0,
         "case_indexes": []
-      },
-      "schema_config_sha256": "8cfd8da77ecb9a7960a0661c2699609818d6cdeaf9ad329b11265586abd62fe7"
+      }
     },
     "mean_alpha_0.5": {
       "alpha": 0.5,
@@ -133,6 +172,7 @@
           "mrr": 0.495130992015667
         }
       },
+      "schema_config_sha256": "b93ab0f8dcdd9c2e0b6fdddd3b611e9d2ba81cd436a56332be1f1a1898af767d",
       "harmful_regressions": {
         "count": 10,
         "case_indexes": [
@@ -147,8 +187,7 @@
           319,
           349
         ]
-      },
-      "schema_config_sha256": "b93ab0f8dcdd9c2e0b6fdddd3b611e9d2ba81cd436a56332be1f1a1898af767d"
+      }
     },
     "mean_alpha_1.0": {
       "alpha": 1.0,
@@ -174,6 +213,7 @@
           "mrr": 0.47201226492155757
         }
       },
+      "schema_config_sha256": "06cc737bd9ac8feaccede950f3d273ed371465cfbe3cd086d48db49b48388afe",
       "harmful_regressions": {
         "count": 20,
         "case_indexes": [
@@ -198,8 +238,7 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "06cc737bd9ac8feaccede950f3d273ed371465cfbe3cd086d48db49b48388afe"
+      }
     },
     "mean_alpha_2.0": {
       "alpha": 2.0,
@@ -225,6 +264,7 @@
           "mrr": 0.45156757821116
         }
       },
+      "schema_config_sha256": "8e25b376c34f8851a437102fd5f7820d44c83aea0536643f2224bf4f8c3baf8c",
       "harmful_regressions": {
         "count": 26,
         "case_indexes": [
@@ -255,8 +295,7 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "8e25b376c34f8851a437102fd5f7820d44c83aea0536643f2224bf4f8c3baf8c"
+      }
     },
     "mean_alpha_3.0": {
       "alpha": 3.0,
@@ -282,6 +321,7 @@
           "mrr": 0.4433871071685292
         }
       },
+      "schema_config_sha256": "21b82a7fbe695e52925e3f230d1c6c89cc97be03c3af194f73ed5934fbe1521d",
       "harmful_regressions": {
         "count": 29,
         "case_indexes": [
@@ -315,8 +355,7 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "21b82a7fbe695e52925e3f230d1c6c89cc97be03c3af194f73ed5934fbe1521d"
+      }
     },
     "mean_alpha_4.0": {
       "alpha": 4.0,
@@ -342,6 +381,7 @@
           "mrr": 0.44058109716870886
         }
       },
+      "schema_config_sha256": "1e61a3d280b35d132d6d2bcd4923c27d1b7805956749ab68ad848a27acb1843b",
       "harmful_regressions": {
         "count": 30,
         "case_indexes": [
@@ -376,8 +416,7 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "1e61a3d280b35d132d6d2bcd4923c27d1b7805956749ab68ad848a27acb1843b"
+      }
     },
     "mean_alpha_5.0": {
       "alpha": 5.0,
@@ -403,6 +442,7 @@
           "mrr": 0.4374450817192607
         }
       },
+      "schema_config_sha256": "d5992c091848bef6a1956b04e99089cd6a6f65536a508ca92abd7a0b82859370",
       "harmful_regressions": {
         "count": 31,
         "case_indexes": [
@@ -438,8 +478,7 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "d5992c091848bef6a1956b04e99089cd6a6f65536a508ca92abd7a0b82859370"
+      }
     },
     "mean_alpha_7.0": {
       "alpha": 7.0,
@@ -465,6 +504,7 @@
           "mrr": 0.43532782160156136
         }
       },
+      "schema_config_sha256": "e0c27c82668e785892acd7ff9b312e8c3579af023fa150c0bb9b60ae69b3784a",
       "harmful_regressions": {
         "count": 32,
         "case_indexes": [
@@ -501,8 +541,7 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "e0c27c82668e785892acd7ff9b312e8c3579af023fa150c0bb9b60ae69b3784a"
+      }
     },
     "mean_alpha_10.0": {
       "alpha": 10.0,
@@ -528,6 +567,7 @@
           "mrr": 0.43407086614684465
         }
       },
+      "schema_config_sha256": "ac9b3ade93b4bdd67775f73a339be2bb8d6fddf0112039d255e2c9d0ac0b52c0",
       "harmful_regressions": {
         "count": 32,
         "case_indexes": [
@@ -564,13 +604,14 @@
           353,
           355
         ]
-      },
-      "schema_config_sha256": "ac9b3ade93b4bdd67775f73a339be2bb8d6fddf0112039d255e2c9d0ac0b52c0"
+      }
     }
   },
-  "final_alpha": "mean_alpha_0.5",
-  "manifest_sha256": "585389135ad1c3a0a5803cf4e3985099a040aa9ecb494e9078c2345077eca317",
-  "final_alpha_value": 0.5,
+  "final_alpha": "baseline",
+  "final_alpha_value": 0.0,
   "internal_optimum": false,
-  "final_alpha_rationale": "No internal optimum exists within the pre-declared grid: word top-1 degrades monotonically as alpha grows (0.2960 at 0.5 -> 0.2338 at 10.0, baseline without the LM term is 0.3134), and the best grid point sits on the lower boundary. The pre-declared extension rule covers the upper boundary only, so per protocol no internal optimum is declared. The least-harmful in-grid value (0.5) is selected as the default alpha, with the caveat that the canonical fixture uses the standalone-word protocol (preceding text empty), so it cannot measure the LM term's contextual disambiguation benefit; a future contextual fixture must re-calibrate."
+  "positive_alpha_qualified": false,
+  "final_alpha_rationale": "The canonical 120/402 fixture supports no positive alpha: alpha=0 (word top-1 0.3134, MRR 0.5130, 126/402) beats every positive grid point [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0] on top-1 and MRR; no positive value qualified: the best positive grid point is alpha=0.5 with word top-1 0.2960, below alpha=0. The best grid point sits on the grid's lower boundary and the pre-declared extension rule covers the upper boundary only, so no internal optimum exists. The data-supported boundary result is therefore alpha=0 (owner decision, Habit130/squirrel#46): the LM term stays disabled by default and the mean-token policy remains available via explicit schema configuration. A future contextual fixture may re-calibrate.",
+  "baseline_candidate_manifest_sha256": "6c5752a1ad2a565edba167d7c8f0af0d0645b11f08d185a5460bfd8a73d35227",
+  "manifest_sha256": "8fd3240c0fc89d82d34d04c33f8472ddf3c4bc27c79edda95f43f5a5c6ad3b8f"
 }

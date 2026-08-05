@@ -142,7 +142,8 @@ only code, message, and identity fields).
 - Old: `baseline_policy_id = "first-stage-base-v1"` with sum-of-suffix-token
   scores.
 - New: `baseline_policy_id = "mean-token-lm-v1"` with mean-target-token
-  scores and default `alpha = 0.5` (the calibrated value, see below).
+  scores and default `alpha = 0` (owner decision, see the calibration
+  result below: no positive alpha qualified on the canonical fixture).
 - The plan identity (`rerank-plan-v2:sha1:...`) hashes the whole scoring
   policy — `baseline_policy_id`, `alpha`, and all coefficients — so any
   change of normalization or of `alpha` changes the plan identity, and a
@@ -152,16 +153,23 @@ only code, message, and identity fields).
   (`llm_rerank/baseline_policy_id`) with the new value as the compiled
   default. This lets deployments pin the strategy explicitly and lets the
   calibration harness emit plans with the correct identity for each policy.
-- The daemon transport protocol stays at version 1: the wire shape is
-  unchanged (positional scores bound to request and plan identity), and the
-  scoring-policy identity is the semantic discriminator, so no compatibility
-  layer for unpersisted old responses is needed.
+- **Policy binding (round-2 acceptance)**: the daemon transport protocol is
+  **version 2** and every request carries an explicit
+  `baseline_policy_id`. Each daemon scoring mode accepts exactly one
+  declared policy id (`mean_token` accepts `mean-token-lm-v1`; the
+  calibration-only `legacy_sum` mode accepts `first-stage-base-v1`) and
+  fails the request closed with a structured, content-free `policy_mismatch`
+  error on any other id. A mean-token plan can therefore never be silently
+  served by a legacy daemon or vice versa; the C++ client passes the whole
+  window through in original order. There is no v1 compatibility layer (no
+  consumer exists for it).
 - The daemon gains a `--scoring` switch: `mean_token` (production default,
   this ticket) and `legacy_sum` (calibration-only faithful reproduction of
   the pre-change algorithm — sum over all suffix tokens, first token skipped
   when the prefix is empty, no anchor). The legacy mode exists solely so the
   old policy's numbers can be reported on the 120/402 denominator without
-  duplicating scoring logic in the calibration tooling.
+  duplicating scoring logic in the calibration tooling, and it only serves
+  legacy plans (`first-stage-base-v1`), never production mean-token plans.
 
 ## Calibration protocol
 
@@ -219,24 +227,57 @@ Run on the canonical 120/402 fixture (see `eval/manifest.json` and
   at 0.5 down to 0.2338 at 10.0); no internal optimum exists in the
   pre-declared grid, and the best grid point sits on the lower boundary, so
   per the pre-declared protocol no unique optimum is declared.
-- **Final mean-token alpha = 0.5**, the least-harmful in-grid value
-  (boundary choice, documented in the manifest). The fixture uses the
-  standalone-word protocol (preceding text empty), so it cannot measure the
-  LM term's contextual-disambiguation benefit; a future contextual fixture
-  must re-calibrate. The sentence-level guard is flat at 0.5833 across every
-  run: the filter does not reorder sentence candidates.
+- **Final alpha = 0, `internal_optimum=false`,
+  `positive_alpha_qualified=false`** (owner decision): no positive alpha
+  qualifies on the canonical fixture — `alpha=0` beats every positive grid
+  point on top-1 and MRR. The mean-token implementation and its versioned
+  policy identity remain available as a schema-configurable capability, but
+  the compiled default keeps the LM term disabled until a contextual
+  fixture produces evidence for a positive coefficient. The full positive
+  grid is preserved as evidence that no positive value qualified.
+- The sentence-level guard is flat at 0.5833 across every run: the filter
+  does not reorder sentence candidates.
 - Score/token-count distribution (mean-token runs): token counts 1-5
   (histogram 21824/41808/9664/520/8), scores in [-25.0, -5.25] with mean
   -12.05, from 5632 daemon requests / 73824 scored candidates.
 
+## Artifacts and re-verification
+
+`calibrate.py` generates every committed artifact itself — run metrics,
+per-case candidate checksums (ordered + multiset), the decision fields
+(`final_alpha`, `final_alpha_value`, `internal_optimum`,
+`positive_alpha_qualified`, `final_alpha_rationale`), the manifest with its
+canonical checksum, and the summary — with no hand-editing afterwards:
+
+- `manifest_sha256 = sha256(canonical_json(manifest minus manifest_sha256))`
+  where `canonical_json` is `json.dumps(obj, ensure_ascii=False,
+  sort_keys=True, separators=(",", ":"))` — the same rule
+  `eval/verify_artifacts.py` recomputes with.
+- `model_identity` covers the actual model weight files (name, size,
+  SHA-256 of every shard) and the tokenizer files separately; the absolute
+  path is display-only.
+- `baseline_candidate_checksums` in results.json carries per-case ordered
+  (merge order) and multiset (duplicate-preserving) SHA-256 checksums; the
+  manifest carries their canonical aggregate. Every later alpha run must
+  reproduce the baseline multiset checksums.
+- `eval/verify_artifacts.py` (read-only) checks the fixture, the manifest
+  checksum, results<->manifest consistency, the decision fields, the
+  baseline candidate manifest, and that SUMMARY.md regenerates
+  byte-for-byte.
+
 ## Verification
 
 - C++: `cmake --build . --target llm_rerank_test` and the test binary; the
-  mean-token change adds attribution/identity tests.
-- Daemon: `python -m unittest discover -s daemon -p 'test_*.py'` plus the
-  tokenizer/window/cache/memory scripts.
-- Real-tokenizer seam tests (deterministic, no model): attribution rules
-  against `Qwen3-0.6B-Base`'s tokenizer.
-- Pure/fake-logit tests (no model, CI-runnable): the mean reducer, batch
-  atomicity, padding exclusion, anchor rule.
+  mean-token change adds attribution/identity/policy-binding tests.
+- Model-free daemon gate (clean Python, no transformers/MLX/model):
+  `python3 -m unittest discover -s daemon -p 'test_*.py'` — protocol, fake
+  tokenizer, fake logits, pure functions.
+- Integration (explicit opt-in, daemon venv required):
+  `daemon/.venv/bin/python daemon/integration_tokenizer.py`,
+  `daemon/integration_prefix_invariant.py`,
+  `daemon/integration_cache_limit.py`, and an isolated daemon plus
+  `daemon/integration_memory.py`. Missing transformers/model fails these
+  with an explicit configuration error, never a fake pass.
+- `eval/.venv/bin/python eval/verify_fixture.py --dict ...` and
+  `eval/verify_artifacts.py --dict ...` for the committed artifacts.
 - `make librime` from the Squirrel repo root and confirm both dylib copies.

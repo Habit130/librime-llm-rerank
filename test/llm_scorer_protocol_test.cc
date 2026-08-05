@@ -280,7 +280,7 @@ string Response(const string& request,
       request_identity.value_or(ExtractStringField(request, "request_id"));
   const string plan_id =
       plan_identity.value_or(ExtractStringField(request, "plan_identity"));
-  return "{\"version\":1,\"request_id\":\"" + request_id +
+  return "{\"version\":2,\"request_id\":\"" + request_id +
          "\",\"plan_identity\":\"" + plan_id + "\",\"scores\":" + scores +
          "}\n";
 }
@@ -296,7 +296,7 @@ string ErrorObject(const string& fields = "") {
 
 string BoundErrorResponse(const string& request,
                           const string& error = ErrorObject()) {
-  return "{\"version\":1,\"request_id\":\"" +
+  return "{\"version\":2,\"request_id\":\"" +
          ExtractStringField(request, "request_id") + "\",\"plan_identity\":\"" +
          ExtractStringField(request, "plan_identity") +
          "\",\"error\":" + error + "}\n";
@@ -306,28 +306,28 @@ string DuplicateTopLevelResponse(const string& request, const string& field) {
   const string request_id = ExtractStringField(request, "request_id");
   const string plan_identity = ExtractStringField(request, "plan_identity");
   if (field == "version") {
-    return "{\"version\":1,\"version\":1,\"request_id\":\"" + request_id +
+    return "{\"version\":2,\"version\":2,\"request_id\":\"" + request_id +
            "\",\"plan_identity\":\"" + plan_identity +
            "\",\"scores\":[0,10,0,10]}\n";
   }
   if (field == "request_id") {
-    return "{\"version\":1,\"request_id\":\"" + request_id +
+    return "{\"version\":2,\"request_id\":\"" + request_id +
            "\",\"request_id\":\"" + request_id + "\",\"plan_identity\":\"" +
            plan_identity + "\",\"scores\":[0,10,0,10]}\n";
   }
   if (field == "plan_identity") {
-    return "{\"version\":1,\"request_id\":\"" + request_id +
+    return "{\"version\":2,\"request_id\":\"" + request_id +
            "\",\"plan_identity\":\"" + plan_identity +
            "\",\"plan_identity\":\"" + plan_identity +
            "\",\"scores\":[0,10,0,10]}\n";
   }
   if (field == "scores") {
-    return "{\"version\":1,\"request_id\":\"" + request_id +
+    return "{\"version\":2,\"request_id\":\"" + request_id +
            "\",\"plan_identity\":\"" + plan_identity +
            "\",\"scores\":[0,10,0,10],\"scores\":[0,10,0,10]}\n";
   }
   const string error = ErrorObject();
-  return "{\"version\":1,\"request_id\":\"" + request_id +
+  return "{\"version\":2,\"request_id\":\"" + request_id +
          "\",\"plan_identity\":\"" + plan_identity + "\",\"error\":" + error +
          ",\"error\":" + error + "}\n";
 }
@@ -341,9 +341,11 @@ void ExpectFailure(ResponseBuilder response_builder) {
 
 TEST(LlmScorerProtocolTest, VersionedBoundResponseReranksCompleteGroups) {
   FakeDaemon daemon([](const string& request) -> std::optional<string> {
-    if (request.find("\"version\":1") == string::npos ||
+    if (request.find("\"version\":2") == string::npos ||
         ExtractStringField(request, "request_id").empty() ||
-        ExtractStringField(request, "plan_identity").empty()) {
+        ExtractStringField(request, "plan_identity").empty() ||
+        ExtractStringField(request, "baseline_policy_id") !=
+            "mean-token-lm-v1") {
       return "{\"error\":\"missing protocol identity\"}\n";
     }
     return Response(request, "[0,10,0,10]");
@@ -351,6 +353,17 @@ TEST(LlmScorerProtocolTest, VersionedBoundResponseReranksCompleteGroups) {
 
   EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
             FilterWithDaemon(daemon.path()));
+}
+
+TEST(LlmScorerProtocolTest, PolicyMismatchErrorPassesThroughWholeWindow) {
+  // Round-2 acceptance: a daemon that rejects the plan's declared
+  // baseline_policy_id must fail the whole window closed, never reorder.
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    return BoundErrorResponse(
+        request, ErrorObject("\"code\":\"policy_mismatch\","
+                             "\"message\":\"plan policy does not match the "
+                             "daemon scoring mode\","));
+  });
 }
 
 TEST(LlmScorerProtocolTest, ClientHalfCloseMatchesEofDelimitedServerContract) {
@@ -380,7 +393,8 @@ TEST(LlmScorerProtocolTest, CppClientMatchesPythonProductionEofFraming) {
       "open(sys.argv[3], 'w').close()\n"
       "connection, _ = server.accept()\n"
       "request = json.loads(read_request(connection))\n"
-      "response = {'version': 1, 'request_id': request['request_id'], "
+      "assert request['baseline_policy_id'] == 'mean-token-lm-v1'\n"
+      "response = {'version': 2, 'request_id': request['request_id'], "
       "'plan_identity': request['plan_identity'], 'scores': [0, 10, 0, 10]}\n"
       "connection.sendall((json.dumps(response) + '\\n').encode())\n"
       "connection.close()\n"
@@ -475,9 +489,12 @@ TEST(LlmScorerProtocolTest, DuplicateCandidateScoresRemainPositional) {
   };
   vector<ScoreComponents> scores;
 
-  ASSERT_TRUE(scorer.ScoreBatch(
-      {"rerank-plan-v2:duplicate", "context", "", {"同", "同"}}, candidates,
-      &scores));
+  ASSERT_TRUE(scorer.ScoreBatch({"rerank-plan-v2:duplicate",
+                                 "mean-token-lm-v1",
+                                 "context",
+                                 "",
+                                 {"同", "同"}},
+                                candidates, &scores));
   ASSERT_EQ(2u, scores.size());
   EXPECT_DOUBLE_EQ(1.0, scores[0].base_score);
   EXPECT_DOUBLE_EQ(2.0, scores[1].base_score);
@@ -503,14 +520,16 @@ TEST(LlmScorerProtocolTest, ConcurrentBatchesKeepTheirOwnResponses) {
   std::thread thread_a([&] {
     while (!start.load())
       std::this_thread::yield();
-    scored_a = scorer.ScoreBatch({"rerank-plan-v2:a", "context-a", "", {"同"}},
-                                 candidates, &scores_a);
+    scored_a = scorer.ScoreBatch(
+        {"rerank-plan-v2:a", "mean-token-lm-v1", "context-a", "", {"同"}},
+        candidates, &scores_a);
   });
   std::thread thread_b([&] {
     while (!start.load())
       std::this_thread::yield();
-    scored_b = scorer.ScoreBatch({"rerank-plan-v2:b", "context-b", "", {"同"}},
-                                 candidates, &scores_b);
+    scored_b = scorer.ScoreBatch(
+        {"rerank-plan-v2:b", "mean-token-lm-v1", "context-b", "", {"同"}},
+        candidates, &scores_b);
   });
   start = true;
   thread_a.join();
@@ -623,7 +642,7 @@ TEST(LlmScorerProtocolTest, InvalidJsonPassesThroughWholeWindow) {
 
 TEST(LlmScorerProtocolTest, MissingFieldPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
-    return "{\"version\":1,\"request_id\":\"" +
+    return "{\"version\":2,\"request_id\":\"" +
            ExtractStringField(request, "request_id") +
            "\",\"plan_identity\":\"" +
            ExtractStringField(request, "plan_identity") + "\"}\n";
@@ -675,7 +694,7 @@ TEST(LlmScorerProtocolTest, ExtraFieldsPassThroughWholeWindow) {
 }
 
 TEST(LlmScorerProtocolTest, TrailingPayloadPassesThroughWholeWindow) {
-  for (const string& suffix : {"garbage", " ", "{\"version\":1}\n"}) {
+  for (const string& suffix : {"garbage", " ", "{\"version\":2}\n"}) {
     SCOPED_TRACE(suffix);
     ExpectFailure([suffix](const string& request) -> std::optional<string> {
       return Response(request, "[0,10,0,10]") + suffix;
@@ -704,7 +723,7 @@ TEST(LlmScorerProtocolTest,
      SecondJsonBeforeTerminalLfPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
     string response = Response(request, "[0,10,0,10]");
-    response.insert(response.size() - 1, "{\"version\":1}");
+    response.insert(response.size() - 1, "{\"version\":2}");
     return response;
   });
 }
@@ -751,15 +770,15 @@ TEST(LlmScorerProtocolTest, WrongFieldTypesPassThroughWholeWindow) {
   const vector<string> damaged_responses{
       "{\"version\":\"1\",\"request_id\":\"%REQUEST%\","
       "\"plan_identity\":\"%PLAN%\",\"scores\":[0,10,0,10]}\n",
-      "{\"version\":1,\"request_id\":1,\"plan_identity\":\"%PLAN%\","
+      "{\"version\":2,\"request_id\":1,\"plan_identity\":\"%PLAN%\","
       "\"scores\":[0,10,0,10]}\n",
-      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "{\"version\":2,\"request_id\":\"%REQUEST%\","
       "\"plan_identity\":false,\"scores\":[0,10,0,10]}\n",
-      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "{\"version\":2,\"request_id\":\"%REQUEST%\","
       "\"plan_identity\":\"%PLAN%\",\"scores\":{}}\n",
-      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "{\"version\":2,\"request_id\":\"%REQUEST%\","
       "\"plan_identity\":\"%PLAN%\",\"scores\":[0,\"10\",0,10]}\n",
-      "{\"version\":1,\"request_id\":\"%REQUEST%\","
+      "{\"version\":2,\"request_id\":\"%REQUEST%\","
       "\"plan_identity\":\"%PLAN%\",\"error\":\"failed\"}\n",
   };
   for (const string& damaged : damaged_responses) {
@@ -798,7 +817,7 @@ TEST(LlmScorerProtocolTest, WrongNestedErrorTypesPassThroughWholeWindow) {
 TEST(LlmScorerProtocolTest, WrongVersionPassesThroughWholeWindow) {
   ExpectFailure([](const string& request) -> std::optional<string> {
     string response = Response(request, "[0,10,0,10]");
-    response.replace(response.find("\"version\":1"), 11, "\"version\":2");
+    response.replace(response.find("\"version\":2"), 11, "\"version\":3");
     return response;
   });
 }
