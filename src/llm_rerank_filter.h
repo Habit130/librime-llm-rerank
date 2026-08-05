@@ -20,11 +20,21 @@ struct ScoreComponents {
   double retrieval_evidence = 0.0;
 };
 
+struct ScoringRequest {
+  string plan_identity;
+  string preceding_text;
+  string previous_word;
+  vector<string> candidate_texts;
+};
+
 class Scorer {
  public:
   virtual ~Scorer() = default;
-  virtual bool Score(const an<Candidate>& cand, ScoreComponents* score) = 0;
-  virtual void Prepare(const vector<string>& candidate_texts) {}
+  // Scores one immutable request as a positional batch. Implementations must
+  // not retain request-specific state after this call returns.
+  virtual bool ScoreBatch(const ScoringRequest& request,
+                          const vector<an<Candidate>>& candidates,
+                          vector<ScoreComponents>* scores) = 0;
 };
 
 // Scores a candidate by its dictionary weight (log space) scaled by a
@@ -37,7 +47,10 @@ class WeightScorer : public Scorer {
   WeightScorer(double sys_coeff, double usr_coeff, bool verbose = false)
       : sys_coeff_(sys_coeff), usr_coeff_(usr_coeff), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
+  bool Score(const an<Candidate>& cand, ScoreComponents* score);
 
  private:
   double sys_coeff_;
@@ -55,9 +68,9 @@ class ContextScorer : public Scorer {
                 bool verbose = false)
       : counter_(counter), saturate_k_(saturate_k), verbose_(verbose) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-
-  void set_prev_word(const string& prev_word) { prev_word_ = prev_word; }
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
 
   // Bounded evidence strength in [0, 1). Zero on a miss (total_count <= 0); a
   // single observation reaches only 1 / (1 + saturate_k), never the bound.
@@ -68,13 +81,11 @@ class ContextScorer : public Scorer {
  private:
   ContextCounter* counter_;
   double saturate_k_;
-  string prev_word_;
   bool verbose_;
 };
 
-// Sums weight and optional LLM terms into the base score while keeping context
-// evidence separate. Candidates the weight scorer rejects are rejected; the
-// existing zero-contribution fallback remains for unavailable optional terms.
+// Sums every enabled term into a complete score while keeping context evidence
+// separate. A failure from any enabled term rejects the whole score.
 class CompositeScorer : public Scorer {
  public:
   CompositeScorer(an<Scorer> weight,
@@ -82,8 +93,9 @@ class CompositeScorer : public Scorer {
                   an<Scorer> llm = nullptr)
       : weight_(weight), context_(context), llm_(llm) {}
 
-  bool Score(const an<Candidate>& cand, ScoreComponents* score) override;
-  void Prepare(const vector<string>& candidate_texts) override;
+  bool ScoreBatch(const ScoringRequest& request,
+                  const vector<an<Candidate>>& candidates,
+                  vector<ScoreComponents>* scores) override;
 
  private:
   an<Scorer> weight_;
@@ -106,6 +118,8 @@ class LlmRerankFilter : public Filter {
   void set_gamma(double gamma) { gamma_ = gamma; }
   void set_schema_id(const string& schema_id) { schema_id_ = schema_id; }
   void set_input(const string& input) { input_ = input; }
+  void set_preceding_text(const string& text) { preceding_text_ = text; }
+  void set_last_word(const string& text) { last_word_ = text; }
 
  private:
   void OnCommit(Context* ctx);
@@ -119,6 +133,7 @@ class LlmRerankFilter : public Filter {
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
+  int deadline_ms_ = 200;
   bool verbose_ = false;
   string schema_id_;
   string input_;

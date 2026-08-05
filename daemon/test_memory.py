@@ -21,7 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from server import SOCKET_PATH
+from server import SOCKET_PATH, make_request
 
 CANDIDATES = [
     "攻击", "公鸡", "工具", "工作", "公共", "公司", "功能", "恭喜",
@@ -76,9 +76,10 @@ def main():
     ap.add_argument("--candidates", type=int, default=32)
     ap.add_argument("--tolerance-mb", type=float, default=500.0)
     ap.add_argument("--ceiling-mb", type=float, default=3072.0)
+    ap.add_argument("--pid", type=int, help="daemon PID for isolated test runs")
     args = ap.parse_args()
 
-    pid = find_daemon_pid()
+    pid = args.pid or find_daemon_pid()
     if pid is None:
         print("FAIL: no running daemon found (pgrep 'server.py --serve')")
         return 1
@@ -94,7 +95,12 @@ def main():
 
     for i in range(1, args.iterations + 1):
         context = context + GROW_CHUNK  # raw context grows unboundedly
-        resp = send(args.socket, {"context": context, "candidates": cands})
+        resp = send(
+            args.socket,
+            make_request(
+                f"memory-test-{i}", f"memory-test-plan-{i}", context, cands
+            ),
+        )
         if "scores" not in resp or len(resp["scores"]) != len(cands):
             print(f"FAIL: bad response at iter {i}: {resp}")
             return 1

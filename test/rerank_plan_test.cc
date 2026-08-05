@@ -26,9 +26,10 @@ RerankPlan BuildPlan(vector<RerankPlanCandidate> candidates,
                      RerankPlanConfig config = DefaultRerankPlanConfig(),
                      RerankScoringPolicy policy = DefaultRerankScoringPolicy(),
                      bool truncated = false,
-                     const string& input = "gongji") {
-  return BuildRerankPlan("luna_pinyin", input, preceding_text, config, policy,
-                         candidates, truncated);
+                     const string& input = "gongji",
+                     const string& previous_word = "计划") {
+  return BuildRerankPlan("luna_pinyin", input, preceding_text, previous_word,
+                         config, policy, candidates, truncated);
 }
 
 RerankScoreResult Scores(
@@ -83,9 +84,10 @@ TEST(RerankPlanTest, SameNormalizedContentsHaveStableIdentity) {
   auto first = BuildPlan(TwoGroupsWithPunctuation());
   auto second = BuildPlan(TwoGroupsWithPunctuation());
 
+  EXPECT_EQ(2, kRerankPlanVersion);
   ASSERT_TRUE(first.identity.has_value());
   EXPECT_EQ(first.identity, second.identity);
-  EXPECT_EQ("rerank-plan-v1:sha1:11c5fea1dd15e4e27d0d5f5f9d9eef758640d536",
+  EXPECT_EQ("rerank-plan-v2:sha1:990957531bc3cfc131f2665dec76b42c5c93011d",
             *first.identity);
   ASSERT_EQ(2u, first.groups->size());
   EXPECT_EQ((*first.groups)[0].identity, (*second.groups)[0].identity);
@@ -125,6 +127,17 @@ TEST(RerankPlanTest, PrecedingTextChangeChangesIdentity) {
   EXPECT_NE(first.identity, changed.identity);
 }
 
+TEST(RerankPlanTest, PreviousWordChangeChangesIdentity) {
+  auto first =
+      BuildPlan(TwoGroupsWithPunctuation(), "研究生", DefaultRerankPlanConfig(),
+                DefaultRerankScoringPolicy(), false, "gongji", "研究生");
+  auto changed =
+      BuildPlan(TwoGroupsWithPunctuation(), "研究生", DefaultRerankPlanConfig(),
+                DefaultRerankScoringPolicy(), false, "gongji", "生");
+
+  EXPECT_NE(first.identity, changed.identity);
+}
+
 TEST(RerankPlanTest, CanonicalInputControlsIdentity) {
   auto uppercase =
       BuildPlan(TwoGroupsWithPunctuation(), "上文", DefaultRerankPlanConfig(),
@@ -147,11 +160,11 @@ TEST(RerankPlanTest, CanonicalInputControlsIdentity) {
 
 TEST(RerankPlanTest, SchemaChangeChangesIdentity) {
   auto candidates = TwoGroupsWithPunctuation();
-  auto first = BuildRerankPlan("luna_pinyin", "gongji", "上文",
+  auto first = BuildRerankPlan("luna_pinyin", "gongji", "上文", "上文",
                                DefaultRerankPlanConfig(),
                                DefaultRerankScoringPolicy(), candidates, false);
   auto changed = BuildRerankPlan(
-      "other_schema", "gongji", "上文", DefaultRerankPlanConfig(),
+      "other_schema", "gongji", "上文", "上文", DefaultRerankPlanConfig(),
       DefaultRerankScoringPolicy(), candidates, false);
 
   EXPECT_NE(first.identity, changed.identity);
@@ -359,6 +372,26 @@ TEST(RerankPlanTest, MissingPlanFieldRejectsWholeReplay) {
   EXPECT_EQ((vector<size_t>{99}), emission_order);
 }
 
+TEST(RerankPlanTest, VersionOnePlanIsRejected) {
+  auto plan = BuildPlan(TwoGroupsWithPunctuation());
+  auto scores = Scores(plan, {{1, 0}, {0, 0}, {2, 0}, {3, 0}, {4, 0}});
+  plan.version = 1;
+  vector<size_t> emission_order{99};
+
+  EXPECT_FALSE(ReplayRerankPlan(plan, scores, &emission_order));
+  EXPECT_EQ((vector<size_t>{99}), emission_order);
+}
+
+TEST(RerankPlanTest, MissingPreviousWordRejectsWholeReplay) {
+  auto plan = BuildPlan(TwoGroupsWithPunctuation());
+  auto scores = Scores(plan, {{1, 0}, {0, 0}, {2, 0}, {3, 0}, {4, 0}});
+  plan.previous_word.reset();
+  vector<size_t> emission_order{99};
+
+  EXPECT_FALSE(ReplayRerankPlan(plan, scores, &emission_order));
+  EXPECT_EQ((vector<size_t>{99}), emission_order);
+}
+
 TEST(RerankPlanTest, MissingNestedPlanFieldRejectsWholeReplay) {
   auto plan = BuildPlan(TwoGroupsWithPunctuation());
   auto scores = Scores(plan, {{1, 0}, {0, 0}, {2, 0}, {3, 0}, {4, 0}});
@@ -433,7 +466,7 @@ TEST(RerankPlanTest, CandidateCountMismatchRejectsWholeReplay) {
 TEST(RerankPlanTest, IdentityMismatchRejectsWholeReplay) {
   auto plan = BuildPlan(TwoGroupsWithPunctuation());
   auto scores = Scores(plan, {{1, 0}, {0, 0}, {2, 0}, {3, 0}, {4, 0}});
-  scores.plan_identity = "rerank-plan-v1:mismatch";
+  scores.plan_identity = "rerank-plan-v2:mismatch";
   vector<size_t> emission_order{99};
 
   EXPECT_FALSE(ReplayRerankPlan(plan, scores, &emission_order));
