@@ -91,6 +91,20 @@ class OwnedLevelDbBackend : public ContextDbBackend {
     return db_->Write(leveldb::WriteOptions(), &batch);
   }
 
+  leveldb::Status IsEmpty(bool* empty) override {
+    if (!empty)
+      return leveldb::Status::InvalidArgument("null empty");
+    std::unique_ptr<leveldb::Iterator> iterator(
+        db_->NewIterator(leveldb::ReadOptions()));
+    iterator->SeekToFirst();
+    const bool has_any_key = iterator->Valid();
+    const leveldb::Status status = iterator->status();
+    if (!status.ok())
+      return status;
+    *empty = !has_any_key;
+    return leveldb::Status::OK();
+  }
+
  private:
   the<leveldb::DB> db_;
 };
@@ -109,9 +123,23 @@ class LevelDbContextStore : public ContextStore {
     ContextReadStatus name_status = ReadMetadata("/db_name", &db_name);
     ContextReadStatus type_status = ReadMetadata("/db_type", &db_type);
     ContextReadStatus user_status = ReadMetadata("/user_id", &user_id);
-    if (initialize_new && name_status == ContextReadStatus::kMissing &&
+    if (name_status == ContextReadStatus::kMissing &&
         type_status == ContextReadStatus::kMissing &&
         user_status == ContextReadStatus::kMissing) {
+      // Either a brand-new database or a first-initialization residue left by
+      // a process that died after LevelDB created its internal files but
+      // before the identity metadata batch landed. The only provably safe
+      // recovery condition is a database that contains no keys at all: any
+      // key - metadata or business data, ours or unknown - means the
+      // directory is not an empty first-init residue and must not be claimed.
+      if (!initialize_new) {
+        bool empty = false;
+        const leveldb::Status scan_status = backend_->IsEmpty(&empty);
+        if (!scan_status.ok() || !empty) {
+          healthy_ = false;
+          return false;
+        }
+      }
       const leveldb::Status write_status = backend_->WriteMetadata({
           {MetadataKey("/db_name"), identity_.db_name},
           {MetadataKey("/db_type"), identity_.db_type},

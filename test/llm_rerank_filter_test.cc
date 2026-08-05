@@ -800,27 +800,37 @@ class InjectedContextDbBackend : public ContextDbBackend {
       string data_value = "",
       leveldb::Status metadata_status = leveldb::Status::OK(),
       leveldb::Status update_status = leveldb::Status::OK(),
-      int fail_update_at = 1)
+      int fail_update_at = 1,
+      leveldb::Status empty_status = leveldb::Status::OK(),
+      bool is_empty = true,
+      leveldb::Status metadata_write_status = leveldb::Status::OK())
       : data_status_(std::move(data_status)),
         data_value_(std::move(data_value)),
         metadata_status_(std::move(metadata_status)),
         update_status_(std::move(update_status)),
-        fail_update_at_(fail_update_at) {}
+        fail_update_at_(fail_update_at),
+        empty_status_(std::move(empty_status)),
+        is_empty_(is_empty),
+        metadata_write_status_(std::move(metadata_write_status)) {}
 
   leveldb::Status Fetch(const string& key, string* value) override {
-    if (key == "\x01/db_name") {
-      if (metadata_status_.ok())
-        *value = "test.llm_rerank";
-      return metadata_status_;
-    }
-    if (key == "\x01/db_type") {
-      if (metadata_status_.ok())
-        *value = "userdb";
-      return metadata_status_;
-    }
-    if (key == "\x01/user_id") {
-      if (metadata_status_.ok())
-        *value = "test-user";
+    if (key == "\x01/db_name" || key == "\x01/db_type" ||
+        key == "\x01/user_id") {
+      for (const auto& [written_key, written_value] : written_metadata_) {
+        if (written_key == key) {
+          if (value)
+            *value = written_value;
+          return leveldb::Status::OK();
+        }
+      }
+      if (metadata_status_.ok()) {
+        if (key == "\x01/db_name")
+          *value = "test.llm_rerank";
+        else if (key == "\x01/db_type")
+          *value = "userdb";
+        else
+          *value = "test-user";
+      }
       return metadata_status_;
     }
     if (data_status_.ok())
@@ -836,9 +846,18 @@ class InjectedContextDbBackend : public ContextDbBackend {
   }
 
   leveldb::Status WriteMetadata(
-      const vector<std::pair<string, string>>&) override {
-    return leveldb::Status::OK();
+      const vector<std::pair<string, string>>& entries) override {
+    written_metadata_ = entries;
+    return metadata_write_status_;
   }
+
+  leveldb::Status IsEmpty(bool* empty) override {
+    if (empty)
+      *empty = is_empty_;
+    return empty_status_;
+  }
+
+  vector<std::pair<string, string>> written_metadata_;
 
  private:
   leveldb::Status data_status_;
@@ -847,6 +866,9 @@ class InjectedContextDbBackend : public ContextDbBackend {
   leveldb::Status update_status_;
   int fail_update_at_;
   int update_count_ = 0;
+  leveldb::Status empty_status_;
+  bool is_empty_;
+  leveldb::Status metadata_write_status_;
 };
 
 static ContextStoreIdentity TestContextIdentity() {
@@ -1156,7 +1178,10 @@ TEST(ContextMemoryTest, ConcurrentLastReleaseAndReopenNeverDoubleOpens) {
   DestroyContextDb(db_path);
 }
 
-TEST(ContextMemoryTest, ExistingDatabaseWithoutMetadataIsUnavailable) {
+TEST(ContextMemoryTest, EmptyDatabaseWithoutMetadataIsRecovered) {
+  // First initialization died after LevelDB created its internal files but
+  // before the identity metadata batch landed: the directory holds a fully
+  // empty LevelDB database.
   const path db_path = TemporaryContextDbPath();
   leveldb::Options options;
   options.create_if_missing = true;
@@ -1164,9 +1189,91 @@ TEST(ContextMemoryTest, ExistingDatabaseWithoutMetadataIsUnavailable) {
   ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
   delete raw_db;
 
+  auto memory = ContextMemory::OpenLevelDb(db_path, TestContextIdentity());
+  ASSERT_TRUE(memory);
+  int count = 99;
+  EXPECT_TRUE(memory->PairCount("上文", "候选", &count));
+  EXPECT_EQ(0, count);
+  memory.reset();
+
+  options.create_if_missing = false;
+  leveldb::DB* check_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &check_db).ok());
+  string value;
+  EXPECT_TRUE(
+      check_db->Get(leveldb::ReadOptions(), "\x01/db_name", &value).ok());
+  EXPECT_EQ(TestContextIdentity().db_name, value);
+  EXPECT_TRUE(
+      check_db->Get(leveldb::ReadOptions(), "\x01/db_type", &value).ok());
+  EXPECT_EQ(TestContextIdentity().db_type, value);
+  EXPECT_TRUE(
+      check_db->Get(leveldb::ReadOptions(), "\x01/user_id", &value).ok());
+  EXPECT_EQ(TestContextIdentity().user_id, value);
+  delete check_db;
+  DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, DatabaseWithDataButWithoutMetadataIsUnavailable) {
+  // An unknown database that already carries business data must never be
+  // claimed, even when the identity metadata is missing entirely.
+  const path db_path = TemporaryContextDbPath();
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::DB* raw_db = nullptr;
+  ASSERT_TRUE(leveldb::DB::Open(options, db_path.string(), &raw_db).ok());
+  ASSERT_TRUE(raw_db
+                  ->Put(leveldb::WriteOptions(), ContextPairKey("上文", "候选"),
+                        "c=1 d=0 t=0")
+                  .ok());
+  delete raw_db;
+
   ExpectUnavailableMemoryPassesThrough(
       ContextMemory::OpenLevelDb(db_path, TestContextIdentity()));
   DestroyContextDb(db_path);
+}
+
+TEST(ContextMemoryTest, EmptyFirstInitResidueIsRecoveredAndInitialized) {
+  auto backend = make_unique<InjectedContextDbBackend>(
+      leveldb::Status::NotFound("no data"), "",
+      leveldb::Status::NotFound("no metadata"), leveldb::Status::OK(), 1,
+      leveldb::Status::OK(), true, leveldb::Status::OK());
+  InjectedContextDbBackend* raw = backend.get();
+  auto memory = ContextMemory::OpenBackendForTesting(
+      std::move(backend), TestContextIdentity(), false);
+  ASSERT_TRUE(memory);
+
+  const ContextStoreIdentity identity = TestContextIdentity();
+  ASSERT_EQ(4u, raw->written_metadata_.size());
+  EXPECT_EQ("\x01/db_name", raw->written_metadata_[0].first);
+  EXPECT_EQ(identity.db_name, raw->written_metadata_[0].second);
+  EXPECT_EQ("\x01/db_type", raw->written_metadata_[1].first);
+  EXPECT_EQ(identity.db_type, raw->written_metadata_[1].second);
+  EXPECT_EQ("\x01/user_id", raw->written_metadata_[2].first);
+  EXPECT_EQ(identity.user_id, raw->written_metadata_[2].second);
+  EXPECT_EQ("\x01/rime_version", raw->written_metadata_[3].first);
+  int count = 99;
+  EXPECT_TRUE(memory->PairCount("上文", "候选", &count));
+  EXPECT_EQ(0, count);
+}
+
+TEST(ContextMemoryTest, MetadataWriteFailureOnEmptyResidueIsUnavailable) {
+  ExpectUnavailableMemoryPassesThrough(ContextMemory::OpenBackendForTesting(
+      make_unique<InjectedContextDbBackend>(
+          leveldb::Status::NotFound("no data"), "",
+          leveldb::Status::NotFound("no metadata"), leveldb::Status::OK(), 1,
+          leveldb::Status::OK(), true,
+          leveldb::Status::IOError("metadata write failed")),
+      TestContextIdentity(), false));
+}
+
+TEST(ContextMemoryTest, EmptyScanErrorOnResidueIsUnavailable) {
+  // A failed emptiness scan must fail closed; it is never treated as empty.
+  ExpectUnavailableMemoryPassesThrough(ContextMemory::OpenBackendForTesting(
+      make_unique<InjectedContextDbBackend>(
+          leveldb::Status::NotFound("no data"), "",
+          leveldb::Status::NotFound("no metadata"), leveldb::Status::OK(), 1,
+          leveldb::Status::IOError("scan failed"), true),
+      TestContextIdentity(), false));
 }
 
 TEST(ContextMemoryTest, NewDatabaseInitializesAndValidatesMetadata) {
@@ -1315,6 +1422,10 @@ TEST(ContextMemoryTest, MissingOrMalformedIdentityIsUnavailable) {
       {{"\x01/db_name", string("test.llm_rerank\0replacement", 27)},
        {"\x01/db_type", "userdb"},
        {"\x01/user_id", "test-user"}},
+      // Partial metadata: only the version banner exists, all three identity
+      // keys are missing. LevelDB batch atomicity means our own initializer
+      // never leaves this shape; it must not be claimed as a residue.
+      {{"\x01/rime_version", "1.2.3"}},
   };
   for (const auto& metadata : metadata_cases) {
     const path db_path = TemporaryContextDbPath();

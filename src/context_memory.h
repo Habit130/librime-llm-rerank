@@ -29,6 +29,9 @@ class ContextDbBackend {
   virtual leveldb::Status Update(const string& key, const string& value) = 0;
   virtual leveldb::Status WriteMetadata(
       const vector<std::pair<string, string>>& entries) = 0;
+  // Reports whether the database contains no keys at all. Scan failures must
+  // surface as a non-OK status (fail closed), never as "empty".
+  virtual leveldb::Status IsEmpty(bool* empty) = 0;
 };
 
 // Count operations are synchronized by the shared production store so a
