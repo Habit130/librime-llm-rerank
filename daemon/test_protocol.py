@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from server import (
     MAX_REQUEST_BYTES,
     PROTOCOL_VERSION,
+    NonFiniteTokenScoreError,
+    TokenAttributionError,
     handle_request,
     read_request,
 )
@@ -260,6 +262,38 @@ class ProtocolTest(unittest.TestCase):
         self.assertNotIn(secret, str(response))
         self.assertNotIn("private context fixture", str(response))
         self.assertNotIn("candidate-a", str(response))
+
+    def test_empty_candidate_is_rejected(self):
+        response = handle_request(
+            FakeState(), encode(request(candidates=["", "b"]))
+        )
+        self.assert_protocol_error(response, "invalid_request")
+        self.assertNotIn('""', str(response["error"]))
+
+    def test_token_attribution_failure_is_bound_and_silent(self):
+        class AttributionFailingState(FakeState):
+            def score(self, context, candidates):
+                raise TokenAttributionError("token straddles boundary")
+
+        response = handle_request(AttributionFailingState(), encode(request()))
+
+        self.assertEqual("token_attribution_failed", response["error"]["code"])
+        self.assertEqual("score", response["error"]["phase"])
+        self.assert_bound_error(response)
+        self.assertNotIn("straddles", str(response))
+        self.assertNotIn("private context fixture", str(response))
+        self.assertNotIn("candidate-a", str(response))
+
+    def test_non_finite_token_score_is_bound_and_silent(self):
+        class NonFiniteState(FakeState):
+            def score(self, context, candidates):
+                raise NonFiniteTokenScoreError()
+
+        response = handle_request(NonFiniteState(), encode(request()))
+
+        self.assertEqual("non_finite_score", response["error"]["code"])
+        self.assert_bound_error(response)
+        self.assertNotIn("private context fixture", str(response))
 
 
 if __name__ == "__main__":

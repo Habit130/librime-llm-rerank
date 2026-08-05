@@ -328,6 +328,8 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     config->GetBool(name_space_ + "/enable", &enabled_);
     config->GetInt(name_space_ + "/window", &window_);
     config->GetDouble(name_space_ + "/alpha", &alpha_);
+    config->GetString(name_space_ + "/baseline_policy_id",
+                      &baseline_policy_id_);
     config->GetDouble(name_space_ + "/sys_coeff", &sys_coeff_);
     config->GetDouble(name_space_ + "/usr_coeff", &usr_coeff_);
     config->GetDouble(name_space_ + "/gamma", &gamma_);
@@ -458,6 +460,7 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   }
   const string preceding_text = BuildContext();
   RerankScoringPolicy scoring_policy = DefaultRerankScoringPolicy();
+  scoring_policy.baseline_policy_id = baseline_policy_id_;
   scoring_policy.alpha = alpha_;
   scoring_policy.sys_coeff = sys_coeff_;
   scoring_policy.usr_coeff = usr_coeff_;

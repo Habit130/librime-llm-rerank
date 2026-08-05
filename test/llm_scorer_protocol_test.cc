@@ -636,6 +636,17 @@ TEST(LlmScorerProtocolTest, BoundDaemonErrorPassesThroughWholeWindow) {
   });
 }
 
+TEST(LlmScorerProtocolTest, TokenAttributionErrorPassesThroughWholeWindow) {
+  // #46: a daemon-side attribution failure (e.g. a BPE token straddling the
+  // tail/candidate boundary) must fail the whole window in original order.
+  ExpectFailure([](const string& request) -> std::optional<string> {
+    return BoundErrorResponse(
+        request, ErrorObject("\"code\":\"token_attribution_failed\","
+                             "\"message\":\"candidate token attribution "
+                             "failed\","));
+  });
+}
+
 TEST(LlmScorerProtocolTest, DuplicateTopLevelFieldsPassThroughWholeWindow) {
   for (const string& field :
        {"version", "request_id", "plan_identity", "scores", "error"}) {

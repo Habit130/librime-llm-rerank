@@ -1,0 +1,576 @@
+{
+  "issue": "Habit130/squirrel#46",
+  "source_commit": "b4ff9387ec65f6333e4c0ffb83cf8e78aab0f15b",
+  "source_pr": "Habit130/squirrel#24",
+  "corpus": "scripts/eval/corpus/sentences.txt",
+  "corpus_sha256": "a89a2bdfe41fbddb077aa5e7088a01616bb6d0240a5d04b3b3738dd94a145aae",
+  "case_counts": {
+    "sentences": 120,
+    "words": 402
+  },
+  "word_manifest_sha256": "9a7dac7704da766b4c1b6519c14d9c7a9d50675517339c7f0bf0c8eb61c5e2c3",
+  "fixture_librime_commit": "33e78140250125871856cdc5b42ddc6a5fcd3cd4",
+  "pinyin_dependency": "pypinyin==0.55.0",
+  "context_protocol": "standalone word, preceding text empty",
+  "model_tokenizer": {
+    "model": "/Users/habit/Models/Qwen/Qwen3-0.6B-Base",
+    "files_sha256": "2d1e90580a12714176ec47d2e25aa4a4318acdefc91365538f914c8e707ad183"
+  },
+  "random_seed": 42,
+  "fixed_coefficients": {
+    "beta_sys": 1.0,
+    "beta_usr": 1.0,
+    "gamma": 0.0,
+    "saturate_k": 3.0,
+    "window": 32
+  },
+  "deadline_ms": 5000,
+  "scoring_policies": {
+    "legacy": {
+      "baseline_policy_id": "first-stage-base-v1",
+      "normalization": "sum (pre-#46 algorithm)"
+    },
+    "mean_token": {
+      "baseline_policy_id": "mean-token-lm-v1",
+      "normalization": "mean per candidate token"
+    }
+  },
+  "alpha_grid": [
+    0,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    4.0,
+    5.0,
+    7.0,
+    10.0
+  ],
+  "alpha_grid_extension_rule": "if the best alpha sits on the grid's upper boundary, extend by [14.0, 20.0]; if still on the boundary, report that no internal optimum exists",
+  "grammar_data_identity": "not installed (matching the PR #24 fixture environment; the frozen candidate sets were produced without octagram data)",
+  "runs": {
+    "baseline": {
+      "alpha": 0.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "disabled",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 126,
+          "top1_rate": 0.31343283582089554,
+          "top5": 316,
+          "top5_rate": 0.7860696517412935,
+          "mrr": 0.5130091682893657
+        }
+      },
+      "harmful_regressions": {
+        "count": 0,
+        "case_indexes": []
+      },
+      "schema_config_sha256": "75e31cf048b1a84e114cde3eabaa1971236d6bc85539c91c250c769fbe81b93c"
+    },
+    "legacy_sum_alpha_2.0": {
+      "alpha": 2.0,
+      "policy": "first-stage-base-v1",
+      "lm_term": "legacy sum",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 126,
+          "top1_rate": 0.31343283582089554,
+          "top5": 316,
+          "top5_rate": 0.7860696517412935,
+          "mrr": 0.51319228050606
+        }
+      },
+      "harmful_regressions": {
+        "count": 0,
+        "case_indexes": []
+      },
+      "schema_config_sha256": "8cfd8da77ecb9a7960a0661c2699609818d6cdeaf9ad329b11265586abd62fe7"
+    },
+    "mean_alpha_0.5": {
+      "alpha": 0.5,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 119,
+          "top1_rate": 0.2960199004975124,
+          "top5": 309,
+          "top5_rate": 0.7686567164179104,
+          "mrr": 0.495130992015667
+        }
+      },
+      "harmful_regressions": {
+        "count": 10,
+        "case_indexes": [
+          14,
+          48,
+          94,
+          101,
+          178,
+          179,
+          205,
+          309,
+          319,
+          349
+        ]
+      },
+      "schema_config_sha256": "b93ab0f8dcdd9c2e0b6fdddd3b611e9d2ba81cd436a56332be1f1a1898af767d"
+    },
+    "mean_alpha_1.0": {
+      "alpha": 1.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 108,
+          "top1_rate": 0.26865671641791045,
+          "top5": 301,
+          "top5_rate": 0.7487562189054726,
+          "mrr": 0.47201226492155757
+        }
+      },
+      "harmful_regressions": {
+        "count": 20,
+        "case_indexes": [
+          14,
+          24,
+          46,
+          48,
+          81,
+          94,
+          101,
+          106,
+          178,
+          179,
+          192,
+          205,
+          206,
+          258,
+          260,
+          309,
+          319,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "06cc737bd9ac8feaccede950f3d273ed371465cfbe3cd086d48db49b48388afe"
+    },
+    "mean_alpha_2.0": {
+      "alpha": 2.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 100,
+          "top1_rate": 0.24875621890547264,
+          "top5": 291,
+          "top5_rate": 0.7238805970149254,
+          "mrr": 0.45156757821116
+        }
+      },
+      "harmful_regressions": {
+        "count": 26,
+        "case_indexes": [
+          14,
+          24,
+          46,
+          48,
+          56,
+          81,
+          94,
+          101,
+          106,
+          114,
+          156,
+          178,
+          179,
+          192,
+          205,
+          206,
+          258,
+          260,
+          289,
+          309,
+          319,
+          322,
+          333,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "8e25b376c34f8851a437102fd5f7820d44c83aea0536643f2224bf4f8c3baf8c"
+    },
+    "mean_alpha_3.0": {
+      "alpha": 3.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 97,
+          "top1_rate": 0.24129353233830847,
+          "top5": 289,
+          "top5_rate": 0.7189054726368159,
+          "mrr": 0.4433871071685292
+        }
+      },
+      "harmful_regressions": {
+        "count": 29,
+        "case_indexes": [
+          14,
+          24,
+          46,
+          48,
+          56,
+          81,
+          94,
+          101,
+          106,
+          114,
+          156,
+          178,
+          179,
+          192,
+          205,
+          206,
+          258,
+          260,
+          262,
+          272,
+          289,
+          309,
+          319,
+          322,
+          333,
+          337,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "21b82a7fbe695e52925e3f230d1c6c89cc97be03c3af194f73ed5934fbe1521d"
+    },
+    "mean_alpha_4.0": {
+      "alpha": 4.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 96,
+          "top1_rate": 0.23880597014925373,
+          "top5": 287,
+          "top5_rate": 0.7139303482587065,
+          "mrr": 0.44058109716870886
+        }
+      },
+      "harmful_regressions": {
+        "count": 30,
+        "case_indexes": [
+          14,
+          24,
+          46,
+          48,
+          56,
+          81,
+          94,
+          101,
+          106,
+          114,
+          156,
+          178,
+          179,
+          192,
+          205,
+          206,
+          223,
+          258,
+          260,
+          262,
+          272,
+          289,
+          309,
+          319,
+          322,
+          333,
+          337,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "1e61a3d280b35d132d6d2bcd4923c27d1b7805956749ab68ad848a27acb1843b"
+    },
+    "mean_alpha_5.0": {
+      "alpha": 5.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 95,
+          "top1_rate": 0.236318407960199,
+          "top5": 285,
+          "top5_rate": 0.7089552238805971,
+          "mrr": 0.4374450817192607
+        }
+      },
+      "harmful_regressions": {
+        "count": 31,
+        "case_indexes": [
+          14,
+          24,
+          46,
+          48,
+          56,
+          81,
+          94,
+          101,
+          106,
+          114,
+          156,
+          178,
+          179,
+          192,
+          205,
+          206,
+          223,
+          258,
+          260,
+          262,
+          272,
+          289,
+          309,
+          319,
+          322,
+          333,
+          337,
+          342,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "d5992c091848bef6a1956b04e99089cd6a6f65536a508ca92abd7a0b82859370"
+    },
+    "mean_alpha_7.0": {
+      "alpha": 7.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 94,
+          "top1_rate": 0.23383084577114427,
+          "top5": 284,
+          "top5_rate": 0.7064676616915423,
+          "mrr": 0.43532782160156136
+        }
+      },
+      "harmful_regressions": {
+        "count": 32,
+        "case_indexes": [
+          3,
+          14,
+          24,
+          46,
+          48,
+          56,
+          81,
+          94,
+          101,
+          106,
+          114,
+          156,
+          178,
+          179,
+          192,
+          205,
+          206,
+          223,
+          258,
+          260,
+          262,
+          272,
+          289,
+          309,
+          319,
+          322,
+          333,
+          337,
+          342,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "e0c27c82668e785892acd7ff9b312e8c3579af023fa150c0bb9b60ae69b3784a"
+    },
+    "mean_alpha_10.0": {
+      "alpha": 10.0,
+      "policy": "mean-token-lm-v1",
+      "lm_term": "mean token",
+      "metrics": {
+        "sentence": {
+          "samples": 120,
+          "not_found": 50,
+          "top1": 70,
+          "top1_rate": 0.5833333333333334,
+          "top5": 70,
+          "top5_rate": 0.5833333333333334,
+          "mrr": 0.5833333333333334
+        },
+        "word": {
+          "samples": 402,
+          "not_found": 0,
+          "top1": 94,
+          "top1_rate": 0.23383084577114427,
+          "top5": 283,
+          "top5_rate": 0.7039800995024875,
+          "mrr": 0.43407086614684465
+        }
+      },
+      "harmful_regressions": {
+        "count": 32,
+        "case_indexes": [
+          3,
+          14,
+          24,
+          46,
+          48,
+          56,
+          81,
+          94,
+          101,
+          106,
+          114,
+          156,
+          178,
+          179,
+          192,
+          205,
+          206,
+          223,
+          258,
+          260,
+          262,
+          272,
+          289,
+          309,
+          319,
+          322,
+          333,
+          337,
+          342,
+          349,
+          353,
+          355
+        ]
+      },
+      "schema_config_sha256": "ac9b3ade93b4bdd67775f73a339be2bb8d6fddf0112039d255e2c9d0ac0b52c0"
+    }
+  },
+  "final_alpha": "mean_alpha_0.5",
+  "manifest_sha256": "585389135ad1c3a0a5803cf4e3985099a040aa9ecb494e9078c2345077eca317",
+  "final_alpha_value": 0.5,
+  "internal_optimum": false,
+  "final_alpha_rationale": "No internal optimum exists within the pre-declared grid: word top-1 degrades monotonically as alpha grows (0.2960 at 0.5 -> 0.2338 at 10.0, baseline without the LM term is 0.3134), and the best grid point sits on the lower boundary. The pre-declared extension rule covers the upper boundary only, so per protocol no internal optimum is declared. The least-harmful in-grid value (0.5) is selected as the default alpha, with the caveat that the canonical fixture uses the standalone-word protocol (preceding text empty), so it cannot measure the LM term's contextual disambiguation benefit; a future contextual fixture must re-calibrate."
+}

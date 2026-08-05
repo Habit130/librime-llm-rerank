@@ -270,9 +270,16 @@ RerankPlanConfig DefaultRerankPlanConfig() {
 RerankScoringPolicy DefaultRerankScoringPolicy() {
   RerankScoringPolicy policy;
   policy.version = 1;
-  policy.baseline_policy_id = "first-stage-base-v1";
+  // mean-token policy (docs/token-attribution.md): the LM term is the mean
+  // log probability of the candidate's own tokens, calibrated in #46. The
+  // id pins the normalization semantics; alpha is hashed into the plan
+  // identity separately, so changing either changes the identity.
+  // alpha=0.5 is the least-harmful in-grid value from the #46 calibration;
+  // no internal optimum exists on the canonical 120/402 denominator (see
+  // eval/manifest.json), so this default is a documented boundary choice.
+  policy.baseline_policy_id = "mean-token-lm-v1";
   policy.retrieval_policy_id = "context-evidence-v1";
-  policy.alpha = 2.0;
+  policy.alpha = 0.5;
   policy.sys_coeff = 1.0;
   policy.usr_coeff = 1.0;
   policy.gamma = 2.0;

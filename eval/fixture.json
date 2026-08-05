@@ -1,0 +1,3434 @@
+{
+  "source_commit": "b4ff9387ec65f6333e4c0ffb83cf8e78aab0f15b",
+  "source_paths": [
+    "scripts/eval/corpus/sentences.txt",
+    "scripts/eval/run_eval.py (derive_word_cases)"
+  ],
+  "corpus_sha256": "a89a2bdfe41fbddb077aa5e7088a01616bb6d0240a5d04b3b3738dd94a145aae",
+  "pinyin_dependency": "pypinyin==0.55.0",
+  "fixture_librime_commit": "33e78140250125871856cdc5b42ddc6a5fcd3cd4",
+  "context_protocol": "standalone word, preceding text empty",
+  "counts": {
+    "sentences": 120,
+    "words": 402
+  },
+  "word_manifest_sha256": "9a7dac7704da766b4c1b6519c14d9c7a9d50675517339c7f0bf0c8eb61c5e2c3",
+  "sentence_cases": [
+    {
+      "index": 1,
+      "sentence": "今天天气很好",
+      "pinyin": "jintiantianqihenhao"
+    },
+    {
+      "index": 2,
+      "sentence": "我们今天到北京开会",
+      "pinyin": "womenjintiandaobeijingkaihui"
+    },
+    {
+      "index": 3,
+      "sentence": "明天早上八点出发",
+      "pinyin": "mingtianzaoshangbadianchufa"
+    },
+    {
+      "index": 4,
+      "sentence": "这家餐厅的菜很好吃",
+      "pinyin": "zhejiacantingdecaihenhaochi"
+    },
+    {
+      "index": 5,
+      "sentence": "他昨天晚上没有睡好",
+      "pinyin": "tazuotianwanshangmeiyoushuihao"
+    },
+    {
+      "index": 6,
+      "sentence": "我想去图书馆看书",
+      "pinyin": "woxiangqutushuguankanshu"
+    },
+    {
+      "index": 7,
+      "sentence": "北京的冬天特别冷",
+      "pinyin": "beijingdedongtiantebieleng"
+    },
+    {
+      "index": 8,
+      "sentence": "她在公司加班到很晚",
+      "pinyin": "tazaigongsijiabandaohenwan"
+    },
+    {
+      "index": 9,
+      "sentence": "这个问题需要认真讨论",
+      "pinyin": "zhegewentixuyaorenzhentaolun"
+    },
+    {
+      "index": 10,
+      "sentence": "我们下周去上海出差",
+      "pinyin": "womenxiazhouqushanghaichuchai"
+    },
+    {
+      "index": 11,
+      "sentence": "孩子们在公园里玩耍",
+      "pinyin": "haizimenzaigongyuanliwanshua"
+    },
+    {
+      "index": 12,
+      "sentence": "老师正在讲台上讲课",
+      "pinyin": "laoshizhengzaijiangtaishangjiangke"
+    },
+    {
+      "index": 13,
+      "sentence": "今天晚上我们一起吃饭",
+      "pinyin": "jintianwanshangwomenyiqichifan"
+    },
+    {
+      "index": 14,
+      "sentence": "这部电影非常感人",
+      "pinyin": "zhebudianyingfeichangganren"
+    },
+    {
+      "index": 15,
+      "sentence": "他的中文说得很流利",
+      "pinyin": "tadezhongwenshuodehenliuli"
+    },
+    {
+      "index": 16,
+      "sentence": "我们需要提前预订机票",
+      "pinyin": "womenxuyaotiqianyudingjipiao"
+    },
+    {
+      "index": 17,
+      "sentence": "这条街道非常繁华",
+      "pinyin": "zhetiaojiedaofeichangfanhua"
+    },
+    {
+      "index": 18,
+      "sentence": "她刚刚买了一台新电脑",
+      "pinyin": "taganggangmaileyitaixindiannao"
+    },
+    {
+      "index": 19,
+      "sentence": "我们公司最近在招聘",
+      "pinyin": "womengongsizuijinzaizhaopin"
+    },
+    {
+      "index": 20,
+      "sentence": "这个项目下个月上线",
+      "pinyin": "zhegexiangmuxiageyueshangxian"
+    },
+    {
+      "index": 21,
+      "sentence": "他每天早上跑步锻炼",
+      "pinyin": "tameitianzaoshangpaobuduanlian"
+    },
+    {
+      "index": 22,
+      "sentence": "她喜欢在周末做饭",
+      "pinyin": "taxihuanzaizhoumozuofan"
+    },
+    {
+      "index": 23,
+      "sentence": "我们的会议改到下午三点",
+      "pinyin": "womendehuiyigaidaoxiawusandian"
+    },
+    {
+      "index": 24,
+      "sentence": "这本书讲的是历史故事",
+      "pinyin": "zhebenshujiangdeshilishigushi"
+    },
+    {
+      "index": 25,
+      "sentence": "他昨天发起了一次讨论",
+      "pinyin": "tazuotianfaqileyicitaolun"
+    },
+    {
+      "index": 26,
+      "sentence": "我们决定发动一次调查",
+      "pinyin": "womenjuedingfadongyicidiaocha"
+    },
+    {
+      "index": 27,
+      "sentence": "他在战场上发起了攻击",
+      "pinyin": "tazaizhanchangshangfaqilegongji"
+    },
+    {
+      "index": 28,
+      "sentence": "军队向敌人发起了进攻",
+      "pinyin": "junduixiangdirenfaqilejingong"
+    },
+    {
+      "index": 29,
+      "sentence": "他对这个方案发起了质疑",
+      "pinyin": "taduizhegefanganfaqilezhiyi"
+    },
+    {
+      "index": 30,
+      "sentence": "这次会议讨论了新的计划",
+      "pinyin": "zhecihuiyitaolunlexindejihua"
+    },
+    {
+      "index": 31,
+      "sentence": "我们需要重新评估这个方案",
+      "pinyin": "womenxuyaochongxinpingguzhegefangan"
+    },
+    {
+      "index": 32,
+      "sentence": "他对这个结果感到满意",
+      "pinyin": "taduizhegejieguogandaomanyi"
+    },
+    {
+      "index": 33,
+      "sentence": "她的态度让大家很意外",
+      "pinyin": "tadetaidurangdajiahenyiwai"
+    },
+    {
+      "index": 34,
+      "sentence": "这次旅行让我们很难忘",
+      "pinyin": "zhecilvxingrangwomenhennanwang"
+    },
+    {
+      "index": 35,
+      "sentence": "他们在山上看到了日出",
+      "pinyin": "tamenzaishanshangkandaolerichu"
+    },
+    {
+      "index": 36,
+      "sentence": "我们沿着河边散步",
+      "pinyin": "womenyanzhehebiansanbu"
+    },
+    {
+      "index": 37,
+      "sentence": "她把房间打扫得很干净",
+      "pinyin": "tabafangjiandasaodehenganjing"
+    },
+    {
+      "index": 38,
+      "sentence": "他每天坚持写日记",
+      "pinyin": "tameitianjianchixieriji"
+    },
+    {
+      "index": 39,
+      "sentence": "我们准备周末去爬山",
+      "pinyin": "womenzhunbeizhoumoqupashan"
+    },
+    {
+      "index": 40,
+      "sentence": "这道数学题很难解",
+      "pinyin": "zhedaoshuxuetihennanjie"
+    },
+    {
+      "index": 41,
+      "sentence": "他的演讲赢得了掌声",
+      "pinyin": "tadeyanjiangyingdelezhangsheng"
+    },
+    {
+      "index": 42,
+      "sentence": "她在医院工作了十年",
+      "pinyin": "tazaiyiyuangongzuoleshinian"
+    },
+    {
+      "index": 43,
+      "sentence": "我们的公司总部在广州",
+      "pinyin": "womendegongsizongbuzaiguangzhou"
+    },
+    {
+      "index": 44,
+      "sentence": "他喜欢喝热茶",
+      "pinyin": "taxihuanherecha"
+    },
+    {
+      "index": 45,
+      "sentence": "她每天早晨都喝牛奶",
+      "pinyin": "tameitianzaochendouheniunai"
+    },
+    {
+      "index": 46,
+      "sentence": "我们的邻居非常友好",
+      "pinyin": "womendelinjufeichangyouhao"
+    },
+    {
+      "index": 47,
+      "sentence": "这个城市的交通很方便",
+      "pinyin": "zhegechengshidejiaotonghenfangbian"
+    },
+    {
+      "index": 48,
+      "sentence": "他把车停在了地下车库",
+      "pinyin": "tabachetingzailedixiacheku"
+    },
+    {
+      "index": 49,
+      "sentence": "她最近在学习弹钢琴",
+      "pinyin": "tazuijinzaixuexitangangqin"
+    },
+    {
+      "index": 50,
+      "sentence": "我们打算明年结婚",
+      "pinyin": "womendasuanmingnianjiehun"
+    },
+    {
+      "index": 51,
+      "sentence": "这份工作压力很大",
+      "pinyin": "zhefengongzuoyalihenda"
+    },
+    {
+      "index": 52,
+      "sentence": "他每周都去健身房锻炼",
+      "pinyin": "tameizhoudouqujianshenfangduanlian"
+    },
+    {
+      "index": 53,
+      "sentence": "她对未来充满信心",
+      "pinyin": "taduiweilaichongmanxinxin"
+    },
+    {
+      "index": 54,
+      "sentence": "我们需要节约用水",
+      "pinyin": "womenxuyaojieyueyongshui"
+    },
+    {
+      "index": 55,
+      "sentence": "这个地区经常下雨",
+      "pinyin": "zhegediqujingchangxiayu"
+    },
+    {
+      "index": 56,
+      "sentence": "他喜欢在雨天听音乐",
+      "pinyin": "taxihuanzaiyutiantingyinyue"
+    },
+    {
+      "index": 57,
+      "sentence": "她把钥匙忘在了家里",
+      "pinyin": "tabayaoshiwangzailejiali"
+    },
+    {
+      "index": 58,
+      "sentence": "我们决定推迟这次旅行",
+      "pinyin": "womenjuedingtuichizhecilvxing"
+    },
+    {
+      "index": 59,
+      "sentence": "他的手机昨天丢了",
+      "pinyin": "tadeshoujizuotiandiule"
+    },
+    {
+      "index": 60,
+      "sentence": "她正在准备考试",
+      "pinyin": "tazhengzaizhunbeikaoshi"
+    },
+    {
+      "index": 61,
+      "sentence": "我们的产品得到了好评",
+      "pinyin": "womendechanpindedaolehaoping"
+    },
+    {
+      "index": 62,
+      "sentence": "他每天骑自行车上班",
+      "pinyin": "tameitianqizixingcheshangban"
+    },
+    {
+      "index": 63,
+      "sentence": "她喜欢收集邮票",
+      "pinyin": "taxihuanshoujiyoupiao"
+    },
+    {
+      "index": 64,
+      "sentence": "我们打算装修新房子",
+      "pinyin": "womendasuanzhuangxiuxinfangzi"
+    },
+    {
+      "index": 65,
+      "sentence": "这个季节樱花开得很美",
+      "pinyin": "zhegejijieyinghuakaidehenmei"
+    },
+    {
+      "index": 66,
+      "sentence": "他在超市买了很多水果",
+      "pinyin": "tazaichaoshimailehenduoshuiguo"
+    },
+    {
+      "index": 67,
+      "sentence": "她给妈妈打了一个电话",
+      "pinyin": "tageimamadaleyigedianhua"
+    },
+    {
+      "index": 68,
+      "sentence": "我们的团队完成了任务",
+      "pinyin": "womendetuanduiwanchenglerenwu"
+    },
+    {
+      "index": 69,
+      "sentence": "他喜欢看科幻小说",
+      "pinyin": "taxihuankankehuanxiaoshuo"
+    },
+    {
+      "index": 70,
+      "sentence": "她在厨房里做蛋糕",
+      "pinyin": "tazaichufanglizuodangao"
+    },
+    {
+      "index": 71,
+      "sentence": "我们的火车马上就要出发",
+      "pinyin": "womendehuochemashangjiuyaochufa"
+    },
+    {
+      "index": 72,
+      "sentence": "他把窗户打开透透气",
+      "pinyin": "tabachuanghudakaitoutouqi"
+    },
+    {
+      "index": 73,
+      "sentence": "她今天穿了一件新衣服",
+      "pinyin": "tajintianchuanleyijianxinyifu"
+    },
+    {
+      "index": 74,
+      "sentence": "我们计划下个月搬家",
+      "pinyin": "womenjihuaxiageyuebanjia"
+    },
+    {
+      "index": 75,
+      "sentence": "这条河流经好几个城市",
+      "pinyin": "zhetiaoheliujinghaojigechengshi"
+    },
+    {
+      "index": 76,
+      "sentence": "他喜欢研究历史文化",
+      "pinyin": "taxihuanyanjiulishiwenhua"
+    },
+    {
+      "index": 77,
+      "sentence": "她每天都会写工作总结",
+      "pinyin": "tameitianduhuixiegongzuozongjie"
+    },
+    {
+      "index": 78,
+      "sentence": "我们需要提高产品质量",
+      "pinyin": "womenxuyaotigaochanpinzhiliang"
+    },
+    {
+      "index": 79,
+      "sentence": "他对音乐有很深的理解",
+      "pinyin": "taduiyinyueyouhenshendelijie"
+    },
+    {
+      "index": 80,
+      "sentence": "她在花园里种了很多花",
+      "pinyin": "tazaihuayuanlizhonglehenduohua"
+    },
+    {
+      "index": 81,
+      "sentence": "我们的假期只剩三天了",
+      "pinyin": "womendejiaqizhishengsantianle"
+    },
+    {
+      "index": 82,
+      "sentence": "他在会议上提出了建议",
+      "pinyin": "tazaihuiyishangtichulejianyi"
+    },
+    {
+      "index": 83,
+      "sentence": "她耐心地回答了问题",
+      "pinyin": "tanaixindihuidalewenti"
+    },
+    {
+      "index": 84,
+      "sentence": "我们决定支持这个计划",
+      "pinyin": "womenjuedingzhichizhegejihua"
+    },
+    {
+      "index": 85,
+      "sentence": "他昨天参加了一场婚礼",
+      "pinyin": "tazuotiancanjialeyichanghunli"
+    },
+    {
+      "index": 86,
+      "sentence": "她喜欢在阳台上看星星",
+      "pinyin": "taxihuanzaiyangtaishangkanxingxing"
+    },
+    {
+      "index": 87,
+      "sentence": "我们的老师非常严格",
+      "pinyin": "womendelaoshifeichangyange"
+    },
+    {
+      "index": 88,
+      "sentence": "他把作业提前完成了",
+      "pinyin": "tabazuoyetiqianwanchengle"
+    },
+    {
+      "index": 89,
+      "sentence": "她在图书馆借了几本书",
+      "pinyin": "tazaitushuguanjielejibenshu"
+    },
+    {
+      "index": 90,
+      "sentence": "我们的城市正在快速发展",
+      "pinyin": "womendechengshizhengzaikuaisufazhan"
+    },
+    {
+      "index": 91,
+      "sentence": "他每天都要处理很多邮件",
+      "pinyin": "tameitiandouyaochulihenduoyoujian"
+    },
+    {
+      "index": 92,
+      "sentence": "她喜欢和朋友聊天",
+      "pinyin": "taxihuanhepengyouliaotian"
+    },
+    {
+      "index": 93,
+      "sentence": "我们的产品销量增长很快",
+      "pinyin": "womendechanpinxiaoliangzengzhanghenkuai"
+    },
+    {
+      "index": 94,
+      "sentence": "他对这次比赛充满期待",
+      "pinyin": "taduizhecibisaichongmanqidai"
+    },
+    {
+      "index": 95,
+      "sentence": "她把行李收拾好了",
+      "pinyin": "tabaxinglishoushihaole"
+    },
+    {
+      "index": 96,
+      "sentence": "我们准备好了所有材料",
+      "pinyin": "womenzhunbeihaolesuoyoucailiao"
+    },
+    {
+      "index": 97,
+      "sentence": "他喜欢在早上喝咖啡",
+      "pinyin": "taxihuanzaizaoshanghekafei"
+    },
+    {
+      "index": 98,
+      "sentence": "她每天坚持学习英语",
+      "pinyin": "tameitianjianchixuexiyingyu"
+    },
+    {
+      "index": 99,
+      "sentence": "我们的公司决定扩大规模",
+      "pinyin": "womendegongsijuedingkuodaguimo"
+    },
+    {
+      "index": 100,
+      "sentence": "他把自行车修好了",
+      "pinyin": "tabazixingchexiuhaole"
+    },
+    {
+      "index": 101,
+      "sentence": "她在市场上买了新鲜蔬菜",
+      "pinyin": "tazaishichangshangmailexinxianshucai"
+    },
+    {
+      "index": 102,
+      "sentence": "我们的项目获得了投资",
+      "pinyin": "womendexiangmuhuodeletouzi"
+    },
+    {
+      "index": 103,
+      "sentence": "他昨天去看了一场演出",
+      "pinyin": "tazuotianqukanleyichangyanchu"
+    },
+    {
+      "index": 104,
+      "sentence": "她喜欢在周末画画",
+      "pinyin": "taxihuanzaizhoumohuahua"
+    },
+    {
+      "index": 105,
+      "sentence": "我们的老板非常重视细节",
+      "pinyin": "womendelaobanfeichangzhongshixijie"
+    },
+    {
+      "index": 106,
+      "sentence": "他把房子租给了朋友",
+      "pinyin": "tabafangzizugeilepengyou"
+    },
+    {
+      "index": 107,
+      "sentence": "她正在写一篇新的文章",
+      "pinyin": "tazhengzaixieyipianxindewenzhang"
+    },
+    {
+      "index": 108,
+      "sentence": "我们的团队正在讨论方案",
+      "pinyin": "womendetuanduizhengzaitaolunfangan"
+    },
+    {
+      "index": 109,
+      "sentence": "他昨天买了一辆新车",
+      "pinyin": "tazuotianmaileyiliangxinche"
+    },
+    {
+      "index": 110,
+      "sentence": "她把猫送去了宠物医院",
+      "pinyin": "tabamaosongqulechongwuyiyuan"
+    },
+    {
+      "index": 111,
+      "sentence": "我们决定在这里建一所学校",
+      "pinyin": "womenjuedingzaizhelijianyisuoxuexiao"
+    },
+    {
+      "index": 112,
+      "sentence": "他喜欢观察天上的云",
+      "pinyin": "taxihuanguanchatianshangdeyun"
+    },
+    {
+      "index": 113,
+      "sentence": "她每天都会整理书桌",
+      "pinyin": "tameitianduhuizhenglishuzhuo"
+    },
+    {
+      "index": 114,
+      "sentence": "我们的城市有很多博物馆",
+      "pinyin": "womendechengshiyouhenduobowuguan"
+    },
+    {
+      "index": 115,
+      "sentence": "他把旧衣服捐给了慈善机构",
+      "pinyin": "tabajiuyifujuangeilecishanjigou"
+    },
+    {
+      "index": 116,
+      "sentence": "她在公司负责市场推广",
+      "pinyin": "tazaigongsifuzeshichangtuiguang"
+    },
+    {
+      "index": 117,
+      "sentence": "我们准备举办一场展览",
+      "pinyin": "womenzhunbeijubanyichangzhanlan"
+    },
+    {
+      "index": 118,
+      "sentence": "他昨天下午去了银行",
+      "pinyin": "tazuotianxiawuquleyinhang"
+    },
+    {
+      "index": 119,
+      "sentence": "她喜欢收听广播节目",
+      "pinyin": "taxihuanshoutingguangbojiemu"
+    },
+    {
+      "index": 120,
+      "sentence": "我们的合作已经持续多年",
+      "pinyin": "womendehezuoyijingchixuduonian"
+    }
+  ],
+  "word_cases": [
+    {
+      "index": 1,
+      "word": "一",
+      "pinyin": "yi",
+      "source_sentence": 13,
+      "source_start": 6
+    },
+    {
+      "index": 2,
+      "word": "三",
+      "pinyin": "san",
+      "source_sentence": 23,
+      "source_start": 9
+    },
+    {
+      "index": 3,
+      "word": "上",
+      "pinyin": "shang",
+      "source_sentence": 3,
+      "source_start": 3
+    },
+    {
+      "index": 4,
+      "word": "下",
+      "pinyin": "xia",
+      "source_sentence": 10,
+      "source_start": 2
+    },
+    {
+      "index": 5,
+      "word": "业",
+      "pinyin": "ye",
+      "source_sentence": 88,
+      "source_start": 3
+    },
+    {
+      "index": 6,
+      "word": "丢",
+      "pinyin": "diu",
+      "source_sentence": 59,
+      "source_start": 6
+    },
+    {
+      "index": 7,
+      "word": "严",
+      "pinyin": "yan",
+      "source_sentence": 87,
+      "source_start": 7
+    },
+    {
+      "index": 8,
+      "word": "个",
+      "pinyin": "ge",
+      "source_sentence": 9,
+      "source_start": 1
+    },
+    {
+      "index": 9,
+      "word": "中",
+      "pinyin": "zhong",
+      "source_sentence": 15,
+      "source_start": 2
+    },
+    {
+      "index": 10,
+      "word": "举",
+      "pinyin": "ju",
+      "source_sentence": 117,
+      "source_start": 4
+    },
+    {
+      "index": 11,
+      "word": "乐",
+      "pinyin": "yue",
+      "source_sentence": 56,
+      "source_start": 8
+    },
+    {
+      "index": 12,
+      "word": "习",
+      "pinyin": "xi",
+      "source_sentence": 49,
+      "source_start": 5
+    },
+    {
+      "index": 13,
+      "word": "书",
+      "pinyin": "shu",
+      "source_sentence": 6,
+      "source_start": 4
+    },
+    {
+      "index": 14,
+      "word": "买",
+      "pinyin": "mai",
+      "source_sentence": 18,
+      "source_start": 3
+    },
+    {
+      "index": 15,
+      "word": "了",
+      "pinyin": "le",
+      "source_sentence": 18,
+      "source_start": 4
+    },
+    {
+      "index": 16,
+      "word": "事",
+      "pinyin": "shi",
+      "source_sentence": 24,
+      "source_start": 9
+    },
+    {
+      "index": 17,
+      "word": "云",
+      "pinyin": "yun",
+      "source_sentence": 112,
+      "source_start": 8
+    },
+    {
+      "index": 18,
+      "word": "交",
+      "pinyin": "jiao",
+      "source_sentence": 47,
+      "source_start": 5
+    },
+    {
+      "index": 19,
+      "word": "产",
+      "pinyin": "chan",
+      "source_sentence": 61,
+      "source_start": 3
+    },
+    {
+      "index": 20,
+      "word": "京",
+      "pinyin": "jing",
+      "source_sentence": 2,
+      "source_start": 6
+    },
+    {
+      "index": 21,
+      "word": "人",
+      "pinyin": "ren",
+      "source_sentence": 14,
+      "source_start": 7
+    },
+    {
+      "index": 22,
+      "word": "今",
+      "pinyin": "jin",
+      "source_sentence": 1,
+      "source_start": 0
+    },
+    {
+      "index": 23,
+      "word": "他",
+      "pinyin": "ta",
+      "source_sentence": 5,
+      "source_start": 0
+    },
+    {
+      "index": 24,
+      "word": "们",
+      "pinyin": "men",
+      "source_sentence": 2,
+      "source_start": 1
+    },
+    {
+      "index": 25,
+      "word": "件",
+      "pinyin": "jian",
+      "source_sentence": 73,
+      "source_start": 6
+    },
+    {
+      "index": 26,
+      "word": "任",
+      "pinyin": "ren",
+      "source_sentence": 68,
+      "source_start": 8
+    },
+    {
+      "index": 27,
+      "word": "份",
+      "pinyin": "fen",
+      "source_sentence": 51,
+      "source_start": 1
+    },
+    {
+      "index": 28,
+      "word": "会",
+      "pinyin": "hui",
+      "source_sentence": 2,
+      "source_start": 8
+    },
+    {
+      "index": 29,
+      "word": "估",
+      "pinyin": "gu",
+      "source_sentence": 31,
+      "source_start": 7
+    },
+    {
+      "index": 30,
+      "word": "作",
+      "pinyin": "zuo",
+      "source_sentence": 42,
+      "source_start": 5
+    },
+    {
+      "index": 31,
+      "word": "便",
+      "pinyin": "bian",
+      "source_sentence": 47,
+      "source_start": 9
+    },
+    {
+      "index": 32,
+      "word": "信",
+      "pinyin": "xin",
+      "source_sentence": 53,
+      "source_start": 6
+    },
+    {
+      "index": 33,
+      "word": "修",
+      "pinyin": "xiu",
+      "source_sentence": 64,
+      "source_start": 5
+    },
+    {
+      "index": 34,
+      "word": "借",
+      "pinyin": "jie",
+      "source_sentence": 89,
+      "source_start": 5
+    },
+    {
+      "index": 35,
+      "word": "假",
+      "pinyin": "jia",
+      "source_sentence": 81,
+      "source_start": 3
+    },
+    {
+      "index": 36,
+      "word": "做",
+      "pinyin": "zuo",
+      "source_sentence": 22,
+      "source_start": 6
+    },
+    {
+      "index": 37,
+      "word": "停",
+      "pinyin": "ting",
+      "source_sentence": 48,
+      "source_start": 3
+    },
+    {
+      "index": 38,
+      "word": "健",
+      "pinyin": "jian",
+      "source_sentence": 52,
+      "source_start": 5
+    },
+    {
+      "index": 39,
+      "word": "充",
+      "pinyin": "chong",
+      "source_sentence": 53,
+      "source_start": 4
+    },
+    {
+      "index": 40,
+      "word": "八",
+      "pinyin": "ba",
+      "source_sentence": 3,
+      "source_start": 4
+    },
+    {
+      "index": 41,
+      "word": "公",
+      "pinyin": "gong",
+      "source_sentence": 8,
+      "source_start": 2
+    },
+    {
+      "index": 42,
+      "word": "写",
+      "pinyin": "xie",
+      "source_sentence": 38,
+      "source_start": 5
+    },
+    {
+      "index": 43,
+      "word": "军",
+      "pinyin": "jun",
+      "source_sentence": 28,
+      "source_start": 0
+    },
+    {
+      "index": 44,
+      "word": "冬",
+      "pinyin": "dong",
+      "source_sentence": 7,
+      "source_start": 3
+    },
+    {
+      "index": 45,
+      "word": "决",
+      "pinyin": "jue",
+      "source_sentence": 26,
+      "source_start": 2
+    },
+    {
+      "index": 46,
+      "word": "冷",
+      "pinyin": "leng",
+      "source_sentence": 7,
+      "source_start": 7
+    },
+    {
+      "index": 47,
+      "word": "净",
+      "pinyin": "jing",
+      "source_sentence": 37,
+      "source_start": 9
+    },
+    {
+      "index": 48,
+      "word": "准",
+      "pinyin": "zhun",
+      "source_sentence": 39,
+      "source_start": 2
+    },
+    {
+      "index": 49,
+      "word": "几",
+      "pinyin": "ji",
+      "source_sentence": 75,
+      "source_start": 6
+    },
+    {
+      "index": 50,
+      "word": "出",
+      "pinyin": "chu",
+      "source_sentence": 3,
+      "source_start": 6
+    },
+    {
+      "index": 51,
+      "word": "出差",
+      "pinyin": "chuchai",
+      "source_sentence": 10,
+      "source_start": 7
+    },
+    {
+      "index": 52,
+      "word": "击",
+      "pinyin": "ji",
+      "source_sentence": 27,
+      "source_start": 9
+    },
+    {
+      "index": 53,
+      "word": "划",
+      "pinyin": "hua",
+      "source_sentence": 30,
+      "source_start": 10
+    },
+    {
+      "index": 54,
+      "word": "刚",
+      "pinyin": "gang",
+      "source_sentence": 18,
+      "source_start": 1
+    },
+    {
+      "index": 55,
+      "word": "利",
+      "pinyin": "li",
+      "source_sentence": 15,
+      "source_start": 8
+    },
+    {
+      "index": 56,
+      "word": "别",
+      "pinyin": "bie",
+      "source_sentence": 7,
+      "source_start": 6
+    },
+    {
+      "index": 57,
+      "word": "到",
+      "pinyin": "dao",
+      "source_sentence": 2,
+      "source_start": 4
+    },
+    {
+      "index": 58,
+      "word": "前",
+      "pinyin": "qian",
+      "source_sentence": 16,
+      "source_start": 5
+    },
+    {
+      "index": 59,
+      "word": "剩",
+      "pinyin": "sheng",
+      "source_sentence": 81,
+      "source_start": 6
+    },
+    {
+      "index": 60,
+      "word": "力",
+      "pinyin": "li",
+      "source_sentence": 51,
+      "source_start": 5
+    },
+    {
+      "index": 61,
+      "word": "办",
+      "pinyin": "ban",
+      "source_sentence": 117,
+      "source_start": 5
+    },
+    {
+      "index": 62,
+      "word": "加",
+      "pinyin": "jia",
+      "source_sentence": 8,
+      "source_start": 4
+    },
+    {
+      "index": 63,
+      "word": "务",
+      "pinyin": "wu",
+      "source_sentence": 68,
+      "source_start": 9
+    },
+    {
+      "index": 64,
+      "word": "动",
+      "pinyin": "dong",
+      "source_sentence": 26,
+      "source_start": 5
+    },
+    {
+      "index": 65,
+      "word": "化",
+      "pinyin": "hua",
+      "source_sentence": 76,
+      "source_start": 8
+    },
+    {
+      "index": 66,
+      "word": "北",
+      "pinyin": "bei",
+      "source_sentence": 2,
+      "source_start": 5
+    },
+    {
+      "index": 67,
+      "word": "匙",
+      "pinyin": "shi",
+      "source_sentence": 57,
+      "source_start": 3
+    },
+    {
+      "index": 68,
+      "word": "区",
+      "pinyin": "qu",
+      "source_sentence": 55,
+      "source_start": 3
+    },
+    {
+      "index": 69,
+      "word": "医",
+      "pinyin": "yi",
+      "source_sentence": 42,
+      "source_start": 2
+    },
+    {
+      "index": 70,
+      "word": "十",
+      "pinyin": "shi",
+      "source_sentence": 42,
+      "source_start": 7
+    },
+    {
+      "index": 71,
+      "word": "午",
+      "pinyin": "wu",
+      "source_sentence": 23,
+      "source_start": 8
+    },
+    {
+      "index": 72,
+      "word": "华",
+      "pinyin": "hua",
+      "source_sentence": 17,
+      "source_start": 7
+    },
+    {
+      "index": 73,
+      "word": "博",
+      "pinyin": "bo",
+      "source_sentence": 114,
+      "source_start": 8
+    },
+    {
+      "index": 74,
+      "word": "厅",
+      "pinyin": "ting",
+      "source_sentence": 4,
+      "source_start": 3
+    },
+    {
+      "index": 75,
+      "word": "历",
+      "pinyin": "li",
+      "source_sentence": 24,
+      "source_start": 6
+    },
+    {
+      "index": 76,
+      "word": "压",
+      "pinyin": "ya",
+      "source_sentence": 51,
+      "source_start": 4
+    },
+    {
+      "index": 77,
+      "word": "厨",
+      "pinyin": "chu",
+      "source_sentence": 70,
+      "source_start": 2
+    },
+    {
+      "index": 78,
+      "word": "去",
+      "pinyin": "qu",
+      "source_sentence": 6,
+      "source_start": 2
+    },
+    {
+      "index": 79,
+      "word": "参",
+      "pinyin": "can",
+      "source_sentence": 85,
+      "source_start": 3
+    },
+    {
+      "index": 80,
+      "word": "友",
+      "pinyin": "you",
+      "source_sentence": 46,
+      "source_start": 7
+    },
+    {
+      "index": 81,
+      "word": "发",
+      "pinyin": "fa",
+      "source_sentence": 3,
+      "source_start": 7
+    },
+    {
+      "index": 82,
+      "word": "只",
+      "pinyin": "zhi",
+      "source_sentence": 81,
+      "source_start": 5
+    },
+    {
+      "index": 83,
+      "word": "台",
+      "pinyin": "tai",
+      "source_sentence": 12,
+      "source_start": 5
+    },
+    {
+      "index": 84,
+      "word": "史",
+      "pinyin": "shi",
+      "source_sentence": 24,
+      "source_start": 7
+    },
+    {
+      "index": 85,
+      "word": "司",
+      "pinyin": "si",
+      "source_sentence": 8,
+      "source_start": 3
+    },
+    {
+      "index": 86,
+      "word": "吃",
+      "pinyin": "chi",
+      "source_sentence": 4,
+      "source_start": 8
+    },
+    {
+      "index": 87,
+      "word": "合",
+      "pinyin": "he",
+      "source_sentence": 120,
+      "source_start": 3
+    },
+    {
+      "index": 88,
+      "word": "向",
+      "pinyin": "xiang",
+      "source_sentence": 28,
+      "source_start": 2
+    },
+    {
+      "index": 89,
+      "word": "听",
+      "pinyin": "ting",
+      "source_sentence": 56,
+      "source_start": 6
+    },
+    {
+      "index": 90,
+      "word": "周",
+      "pinyin": "zhou",
+      "source_sentence": 10,
+      "source_start": 3
+    },
+    {
+      "index": 91,
+      "word": "和",
+      "pinyin": "he",
+      "source_sentence": 92,
+      "source_start": 3
+    },
+    {
+      "index": 92,
+      "word": "咖",
+      "pinyin": "ka",
+      "source_sentence": 97,
+      "source_start": 7
+    },
+    {
+      "index": 93,
+      "word": "咖啡",
+      "pinyin": "kafei",
+      "source_sentence": 97,
+      "source_start": 7
+    },
+    {
+      "index": 94,
+      "word": "品",
+      "pinyin": "pin",
+      "source_sentence": 61,
+      "source_start": 4
+    },
+    {
+      "index": 95,
+      "word": "啡",
+      "pinyin": "fei",
+      "source_sentence": 97,
+      "source_start": 8
+    },
+    {
+      "index": 96,
+      "word": "善",
+      "pinyin": "shan",
+      "source_sentence": 115,
+      "source_start": 9
+    },
+    {
+      "index": 97,
+      "word": "喜",
+      "pinyin": "xi",
+      "source_sentence": 22,
+      "source_start": 1
+    },
+    {
+      "index": 98,
+      "word": "喝",
+      "pinyin": "he",
+      "source_sentence": 44,
+      "source_start": 3
+    },
+    {
+      "index": 99,
+      "word": "喝咖啡",
+      "pinyin": "hekafei",
+      "source_sentence": 97,
+      "source_start": 6
+    },
+    {
+      "index": 100,
+      "word": "回",
+      "pinyin": "hui",
+      "source_sentence": 83,
+      "source_start": 4
+    },
+    {
+      "index": 101,
+      "word": "团",
+      "pinyin": "tuan",
+      "source_sentence": 68,
+      "source_start": 3
+    },
+    {
+      "index": 102,
+      "word": "园",
+      "pinyin": "yuan",
+      "source_sentence": 11,
+      "source_start": 5
+    },
+    {
+      "index": 103,
+      "word": "图",
+      "pinyin": "tu",
+      "source_sentence": 6,
+      "source_start": 3
+    },
+    {
+      "index": 104,
+      "word": "在",
+      "pinyin": "zai",
+      "source_sentence": 8,
+      "source_start": 1
+    },
+    {
+      "index": 105,
+      "word": "地",
+      "pinyin": "di",
+      "source_sentence": 48,
+      "source_start": 6
+    },
+    {
+      "index": 106,
+      "word": "地下",
+      "pinyin": "dixia",
+      "source_sentence": 48,
+      "source_start": 6
+    },
+    {
+      "index": 107,
+      "word": "场",
+      "pinyin": "chang",
+      "source_sentence": 27,
+      "source_start": 3
+    },
+    {
+      "index": 108,
+      "word": "坚",
+      "pinyin": "jian",
+      "source_sentence": 38,
+      "source_start": 3
+    },
+    {
+      "index": 109,
+      "word": "城",
+      "pinyin": "cheng",
+      "source_sentence": 47,
+      "source_start": 2
+    },
+    {
+      "index": 110,
+      "word": "增",
+      "pinyin": "zeng",
+      "source_sentence": 93,
+      "source_start": 7
+    },
+    {
+      "index": 111,
+      "word": "声",
+      "pinyin": "sheng",
+      "source_sentence": 41,
+      "source_start": 8
+    },
+    {
+      "index": 112,
+      "word": "处",
+      "pinyin": "chu",
+      "source_sentence": 91,
+      "source_start": 5
+    },
+    {
+      "index": 113,
+      "word": "备",
+      "pinyin": "bei",
+      "source_sentence": 39,
+      "source_start": 3
+    },
+    {
+      "index": 114,
+      "word": "外",
+      "pinyin": "wai",
+      "source_sentence": 33,
+      "source_start": 9
+    },
+    {
+      "index": 115,
+      "word": "多",
+      "pinyin": "duo",
+      "source_sentence": 66,
+      "source_start": 7
+    },
+    {
+      "index": 116,
+      "word": "大",
+      "pinyin": "da",
+      "source_sentence": 33,
+      "source_start": 5
+    },
+    {
+      "index": 117,
+      "word": "天",
+      "pinyin": "tian",
+      "source_sentence": 1,
+      "source_start": 1
+    },
+    {
+      "index": 118,
+      "word": "奶",
+      "pinyin": "nai",
+      "source_sentence": 45,
+      "source_start": 8
+    },
+    {
+      "index": 119,
+      "word": "她",
+      "pinyin": "ta",
+      "source_sentence": 8,
+      "source_start": 0
+    },
+    {
+      "index": 120,
+      "word": "好",
+      "pinyin": "hao",
+      "source_sentence": 1,
+      "source_start": 5
+    },
+    {
+      "index": 121,
+      "word": "妈",
+      "pinyin": "ma",
+      "source_sentence": 67,
+      "source_start": 2
+    },
+    {
+      "index": 122,
+      "word": "婚",
+      "pinyin": "hun",
+      "source_sentence": 50,
+      "source_start": 7
+    },
+    {
+      "index": 123,
+      "word": "子",
+      "pinyin": "zi",
+      "source_sentence": 11,
+      "source_start": 1
+    },
+    {
+      "index": 124,
+      "word": "季",
+      "pinyin": "ji",
+      "source_sentence": 65,
+      "source_start": 2
+    },
+    {
+      "index": 125,
+      "word": "学",
+      "pinyin": "xue",
+      "source_sentence": 40,
+      "source_start": 3
+    },
+    {
+      "index": 126,
+      "word": "孩",
+      "pinyin": "hai",
+      "source_sentence": 11,
+      "source_start": 0
+    },
+    {
+      "index": 127,
+      "word": "完",
+      "pinyin": "wan",
+      "source_sentence": 68,
+      "source_start": 5
+    },
+    {
+      "index": 128,
+      "word": "定",
+      "pinyin": "ding",
+      "source_sentence": 26,
+      "source_start": 3
+    },
+    {
+      "index": 129,
+      "word": "宠",
+      "pinyin": "chong",
+      "source_sentence": 110,
+      "source_start": 6
+    },
+    {
+      "index": 130,
+      "word": "家",
+      "pinyin": "jia",
+      "source_sentence": 4,
+      "source_start": 1
+    },
+    {
+      "index": 131,
+      "word": "察",
+      "pinyin": "cha",
+      "source_sentence": 112,
+      "source_start": 4
+    },
+    {
+      "index": 132,
+      "word": "对",
+      "pinyin": "dui",
+      "source_sentence": 29,
+      "source_start": 1
+    },
+    {
+      "index": 133,
+      "word": "小",
+      "pinyin": "xiao",
+      "source_sentence": 69,
+      "source_start": 6
+    },
+    {
+      "index": 134,
+      "word": "就",
+      "pinyin": "jiu",
+      "source_sentence": 71,
+      "source_start": 7
+    },
+    {
+      "index": 135,
+      "word": "居",
+      "pinyin": "ju",
+      "source_sentence": 46,
+      "source_start": 4
+    },
+    {
+      "index": 136,
+      "word": "展",
+      "pinyin": "zhan",
+      "source_sentence": 90,
+      "source_start": 10
+    },
+    {
+      "index": 137,
+      "word": "山",
+      "pinyin": "shan",
+      "source_sentence": 35,
+      "source_start": 3
+    },
+    {
+      "index": 138,
+      "word": "州",
+      "pinyin": "zhou",
+      "source_sentence": 43,
+      "source_start": 9
+    },
+    {
+      "index": 139,
+      "word": "工",
+      "pinyin": "gong",
+      "source_sentence": 42,
+      "source_start": 4
+    },
+    {
+      "index": 140,
+      "word": "差",
+      "pinyin": "chai",
+      "source_sentence": 10,
+      "source_start": 8
+    },
+    {
+      "index": 141,
+      "word": "已",
+      "pinyin": "yi",
+      "source_sentence": 120,
+      "source_start": 5
+    },
+    {
+      "index": 142,
+      "word": "市",
+      "pinyin": "shi",
+      "source_sentence": 47,
+      "source_start": 3
+    },
+    {
+      "index": 143,
+      "word": "师",
+      "pinyin": "shi",
+      "source_sentence": 12,
+      "source_start": 1
+    },
+    {
+      "index": 144,
+      "word": "常",
+      "pinyin": "chang",
+      "source_sentence": 14,
+      "source_start": 5
+    },
+    {
+      "index": 145,
+      "word": "干",
+      "pinyin": "gan",
+      "source_sentence": 37,
+      "source_start": 8
+    },
+    {
+      "index": 146,
+      "word": "年",
+      "pinyin": "nian",
+      "source_sentence": 42,
+      "source_start": 8
+    },
+    {
+      "index": 147,
+      "word": "幻",
+      "pinyin": "huan",
+      "source_sentence": 69,
+      "source_start": 5
+    },
+    {
+      "index": 148,
+      "word": "广",
+      "pinyin": "guang",
+      "source_sentence": 43,
+      "source_start": 8
+    },
+    {
+      "index": 149,
+      "word": "库",
+      "pinyin": "ku",
+      "source_sentence": 48,
+      "source_start": 9
+    },
+    {
+      "index": 150,
+      "word": "度",
+      "pinyin": "du",
+      "source_sentence": 33,
+      "source_start": 3
+    },
+    {
+      "index": 151,
+      "word": "建",
+      "pinyin": "jian",
+      "source_sentence": 82,
+      "source_start": 8
+    },
+    {
+      "index": 152,
+      "word": "开",
+      "pinyin": "kai",
+      "source_sentence": 2,
+      "source_start": 7
+    },
+    {
+      "index": 153,
+      "word": "弹",
+      "pinyin": "tan",
+      "source_sentence": 49,
+      "source_start": 6
+    },
+    {
+      "index": 154,
+      "word": "影",
+      "pinyin": "ying",
+      "source_sentence": 14,
+      "source_start": 3
+    },
+    {
+      "index": 155,
+      "word": "待",
+      "pinyin": "dai",
+      "source_sentence": 94,
+      "source_start": 9
+    },
+    {
+      "index": 156,
+      "word": "很",
+      "pinyin": "hen",
+      "source_sentence": 1,
+      "source_start": 4
+    },
+    {
+      "index": 157,
+      "word": "得",
+      "pinyin": "de",
+      "source_sentence": 15,
+      "source_start": 5
+    },
+    {
+      "index": 158,
+      "word": "得了",
+      "pinyin": "dele",
+      "source_sentence": 41,
+      "source_start": 5
+    },
+    {
+      "index": 159,
+      "word": "得到",
+      "pinyin": "dedao",
+      "source_sentence": 61,
+      "source_start": 5
+    },
+    {
+      "index": 160,
+      "word": "心",
+      "pinyin": "xin",
+      "source_sentence": 53,
+      "source_start": 7
+    },
+    {
+      "index": 161,
+      "word": "心地",
+      "pinyin": "xindi",
+      "source_sentence": 83,
+      "source_start": 2
+    },
+    {
+      "index": 162,
+      "word": "忘",
+      "pinyin": "wang",
+      "source_sentence": 34,
+      "source_start": 9
+    },
+    {
+      "index": 163,
+      "word": "快",
+      "pinyin": "kuai",
+      "source_sentence": 90,
+      "source_start": 7
+    },
+    {
+      "index": 164,
+      "word": "态",
+      "pinyin": "tai",
+      "source_sentence": 33,
+      "source_start": 2
+    },
+    {
+      "index": 165,
+      "word": "总",
+      "pinyin": "zong",
+      "source_sentence": 43,
+      "source_start": 5
+    },
+    {
+      "index": 166,
+      "word": "想",
+      "pinyin": "xiang",
+      "source_sentence": 6,
+      "source_start": 1
+    },
+    {
+      "index": 167,
+      "word": "意",
+      "pinyin": "yi",
+      "source_sentence": 32,
+      "source_start": 9
+    },
+    {
+      "index": 168,
+      "word": "感",
+      "pinyin": "gan",
+      "source_sentence": 14,
+      "source_start": 6
+    },
+    {
+      "index": 169,
+      "word": "慈",
+      "pinyin": "ci",
+      "source_sentence": 115,
+      "source_start": 8
+    },
+    {
+      "index": 170,
+      "word": "成",
+      "pinyin": "cheng",
+      "source_sentence": 68,
+      "source_start": 6
+    },
+    {
+      "index": 171,
+      "word": "我",
+      "pinyin": "wo",
+      "source_sentence": 2,
+      "source_start": 0
+    },
+    {
+      "index": 172,
+      "word": "战",
+      "pinyin": "zhan",
+      "source_sentence": 27,
+      "source_start": 2
+    },
+    {
+      "index": 173,
+      "word": "户",
+      "pinyin": "hu",
+      "source_sentence": 72,
+      "source_start": 3
+    },
+    {
+      "index": 174,
+      "word": "房",
+      "pinyin": "fang",
+      "source_sentence": 37,
+      "source_start": 2
+    },
+    {
+      "index": 175,
+      "word": "所",
+      "pinyin": "suo",
+      "source_sentence": 96,
+      "source_start": 6
+    },
+    {
+      "index": 176,
+      "word": "手",
+      "pinyin": "shou",
+      "source_sentence": 59,
+      "source_start": 2
+    },
+    {
+      "index": 177,
+      "word": "打",
+      "pinyin": "da",
+      "source_sentence": 37,
+      "source_start": 4
+    },
+    {
+      "index": 178,
+      "word": "扩",
+      "pinyin": "kuo",
+      "source_sentence": 99,
+      "source_start": 7
+    },
+    {
+      "index": 179,
+      "word": "扫",
+      "pinyin": "sao",
+      "source_sentence": 37,
+      "source_start": 5
+    },
+    {
+      "index": 180,
+      "word": "把",
+      "pinyin": "ba",
+      "source_sentence": 37,
+      "source_start": 1
+    },
+    {
+      "index": 181,
+      "word": "投",
+      "pinyin": "tou",
+      "source_sentence": 102,
+      "source_start": 8
+    },
+    {
+      "index": 182,
+      "word": "招",
+      "pinyin": "zhao",
+      "source_sentence": 19,
+      "source_start": 7
+    },
+    {
+      "index": 183,
+      "word": "拾",
+      "pinyin": "shi",
+      "source_sentence": 95,
+      "source_start": 5
+    },
+    {
+      "index": 184,
+      "word": "持",
+      "pinyin": "chi",
+      "source_sentence": 38,
+      "source_start": 4
+    },
+    {
+      "index": 185,
+      "word": "捐",
+      "pinyin": "juan",
+      "source_sentence": 115,
+      "source_start": 5
+    },
+    {
+      "index": 186,
+      "word": "掌",
+      "pinyin": "zhang",
+      "source_sentence": 41,
+      "source_start": 7
+    },
+    {
+      "index": 187,
+      "word": "推",
+      "pinyin": "tui",
+      "source_sentence": 58,
+      "source_start": 4
+    },
+    {
+      "index": 188,
+      "word": "提",
+      "pinyin": "ti",
+      "source_sentence": 16,
+      "source_start": 4
+    },
+    {
+      "index": 189,
+      "word": "搬",
+      "pinyin": "ban",
+      "source_sentence": 74,
+      "source_start": 7
+    },
+    {
+      "index": 190,
+      "word": "播",
+      "pinyin": "bo",
+      "source_sentence": 119,
+      "source_start": 6
+    },
+    {
+      "index": 191,
+      "word": "支",
+      "pinyin": "zhi",
+      "source_sentence": 84,
+      "source_start": 4
+    },
+    {
+      "index": 192,
+      "word": "收",
+      "pinyin": "shou",
+      "source_sentence": 63,
+      "source_start": 3
+    },
+    {
+      "index": 193,
+      "word": "改",
+      "pinyin": "gai",
+      "source_sentence": 23,
+      "source_start": 5
+    },
+    {
+      "index": 194,
+      "word": "攻",
+      "pinyin": "gong",
+      "source_sentence": 27,
+      "source_start": 8
+    },
+    {
+      "index": 195,
+      "word": "故",
+      "pinyin": "gu",
+      "source_sentence": 24,
+      "source_start": 8
+    },
+    {
+      "index": 196,
+      "word": "敌",
+      "pinyin": "di",
+      "source_sentence": 28,
+      "source_start": 3
+    },
+    {
+      "index": 197,
+      "word": "散",
+      "pinyin": "san",
+      "source_sentence": 36,
+      "source_start": 6
+    },
+    {
+      "index": 198,
+      "word": "数",
+      "pinyin": "shu",
+      "source_sentence": 40,
+      "source_start": 2
+    },
+    {
+      "index": 199,
+      "word": "整",
+      "pinyin": "zheng",
+      "source_sentence": 113,
+      "source_start": 5
+    },
+    {
+      "index": 200,
+      "word": "文",
+      "pinyin": "wen",
+      "source_sentence": 15,
+      "source_start": 3
+    },
+    {
+      "index": 201,
+      "word": "料",
+      "pinyin": "liao",
+      "source_sentence": 96,
+      "source_start": 9
+    },
+    {
+      "index": 202,
+      "word": "新",
+      "pinyin": "xin",
+      "source_sentence": 18,
+      "source_start": 7
+    },
+    {
+      "index": 203,
+      "word": "方",
+      "pinyin": "fang",
+      "source_sentence": 29,
+      "source_start": 4
+    },
+    {
+      "index": 204,
+      "word": "旅",
+      "pinyin": "lv",
+      "source_sentence": 34,
+      "source_start": 2
+    },
+    {
+      "index": 205,
+      "word": "旅行",
+      "pinyin": "lvxing",
+      "source_sentence": 34,
+      "source_start": 2
+    },
+    {
+      "index": 206,
+      "word": "日",
+      "pinyin": "ri",
+      "source_sentence": 35,
+      "source_start": 8
+    },
+    {
+      "index": 207,
+      "word": "旧",
+      "pinyin": "jiu",
+      "source_sentence": 115,
+      "source_start": 2
+    },
+    {
+      "index": 208,
+      "word": "早",
+      "pinyin": "zao",
+      "source_sentence": 3,
+      "source_start": 2
+    },
+    {
+      "index": 209,
+      "word": "明",
+      "pinyin": "ming",
+      "source_sentence": 3,
+      "source_start": 0
+    },
+    {
+      "index": 210,
+      "word": "星",
+      "pinyin": "xing",
+      "source_sentence": 86,
+      "source_start": 8
+    },
+    {
+      "index": 211,
+      "word": "昨",
+      "pinyin": "zuo",
+      "source_sentence": 5,
+      "source_start": 1
+    },
+    {
+      "index": 212,
+      "word": "是",
+      "pinyin": "shi",
+      "source_sentence": 24,
+      "source_start": 5
+    },
+    {
+      "index": 213,
+      "word": "晚",
+      "pinyin": "wan",
+      "source_sentence": 5,
+      "source_start": 3
+    },
+    {
+      "index": 214,
+      "word": "晨",
+      "pinyin": "chen",
+      "source_sentence": 45,
+      "source_start": 4
+    },
+    {
+      "index": 215,
+      "word": "最",
+      "pinyin": "zui",
+      "source_sentence": 19,
+      "source_start": 4
+    },
+    {
+      "index": 216,
+      "word": "月",
+      "pinyin": "yue",
+      "source_sentence": 20,
+      "source_start": 6
+    },
+    {
+      "index": 217,
+      "word": "有",
+      "pinyin": "you",
+      "source_sentence": 5,
+      "source_start": 6
+    },
+    {
+      "index": 218,
+      "word": "朋",
+      "pinyin": "peng",
+      "source_sentence": 92,
+      "source_start": 4
+    },
+    {
+      "index": 219,
+      "word": "服",
+      "pinyin": "fu",
+      "source_sentence": 73,
+      "source_start": 9
+    },
+    {
+      "index": 220,
+      "word": "期",
+      "pinyin": "qi",
+      "source_sentence": 81,
+      "source_start": 4
+    },
+    {
+      "index": 221,
+      "word": "未",
+      "pinyin": "wei",
+      "source_sentence": 53,
+      "source_start": 2
+    },
+    {
+      "index": 222,
+      "word": "末",
+      "pinyin": "mo",
+      "source_sentence": 22,
+      "source_start": 5
+    },
+    {
+      "index": 223,
+      "word": "本",
+      "pinyin": "ben",
+      "source_sentence": 24,
+      "source_start": 1
+    },
+    {
+      "index": 224,
+      "word": "机",
+      "pinyin": "ji",
+      "source_sentence": 16,
+      "source_start": 8
+    },
+    {
+      "index": 225,
+      "word": "李",
+      "pinyin": "li",
+      "source_sentence": 95,
+      "source_start": 3
+    },
+    {
+      "index": 226,
+      "word": "材",
+      "pinyin": "cai",
+      "source_sentence": 96,
+      "source_start": 8
+    },
+    {
+      "index": 227,
+      "word": "条",
+      "pinyin": "tiao",
+      "source_sentence": 17,
+      "source_start": 1
+    },
+    {
+      "index": 228,
+      "word": "来",
+      "pinyin": "lai",
+      "source_sentence": 53,
+      "source_start": 3
+    },
+    {
+      "index": 229,
+      "word": "板",
+      "pinyin": "ban",
+      "source_sentence": 105,
+      "source_start": 4
+    },
+    {
+      "index": 230,
+      "word": "构",
+      "pinyin": "gou",
+      "source_sentence": 115,
+      "source_start": 11
+    },
+    {
+      "index": 231,
+      "word": "果",
+      "pinyin": "guo",
+      "source_sentence": 32,
+      "source_start": 5
+    },
+    {
+      "index": 232,
+      "word": "查",
+      "pinyin": "cha",
+      "source_sentence": 26,
+      "source_start": 9
+    },
+    {
+      "index": 233,
+      "word": "校",
+      "pinyin": "xiao",
+      "source_sentence": 111,
+      "source_start": 11
+    },
+    {
+      "index": 234,
+      "word": "格",
+      "pinyin": "ge",
+      "source_sentence": 87,
+      "source_start": 8
+    },
+    {
+      "index": 235,
+      "word": "案",
+      "pinyin": "an",
+      "source_sentence": 29,
+      "source_start": 5
+    },
+    {
+      "index": 236,
+      "word": "桌",
+      "pinyin": "zhuo",
+      "source_sentence": 113,
+      "source_start": 8
+    },
+    {
+      "index": 237,
+      "word": "模",
+      "pinyin": "mo",
+      "source_sentence": 99,
+      "source_start": 10
+    },
+    {
+      "index": 238,
+      "word": "樱",
+      "pinyin": "ying",
+      "source_sentence": 65,
+      "source_start": 4
+    },
+    {
+      "index": 239,
+      "word": "次",
+      "pinyin": "ci",
+      "source_sentence": 25,
+      "source_start": 7
+    },
+    {
+      "index": 240,
+      "word": "欢",
+      "pinyin": "huan",
+      "source_sentence": 22,
+      "source_start": 2
+    },
+    {
+      "index": 241,
+      "word": "正",
+      "pinyin": "zheng",
+      "source_sentence": 12,
+      "source_start": 2
+    },
+    {
+      "index": 242,
+      "word": "步",
+      "pinyin": "bu",
+      "source_sentence": 21,
+      "source_start": 6
+    },
+    {
+      "index": 243,
+      "word": "每",
+      "pinyin": "mei",
+      "source_sentence": 21,
+      "source_start": 1
+    },
+    {
+      "index": 244,
+      "word": "比",
+      "pinyin": "bi",
+      "source_sentence": 94,
+      "source_start": 4
+    },
+    {
+      "index": 245,
+      "word": "气",
+      "pinyin": "qi",
+      "source_sentence": 1,
+      "source_start": 3
+    },
+    {
+      "index": 246,
+      "word": "水",
+      "pinyin": "shui",
+      "source_sentence": 54,
+      "source_start": 7
+    },
+    {
+      "index": 247,
+      "word": "没",
+      "pinyin": "mei",
+      "source_sentence": 5,
+      "source_start": 5
+    },
+    {
+      "index": 248,
+      "word": "河",
+      "pinyin": "he",
+      "source_sentence": 36,
+      "source_start": 4
+    },
+    {
+      "index": 249,
+      "word": "沿",
+      "pinyin": "yan",
+      "source_sentence": 36,
+      "source_start": 2
+    },
+    {
+      "index": 250,
+      "word": "流",
+      "pinyin": "liu",
+      "source_sentence": 15,
+      "source_start": 7
+    },
+    {
+      "index": 251,
+      "word": "海",
+      "pinyin": "hai",
+      "source_sentence": 10,
+      "source_start": 6
+    },
+    {
+      "index": 252,
+      "word": "深",
+      "pinyin": "shen",
+      "source_sentence": 79,
+      "source_start": 6
+    },
+    {
+      "index": 253,
+      "word": "满",
+      "pinyin": "man",
+      "source_sentence": 32,
+      "source_start": 8
+    },
+    {
+      "index": 254,
+      "word": "演",
+      "pinyin": "yan",
+      "source_sentence": 41,
+      "source_start": 2
+    },
+    {
+      "index": 255,
+      "word": "火",
+      "pinyin": "huo",
+      "source_sentence": 71,
+      "source_start": 3
+    },
+    {
+      "index": 256,
+      "word": "点",
+      "pinyin": "dian",
+      "source_sentence": 3,
+      "source_start": 5
+    },
+    {
+      "index": 257,
+      "word": "炼",
+      "pinyin": "lian",
+      "source_sentence": 21,
+      "source_start": 8
+    },
+    {
+      "index": 258,
+      "word": "热",
+      "pinyin": "re",
+      "source_sentence": 44,
+      "source_start": 4
+    },
+    {
+      "index": 259,
+      "word": "爬",
+      "pinyin": "pa",
+      "source_sentence": 39,
+      "source_start": 7
+    },
+    {
+      "index": 260,
+      "word": "牛",
+      "pinyin": "niu",
+      "source_sentence": 45,
+      "source_start": 7
+    },
+    {
+      "index": 261,
+      "word": "物",
+      "pinyin": "wu",
+      "source_sentence": 110,
+      "source_start": 7
+    },
+    {
+      "index": 262,
+      "word": "特",
+      "pinyin": "te",
+      "source_sentence": 7,
+      "source_start": 5
+    },
+    {
+      "index": 263,
+      "word": "猫",
+      "pinyin": "mao",
+      "source_sentence": 110,
+      "source_start": 2
+    },
+    {
+      "index": 264,
+      "word": "玩",
+      "pinyin": "wan",
+      "source_sentence": 11,
+      "source_start": 7
+    },
+    {
+      "index": 265,
+      "word": "班",
+      "pinyin": "ban",
+      "source_sentence": 8,
+      "source_start": 5
+    },
+    {
+      "index": 266,
+      "word": "理",
+      "pinyin": "li",
+      "source_sentence": 79,
+      "source_start": 8
+    },
+    {
+      "index": 267,
+      "word": "琴",
+      "pinyin": "qin",
+      "source_sentence": 49,
+      "source_start": 8
+    },
+    {
+      "index": 268,
+      "word": "用",
+      "pinyin": "yong",
+      "source_sentence": 54,
+      "source_start": 6
+    },
+    {
+      "index": 269,
+      "word": "电",
+      "pinyin": "dian",
+      "source_sentence": 14,
+      "source_start": 2
+    },
+    {
+      "index": 270,
+      "word": "画",
+      "pinyin": "hua",
+      "source_sentence": 104,
+      "source_start": 6
+    },
+    {
+      "index": 271,
+      "word": "疑",
+      "pinyin": "yi",
+      "source_sentence": 29,
+      "source_start": 10
+    },
+    {
+      "index": 272,
+      "word": "的",
+      "pinyin": "de",
+      "source_sentence": 4,
+      "source_start": 4
+    },
+    {
+      "index": 273,
+      "word": "目",
+      "pinyin": "mu",
+      "source_sentence": 20,
+      "source_start": 3
+    },
+    {
+      "index": 274,
+      "word": "看",
+      "pinyin": "kan",
+      "source_sentence": 6,
+      "source_start": 6
+    },
+    {
+      "index": 275,
+      "word": "真",
+      "pinyin": "zhen",
+      "source_sentence": 9,
+      "source_start": 7
+    },
+    {
+      "index": 276,
+      "word": "着",
+      "pinyin": "zhe",
+      "source_sentence": 36,
+      "source_start": 3
+    },
+    {
+      "index": 277,
+      "word": "睡",
+      "pinyin": "shui",
+      "source_sentence": 5,
+      "source_start": 7
+    },
+    {
+      "index": 278,
+      "word": "研",
+      "pinyin": "yan",
+      "source_sentence": 76,
+      "source_start": 3
+    },
+    {
+      "index": 279,
+      "word": "礼",
+      "pinyin": "li",
+      "source_sentence": 85,
+      "source_start": 9
+    },
+    {
+      "index": 280,
+      "word": "票",
+      "pinyin": "piao",
+      "source_sentence": 16,
+      "source_start": 9
+    },
+    {
+      "index": 281,
+      "word": "种",
+      "pinyin": "zhong",
+      "source_sentence": 80,
+      "source_start": 5
+    },
+    {
+      "index": 282,
+      "word": "科",
+      "pinyin": "ke",
+      "source_sentence": 69,
+      "source_start": 4
+    },
+    {
+      "index": 283,
+      "word": "租",
+      "pinyin": "zu",
+      "source_sentence": 106,
+      "source_start": 4
+    },
+    {
+      "index": 284,
+      "word": "究",
+      "pinyin": "jiu",
+      "source_sentence": 76,
+      "source_start": 4
+    },
+    {
+      "index": 285,
+      "word": "穿",
+      "pinyin": "chuan",
+      "source_sentence": 73,
+      "source_start": 3
+    },
+    {
+      "index": 286,
+      "word": "窗",
+      "pinyin": "chuang",
+      "source_sentence": 72,
+      "source_start": 2
+    },
+    {
+      "index": 287,
+      "word": "章",
+      "pinyin": "zhang",
+      "source_sentence": 107,
+      "source_start": 9
+    },
+    {
+      "index": 288,
+      "word": "答",
+      "pinyin": "da",
+      "source_sentence": 83,
+      "source_start": 5
+    },
+    {
+      "index": 289,
+      "word": "算",
+      "pinyin": "suan",
+      "source_sentence": 50,
+      "source_start": 3
+    },
+    {
+      "index": 290,
+      "word": "篇",
+      "pinyin": "pian",
+      "source_sentence": 107,
+      "source_start": 5
+    },
+    {
+      "index": 291,
+      "word": "糕",
+      "pinyin": "gao",
+      "source_sentence": 70,
+      "source_start": 7
+    },
+    {
+      "index": 292,
+      "word": "繁",
+      "pinyin": "fan",
+      "source_sentence": 17,
+      "source_start": 6
+    },
+    {
+      "index": 293,
+      "word": "约",
+      "pinyin": "yue",
+      "source_sentence": 54,
+      "source_start": 5
+    },
+    {
+      "index": 294,
+      "word": "线",
+      "pinyin": "xian",
+      "source_sentence": 20,
+      "source_start": 8
+    },
+    {
+      "index": 295,
+      "word": "细",
+      "pinyin": "xi",
+      "source_sentence": 105,
+      "source_start": 9
+    },
+    {
+      "index": 296,
+      "word": "经",
+      "pinyin": "jing",
+      "source_sentence": 55,
+      "source_start": 4
+    },
+    {
+      "index": 297,
+      "word": "结",
+      "pinyin": "jie",
+      "source_sentence": 32,
+      "source_start": 4
+    },
+    {
+      "index": 298,
+      "word": "给",
+      "pinyin": "gei",
+      "source_sentence": 67,
+      "source_start": 1
+    },
+    {
+      "index": 299,
+      "word": "续",
+      "pinyin": "xu",
+      "source_sentence": 120,
+      "source_start": 8
+    },
+    {
+      "index": 300,
+      "word": "美",
+      "pinyin": "mei",
+      "source_sentence": 65,
+      "source_start": 9
+    },
+    {
+      "index": 301,
+      "word": "老",
+      "pinyin": "lao",
+      "source_sentence": 12,
+      "source_start": 0
+    },
+    {
+      "index": 302,
+      "word": "考",
+      "pinyin": "kao",
+      "source_sentence": 60,
+      "source_start": 5
+    },
+    {
+      "index": 303,
+      "word": "耍",
+      "pinyin": "shua",
+      "source_sentence": 11,
+      "source_start": 8
+    },
+    {
+      "index": 304,
+      "word": "耐",
+      "pinyin": "nai",
+      "source_sentence": 83,
+      "source_start": 1
+    },
+    {
+      "index": 305,
+      "word": "聊",
+      "pinyin": "liao",
+      "source_sentence": 92,
+      "source_start": 6
+    },
+    {
+      "index": 306,
+      "word": "聘",
+      "pinyin": "pin",
+      "source_sentence": 19,
+      "source_start": 8
+    },
+    {
+      "index": 307,
+      "word": "脑",
+      "pinyin": "nao",
+      "source_sentence": 18,
+      "source_start": 9
+    },
+    {
+      "index": 308,
+      "word": "自",
+      "pinyin": "zi",
+      "source_sentence": 62,
+      "source_start": 4
+    },
+    {
+      "index": 309,
+      "word": "自行",
+      "pinyin": "zixing",
+      "source_sentence": 62,
+      "source_start": 4
+    },
+    {
+      "index": 310,
+      "word": "节",
+      "pinyin": "jie",
+      "source_sentence": 54,
+      "source_start": 4
+    },
+    {
+      "index": 311,
+      "word": "花",
+      "pinyin": "hua",
+      "source_sentence": 65,
+      "source_start": 5
+    },
+    {
+      "index": 312,
+      "word": "英",
+      "pinyin": "ying",
+      "source_sentence": 98,
+      "source_start": 7
+    },
+    {
+      "index": 313,
+      "word": "茶",
+      "pinyin": "cha",
+      "source_sentence": 44,
+      "source_start": 5
+    },
+    {
+      "index": 314,
+      "word": "获",
+      "pinyin": "huo",
+      "source_sentence": 102,
+      "source_start": 5
+    },
+    {
+      "index": 315,
+      "word": "菜",
+      "pinyin": "cai",
+      "source_sentence": 4,
+      "source_start": 5
+    },
+    {
+      "index": 316,
+      "word": "蔬",
+      "pinyin": "shu",
+      "source_sentence": 101,
+      "source_start": 9
+    },
+    {
+      "index": 317,
+      "word": "蛋",
+      "pinyin": "dan",
+      "source_sentence": 70,
+      "source_start": 6
+    },
+    {
+      "index": 318,
+      "word": "行",
+      "pinyin": "xing",
+      "source_sentence": 34,
+      "source_start": 3
+    },
+    {
+      "index": 319,
+      "word": "行李",
+      "pinyin": "xingli",
+      "source_sentence": 95,
+      "source_start": 2
+    },
+    {
+      "index": 320,
+      "word": "街",
+      "pinyin": "jie",
+      "source_sentence": 17,
+      "source_start": 2
+    },
+    {
+      "index": 321,
+      "word": "衣",
+      "pinyin": "yi",
+      "source_sentence": 73,
+      "source_start": 8
+    },
+    {
+      "index": 322,
+      "word": "装",
+      "pinyin": "zhuang",
+      "source_sentence": 64,
+      "source_start": 4
+    },
+    {
+      "index": 323,
+      "word": "要",
+      "pinyin": "yao",
+      "source_sentence": 9,
+      "source_start": 5
+    },
+    {
+      "index": 324,
+      "word": "观",
+      "pinyin": "guan",
+      "source_sentence": 112,
+      "source_start": 3
+    },
+    {
+      "index": 325,
+      "word": "规",
+      "pinyin": "gui",
+      "source_sentence": 99,
+      "source_start": 9
+    },
+    {
+      "index": 326,
+      "word": "视",
+      "pinyin": "shi",
+      "source_sentence": 105,
+      "source_start": 8
+    },
+    {
+      "index": 327,
+      "word": "览",
+      "pinyin": "lan",
+      "source_sentence": 117,
+      "source_start": 9
+    },
+    {
+      "index": 328,
+      "word": "解",
+      "pinyin": "jie",
+      "source_sentence": 40,
+      "source_start": 7
+    },
+    {
+      "index": 329,
+      "word": "计",
+      "pinyin": "ji",
+      "source_sentence": 30,
+      "source_start": 9
+    },
+    {
+      "index": 330,
+      "word": "订",
+      "pinyin": "ding",
+      "source_sentence": 16,
+      "source_start": 7
+    },
+    {
+      "index": 331,
+      "word": "认",
+      "pinyin": "ren",
+      "source_sentence": 9,
+      "source_start": 6
+    },
+    {
+      "index": 332,
+      "word": "讨",
+      "pinyin": "tao",
+      "source_sentence": 9,
+      "source_start": 8
+    },
+    {
+      "index": 333,
+      "word": "让",
+      "pinyin": "rang",
+      "source_sentence": 33,
+      "source_start": 4
+    },
+    {
+      "index": 334,
+      "word": "议",
+      "pinyin": "yi",
+      "source_sentence": 23,
+      "source_start": 4
+    },
+    {
+      "index": 335,
+      "word": "记",
+      "pinyin": "ji",
+      "source_sentence": 38,
+      "source_start": 7
+    },
+    {
+      "index": 336,
+      "word": "讲",
+      "pinyin": "jiang",
+      "source_sentence": 12,
+      "source_start": 4
+    },
+    {
+      "index": 337,
+      "word": "论",
+      "pinyin": "lun",
+      "source_sentence": 9,
+      "source_start": 9
+    },
+    {
+      "index": 338,
+      "word": "评",
+      "pinyin": "ping",
+      "source_sentence": 31,
+      "source_start": 6
+    },
+    {
+      "index": 339,
+      "word": "试",
+      "pinyin": "shi",
+      "source_sentence": 60,
+      "source_start": 6
+    },
+    {
+      "index": 340,
+      "word": "话",
+      "pinyin": "hua",
+      "source_sentence": 67,
+      "source_start": 9
+    },
+    {
+      "index": 341,
+      "word": "语",
+      "pinyin": "yu",
+      "source_sentence": 98,
+      "source_start": 8
+    },
+    {
+      "index": 342,
+      "word": "说",
+      "pinyin": "shuo",
+      "source_sentence": 15,
+      "source_start": 4
+    },
+    {
+      "index": 343,
+      "word": "课",
+      "pinyin": "ke",
+      "source_sentence": 12,
+      "source_start": 8
+    },
+    {
+      "index": 344,
+      "word": "调",
+      "pinyin": "diao",
+      "source_sentence": 26,
+      "source_start": 8
+    },
+    {
+      "index": 345,
+      "word": "负",
+      "pinyin": "fu",
+      "source_sentence": 116,
+      "source_start": 4
+    },
+    {
+      "index": 346,
+      "word": "责",
+      "pinyin": "ze",
+      "source_sentence": 116,
+      "source_start": 5
+    },
+    {
+      "index": 347,
+      "word": "质",
+      "pinyin": "zhi",
+      "source_sentence": 29,
+      "source_start": 9
+    },
+    {
+      "index": 348,
+      "word": "资",
+      "pinyin": "zi",
+      "source_sentence": 102,
+      "source_start": 9
+    },
+    {
+      "index": 349,
+      "word": "赛",
+      "pinyin": "sai",
+      "source_sentence": 94,
+      "source_start": 5
+    },
+    {
+      "index": 350,
+      "word": "赢",
+      "pinyin": "ying",
+      "source_sentence": 41,
+      "source_start": 4
+    },
+    {
+      "index": 351,
+      "word": "起",
+      "pinyin": "qi",
+      "source_sentence": 13,
+      "source_start": 7
+    },
+    {
+      "index": 352,
+      "word": "超",
+      "pinyin": "chao",
+      "source_sentence": 66,
+      "source_start": 2
+    },
+    {
+      "index": 353,
+      "word": "跑",
+      "pinyin": "pao",
+      "source_sentence": 21,
+      "source_start": 5
+    },
+    {
+      "index": 354,
+      "word": "身",
+      "pinyin": "shen",
+      "source_sentence": 52,
+      "source_start": 6
+    },
+    {
+      "index": 355,
+      "word": "车",
+      "pinyin": "che",
+      "source_sentence": 48,
+      "source_start": 2
+    },
+    {
+      "index": 356,
+      "word": "辆",
+      "pinyin": "liang",
+      "source_sentence": 109,
+      "source_start": 6
+    },
+    {
+      "index": 357,
+      "word": "边",
+      "pinyin": "bian",
+      "source_sentence": 36,
+      "source_start": 5
+    },
+    {
+      "index": 358,
+      "word": "近",
+      "pinyin": "jin",
+      "source_sentence": 19,
+      "source_start": 5
+    },
+    {
+      "index": 359,
+      "word": "这",
+      "pinyin": "zhe",
+      "source_sentence": 4,
+      "source_start": 0
+    },
+    {
+      "index": 360,
+      "word": "进",
+      "pinyin": "jin",
+      "source_sentence": 28,
+      "source_start": 8
+    },
+    {
+      "index": 361,
+      "word": "迟",
+      "pinyin": "chi",
+      "source_sentence": 58,
+      "source_start": 5
+    },
+    {
+      "index": 362,
+      "word": "送",
+      "pinyin": "song",
+      "source_sentence": 110,
+      "source_start": 3
+    },
+    {
+      "index": 363,
+      "word": "透",
+      "pinyin": "tou",
+      "source_sentence": 72,
+      "source_start": 6
+    },
+    {
+      "index": 364,
+      "word": "通",
+      "pinyin": "tong",
+      "source_sentence": 47,
+      "source_start": 6
+    },
+    {
+      "index": 365,
+      "word": "速",
+      "pinyin": "su",
+      "source_sentence": 90,
+      "source_start": 8
+    },
+    {
+      "index": 366,
+      "word": "道",
+      "pinyin": "dao",
+      "source_sentence": 17,
+      "source_start": 3
+    },
+    {
+      "index": 367,
+      "word": "邮",
+      "pinyin": "you",
+      "source_sentence": 63,
+      "source_start": 5
+    },
+    {
+      "index": 368,
+      "word": "邻",
+      "pinyin": "lin",
+      "source_sentence": 46,
+      "source_start": 3
+    },
+    {
+      "index": 369,
+      "word": "部",
+      "pinyin": "bu",
+      "source_sentence": 14,
+      "source_start": 1
+    },
+    {
+      "index": 370,
+      "word": "都",
+      "pinyin": "dou",
+      "source_sentence": 45,
+      "source_start": 5
+    },
+    {
+      "index": 371,
+      "word": "都要",
+      "pinyin": "douyao",
+      "source_sentence": 91,
+      "source_start": 3
+    },
+    {
+      "index": 372,
+      "word": "里",
+      "pinyin": "li",
+      "source_sentence": 11,
+      "source_start": 6
+    },
+    {
+      "index": 373,
+      "word": "重",
+      "pinyin": "chong",
+      "source_sentence": 31,
+      "source_start": 4
+    },
+    {
+      "index": 374,
+      "word": "重新",
+      "pinyin": "chongxin",
+      "source_sentence": 31,
+      "source_start": 4
+    },
+    {
+      "index": 375,
+      "word": "量",
+      "pinyin": "liang",
+      "source_sentence": 78,
+      "source_start": 9
+    },
+    {
+      "index": 376,
+      "word": "钢",
+      "pinyin": "gang",
+      "source_sentence": 49,
+      "source_start": 7
+    },
+    {
+      "index": 377,
+      "word": "钥",
+      "pinyin": "yao",
+      "source_sentence": 57,
+      "source_start": 2
+    },
+    {
+      "index": 378,
+      "word": "银",
+      "pinyin": "yin",
+      "source_sentence": 118,
+      "source_start": 7
+    },
+    {
+      "index": 379,
+      "word": "销",
+      "pinyin": "xiao",
+      "source_sentence": 93,
+      "source_start": 5
+    },
+    {
+      "index": 380,
+      "word": "锻",
+      "pinyin": "duan",
+      "source_sentence": 21,
+      "source_start": 7
+    },
+    {
+      "index": 381,
+      "word": "长",
+      "pinyin": "zhang",
+      "source_sentence": 93,
+      "source_start": 8
+    },
+    {
+      "index": 382,
+      "word": "问",
+      "pinyin": "wen",
+      "source_sentence": 9,
+      "source_start": 2
+    },
+    {
+      "index": 383,
+      "word": "间",
+      "pinyin": "jian",
+      "source_sentence": 37,
+      "source_start": 3
+    },
+    {
+      "index": 384,
+      "word": "队",
+      "pinyin": "dui",
+      "source_sentence": 28,
+      "source_start": 1
+    },
+    {
+      "index": 385,
+      "word": "阳",
+      "pinyin": "yang",
+      "source_sentence": 86,
+      "source_start": 4
+    },
+    {
+      "index": 386,
+      "word": "院",
+      "pinyin": "yuan",
+      "source_sentence": 42,
+      "source_start": 3
+    },
+    {
+      "index": 387,
+      "word": "难",
+      "pinyin": "nan",
+      "source_sentence": 34,
+      "source_start": 8
+    },
+    {
+      "index": 388,
+      "word": "集",
+      "pinyin": "ji",
+      "source_sentence": 63,
+      "source_start": 4
+    },
+    {
+      "index": 389,
+      "word": "雨",
+      "pinyin": "yu",
+      "source_sentence": 55,
+      "source_start": 7
+    },
+    {
+      "index": 390,
+      "word": "需",
+      "pinyin": "xu",
+      "source_sentence": 9,
+      "source_start": 4
+    },
+    {
+      "index": 391,
+      "word": "非",
+      "pinyin": "fei",
+      "source_sentence": 14,
+      "source_start": 4
+    },
+    {
+      "index": 392,
+      "word": "音",
+      "pinyin": "yin",
+      "source_sentence": 56,
+      "source_start": 7
+    },
+    {
+      "index": 393,
+      "word": "项",
+      "pinyin": "xiang",
+      "source_sentence": 20,
+      "source_start": 2
+    },
+    {
+      "index": 394,
+      "word": "预",
+      "pinyin": "yu",
+      "source_sentence": 16,
+      "source_start": 6
+    },
+    {
+      "index": 395,
+      "word": "题",
+      "pinyin": "ti",
+      "source_sentence": 9,
+      "source_start": 3
+    },
+    {
+      "index": 396,
+      "word": "餐",
+      "pinyin": "can",
+      "source_sentence": 4,
+      "source_start": 2
+    },
+    {
+      "index": 397,
+      "word": "饭",
+      "pinyin": "fan",
+      "source_sentence": 13,
+      "source_start": 9
+    },
+    {
+      "index": 398,
+      "word": "馆",
+      "pinyin": "guan",
+      "source_sentence": 6,
+      "source_start": 5
+    },
+    {
+      "index": 399,
+      "word": "马",
+      "pinyin": "ma",
+      "source_sentence": 71,
+      "source_start": 5
+    },
+    {
+      "index": 400,
+      "word": "骑",
+      "pinyin": "qi",
+      "source_sentence": 62,
+      "source_start": 3
+    },
+    {
+      "index": 401,
+      "word": "高",
+      "pinyin": "gao",
+      "source_sentence": 78,
+      "source_start": 5
+    },
+    {
+      "index": 402,
+      "word": "鲜",
+      "pinyin": "xian",
+      "source_sentence": 101,
+      "source_start": 8
+    }
+  ]
+}

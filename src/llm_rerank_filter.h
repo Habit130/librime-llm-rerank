@@ -128,13 +128,20 @@ class LlmRerankFilter : public Filter {
 
   bool enabled_ = true;
   int window_ = 32;
-  double alpha_ = 2.0;
+  // Calibrated in #46 on the canonical 120/402 fixture: least-harmful
+  // in-grid value; no internal optimum exists on that denominator (see
+  // eval/manifest.json).
+  double alpha_ = 0.5;
   double sys_coeff_ = 1.0;
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
   int deadline_ms_ = 200;
   bool verbose_ = false;
+  // Versioned scoring-policy identity (docs/token-attribution.md); pins the
+  // normalization semantics (mean-token since #46). Overridable per machine
+  // via the schema so deployments can pin the strategy explicitly.
+  string baseline_policy_id_ = "mean-token-lm-v1";
   string schema_id_;
   string input_;
   string socket_path_;

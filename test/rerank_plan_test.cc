@@ -87,7 +87,7 @@ TEST(RerankPlanTest, SameNormalizedContentsHaveStableIdentity) {
   EXPECT_EQ(2, kRerankPlanVersion);
   ASSERT_TRUE(first.identity.has_value());
   EXPECT_EQ(first.identity, second.identity);
-  EXPECT_EQ("rerank-plan-v2:sha1:990957531bc3cfc131f2665dec76b42c5c93011d",
+  EXPECT_EQ("rerank-plan-v2:sha1:de39eff73c7b7da76861a6ffbe551e4eb3776de3",
             *first.identity);
   ASSERT_EQ(2u, first.groups->size());
   EXPECT_EQ((*first.groups)[0].identity, (*second.groups)[0].identity);
@@ -192,6 +192,29 @@ TEST(RerankPlanTest, ScoringPolicyChangeChangesIdentity) {
                            DefaultRerankPlanConfig(), changed_policy);
 
   EXPECT_NE(first.identity, changed.identity);
+}
+
+TEST(RerankPlanTest, BaselinePolicyIdChangeChangesIdentity) {
+  // The mean-token policy (default) must never share an identity with the
+  // old sum-score policy, even at the same alpha.
+  RerankScoringPolicy old_policy = DefaultRerankScoringPolicy();
+  old_policy.baseline_policy_id = "first-stage-base-v1";
+  RerankScoringPolicy new_policy = DefaultRerankScoringPolicy();
+  EXPECT_EQ("mean-token-lm-v1", *new_policy.baseline_policy_id);
+  EXPECT_EQ(*old_policy.alpha, *new_policy.alpha);
+
+  auto old_plan = BuildPlan(TwoGroupsWithPunctuation(), "上文",
+                            DefaultRerankPlanConfig(), old_policy);
+  auto new_plan = BuildPlan(TwoGroupsWithPunctuation(), "上文",
+                            DefaultRerankPlanConfig(), new_policy);
+
+  EXPECT_NE(old_plan.identity, new_plan.identity);
+}
+
+TEST(RerankPlanTest, SamePolicyIdentityIsDeterministic) {
+  auto first = BuildPlan(TwoGroupsWithPunctuation());
+  auto second = BuildPlan(TwoGroupsWithPunctuation());
+  EXPECT_EQ(first.identity, second.identity);
 }
 
 TEST(RerankPlanTest, StoresLast64UnicodeCharacters) {
