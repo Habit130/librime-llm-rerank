@@ -9,10 +9,14 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     llm_rerank_filter_test.cc
     llm_scorer_protocol_test.cc
     rerank_plan_test.cc
+    recorder_session_test.cc
+    fact_store_test.cc
+    recorder_e2e_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
   target_link_libraries(llm_rerank_test
     ${rime_library}
-    ${GTEST_LIBRARIES})
+    ${GTEST_LIBRARIES}
+    sqlite3)
   if(BUILD_SHARED_LIBS)
     target_compile_definitions(llm_rerank_test PRIVATE RIME_IMPORTS)
   endif()
