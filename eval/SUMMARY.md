@@ -50,5 +50,5 @@
 - Old sum policy alpha=2.0: top-1 0.3134, MRR 0.5132
 - Delta vs baseline: top-1 +0.0000; vs old policy: +0.0000
 - Harmful regressions at final alpha: 0 cases whose expected word dropped from rank 1
-- Baseline candidate manifest SHA-256: `6c5752a1ad2a565edba167d7c8f0af0d0645b11f08d185a5460bfd8a73d35227` (per-case ordered and multiset checksums in results.json)
+- Baseline candidate manifest SHA-256: `455f77d241be1e763f798517962841d0c4ec12ba8b4b87340fc228e53e2c20d6` (per-case ordered and multiset checksums in results.json)
 - Historical 78-case numbers are background only and are NOT a paired baseline (different denominator).

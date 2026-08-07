@@ -612,6 +612,6 @@
   "internal_optimum": false,
   "positive_alpha_qualified": false,
   "final_alpha_rationale": "The canonical 120/402 fixture supports no positive alpha: alpha=0 (word top-1 0.3134, MRR 0.5130, 126/402) beats every positive grid point [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0] on top-1 and MRR; no positive value qualified: the best positive grid point is alpha=0.5 with word top-1 0.2960, below alpha=0. The best grid point sits on the grid's lower boundary and the pre-declared extension rule covers the upper boundary only, so no internal optimum exists. The data-supported boundary result is therefore alpha=0 (owner decision, Habit130/squirrel#46): the LM term stays disabled by default and the mean-token policy remains available via explicit schema configuration. A future contextual fixture may re-calibrate.",
-  "baseline_candidate_manifest_sha256": "6c5752a1ad2a565edba167d7c8f0af0d0645b11f08d185a5460bfd8a73d35227",
-  "manifest_sha256": "8fd3240c0fc89d82d34d04c33f8472ddf3c4bc27c79edda95f43f5a5c6ad3b8f"
+  "baseline_candidate_manifest_sha256": "455f77d241be1e763f798517962841d0c4ec12ba8b4b87340fc228e53e2c20d6",
+  "manifest_sha256": "b34e5534f2cdf2f20f8e6aa5ce85cf133d24d4763f9aa51a52b544443f7d61d7"
 }

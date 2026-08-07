@@ -735,16 +735,16 @@ def run_single(args, script, sentence_targets, word_targets, all_pinyins,
     word_blocks = blocks[len(sentence_targets):]
 
     sentence_ranks = []
-    sentence_sets = []
+    sentence_emissions = []
     for target, block in zip(sentence_targets, sentence_blocks):
         candidates = parse_candidates(block)
-        sentence_sets.append(sorted(candidates))
+        sentence_emissions.append(candidates)
         sentence_ranks.append(rank_of(target, candidates))
     word_ranks = []
-    word_sets = []
+    word_emissions = []
     for target, block in zip(word_targets, word_blocks):
         candidates = parse_candidates(block)
-        word_sets.append(sorted(candidates))
+        word_emissions.append(candidates)
         word_ranks.append(rank_of(target, candidates))
 
     return {
@@ -754,8 +754,8 @@ def run_single(args, script, sentence_targets, word_targets, all_pinyins,
         },
         "ranks": {"sentence": sentence_ranks, "word": word_ranks},
         "candidate_checksums": {
-            "sentence": [candidate_checksums(s) for s in sentence_sets],
-            "word": [candidate_checksums(w) for w in word_sets],
+            "sentence": [candidate_checksums(s) for s in sentence_emissions],
+            "word": [candidate_checksums(w) for w in word_emissions],
         },
         "config_identity": config_identity(args.template_dir, alpha,
                                            baseline_policy_id),

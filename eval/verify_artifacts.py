@@ -18,7 +18,9 @@ Checks, all from committed files (no model, no console run):
    run.
 4. **Baseline candidate manifest**: `baseline_candidate_manifest_sha256`
    equals the canonical checksum of results.json's per-case ordered +
-   multiset candidate checksums (522 cases).
+   multiset candidate checksums (522 cases), and at least one case's
+   ordered checksum differs from its multiset checksum (proof the ordered
+   hash captures emission order, not a re-sorted multiset).
 5. **Summary**: regenerates SUMMARY.md with the same `write_summary` the
    script uses and compares byte-for-byte with the committed file.
 6. **Distributions**: results.json carries the summarized score/token-count
@@ -148,6 +150,18 @@ def main():
                     failures.append(
                         f"baseline_candidate_checksums[{kind}] case {i}: "
                         "missing ordered/multiset checksum")
+        distinct_order_cases = sum(
+            1
+            for kind in expected_counts
+            for entry in baseline_checksums.get(kind, [])
+            if isinstance(entry, dict)
+            and entry.get("ordered_sha256") != entry.get("multiset_sha256")
+        )
+        if distinct_order_cases == 0:
+            failures.append(
+                "every case has ordered_sha256 == multiset_sha256: the "
+                "ordered checksums do not capture emission/merge order "
+                "(candidate lists were sorted before hashing)")
         expected_manifest_sha = sha256_bytes(
             canonical_json(baseline_checksums).encode("utf-8"))
         if manifest.get("baseline_candidate_manifest_sha256") != \

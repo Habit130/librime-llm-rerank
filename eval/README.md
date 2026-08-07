@@ -82,15 +82,17 @@ eval/.venv/bin/python eval/verify_artifacts.py \
 Checks the committed fixture, the manifest checksum (canonical rule:
 `sha256(canonical_json(manifest minus manifest_sha256))`), results<->manifest
 consistency including the recomputed decision fields, the baseline candidate
-manifest, and byte-for-byte summary regeneration. Must pass on the committed
-artifacts.
+manifest (including that at least one case's ordered checksum differs from its
+multiset checksum, i.e. the ordered hash really captures emission order), and
+byte-for-byte summary regeneration. Must pass on the committed artifacts.
 
-## Model-free vs integration tests (daemon)
+## Model-free vs integration tests
 
 - **Model-free gate** (clean Python, no transformers/MLX/model):
   `python3 -m unittest discover -s daemon -p 'test_*.py'` — protocol, fake
-  tokenizer, fake logits, pure functions. Must pass without any model
-  dependency.
+  tokenizer, fake logits, pure functions — plus
+  `python3 -m unittest discover -s eval -p 'test_*.py'` — candidate-checksum
+  contract. Both must pass without any model dependency.
 - **Integration** (explicit opt-in, daemon venv; missing model or
   transformers fails with an explicit configuration error):
   `daemon/.venv/bin/python daemon/integration_tokenizer.py`,
