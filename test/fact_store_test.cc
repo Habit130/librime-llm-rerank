@@ -3,6 +3,8 @@
 // Distributed under the BSD License
 //
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -309,4 +311,165 @@ TEST_F(FactStoreTest, MissingHomeMeansNoRoot) {
   ASSERT_EQ(FactStore::Status::kNoHome, store.Open());
   ASSERT_FALSE(store.is_open());
   EXPECT_STREQ("no_home", FactStore::StatusCode(store.status()));
+}
+
+TEST_F(FactStoreTest, ClockRollbackOnlyAdvancesLogicalComponent) {
+  // Simulate the wall clock moving backwards between batches: the physical
+  // component must stay put and only the logical component may advance.
+  // A rollback happens whenever NowMs() <= the persisted clock.
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    std::vector<FactStore::Event> events{MakeEvent(1)};
+    ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events));
+  }
+  sqlite3* tamper = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((root_ / "facts.sqlite3").c_str(),
+                                       &tamper, SQLITE_OPEN_READWRITE,
+                                       nullptr));
+  // Rewind the persisted clock far into the future so the next real-time
+  // NowMs() is smaller: a clock rollback in the store's eyes.
+  ASSERT_EQ(SQLITE_OK,
+            sqlite3_exec(tamper, "UPDATE meta SET value = '7000000000000'"
+                                 " WHERE key = 'hlc_physical_ms';",
+                         nullptr, nullptr, nullptr));
+  sqlite3_close(tamper);
+
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  std::vector<FactStore::Event> events{MakeEvent(2)};
+  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &events));
+  // The wall clock is behind the persisted clock, so the physical component
+  // is untouched; only the logical component advances.
+  EXPECT_EQ(7000000000000LL, events[0].hlc_physical_ms);
+  EXPECT_GT(events[0].hlc_logical, 0LL);
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  EXPECT_EQ(7000000000000LL,
+            QueryCount(db, "SELECT value FROM meta WHERE key='hlc_physical_ms';"));
+  EXPECT_EQ(events[0].hlc_logical,
+            QueryCount(db, "SELECT value FROM meta WHERE key='hlc_logical';"));
+  sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, CrashMidBatchLeavesNothingVisible) {
+  // A crash inside a batch (a writer dies mid-transaction, never COMMITting)
+  // must leave no half-visible facts: a fresh reader sees only the complete
+  // earlier commit, and a new store can still open and write afterwards.
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  std::vector<FactStore::Event> first{MakeEvent(1)};
+  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &first));
+
+  // Simulate a second writer that dies right after BEGIN IMMEDIATE with a
+  // commit row and events inserted but never COMMITted.
+  sqlite3* crashed = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((root_ / "facts.sqlite3").c_str(),
+                                       &crashed, SQLITE_OPEN_READWRITE,
+                                       nullptr));
+  ASSERT_EQ(SQLITE_OK, sqlite3_exec(crashed, "BEGIN IMMEDIATE;", nullptr,
+                                    nullptr, nullptr));
+  ASSERT_EQ(SQLITE_OK,
+            sqlite3_exec(crashed,
+                         "INSERT INTO commits(commit_id, utc_committed_at_ms)"
+                         " VALUES('crashed', 1700000002000);",
+                         nullptr, nullptr, nullptr));
+  ASSERT_EQ(SQLITE_OK,
+            sqlite3_exec(crashed,
+                         "INSERT INTO selection_events(event_id, commit_id,"
+                         " event_format_version, schema_id,"
+                         " canonical_segment_input, span_start, span_end,"
+                         " category, preceding_text, competition_complete,"
+                         " final_selection_text, confirmation_source,"
+                         " trigger_keycode, display_rank, display_page,"
+                         " session_id, session_seq, hlc_physical_ms,"
+                         " hlc_logical, utc_confirmed_at_ms,"
+                         " utc_committed_at_ms)"
+                         " VALUES('crashed-event', 'crashed', 1, 'test',"
+                         " 'shijie', 0, 6, 'word', '', 0, '时界',"
+                         " 'explicit_indexed', 2, 2, 1, 'crashed-session',"
+                         " 1, 1, 0, 1700000002000, 1700000002000);",
+                         nullptr, nullptr, nullptr));
+  // Die without COMMIT or ROLLBACK: the transaction is abandoned.
+  sqlite3_close(crashed);
+
+  // A fresh reader must see the pre-crash batch only.
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM commits;"));
+  EXPECT_EQ(0LL, QueryCount(db,
+      "SELECT COUNT(*) FROM selection_events"
+      " WHERE event_id = 'crashed-event';"));
+  EXPECT_EQ(0LL, QueryCount(db,
+      "SELECT COUNT(*) FROM commits WHERE commit_id = 'crashed';"));
+  sqlite3_close(db);
+
+  // The store survives the crash and keeps recording.
+  FactStore store2(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store2.Open());
+  std::vector<FactStore::Event> second{MakeEvent(2)};
+  ASSERT_TRUE(store2.PersistBatch(1700000004000LL, &second));
+  sqlite3* db2 = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db2));
+  EXPECT_EQ(2LL, QueryCount(db2, "SELECT COUNT(*) FROM commits;"));
+  sqlite3_close(db2);
+}
+
+TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
+  // Two independent store handles on the same facts root, writing batches
+  // concurrently (a multi-process write competition). Each batch must land
+  // whole or not at all, and no batch may be lost.
+  const int kBatches = 8;
+  // Establish the database before forking so both writers race on writes
+  // only, never on schema/meta initialization.
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    std::vector<FactStore::Event> bootstrap{MakeEvent(0)};
+    ASSERT_TRUE(store.PersistBatch(1699999999000LL, &bootstrap));
+  }
+
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+  int exit_code = 0;
+  if (pid == 0) {
+    // Child writer: its own store handle; loops, then exits cleanly.
+    FactStore store(root_);
+    FactStore::Status status = store.Open();
+    if (status != FactStore::Status::kOk)
+      _exit(2);
+    for (int i = 0; i < kBatches; ++i) {
+      std::vector<FactStore::Event> events{MakeEvent(100 + i)};
+      if (!store.PersistBatch(1700000000000LL + i, &events))
+        _exit(3);
+    }
+    _exit(0);
+  }
+  // Parent writer on the same root, racing the child.
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    for (int i = 0; i < kBatches; ++i) {
+      std::vector<FactStore::Event> events{MakeEvent(200 + i)};
+      ASSERT_TRUE(store.PersistBatch(1700000001000LL + i, &events));
+    }
+  }
+  waitpid(pid, &exit_code, 0);
+  ASSERT_TRUE(WIFEXITED(exit_code));
+  ASSERT_EQ(0, WEXITSTATUS(exit_code));
+
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  // Every batch from both writers became exactly one commit row, plus the
+  // bootstrap commit.
+  EXPECT_EQ(2LL * kBatches + 1, QueryCount(db, "SELECT COUNT(*) FROM commits;"));
+  EXPECT_EQ(2LL * kBatches + 1,
+            QueryCount(db, "SELECT COUNT(*) FROM selection_events;"));
+  // Each event must have its full candidate set — no torn batches.
+  EXPECT_EQ(3LL * (2 * kBatches + 1),
+            QueryCount(db, "SELECT COUNT(*) FROM selection_candidates;"));
+  EXPECT_EQ(0LL, QueryCount(db,
+      "SELECT COUNT(*) FROM commits c LEFT JOIN selection_events e"
+      " ON c.commit_id = e.commit_id WHERE e.event_id IS NULL;"));
+  sqlite3_close(db);
 }
