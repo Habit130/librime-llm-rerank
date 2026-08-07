@@ -9,6 +9,7 @@
 #include <rime_api.h>
 
 #include "llm_rerank_filter.h"
+#include "llm_rerank_recorder.h"
 
 static void rime_llm_rerank_initialize() {
   using namespace rime;
@@ -16,6 +17,7 @@ static void rime_llm_rerank_initialize() {
   LOG(INFO) << "registering components from module 'llm_rerank'.";
   Registry& r = Registry::instance();
   r.Register("llm_rerank", new Component<LlmRerankFilter>);
+  r.Register("llm_rerank_recorder", new Component<LlmRerankRecorder>);
 }
 
 static void rime_llm_rerank_finalize() {}
