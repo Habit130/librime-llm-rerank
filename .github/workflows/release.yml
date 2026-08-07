@@ -1,0 +1,97 @@
+name: Release
+
+# Builds a universal (arm64 + x86_64) `librime-llm-rerank.dylib` binary
+# artifact and attaches it to a GitHub Release. The build pins the exact
+# librime source revision and prebuilt dependency set that
+# Habit130/squirrel's `action-install.sh` consumes, so the artifact is ABI
+# compatible with the librime 1.17.0 runtime bundled by Squirrel by
+# construction (same commit, same headers, same plugin build options as
+# librime's own `make release`).
+#
+# Squirrel downloads the artifact by release tag and verifies its sha256;
+# see the pins at the top of `.github/workflows/release.yml` and
+# squirrel's `action-install.sh`.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    env:
+      # librime revision to build against (mirrors squirrel submodule pin +
+      # action-install.sh's rime_git_hash). Prebuilt deps are pulled from this
+      # same librime release, so we never run librime's `make deps`.
+      RIME_GIT_HASH: 33e7814
+      RIME_RELEASE_TAG: 1.17.0
+      RIME_DEPS_ARCHIVE: rime-deps-33e7814-macOS-universal.tar.bz2
+      MACOSX_DEPLOYMENT_TARGET: 13.0
+    steps:
+      - name: Set Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.5'
+
+      - name: Checkout plugin source
+        uses: actions/checkout@v6
+
+      - name: Checkout librime at pinned revision
+        uses: actions/checkout@v6
+        with:
+          repository: rime/librime
+          ref: 33e78140250125871856cdc5b42ddc6a5fcd3cd4
+          path: librime
+          submodules: recursive
+
+      - name: Install Boost
+        run: brew install boost
+
+      - name: Download prebuilt librime dependencies
+        run: |
+          curl -fLO "https://github.com/rime/librime/releases/download/${RIME_RELEASE_TAG}/${RIME_DEPS_ARCHIVE}"
+          tar -xjf "${RIME_DEPS_ARCHIVE}" -C librime
+
+      - name: Install plugin into librime build tree
+        run: |
+          mkdir -p librime/plugins/llm-rerank
+          git archive HEAD | tar -x -C librime/plugins/llm-rerank
+
+      - name: Configure
+        env:
+          BOOST_ROOT: /opt/homebrew/opt/boost
+        working-directory: librime
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_PREFIX=$PWD/dist \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_MERGED_PLUGINS=OFF \
+            -DENABLE_EXTERNAL_PLUGINS=ON \
+            -DBUILD_TEST=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build plugin
+        env:
+          BOOST_ROOT: /opt/homebrew/opt/boost
+        run: cmake --build build --target rime-llm-rerank
+
+      - name: Verify artifact
+        working-directory: librime
+        run: |
+          PLUGIN=build/lib/rime-plugins/librime-llm-rerank.dylib
+          test -f "${PLUGIN}" || { echo "plugin dylib not built"; exit 1; }
+          lipo -info "${PLUGIN}"
+          otool -L "${PLUGIN}" | grep -F "@rpath/librime.1.dylib (compatibility version 1.0.0, current version 1.17.0)" || \
+            { echo "plugin not linked against librime 1.17.0"; exit 1; }
+          shasum -a 256 "${PLUGIN}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: librime/build/lib/rime-plugins/librime-llm-rerank.dylib
+          fail_on_unmatched_files: true
