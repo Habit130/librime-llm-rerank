@@ -270,9 +270,19 @@ RerankPlanConfig DefaultRerankPlanConfig() {
 RerankScoringPolicy DefaultRerankScoringPolicy() {
   RerankScoringPolicy policy;
   policy.version = 1;
-  policy.baseline_policy_id = "first-stage-base-v1";
+  // mean-token policy (docs/token-attribution.md): the LM term is the mean
+  // log probability of the candidate's own tokens. The id pins the
+  // normalization semantics; alpha is hashed into the plan identity
+  // separately, so changing either changes the identity.
+  //
+  // Default alpha = 0 (owner decision, Habit130/squirrel#46): on the
+  // canonical 120/402 fixture no positive alpha qualifies (alpha=0 beats
+  // every positive grid point on top-1 and MRR; see eval/manifest.json).
+  // The LM term stays disabled by default and can be enabled explicitly via
+  // the schema; a future contextual fixture decides a positive default.
+  policy.baseline_policy_id = "mean-token-lm-v1";
   policy.retrieval_policy_id = "context-evidence-v1";
-  policy.alpha = 2.0;
+  policy.alpha = 0.0;
   policy.sys_coeff = 1.0;
   policy.usr_coeff = 1.0;
   policy.gamma = 2.0;

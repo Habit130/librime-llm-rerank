@@ -26,7 +26,7 @@
 namespace rime {
 namespace {
 
-constexpr int kLlmScoringProtocolVersion = 1;
+constexpr int kLlmScoringProtocolVersion = 2;
 constexpr size_t kMaximumResponseBytes = 64 * 1024;
 
 enum class WaitStatus { kReady, kTimeout, kError };
@@ -133,11 +133,13 @@ static string JsonEscape(const string& s) {
 static string BuildRequest(const string& context,
                            const vector<string>& candidates,
                            const string& request_id,
-                           const string& plan_identity) {
+                           const string& plan_identity,
+                           const string& baseline_policy_id) {
   string json = "{\"version\":" + std::to_string(kLlmScoringProtocolVersion) +
                 ",\"request_id\":\"" + JsonEscape(request_id) +
                 "\",\"plan_identity\":\"" + JsonEscape(plan_identity) +
-                "\",\"context\":\"";
+                "\",\"baseline_policy_id\":\"" +
+                JsonEscape(baseline_policy_id) + "\",\"context\":\"";
   json += JsonEscape(context);
   json += "\",\"candidates\":[";
   for (size_t i = 0; i < candidates.size(); i++) {
@@ -312,6 +314,7 @@ bool LlmScorer::SendRequest(const string& context,
                             const vector<string>& candidates,
                             const string& request_id,
                             const string& plan_identity,
+                            const string& baseline_policy_id,
                             string* response) {
   if (deadline_ms_ <= 0) {
     LogFailure("deadline_invalid", "score", candidates.size());
@@ -359,7 +362,8 @@ bool LlmScorer::SendRequest(const string& context,
     return false;
   }
 
-  string request = BuildRequest(context, candidates, request_id, plan_identity);
+  string request = BuildRequest(context, candidates, request_id, plan_identity,
+                                baseline_policy_id);
   size_t sent = 0;
   while (sent < request.size()) {
     WaitStatus wait = WaitFor(fd, POLLOUT, deadline, &DefaultConnectSyscalls());
@@ -440,7 +444,8 @@ bool LlmScorer::ScoreBatch(const ScoringRequest& request,
                             ":" + std::to_string(next_request++);
   string response;
   if (!SendRequest(request.preceding_text, request.candidate_texts, request_id,
-                   request.plan_identity, &response))
+                   request.plan_identity, request.baseline_policy_id,
+                   &response))
     return false;
 
   vector<double> scores;

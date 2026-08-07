@@ -13,8 +13,14 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from server import (
+    LEGACY_SUM_POLICY_ID,
     MAX_REQUEST_BYTES,
+    MEAN_TOKEN_POLICY_ID,
     PROTOCOL_VERSION,
+    SCORING_STRATEGY_LEGACY_SUM,
+    SCORING_STRATEGY_MEAN_TOKEN,
+    NonFiniteTokenScoreError,
+    TokenAttributionError,
     handle_request,
     read_request,
 )
@@ -24,6 +30,7 @@ class FakeState:
     def __init__(self, result=None, error=None):
         self.result = [1.25, -2.5] if result is None else result
         self.error = error
+        self.scoring_strategy = SCORING_STRATEGY_MEAN_TOKEN
 
     def score(self, context, candidates):
         if self.error:
@@ -36,6 +43,7 @@ def request(**overrides):
         "version": PROTOCOL_VERSION,
         "request_id": "request-17",
         "plan_identity": "rerank-plan-v2:sha1:0123456789abcdef",
+        "baseline_policy_id": MEAN_TOKEN_POLICY_ID,
         "context": "private context fixture",
         "candidates": ["candidate-a", "candidate-b"],
     }
@@ -101,6 +109,7 @@ class ProtocolTest(unittest.TestCase):
             "version": "1",
             "request_id": 17,
             "plan_identity": None,
+            "baseline_policy_id": 17,
             "context": ["not", "text"],
             "candidates": "not-a-list",
         }
@@ -222,10 +231,54 @@ class ProtocolTest(unittest.TestCase):
             writer.close()
 
     def test_extra_field_and_wrong_version_are_rejected(self):
-        for damaged in (request(extra=True), request(version=2)):
+        for damaged in (request(extra=True), request(version=PROTOCOL_VERSION + 1)):
             with self.subTest(damaged=damaged):
                 response = handle_request(FakeState(), encode(damaged))
                 self.assert_protocol_error(response, "invalid_request")
+
+    def test_policy_mismatch_is_rejected_in_both_directions(self):
+        # A mean-token daemon must reject a legacy-sum plan...
+        mean_state = FakeState()
+        response = handle_request(
+            mean_state,
+            encode(request(baseline_policy_id=LEGACY_SUM_POLICY_ID)),
+        )
+        self.assert_protocol_error(response, "policy_mismatch")
+        self.assert_bound_error(response)
+        # ...and a legacy-sum daemon must reject a mean-token plan.
+        legacy_state = FakeState()
+        legacy_state.scoring_strategy = SCORING_STRATEGY_LEGACY_SUM
+        response = handle_request(
+            legacy_state,
+            encode(request(baseline_policy_id=MEAN_TOKEN_POLICY_ID)),
+        )
+        self.assert_protocol_error(response, "policy_mismatch")
+        self.assert_bound_error(response)
+
+    def test_matching_policy_is_accepted_in_both_modes(self):
+        mean_state = FakeState()
+        response = handle_request(
+            mean_state,
+            encode(request(baseline_policy_id=MEAN_TOKEN_POLICY_ID)),
+        )
+        self.assertIn("scores", response)
+        legacy_state = FakeState()
+        legacy_state.scoring_strategy = SCORING_STRATEGY_LEGACY_SUM
+        response = handle_request(
+            legacy_state,
+            encode(request(baseline_policy_id=LEGACY_SUM_POLICY_ID)),
+        )
+        self.assertIn("scores", response)
+
+    def test_policy_mismatch_does_not_echo_input(self):
+        response = handle_request(
+            FakeState(),
+            encode(request(baseline_policy_id=LEGACY_SUM_POLICY_ID)),
+        )
+        self.assertEqual("policy_mismatch", response["error"]["code"])
+        self.assertNotIn("private context fixture", str(response))
+        self.assertNotIn("candidate-a", str(response))
+        self.assertNotIn("first-stage-base-v1", str(response["error"]))
 
     def test_score_count_mismatch_is_not_emitted_as_success(self):
         response = handle_request(FakeState(result=[1.0]), encode(request()))
@@ -260,6 +313,38 @@ class ProtocolTest(unittest.TestCase):
         self.assertNotIn(secret, str(response))
         self.assertNotIn("private context fixture", str(response))
         self.assertNotIn("candidate-a", str(response))
+
+    def test_empty_candidate_is_rejected(self):
+        response = handle_request(
+            FakeState(), encode(request(candidates=["", "b"]))
+        )
+        self.assert_protocol_error(response, "invalid_request")
+        self.assertNotIn('""', str(response["error"]))
+
+    def test_token_attribution_failure_is_bound_and_silent(self):
+        class AttributionFailingState(FakeState):
+            def score(self, context, candidates):
+                raise TokenAttributionError("token straddles boundary")
+
+        response = handle_request(AttributionFailingState(), encode(request()))
+
+        self.assertEqual("token_attribution_failed", response["error"]["code"])
+        self.assertEqual("score", response["error"]["phase"])
+        self.assert_bound_error(response)
+        self.assertNotIn("straddles", str(response))
+        self.assertNotIn("private context fixture", str(response))
+        self.assertNotIn("candidate-a", str(response))
+
+    def test_non_finite_token_score_is_bound_and_silent(self):
+        class NonFiniteState(FakeState):
+            def score(self, context, candidates):
+                raise NonFiniteTokenScoreError()
+
+        response = handle_request(NonFiniteState(), encode(request()))
+
+        self.assertEqual("non_finite_score", response["error"]["code"])
+        self.assert_bound_error(response)
+        self.assertNotIn("private context fixture", str(response))
 
 
 if __name__ == "__main__":
