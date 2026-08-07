@@ -62,6 +62,7 @@ class LlmScorer : public Scorer {
                    const vector<string>& candidates,
                    const string& request_id,
                    const string& plan_identity,
+                   const string& baseline_policy_id,
                    string* response);
 
   string socket_path_;

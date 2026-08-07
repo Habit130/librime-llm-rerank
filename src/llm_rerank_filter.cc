@@ -276,8 +276,9 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       texts.push_back(buffer[index]->text());
     }
   }
-  ScoringRequest request{*plan.identity, *plan.preceding_text,
-                         *plan.previous_word, std::move(texts)};
+  ScoringRequest request{*plan.identity, *scoring_policy_.baseline_policy_id,
+                         *plan.preceding_text, *plan.previous_word,
+                         std::move(texts)};
   vector<ScoreComponents> batch_scores;
   if (!scorer_->ScoreBatch(request, scored_candidates, &batch_scores) ||
       batch_scores.size() != scored_candidates.size()) {
@@ -328,6 +329,8 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     config->GetBool(name_space_ + "/enable", &enabled_);
     config->GetInt(name_space_ + "/window", &window_);
     config->GetDouble(name_space_ + "/alpha", &alpha_);
+    config->GetString(name_space_ + "/baseline_policy_id",
+                      &baseline_policy_id_);
     config->GetDouble(name_space_ + "/sys_coeff", &sys_coeff_);
     config->GetDouble(name_space_ + "/usr_coeff", &usr_coeff_);
     config->GetDouble(name_space_ + "/gamma", &gamma_);
@@ -458,6 +461,7 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   }
   const string preceding_text = BuildContext();
   RerankScoringPolicy scoring_policy = DefaultRerankScoringPolicy();
+  scoring_policy.baseline_policy_id = baseline_policy_id_;
   scoring_policy.alpha = alpha_;
   scoring_policy.sys_coeff = sys_coeff_;
   scoring_policy.usr_coeff = usr_coeff_;

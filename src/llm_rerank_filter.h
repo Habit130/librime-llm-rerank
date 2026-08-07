@@ -22,6 +22,7 @@ struct ScoreComponents {
 
 struct ScoringRequest {
   string plan_identity;
+  string baseline_policy_id;
   string preceding_text;
   string previous_word;
   vector<string> candidate_texts;
@@ -128,13 +129,21 @@ class LlmRerankFilter : public Filter {
 
   bool enabled_ = true;
   int window_ = 32;
-  double alpha_ = 2.0;
+  // Default alpha = 0 (owner decision, Habit130/squirrel#46): the canonical
+  // 120/402 calibration supports no positive alpha (see
+  // eval/manifest.json), so the LM term is disabled unless the schema
+  // explicitly sets a positive value.
+  double alpha_ = 0.0;
   double sys_coeff_ = 1.0;
   double usr_coeff_ = 1.0;
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
   int deadline_ms_ = 200;
   bool verbose_ = false;
+  // Versioned scoring-policy identity (docs/token-attribution.md); pins the
+  // normalization semantics (mean-token since #46). Overridable per machine
+  // via the schema so deployments can pin the strategy explicitly.
+  string baseline_policy_id_ = "mean-token-lm-v1";
   string schema_id_;
   string input_;
   string socket_path_;

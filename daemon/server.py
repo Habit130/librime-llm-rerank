@@ -32,16 +32,47 @@ IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
 CACHE_LIMIT_MB = 512  # MLX allocator cache cap; 0 = unlimited (default MLX behavior)
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 64 * 1024
 REQUEST_READ_DEADLINE = 5.0
 REQUEST_FIELDS = {
     "version",
     "request_id",
     "plan_identity",
+    "baseline_policy_id",
     "context",
     "candidates",
 }
+
+# Scoring strategies (see docs/token-attribution.md). The production strategy
+# is mean_token: the mean log probability of the tokens that provably belong
+# to the candidate text. legacy_sum is a calibration-only faithful
+# reproduction of the pre-#46 algorithm (sum over all suffix tokens, first
+# token skipped when the prefix is empty); it exists so the old policy's
+# numbers can be reported on the canonical 120/402 denominator without
+# duplicating scoring logic in the calibration tooling.
+SCORING_STRATEGY_MEAN_TOKEN = "mean_token"
+SCORING_STRATEGY_LEGACY_SUM = "legacy_sum"
+
+# Policy-id binding (Habit130/squirrel#46 acceptance, PR #12 round 2): each
+# daemon scoring mode accepts exactly one declared baseline_policy_id, so a
+# plan's declared normalization can never be silently served by a daemon
+# running a different algorithm. legacy_sum exists solely for calibration
+# and only accepts the old sum policy id.
+MEAN_TOKEN_POLICY_ID = "mean-token-lm-v1"
+LEGACY_SUM_POLICY_ID = "first-stage-base-v1"
+POLICY_ID_BY_STRATEGY = {
+    SCORING_STRATEGY_MEAN_TOKEN: MEAN_TOKEN_POLICY_ID,
+    SCORING_STRATEGY_LEGACY_SUM: LEGACY_SUM_POLICY_ID,
+}
+
+
+class TokenAttributionError(Exception):
+    """The candidate token boundary cannot be proven safe to score."""
+
+
+class NonFiniteTokenScoreError(Exception):
+    """A per-token or reduced log probability is not finite."""
 
 
 def reject_duplicate_object_fields(pairs):
@@ -58,6 +89,122 @@ def window_context(context, context_window):
     return context[-context_window:]
 
 
+def candidate_scoring_plan(tokenizer, tail_text, candidate):
+    """Tokenize `tail_text + candidate` and attribute tokens to the candidate.
+
+    Returns (suffix_ids, first_target_position, target_count) or raises
+    TokenAttributionError.
+
+    Attribution is by reconstruction (docs/token-attribution.md): the token
+    boundary is located by decoding token-sequence prefixes and comparing
+    them with the tail text. This is provably safe -- `decode(ids[:k]) ==
+    tail_text` proves tokens [0, k) cover exactly the tail characters, the
+    round-trip precondition `decode(ids) == full` proves the remaining
+    tokens cover exactly the candidate characters, and the suffix
+    precondition `decode(ids[k:]) == candidate` closes the loop without
+    relying on decoder composability. It also handles Qwen's byte-level BPE
+    fallback pairs (rare characters tokenize as two byte tokens whose
+    offset mappings are unreliable): the pair stays whole on whichever side
+    of the boundary it falls.
+
+    Fail-closed conditions:
+      - empty candidate;
+      - lossy tokenization (decode of the full sequence != the input text);
+      - a token spanning the tail/candidate boundary (no prefix k decodes
+        to exactly the tail text);
+      - the candidate suffix does not decode back to the candidate text;
+      - zero candidate tokens.
+    """
+    if not candidate:
+        raise TokenAttributionError("empty candidate")
+    full = tail_text + candidate
+    ids = tokenizer.encode(full, add_special_tokens=False)
+    if not ids:
+        raise TokenAttributionError("no tokens")
+    if tokenizer.decode(ids) != full:
+        raise TokenAttributionError("lossy tokenization")
+    if not tail_text:
+        if tokenizer.decode(ids) != candidate:
+            raise TokenAttributionError("candidate suffix mismatch")
+        return ids, 0, len(ids)
+    for k in range(1, len(ids) + 1):
+        if tokenizer.decode(ids[:k]) == tail_text:
+            if k == len(ids):
+                raise TokenAttributionError("no candidate tokens")
+            if tokenizer.decode(ids[k:]) != candidate:
+                raise TokenAttributionError("candidate suffix mismatch")
+            return ids, k, len(ids) - k
+    raise TokenAttributionError("token straddles text boundary")
+
+
+def mean_token_scores(prefix_last_lp, lp_getter, plans):
+    """Reduce per-token log probabilities to mean scores (mean_token policy).
+
+    `plans` is a list of (suffix_ids, first_target_position, target_count).
+    `prefix_last_lp` is a callable token_id -> log prob of the first suffix
+    token given the prefix, or None (callers must guarantee it is not None
+    when a target token sits at position 0). `lp_getter(batch, position,
+    token_id)` returns the log prob of suffix token `position + 1` given the
+    prefix and the tokens before it.
+
+    Each candidate is scored by its own target token count (never the batch
+    padding length); padding positions are never read. Any non-finite value
+    fails the whole batch (NonFiniteTokenScoreError).
+    """
+    scores = []
+    counts = []
+    for batch, (ids, target_start, target_count) in enumerate(plans):
+        if target_count <= 0:
+            raise TokenAttributionError("zero candidate tokens")
+        total = 0.0
+        for offset in range(target_count):
+            position = target_start + offset
+            if position >= len(ids):
+                raise TokenAttributionError("target position out of range")
+            token_id = ids[position]
+            if position == 0:
+                if prefix_last_lp is None:
+                    raise TokenAttributionError("no conditioning for first token")
+                logp = prefix_last_lp(token_id)
+            else:
+                logp = lp_getter(batch, position - 1, token_id)
+            if not math.isfinite(logp):
+                raise NonFiniteTokenScoreError()
+            total += logp
+        mean = total / target_count
+        if not math.isfinite(mean):
+            raise NonFiniteTokenScoreError()
+        scores.append(mean)
+        counts.append(target_count)
+    return scores, counts
+
+
+def legacy_sum_scores(prefix_last_lp, lp_getter, ids_list):
+    """Faithful reproduction of the pre-#46 sum policy (legacy_sum, calib-only).
+
+    Sums the log probability of every suffix token; the first suffix token is
+    accumulated only when a prefix exists, exactly as the old
+    ModelState.score() did. Any non-finite value fails the whole batch.
+    """
+    scores = []
+    for batch, ids in enumerate(ids_list):
+        total = 0.0
+        if prefix_last_lp is not None and ids:
+            logp = prefix_last_lp(ids[0])
+            if not math.isfinite(logp):
+                raise NonFiniteTokenScoreError()
+            total += logp
+        for position in range(len(ids) - 1):
+            logp = lp_getter(batch, position, ids[position + 1])
+            if not math.isfinite(logp):
+                raise NonFiniteTokenScoreError()
+            total += logp
+        if not math.isfinite(total):
+            raise NonFiniteTokenScoreError()
+        scores.append(total)
+    return scores
+
+
 class ModelState:
     """Holds the loaded model and tokenizer.
 
@@ -65,9 +212,11 @@ class ModelState:
     each score() call as local state, so nothing accumulates across requests.
     """
 
-    def __init__(self, model_path, context_window=CONTEXT_WINDOW):
+    def __init__(self, model_path, context_window=CONTEXT_WINDOW,
+                 scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN):
         self.model_path = model_path
         self.context_window = context_window
+        self.scoring_strategy = scoring_strategy
         self.model = None
         self.tokenizer = None
         self.pad_id = None
@@ -120,10 +269,17 @@ class ModelState:
         Stateless: the prefix KV cache is built fresh per request as local
         state, shared across the candidate batch, and freed on return.
 
-        Tokenize strategy (#12), applied to the windowed string:
+        Tokenize strategy (#12) + attribution (#46), applied to the windowed
+        string:
           - prefix = context[:-TAIL_CHARS], tokenized once, KV cached
           - per candidate: tokenize context[-TAIL_CHARS:] + candidate as tail
-          - batched forward, sum log probs of candidate tokens
+          - batched forward
+          - mean_token: sum the log probs of the tokens that provably belong
+            to the candidate text, divided by that candidate's own token
+            count (see docs/token-attribution.md)
+          - legacy_sum: pre-#46 policy (calibration-only), sum over all
+            suffix tokens with the first token skipped when the prefix is
+            empty
         """
         import mlx.core as mx
         import mlx.nn as nn
@@ -148,16 +304,38 @@ class ModelState:
             if prefix_text
             else []
         )
+        if self.scoring_strategy == SCORING_STRATEGY_MEAN_TOKEN:
+            # Defined model-input rule (docs/token-attribution.md): when the
+            # windowed context is empty there is nothing to condition the
+            # first candidate token on; anchor it on EOS so its conditional
+            # probability is defined. Identical for every candidate in the
+            # batch, so it cannot bias comparison. The legacy policy
+            # reproduced no such anchor and is not given one here.
+            anchor = self.tokenizer.eos_token_id
+            if anchor is None:
+                anchor = self.pad_id
+            if anchor is None:
+                raise TokenAttributionError("no anchor token")
+            if not prefix_ids and not tail_text:
+                prefix_ids = [anchor]
         prefix_cache, prefix_last_lp = self._build_prefix_cache(prefix_ids)
 
-        tail_ids_per_cand = []
-        for c in candidates:
-            full_tail = tail_text + c
-            ids = self.tokenizer.encode(full_tail, add_special_tokens=False)
-            tail_ids_per_cand.append(ids)
+        if self.scoring_strategy == SCORING_STRATEGY_MEAN_TOKEN:
+            plans = [
+                candidate_scoring_plan(self.tokenizer, tail_text, c)
+                for c in candidates
+            ]
+            ids_per_candidate = [plan[0] for plan in plans]
+        else:
+            ids_per_candidate = [
+                self.tokenizer.encode(tail_text + c, add_special_tokens=False)
+                for c in candidates
+            ]
 
-        max_tail = max(len(t) for t in tail_ids_per_cand)
-        padded = [t + [self.pad_id] * (max_tail - len(t)) for t in tail_ids_per_cand]
+        max_tail = max(len(t) for t in ids_per_candidate)
+        padded = [
+            t + [self.pad_id] * (max_tail - len(t)) for t in ids_per_candidate
+        ]
         suffix = mx.array(padded)
 
         has_prefix = prefix_last_lp is not None
@@ -169,17 +347,35 @@ class ModelState:
         logits = self.model(suffix, score_cache)
         lp = nn.log_softmax(logits, axis=-1)
 
-        scores = []
-        for i in range(n):
-            tail_ids = tail_ids_per_cand[i]
-            total = 0.0
-            if has_prefix and tail_ids:
-                total += float(prefix_last_lp[tail_ids[0]])
-            for t in range(len(tail_ids) - 1):
-                total += float(lp[i, t, tail_ids[t + 1]])
-            scores.append(total)
+        def prefix_lp(token_id):
+            return float(prefix_last_lp[token_id])
+
+        def suffix_lp(batch, position, token_id):
+            return float(lp[batch, position, token_id])
+
+        if self.scoring_strategy == SCORING_STRATEGY_MEAN_TOKEN:
+            scores, counts = mean_token_scores(
+                prefix_lp if has_prefix else None, suffix_lp, plans
+            )
+        else:
+            scores = legacy_sum_scores(
+                prefix_lp if has_prefix else None, suffix_lp, ids_per_candidate
+            )
+            counts = None
 
         mx.eval(mx.array(scores))
+        telemetry = os.environ.get("LLM_RERANK_TELEMETRY")
+        if telemetry:
+            # Calibration telemetry: scores and per-candidate token counts
+            # only. Never contains context, candidate text, or token text.
+            try:
+                with open(telemetry, "a", encoding="utf-8") as f:
+                    row = {"n": n, "scores": scores}
+                    if counts is not None:
+                        row["counts"] = counts
+                    f.write(json.dumps(row) + "\n")
+            except OSError:
+                pass
         return scores
 
     def _expand_cache(self, ctx_cache, n, tail_len):
@@ -224,6 +420,8 @@ def protocol_error(
         "invalid_score_result": "scorer returned an invalid result",
         "score_count_mismatch": "score count does not match candidate count",
         "non_finite_score": "scorer returned a non-finite score",
+        "token_attribution_failed": "candidate token attribution failed",
+        "policy_mismatch": "plan policy does not match the daemon scoring mode",
         "server_error": "scoring transport failed",
     }
     response = {
@@ -246,11 +444,13 @@ def protocol_error(
     return response
 
 
-def make_request(request_id, plan_identity, context, candidates):
+def make_request(request_id, plan_identity, context, candidates,
+                 baseline_policy_id=MEAN_TOKEN_POLICY_ID):
     return {
         "version": PROTOCOL_VERSION,
         "request_id": request_id,
         "plan_identity": plan_identity,
+        "baseline_policy_id": baseline_policy_id,
         "context": context,
         "candidates": candidates,
     }
@@ -265,7 +465,12 @@ def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
         if remaining <= 0:
             raise TimeoutError("request deadline exceeded")
         conn.settimeout(remaining)
-        chunk = conn.recv(65536)
+        try:
+            chunk = conn.recv(65536)
+        except socket.timeout:
+            # socket.timeout is only an alias of TimeoutError since
+            # Python 3.10; normalize so callers see one exception type.
+            raise TimeoutError("request deadline exceeded") from None
         if not chunk:
             break
         size += len(chunk)
@@ -298,6 +503,8 @@ def handle_request(state, data):
         or not req["request_id"]
         or not isinstance(req["plan_identity"], str)
         or not req["plan_identity"]
+        or not isinstance(req["baseline_policy_id"], str)
+        or not req["baseline_policy_id"]
         or not isinstance(req["context"], str)
         or not isinstance(req["candidates"], list)
         or any(
@@ -307,6 +514,19 @@ def handle_request(state, data):
     ):
         return protocol_error("invalid_request")
 
+    # Policy binding: the declared baseline_policy_id must be the exact id
+    # of the daemon's scoring mode, otherwise the plan's declared
+    # normalization could be silently served by a different algorithm.
+    accepted_policy = POLICY_ID_BY_STRATEGY.get(
+        getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN))
+    if accepted_policy is None or req["baseline_policy_id"] != accepted_policy:
+        return protocol_error(
+            "policy_mismatch",
+            phase="validate",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+
     try:
         scores = state.score(req["context"], req["candidates"])
     except TimeoutError:
@@ -314,6 +534,20 @@ def handle_request(state, data):
             "inference_failed",
             phase="score",
             retryable=True,
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+    except TokenAttributionError:
+        return protocol_error(
+            "token_attribution_failed",
+            phase="score",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+    except NonFiniteTokenScoreError:
+        return protocol_error(
+            "non_finite_score",
+            phase="score",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
         )
@@ -358,13 +592,13 @@ def handle_request(state, data):
     }
 
 
-def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, test_mode=False):
+def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False):
     import mlx.core as mx
 
     if cache_limit_mb > 0:
         mx.set_cache_limit(cache_limit_mb * 10**6)
 
-    state = ModelState(model_path, context_window)
+    state = ModelState(model_path, context_window, scoring_strategy)
     last_activity = time.time()
     lock = threading.Lock()
 
@@ -552,6 +786,13 @@ if __name__ == "__main__":
         default=CACHE_LIMIT_MB,
         help="MLX allocator cache cap in MB; 0 = unlimited",
     )
+    parser.add_argument(
+        "--scoring",
+        choices=[SCORING_STRATEGY_MEAN_TOKEN, SCORING_STRATEGY_LEGACY_SUM],
+        default=SCORING_STRATEGY_MEAN_TOKEN,
+        help="scoring strategy; legacy_sum reproduces the pre-#46 sum policy "
+        "for calibration comparison only",
+    )
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
@@ -567,5 +808,6 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
     else:
         run_server(
-            args.socket, args.model, args.context_window, args.cache_limit_mb, test_mode=True
+            args.socket, args.model, args.context_window, args.cache_limit_mb,
+            args.scoring, test_mode=True
         )
