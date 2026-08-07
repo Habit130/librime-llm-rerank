@@ -29,6 +29,7 @@ namespace {
 const char* kE2eSchema = "e2e_recorder";
 const char* kOffSchema = "e2e_recorder_off";
 const char* kFluidSchema = "e2e_recorder_fluid";
+const char* kWinSchema = "e2e_recorder_window2";
 const char* kDictName = "e2e_recorder";
 const char* kRimeDirPrefix = "/tmp/llm_rerank_e2e_rime_";
 const char* kHomePrefix = "/tmp/llm_rerank_e2e_home_";
@@ -42,6 +43,7 @@ const char* kDefaultYaml =
     "  - schema: e2e_recorder\n"
     "  - schema: e2e_recorder_off\n"
     "  - schema: e2e_recorder_fluid\n"
+    "  - schema: e2e_recorder_window2\n"
     "menu:\n"
     "  page_size: 5\n";
 
@@ -154,6 +156,46 @@ const char* kFluidSchemaYaml =
     "\n"
     "llm_rerank:\n"
     "  recording_enabled: true\n";
+
+// Narrow rerank window variant: only two candidates are materialized, so the
+// competition snapshot for a three-way group is incomplete. Recording must
+// still persist the visible candidates with competition_complete=false.
+const char* kWinSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_recorder_window2\n"
+    "  name: E2E Recorder (window 2)\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 5\n"
+    "\n"
+    "llm_rerank:\n"
+    "  recording_enabled: true\n"
+    "  window: 2\n";
 
 const char* kDictYaml =
     "---\n"
@@ -351,6 +393,8 @@ class RecorderE2ETest : public ::testing::Test {
               kOffSchemaYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_recorder_fluid.schema.yaml",
               kFluidSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_recorder_window2.schema.yaml",
+              kWinSchemaYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_recorder.dict.yaml", kDictYaml);
 
     RIME_STRUCT(RimeTraits, traits);
@@ -640,6 +684,90 @@ TEST_F(RecorderE2ETest, RecordingDefaultsOffWithoutConfig) {
     EXPECT_EQ(0LL, count);
     sqlite3_close(db);
   }
+}
+
+TEST_F(RecorderE2ETest, ApiSelectionIsExplicitIndexedWithoutTriggerKey) {
+  // Mouse clicks and API selections fire select_notifier outside any key
+  // event: they are explicit_indexed with no trigger keycode.
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->select_candidate_on_current_page(session, 1));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ("explicit_indexed", event.confirmation_source);
+  // No trigger key: NULL in sqlite3 reads back as 0.
+  EXPECT_EQ(0LL, event.trigger_keycode);
+  EXPECT_EQ("时界", event.final_selection_text);
+  EXPECT_EQ(2LL, event.display_rank);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, UniqueCandidateFormsNoEvent) {
+  // "wo" matches exactly one dictionary candidate (我): confirming it is not
+  // a real competition, so no event may be recorded even on explicit confirm.
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  // No event implies no persisted commit record either: the commit
+  // transaction only exists when a tentative event survives validation.
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, TruncatedWindowSavesVisibleCompetitionIncomplete) {
+  // window: 2 materializes only two of the three shijie candidates, so the
+  // competition snapshot is incomplete; recording must persist the visible
+  // candidates and mark competition_complete=false.
+  RimeSessionId session = NewSession(kWinSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ("时界", event.final_selection_text);
+  EXPECT_EQ(0LL, event.competition_complete);
+
+  std::vector<std::pair<long long, std::string>> candidates;
+  ASSERT_TRUE(ReadCandidates(db, event.event_id, &candidates));
+  ASSERT_EQ(2u, candidates.size());
+  EXPECT_EQ(0LL, candidates[0].first);
+  EXPECT_EQ("世界", candidates[0].second);
+  EXPECT_EQ(1LL, candidates[1].first);
+  EXPECT_EQ("时界", candidates[1].second);
+  sqlite3_close(db);
 }
 
 }  // namespace
