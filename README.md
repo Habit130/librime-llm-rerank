@@ -22,6 +22,15 @@ This strips the `librime-` prefix and clones the repo to
 librime with `make librime` from the Squirrel repo root; the plugin dylib lands
 in `lib/rime-plugins/`.
 
+## Releases
+
+Tagging this repo with `v*` runs `.github/workflows/release.yml`, which builds
+a universal (arm64 + x86_64) `librime-llm-rerank.dylib` against the pinned
+librime revision used by Squirrel and attaches it to the GitHub Release.
+Squirrel's `action-install.sh` downloads that artifact by tag and verifies its
+sha256 on the fast build path; the from-source build path keeps using
+`install-plugins.sh` instead.
+
 ## Scope
 
 Simplified Chinese (简体) only, developed against the `luna_pinyin` schema.
