@@ -770,4 +770,109 @@ TEST_F(RecorderE2ETest, TruncatedWindowSavesVisibleCompetitionIncomplete) {
   sqlite3_close(db);
 }
 
+TEST_F(RecorderE2ETest, TwoGroupCompositionSharesOneCommitId) {
+  // One composition with two explicitly confirmed rerank groups: the events
+  // must share a commit identity but keep independent event IDs, and the
+  // later group's preceding text must contain the earlier group's confirmed
+  // text while the earlier group sees none of the future selection.
+  RimeSessionId session = NewSession(kFluidSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));  // 时界 (index 1)
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '3', 0));  // 石阶 (index 2)
+  EXPECT_EQ("时界石阶", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  ASSERT_TRUE(
+      QueryCount(db, "SELECT COUNT(*) FROM selection_candidates;", &count));
+  EXPECT_EQ(6LL, count);
+
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+  // Events arrive in HLC order, which is confirmation order.
+  EXPECT_EQ(0LL, events[0].span_start);
+  EXPECT_EQ(6LL, events[0].span_end);
+  EXPECT_EQ("时界", events[0].final_selection_text);
+  EXPECT_EQ("", events[0].preceding_text);
+  EXPECT_EQ(1LL, events[0].session_seq);
+  EXPECT_EQ(6LL, events[1].span_start);
+  EXPECT_EQ(12LL, events[1].span_end);
+  EXPECT_EQ("石阶", events[1].final_selection_text);
+  EXPECT_EQ("时界", events[1].preceding_text);
+  EXPECT_EQ(2LL, events[1].session_seq);
+  EXPECT_EQ(events[0].session_id, events[1].session_id);
+  EXPECT_NE(events[0].event_id, events[1].event_id);
+  EXPECT_EQ(events[0].commit_id, events[1].commit_id);
+  // HLC assigned in confirmation order inside the shared commit.
+  EXPECT_LT(std::make_pair(events[0].hlc_physical_ms, events[0].hlc_logical),
+            std::make_pair(events[1].hlc_physical_ms, events[1].hlc_logical));
+  EXPECT_EQ("explicit_indexed", events[0].confirmation_source);
+  EXPECT_EQ("explicit_indexed", events[1].confirmation_source);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, ReopenReselectReplacesTentativeEvent) {
+  // Confirming a candidate, reopening the segment (BackSpace in the fluid
+  // editor) and reselecting another candidate must replace the tentative
+  // event: only the final selection may survive into the commit.
+  RimeSessionId session = NewSession(kFluidSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));  // 时界 (index 1)
+  ASSERT_TRUE(g_rime->process_key(session, XK_BackSpace, 0));
+  ASSERT_TRUE(g_rime->process_key(session, '3', 0));  // 石阶 (index 2)
+  EXPECT_EQ("石阶", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ("石阶", event.final_selection_text);
+  EXPECT_EQ("explicit_indexed", event.confirmation_source);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, AbortDropsWholePendingBatch) {
+  // Two confirmed groups in one composition, then Escape cancels the whole
+  // composition: every tentative event dies with it, not just the last one.
+  RimeSessionId session = NewSession(kFluidSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '3', 0));
+  ASSERT_TRUE(g_rime->process_key(session, XK_Escape, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
 }  // namespace
