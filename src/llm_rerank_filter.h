@@ -7,7 +7,10 @@
 
 #include <rime/filter.h>
 
+#include <memory>
+
 #include "context_memory.h"
+#include "recorder_session.h"
 #include "rerank_plan.h"
 
 namespace rime {
@@ -144,6 +147,7 @@ class LlmRerankFilter : public Filter {
   the<ContextMemory> memory_;
   connection commit_connection_;
   connection commit_text_connection_;
+  std::shared_ptr<RecorderSession> recorder_session_;
   string last_word_;
   string preceding_text_;
   bool preceding_text_valid_ = true;
