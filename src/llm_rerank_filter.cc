@@ -179,7 +179,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
                        string input,
                        string preceding_text,
                        string previous_word,
-                       RerankScoringPolicy scoring_policy)
+                       RerankScoringPolicy scoring_policy,
+                       std::shared_ptr<RecorderSession> recorder_session,
+                       size_t segment_start)
       : PrefetchTranslation(translation),
         scorer_(scorer),
         window_(window),
@@ -187,7 +189,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
         input_(std::move(input)),
         preceding_text_(std::move(preceding_text)),
         previous_word_(std::move(previous_word)),
-        scoring_policy_(std::move(scoring_policy)) {}
+        scoring_policy_(std::move(scoring_policy)),
+        recorder_session_(std::move(recorder_session)),
+        segment_start_(segment_start) {}
 
  protected:
   virtual bool Replenish();
@@ -204,6 +208,12 @@ class LlmRerankTranslation : public PrefetchTranslation {
   string preceding_text_;
   string previous_word_;
   RerankScoringPolicy scoring_policy_;
+  std::shared_ptr<RecorderSession> recorder_session_;
+  size_t segment_start_ = 0;
+  // Accumulated pre-rerank competition materialization for the recorder.
+  vector<RecordedCandidate> materialized_;
+  size_t next_merge_order_ = 0;
+  bool fully_materialized_ = false;
 };
 
 bool LlmRerankTranslation::Replenish() {
@@ -224,6 +234,33 @@ bool LlmRerankTranslation::Replenish() {
   }
   if (buffer.empty())
     return false;
+
+  if (recorder_session_) {
+    // Snapshot the materialized window for the recorder: candidates in the
+    // order they arrived from upstream (original merge order), after
+    // upstream dedup. A window that was not fully pulled leaves the
+    // competition set marked incomplete.
+    for (const auto& cand : buffer) {
+      RecordedCandidate recorded;
+      recorded.merge_order = next_merge_order_++;
+      recorded.start = cand->start();
+      recorded.end = cand->end();
+      auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(cand));
+      const string source_type = phrase ? phrase->type() : cand->type();
+      recorded.category = CategoryOf(source_type);
+      recorded.text = cand->text();
+      materialized_.push_back(std::move(recorded));
+    }
+    bool truncated =
+        (int)buffer.size() >= window_ && !translation_->exhausted();
+    fully_materialized_ = fully_materialized_ || !truncated;
+    CompetitionSnapshot snapshot;
+    snapshot.segment_start = segment_start_;
+    snapshot.preceding_text = preceding_text_;
+    snapshot.candidates = materialized_;
+    snapshot.complete = fully_materialized_;
+    recorder_session_->PushSnapshot(std::move(snapshot));
+  }
 
   bool truncated = (int)buffer.size() >= window_ && !translation_->exhausted();
   CandidateQueue result;
@@ -389,6 +426,7 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     }
     commit_text_connection_ = engine_->sink().connect(
         [this](const string& text) { OnCommitText(text); });
+    recorder_session_ = RecorderSessionRegistry::GetForEngine(engine_);
   }
   if (alpha_ > 0.0 && !llm_scorer_) {
     LOG(WARNING) << name_space_ << ": LLM scoring unavailable";
@@ -470,9 +508,15 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   string input = input_;
   if (engine_ && engine_->context())
     input = engine_->context()->input();
+  size_t segment_start = 0;
+  if (engine_ && engine_->context() &&
+      !engine_->context()->composition().empty()) {
+    segment_start = engine_->context()->composition().back().start;
+  }
   return New<LlmRerankTranslation>(translation, scorer_, window_, schema_id_,
                                    input, preceding_text, last_word_,
-                                   scoring_policy);
+                                   scoring_policy, recorder_session_,
+                                   segment_start);
 }
 
 }  // namespace rime
