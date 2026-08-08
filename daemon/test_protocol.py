@@ -21,6 +21,7 @@ from server import (
     SCORING_STRATEGY_MEAN_TOKEN,
     NonFiniteTokenScoreError,
     TokenAttributionError,
+    handle_health,
     handle_request,
     read_request,
 )
@@ -31,6 +32,9 @@ class FakeState:
         self.result = [1.25, -2.5] if result is None else result
         self.error = error
         self.scoring_strategy = SCORING_STRATEGY_MEAN_TOKEN
+        self.loaded = False
+        self.context_window = 64
+        self.cache_limit_mb = 512
 
     def score(self, context, candidates):
         if self.error:
@@ -345,6 +349,86 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual("non_finite_score", response["error"]["code"])
         self.assert_bound_error(response)
         self.assertNotIn("private context fixture", str(response))
+
+
+class HealthHandshakeTest(unittest.TestCase):
+    def health_request(self, **overrides):
+        value = {
+            "version": PROTOCOL_VERSION,
+            "request_id": "health-1",
+            "kind": "health",
+        }
+        value.update(overrides)
+        return value
+
+    def test_health_response_is_versioned_and_model_free(self):
+        state = FakeState()
+        state.scoring_strategy = SCORING_STRATEGY_MEAN_TOKEN
+        response = handle_request(state, encode(self.health_request()))
+        self.assertEqual(PROTOCOL_VERSION, response["version"])
+        self.assertEqual("health-1", response["request_id"])
+        self.assertEqual("health", response["kind"])
+        health = response["health"]
+        self.assertFalse(health["model_loaded"])
+        self.assertEqual(MEAN_TOKEN_POLICY_ID, health["policy_id"])
+        self.assertEqual(SCORING_STRATEGY_MEAN_TOKEN, health["scoring_strategy"])
+        self.assertEqual(64, health["context_window"])
+        self.assertIsInstance(health["pid"], int)
+        # The daemon state is never touched by the handshake: loading stays
+        # off and no score() call happens.
+        self.assertFalse(state.loaded)
+
+    def test_health_reports_loaded_model_state(self):
+        state = FakeState()
+        state.loaded = True
+        response = handle_request(state, encode(self.health_request()))
+        self.assertTrue(response["health"]["model_loaded"])
+
+    def test_health_reports_legacy_sum_policy(self):
+        state = FakeState()
+        state.scoring_strategy = SCORING_STRATEGY_LEGACY_SUM
+        response = handle_request(state, encode(self.health_request()))
+        self.assertEqual(LEGACY_SUM_POLICY_ID, response["health"]["policy_id"])
+
+    def test_health_rejects_extra_or_missing_fields(self):
+        for damaged in (
+            self.health_request(extra="x"),
+            self.health_request(request_id=""),
+            self.health_request(version=PROTOCOL_VERSION + 1),
+            self.health_request(version="2"),
+            {"version": PROTOCOL_VERSION, "kind": "health"},
+            {"version": PROTOCOL_VERSION, "request_id": "health-1"},
+        ):
+            with self.subTest(damaged=damaged):
+                response = handle_request(FakeState(), encode(damaged))
+                self.assertEqual("invalid_request", response["error"]["code"])
+
+    def test_scoring_request_with_kind_is_rejected(self):
+        response = handle_request(
+            FakeState(), encode(request(kind="health"))
+        )
+        self.assertEqual("invalid_request", response["error"]["code"])
+        self.assertNotIn("private context fixture", str(response))
+
+    def test_health_never_echoes_private_input(self):
+        response = handle_request(FakeState(), encode(self.health_request()))
+        self.assertNotIn("private context fixture", str(response))
+        self.assertNotIn("candidate-a", str(response))
+
+    def test_health_handshake_does_not_run_score(self):
+        class ExplodingState(FakeState):
+            def score(self, context, candidates):
+                raise AssertionError("health must never score")
+
+        response = handle_request(ExplodingState(), encode(self.health_request()))
+        self.assertEqual("health", response["kind"])
+
+    def test_handle_health_is_strict_on_field_shapes(self):
+        state = FakeState()
+        response = handle_health(state, {"version": PROTOCOL_VERSION,
+                                         "request_id": "h", "kind": "health"})
+        self.assertEqual("health", response["kind"])
+        self.assertEqual("h", response["request_id"])
 
 
 if __name__ == "__main__":
