@@ -1789,6 +1789,159 @@ TEST(ContextRerankTest, SingleObservationCannotOverrideLargeWeightGap) {
 
 // --- T4: LlmScorer failure paths ---
 
+// --- #51: three-switch behavior at the filter seam ---
+
+// Holds the Schema (and its owned Config) alive for the filter's lifetime:
+// the filter only reads config at construction, but the Schema must outlive
+// the ctor call.
+struct SchemaFilter {
+  std::unique_ptr<Schema> schema;
+  LlmRerankFilter filter;
+
+  static SchemaFilter From(Config* config) {
+    auto schema = std::make_unique<Schema>("test", config);
+    Ticket ticket;
+    ticket.schema = schema.get();
+    ticket.name_space = "llm_rerank";
+    return SchemaFilter{std::move(schema), LlmRerankFilter(ticket)};
+  }
+};
+
+TEST(LlmRerankFilterTest, RerankingOffReturnsIdentityAndSkipsScoring) {
+  auto* config = new Config;
+  config->SetBool("llm_rerank/reranking_enabled", false);
+  config->SetBool("llm_rerank/recording_enabled", false);
+  config->SetBool("llm_rerank/evidence_enabled", false);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  auto captured = New<CapturingRequestScorer>();
+  filter.set_scorer(captured);
+  auto translation = New<VecTranslation>(std::vector<an<Candidate>>{
+      MakePhrase("table", 0, 2, "甲", 1.0),
+      MakePhrase("table", 0, 2, "乙", 3.0),
+  });
+  CandidateList candidates;
+  auto filtered = filter.Apply(translation, &candidates);
+  // The very same translation object passes through untouched: no wrapping,
+  // no scoring, no reordering.
+  EXPECT_EQ(translation.get(), filtered.get());
+  EXPECT_EQ((vector<string>{"甲", "乙"}), CollectTexts(filtered));
+  EXPECT_TRUE(captured->requests.empty());
+}
+
+TEST(LlmRerankFilterTest, RerankingOffSkipsScoringEvenWithOnCombo) {
+  // Reranking off + recording on: still no synchronous model scoring and no
+  // reordering. (The snapshot-only wrap needs a recorder session, which only
+  // exists inside a real engine — covered by the E2E
+  // RecorderE2ETest.RerankingOffStillRecordsEvents.)
+  auto* config = new Config;
+  config->SetBool("llm_rerank/reranking_enabled", false);
+  config->SetBool("llm_rerank/recording_enabled", true);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  auto captured = New<CapturingRequestScorer>();
+  filter.set_scorer(captured);
+  auto translation = New<VecTranslation>(std::vector<an<Candidate>>{
+      MakePhrase("table", 0, 2, "甲", 1.0),
+      MakePhrase("table", 0, 2, "乙", 3.0),
+  });
+  CandidateList candidates;
+  auto filtered = filter.Apply(translation, &candidates);
+  EXPECT_EQ((vector<string>{"甲", "乙"}), CollectTexts(filtered));
+  EXPECT_TRUE(captured->requests.empty());
+}
+
+TEST(LlmRerankFilterTest, SwitchSnapshotIsTakenAtConstruction) {
+  // The three switches form an immutable snapshot at Engine/schema instance
+  // creation; mutating the config afterwards never changes behavior
+  // mid-composition (spec: "配置在 Engine/schema 实例创建时形成不可变快照").
+  auto* config = new Config;
+  config->SetBool("llm_rerank/reranking_enabled", false);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  auto captured = New<CapturingRequestScorer>();
+  filter.set_scorer(captured);
+  // The config changes behind the filter's back; the instance must not adopt
+  // it.
+  config->SetBool("llm_rerank/reranking_enabled", true);
+  auto translation = New<VecTranslation>(std::vector<an<Candidate>>{
+      MakePhrase("table", 0, 2, "甲", 1.0),
+      MakePhrase("table", 0, 2, "乙", 3.0),
+  });
+  CandidateList candidates;
+  auto filtered = filter.Apply(translation, &candidates);
+  EXPECT_EQ(translation.get(), filtered.get());
+  EXPECT_TRUE(captured->requests.empty());
+}
+
+TEST(LlmRerankFilterTest, LegacyEnableKeepsVisibleReranking) {
+  auto* config = new Config;
+  config->SetBool("llm_rerank/enable", true);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  filter.set_scorer(
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
+  filter.set_input("abcdef");
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                      });
+  // First-stage visible reranking is maintained under legacy config.
+  EXPECT_EQ((vector<string>{"乙", "丙", "甲"}), CollectTexts(filtered));
+}
+
+TEST(LlmRerankFilterTest, LegacyEnableFalsePassesThrough) {
+  auto* config = new Config;
+  config->SetBool("llm_rerank/enable", false);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  filter.set_scorer(
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
+  auto translation = New<VecTranslation>(std::vector<an<Candidate>>{
+      MakePhrase("table", 0, 2, "甲"),
+      MakePhrase("table", 0, 2, "乙"),
+  });
+  CandidateList candidates;
+  auto filtered = filter.Apply(translation, &candidates);
+  EXPECT_EQ(translation.get(), filtered.get());
+}
+
+TEST(LlmRerankFilterTest, V2RerankingOnStillReranks) {
+  auto* config = new Config;
+  config->SetBool("llm_rerank/reranking_enabled", true);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  filter.set_scorer(
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
+  filter.set_input("abcdef");
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                      });
+  EXPECT_EQ((vector<string>{"乙", "丙", "甲"}), CollectTexts(filtered));
+}
+
+TEST(LlmRerankFilterTest, V2CoexistV2WinsOverLegacyEnable) {
+  // New and old keys coexist: v2 takes precedence (and a deprecation warning
+  // is logged). `enable: false` must be ignored — reranking stays on.
+  auto* config = new Config;
+  config->SetBool("llm_rerank/enable", false);
+  config->SetBool("llm_rerank/reranking_enabled", true);
+  auto holder = SchemaFilter::From(config);
+  auto& filter = holder.filter;
+  filter.set_scorer(
+      New<TableScorer>(map<string, double>{{"甲", 1}, {"乙", 3}, {"丙", 2}}));
+  filter.set_input("abcdef");
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲"),
+                                          MakePhrase("table", 0, 2, "乙"),
+                                          MakePhrase("table", 0, 2, "丙"),
+                                      });
+  EXPECT_EQ((vector<string>{"乙", "丙", "甲"}), CollectTexts(filtered));
+}
+
 TEST(LlmScorerTest, DaemonUnavailableReturnsFalse) {
   LlmScorer scorer("/tmp/nonexistent-llm-rerank-test.sock", 1.0);
   ScoreComponents score;

@@ -16,6 +16,7 @@
 #include <rime/segmentation.h>
 #include <rime/gear/translator_commons.h>
 
+#include "llm_rerank_config.h"
 #include "llm_rerank_recorder.h"
 #include "rerank_plan.h"
 
@@ -47,11 +48,19 @@ bool IsPlainBackspace(const KeyEvent& key) {
 
 LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
     : Processor(ticket) {
-  bool recording_enabled = false;  // default off: user story 26
-  if (ticket.schema) {
-    if (Config* config = ticket.schema->config()) {
-      config->GetBool("llm_rerank/recording_enabled", &recording_enabled);
-    }
+  // Switch resolution shared with the filter (llm_rerank_config.h): recording
+  // is enabled only by an explicit v2 `recording_enabled: true`; legacy and
+  // not_configured never record (user story 26: upgrades must not start
+  // collecting silently).
+  SwitchConfig switches = ResolveSwitchConfig(
+      ticket.schema && ticket.schema->config()
+          ? ticket.schema->config()
+          : nullptr,
+      "llm_rerank");
+  const bool recording_enabled = switches.recording_enabled;
+  if (switches.deprecation_warning) {
+    LOG(WARNING) << "llm_rerank recorder: legacy 'enable' key is deprecated "
+                    "and ignored; v2 switch keys take precedence";
   }
   const string schema_id = ticket.schema ? ticket.schema->schema_id() : "";
   const int page_size = ticket.schema ? ticket.schema->page_size() : 5;
@@ -62,8 +71,9 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
   RecorderSessionRegistry::Register(engine_, session_);
 
   if (!recording_enabled) {
-    LOG(INFO) << "llm_rerank recorder: recording_enabled=false schema="
-              << schema_id;
+    LOG(INFO) << "llm_rerank recorder: recording_enabled=false"
+              << " source=" << SwitchConfigSourceName(switches.source)
+              << " schema=" << schema_id;
     session_->fault_code = "";
   } else {
     session_->store = std::make_unique<FactStore>(FactStore::DefaultRootDir());

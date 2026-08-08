@@ -10,6 +10,7 @@
 #include <memory>
 
 #include "context_memory.h"
+#include "llm_rerank_config.h"
 #include "recorder_session.h"
 #include "rerank_plan.h"
 
@@ -130,7 +131,14 @@ class LlmRerankFilter : public Filter {
   void OnCommitText(const string& text);
   string BuildContext();
 
-  bool enabled_ = true;
+  // Resolved at construction (per-Engine/schema instance snapshot; never
+  // re-read mid-composition). When not configured, phase-1 defaults apply
+  // (reranking on, recording off, evidence off) so existing deployments are
+  // bit-compatible; the config source is reported by status.
+  SwitchConfigSource config_source_ = SwitchConfigSource::kNotConfigured;
+  bool reranking_enabled_ = true;
+  bool recording_enabled_ = false;
+  bool evidence_enabled_ = false;
   int window_ = 32;
   // Default alpha = 0 (owner decision, Habit130/squirrel#46): the canonical
   // 120/402 calibration supports no positive alpha (see
