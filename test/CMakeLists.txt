@@ -10,6 +10,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     llm_scorer_protocol_test.cc
     rerank_plan_test.cc
     recorder_session_test.cc
+    switch_config_test.cc
     fact_store_test.cc
     recorder_e2e_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)

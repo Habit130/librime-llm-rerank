@@ -30,6 +30,11 @@ const char* kE2eSchema = "e2e_recorder";
 const char* kOffSchema = "e2e_recorder_off";
 const char* kFluidSchema = "e2e_recorder_fluid";
 const char* kWinSchema = "e2e_recorder_window2";
+const char* kRerankOffSchema = "e2e_recorder_rerank_off";
+const char* kLegacySchema = "e2e_recorder_legacy";
+const char* kV2PrioritySchema = "e2e_recorder_v2priority";
+const char* kEvOnSchema = "e2e_evidence_on";
+const char* kEvOffSchema = "e2e_evidence_off";
 const char* kDictName = "e2e_recorder";
 const char* kRimeDirPrefix = "/tmp/llm_rerank_e2e_rime_";
 const char* kHomePrefix = "/tmp/llm_rerank_e2e_home_";
@@ -40,10 +45,24 @@ RimeApi* g_rime = nullptr;
 const char* kDefaultYaml =
     "config_version: \"0.1\"\n"
     "schema_list:\n"
-    "  - schema: e2e_recorder\n"
+    // The first entry is the default schema of a new session. It must not
+    // record: `create_session` builds an engine for the default schema
+    // before the test switches to the schema under test, and the binary's
+    // init-time session (HOME inherited from the shell) must never touch a
+    // real facts root. fix_schema_list_order pins the default to the first
+    // entry instead of the previously selected schema (which the switcher
+    // persists in the user config across tests).
     "  - schema: e2e_recorder_off\n"
+    "  - schema: e2e_recorder\n"
     "  - schema: e2e_recorder_fluid\n"
     "  - schema: e2e_recorder_window2\n"
+    "  - schema: e2e_recorder_rerank_off\n"
+    "  - schema: e2e_recorder_legacy\n"
+    "  - schema: e2e_recorder_v2priority\n"
+    "  - schema: e2e_evidence_on\n"
+    "  - schema: e2e_evidence_off\n"
+    "switcher:\n"
+    "  fix_schema_list_order: true\n"
     "menu:\n"
     "  page_size: 5\n";
 
@@ -80,8 +99,12 @@ const char* kSchemaYaml =
     "menu:\n"
     "  page_size: 5\n"
     "\n"
+    // Canonical v2 adoption: all three switches are explicit (true / true /
+    // false per spec "三个配置开关").
     "llm_rerank:\n"
-    "  recording_enabled: true\n";
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
 
 // Same schema without the llm_rerank section: recording must default off
 // (user story 26: an upgrade never starts collecting silently).
@@ -155,7 +178,9 @@ const char* kFluidSchemaYaml =
     "  page_size: 5\n"
     "\n"
     "llm_rerank:\n"
-    "  recording_enabled: true\n";
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
 
 // Narrow rerank window variant: only two candidates are materialized, so the
 // competition snapshot for a three-way group is incomplete. Recording must
@@ -194,8 +219,211 @@ const char* kWinSchemaYaml =
     "  page_size: 5\n"
     "\n"
     "llm_rerank:\n"
+    "  reranking_enabled: true\n"
     "  recording_enabled: true\n"
+    "  evidence_enabled: false\n"
     "  window: 2\n";
+
+// v2 partial adoption: only `recording_enabled` is explicit. Missing v2 keys
+// default to false, so visible reranking is off but recording continues (the
+// snapshot-only wrapper keeps feeding the recorder).
+const char* kRerankOffSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_recorder_rerank_off\n"
+    "  name: E2E Recorder (rerank off, recording on)\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 5\n"
+    "\n"
+    "llm_rerank:\n"
+    "  recording_enabled: true\n";
+
+// Legacy migration: only the old `enable` key. Visible reranking follows it,
+// recording and semantic evidence stay off (no silent collection on
+// upgrade); the config source is reported as legacy.
+const char* kLegacySchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_recorder_legacy\n"
+    "  name: E2E Recorder (legacy enable)\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 5\n"
+    "\n"
+    "llm_rerank:\n"
+    "  enable: true\n";
+
+// New and old keys coexist: v2 takes precedence (deprecation warning). The
+// legacy `enable: false` must be ignored — recording stays enabled.
+const char* kV2PrioritySchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_recorder_v2priority\n"
+    "  name: E2E Recorder (v2 wins)\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 5\n"
+    "\n"
+    "llm_rerank:\n"
+    "  enable: false\n"
+    "  recording_enabled: true\n";
+
+// Evidence-application schemas on a dedicated dictionary with a small weight
+// gap (世界 99 / 时界 98) so one bigram observation can flip the order under
+// a strong gamma. Each schema owns its own bigram userdb
+// (<schema>.llm_rerank), so no cross-test contamination is possible.
+const char* kEvOnSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_evidence_on\n"
+    "  name: E2E Evidence (on)\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_evidence\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 5\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: true\n"
+    "  gamma: 4.0\n"
+    "  saturate_k: 1.0\n";
+
+const char* kEvOffSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_evidence_off\n"
+    "  name: E2E Evidence (off)\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_evidence\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 5\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n"
+    "  gamma: 4.0\n"
+    "  saturate_k: 1.0\n";
 
 const char* kDictYaml =
     "---\n"
@@ -209,6 +437,19 @@ const char* kDictYaml =
     "时间\tshi jian\t100\n"
     "实践\tshi jian\t90\n"
     "试件\tshi jian\t70\n"
+    "我\two\t100\n";
+
+// Dedicated evidence dictionary: a small weight gap between the top two
+// candidates so one observed bigram can flip their order (see kEvOnSchema).
+const char* kEvDictYaml =
+    "---\n"
+    "name: e2e_evidence\n"
+    "version: \"1.0\"\n"
+    "sort: by_weight\n"
+    "...\n"
+    "世界\tshi jie\t99\n"
+    "时界\tshi jie\t98\n"
+    "石阶\tshi jie\t80\n"
     "我\two\t100\n";
 
 std::string MakeTempDir(const char* prefix) {
@@ -466,7 +707,18 @@ class RecorderE2ETest : public ::testing::Test {
               kFluidSchemaYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_recorder_window2.schema.yaml",
               kWinSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_recorder_rerank_off.schema.yaml",
+              kRerankOffSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_recorder_legacy.schema.yaml",
+              kLegacySchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_recorder_v2priority.schema.yaml",
+              kV2PrioritySchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_evidence_on.schema.yaml",
+              kEvOnSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_evidence_off.schema.yaml",
+              kEvOffSchemaYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_recorder.dict.yaml", kDictYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_evidence.dict.yaml", kEvDictYaml);
 
     RIME_STRUCT(RimeTraits, traits);
     traits.app_name = "llm_rerank_e2e";
@@ -728,7 +980,6 @@ TEST_F(RecorderE2ETest, BrokenFactsRootStopsRecordingButNotCommitting) {
   EXPECT_EQ("时界", CommitText(session));
   g_rime->destroy_session(session);
   session_ = 0;
-
   EXPECT_FALSE(fs::exists(FactsRoot() / "facts.sqlite3"));
 }
 
@@ -744,9 +995,12 @@ TEST_F(RecorderE2ETest, RecordingDefaultsOffWithoutConfig) {
   g_rime->destroy_session(session);
   session_ = 0;
 
-  // No selection event was collected: upgrades do not start recording.
-  sqlite3* db = OpenFactsDb();
-  if (db) {
+  // No selection event was collected: upgrades do not start recording. With
+  // deterministic default-schema ordering the store was never even created
+  // (no recorder instance ever opened it), which is exactly the guarantee.
+  if (fs::exists(FactsRoot() / "facts.sqlite3")) {
+    sqlite3* db = OpenFactsDb();
+    ASSERT_TRUE(db != nullptr);
     long long count = -1;
     ASSERT_TRUE(
         QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
@@ -754,6 +1008,8 @@ TEST_F(RecorderE2ETest, RecordingDefaultsOffWithoutConfig) {
     ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
     EXPECT_EQ(0LL, count);
     sqlite3_close(db);
+  } else {
+    EXPECT_FALSE(fs::exists(FactsRoot()));
   }
 }
 
@@ -1181,6 +1437,248 @@ TEST_F(RecorderE2ETest, ConfirmingKeyReleaseDoesNotConsumeUndoWindow) {
   EXPECT_EQ(1LL, count);
   ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
   EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+// --- #51: three-switch orthogonality, legacy migration, per-instance config ---
+
+TEST_F(RecorderE2ETest, RerankingOffStillRecordsEvents) {
+  // Reranking off + recording on (v2 partial config): no visible reranking,
+  // no synchronous scoring, but the snapshot-only wrapper keeps feeding the
+  // recorder so a full competition event is still persisted.
+  RimeSessionId session = NewSession(kRerankOffSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ("时界", event.final_selection_text);
+  EXPECT_EQ(1LL, event.competition_complete);
+  std::vector<std::pair<long long, std::string>> candidates;
+  ASSERT_TRUE(ReadCandidates(db, event.event_id, &candidates));
+  ASSERT_EQ(3u, candidates.size());
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, LegacySchemaNeverCollects) {
+  // Legacy `enable: true` keeps the first-stage visible reranking but must
+  // not start collecting facts: no store is even created.
+  RimeSessionId session = NewSession(kLegacySchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  EXPECT_FALSE(fs::exists(FactsRoot() / "facts.sqlite3"));
+  // Belt and braces: even if the harness's default engine ever opened a
+  // store, the legacy schema itself must never have recorded anything.
+  if (fs::exists(FactsRoot() / "facts.sqlite3")) {
+    sqlite3* db = OpenFactsDb();
+    if (db) {
+      long long count = -1;
+      ASSERT_TRUE(
+          QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+      EXPECT_EQ(0LL, count);
+      ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+      EXPECT_EQ(0LL, count);
+      sqlite3_close(db);
+    }
+  }
+}
+
+TEST_F(RecorderE2ETest, V2KeysTakePrecedenceOverLegacyEnable) {
+  // `enable: false` coexists with `recording_enabled: true`: v2 wins, so
+  // recording is active even though the legacy key says disabled.
+  RimeSessionId session = NewSession(kV2PrioritySchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, DisablingRecordingKeepsExistingFactsUntouched) {
+  // Recording off stops new facts only: existing events must remain intact,
+  // and re-enabling resumes collection without backfilling.
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+  std::string facts_before;
+  {
+    sqlite3* db = OpenFactsDb();
+    ASSERT_TRUE(db != nullptr);
+    facts_before = DumpEventFacts(db);
+    sqlite3_close(db);
+  }
+
+  // Legacy schema (recording off): same explicit selection, nothing new.
+  session = NewSession(kLegacySchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  EXPECT_EQ(facts_before, DumpEventFacts(db));
+  sqlite3_close(db);
+
+  // Re-enable: a fresh instance adopts the new config and records again,
+  // without ever backfilling the disabled period.
+  session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, SwitchConfigIsSnapshottedPerInstance) {
+  // Each Engine/schema instance snapshots the switches at creation: a
+  // recording-enabled schema instance collects, while an instance of a
+  // not_configured schema (no llm_rerank section) does not.
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  // A not_configured schema (no llm_rerank section) does not record.
+  session = NewSession(kOffSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, EvidenceOffIgnoresBigramHistory) {
+  // Evidence application off: the personalized evidence term is zero, so the
+  // bigram history is neither fed nor applied; recording continues (the
+  // explicit selection still lands as a fact).
+  RimeSessionId session = NewSession(kEvOffSchema);
+  ASSERT_NE(0, session);
+
+  // 我 -> commit (unique candidate: no event, bigram never fed).
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  // shijie -> 时界 (index 1): event 1.
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // 我 again, so the immediately preceding word before the next shijie is 我
+  // (the bigram key is the last committed word).
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  // No bigram was ever fed, so the shijie menu keeps the dictionary order:
+  // 世界 (99) stays first and Space confirms it.
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("世界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+  EXPECT_EQ("时界", events[0].final_selection_text);
+  EXPECT_EQ("世界", events[1].final_selection_text);
+  EXPECT_EQ("explicit_current", events[1].confirmation_source);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, EvidenceOnAppliesBigramHistory) {
+  // Evidence application on: the observed (我, 时界) bigram promotes 时界
+  // above 世界 on the next identical problem, and Space confirms the promoted
+  // first candidate.
+  RimeSessionId session = NewSession(kEvOnSchema);
+  ASSERT_NE(0, session);
+
+  // 我 -> commit (unique candidate: no event; last word becomes 我).
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  // shijie -> 时界 (index 1): event 1, and the (我, 时界) bigram is fed.
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // 我 again so the immediately preceding word before the next shijie is 我.
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  // The bigram (我, 时界) now promotes 时界 above 世界 (98 + 4*0.5 > 99).
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+  EXPECT_EQ("时界", events[0].final_selection_text);
+  EXPECT_EQ("时界", events[1].final_selection_text);
+  EXPECT_EQ("explicit_current", events[1].confirmation_source);
   sqlite3_close(db);
 }
 

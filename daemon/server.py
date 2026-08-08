@@ -8,6 +8,12 @@ Protocol (JSON, newline-delimited):
              "scores": [s1, s2, ...]}
   Error:    {"version": 1, "error": {"code": "...", ...}}
 
+Health request (issue #51, model-free; the status core uses it to observe
+serving state without loading the model):
+  Request:  {"version": 2, "request_id": "...", "kind": "health"}
+  Response: {"version": 2, "request_id": "...", "kind": "health",
+             "health": {"pid": ..., "model_loaded": bool, ...}}
+
 Lifecycle:
   - Model is lazy-loaded on first request (0.33 s cold start).
   - 5 minutes of idle unloads the model (releases ~1.5 GB).
@@ -485,6 +491,31 @@ def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
     return framed[:-1].decode("utf-8")
 
 
+def handle_health(state, request):
+    """Model-free serving observation (issue #51 status core).
+
+    Never loads the model: `model_loaded` is the daemon's own current state,
+    which is exactly what a status command may observe without triggering a
+    load. Response carries no context, candidate text or embedding.
+    """
+    strategy = getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN)
+    return {
+        "version": PROTOCOL_VERSION,
+        "request_id": request["request_id"],
+        "kind": "health",
+        "health": {
+            "pid": os.getpid(),
+            "model_loaded": bool(getattr(state, "loaded", False)),
+            "scoring_strategy": strategy,
+            "policy_id": POLICY_ID_BY_STRATEGY.get(strategy),
+            "context_window": getattr(state, "context_window", CONTEXT_WINDOW),
+            "cache_limit_mb": getattr(state, "cache_limit_mb", CACHE_LIMIT_MB),
+            "telemetry": bool(os.environ.get("LLM_RERANK_TELEMETRY")),
+            "started_at": getattr(state, "started_at", None),
+        },
+    }
+
+
 def handle_request(state, data):
     try:
         decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_object_fields)
@@ -493,6 +524,19 @@ def handle_request(state, data):
             raise ValueError("trailing request payload")
     except (json.JSONDecodeError, TypeError, ValueError):
         return protocol_error("invalid_json")
+
+    # Health handshake (additive v2 request kind; scoring requests are
+    # untouched and must not carry a "kind" field).
+    if isinstance(req, dict) and req.get("kind") == "health":
+        if (
+            set(req) != {"version", "request_id", "kind"}
+            or type(req["version"]) is not int
+            or req["version"] != PROTOCOL_VERSION
+            or not isinstance(req["request_id"], str)
+            or not req["request_id"]
+        ):
+            return protocol_error("invalid_request")
+        return handle_health(state, req)
 
     if (
         not isinstance(req, dict)
@@ -599,6 +643,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
         mx.set_cache_limit(cache_limit_mb * 10**6)
 
     state = ModelState(model_path, context_window, scoring_strategy)
+    state.cache_limit_mb = cache_limit_mb
+    state.started_at = datetime.now(timezone.utc).isoformat()
     last_activity = time.time()
     lock = threading.Lock()
 

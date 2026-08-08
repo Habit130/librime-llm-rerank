@@ -181,7 +181,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
                        string previous_word,
                        RerankScoringPolicy scoring_policy,
                        std::shared_ptr<RecorderSession> recorder_session,
-                       size_t segment_start)
+                       size_t segment_start,
+                       bool record_snapshots,
+                       bool snapshot_only)
       : PrefetchTranslation(translation),
         scorer_(scorer),
         window_(window),
@@ -191,7 +193,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
         previous_word_(std::move(previous_word)),
         scoring_policy_(std::move(scoring_policy)),
         recorder_session_(std::move(recorder_session)),
-        segment_start_(segment_start) {}
+        segment_start_(segment_start),
+        record_snapshots_(record_snapshots),
+        snapshot_only_(snapshot_only) {}
 
  protected:
   virtual bool Replenish();
@@ -210,6 +214,11 @@ class LlmRerankTranslation : public PrefetchTranslation {
   RerankScoringPolicy scoring_policy_;
   std::shared_ptr<RecorderSession> recorder_session_;
   size_t segment_start_ = 0;
+  // When reranking is off but recording is on, the translation still wraps
+  // the upstream stream so the recorder's competition snapshots keep flowing;
+  // it never scores or reorders.
+  bool record_snapshots_ = false;
+  bool snapshot_only_ = false;
   // Accumulated pre-rerank competition materialization for the recorder.
   vector<RecordedCandidate> materialized_;
   size_t next_merge_order_ = 0;
@@ -235,7 +244,7 @@ bool LlmRerankTranslation::Replenish() {
   if (buffer.empty())
     return false;
 
-  if (recorder_session_) {
+  if (recorder_session_ && record_snapshots_) {
     // Snapshot the materialized window for the recorder: candidates in the
     // order they arrived from upstream (original merge order), after
     // upstream dedup. A window that was not fully pulled leaves the
@@ -264,6 +273,13 @@ bool LlmRerankTranslation::Replenish() {
 
   bool truncated = (int)buffer.size() >= window_ && !translation_->exhausted();
   CandidateQueue result;
+  if (snapshot_only_) {
+    // Reranking disabled: emit in original order, no synchronous scoring.
+    for (auto& c : buffer)
+      result.push_back(c);
+    cache_.splice(cache_.end(), result);
+    return !cache_.empty();
+  }
   bool reranked = false;
   if (!scorer_) {
     LogWindowFailure("scoring_unavailable", "score", buffer.size());
@@ -362,8 +378,22 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   if (!ticket.schema)
     return;
   schema_id_ = ticket.schema->schema_id();
+  // Immutable per-instance switch snapshot (spec "三个配置开关"): resolved at
+  // Engine/schema instance creation, never re-read mid-composition. New
+  // sessions adopt new config after redeploy.
+  SwitchConfig switches = ResolveSwitchConfig(
+      ticket.schema->config() ? ticket.schema->config() : nullptr,
+      name_space_);
+  config_source_ = switches.source;
+  reranking_enabled_ = switches.reranking_enabled;
+  recording_enabled_ = switches.recording_enabled;
+  evidence_enabled_ = switches.evidence_enabled;
+  if (switches.deprecation_warning) {
+    LOG(WARNING) << name_space_
+                 << ": legacy 'enable' key is deprecated and ignored; v2 "
+                    "switch keys take precedence";
+  }
   if (Config* config = ticket.schema->config()) {
-    config->GetBool(name_space_ + "/enable", &enabled_);
     config->GetInt(name_space_ + "/window", &window_);
     config->GetDouble(name_space_ + "/alpha", &alpha_);
     config->GetString(name_space_ + "/baseline_policy_id",
@@ -385,9 +415,21 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
   }
   auto weight_scorer = New<WeightScorer>(sys_coeff_, usr_coeff_, verbose_);
   scorer_ = weight_scorer;
-  if (alpha_ > 0.0 && !socket_path_.empty()) {
+  // Reranking disabled -> the key hot path must not do synchronous model
+  // scoring: no LLM scorer is built at all (no socket handle, no attempts).
+  // Recording and snapshot production can still continue independently.
+  if (reranking_enabled_ && alpha_ > 0.0 && !socket_path_.empty()) {
     llm_scorer_ = New<LlmScorer>(socket_path_, alpha_, verbose_, deadline_ms_);
   }
+  // Evidence application (v2): only the explicit `evidence_enabled` switch
+  // admits the personalized evidence term (currently the first-stage bigram,
+  // standing in for the phase-2 retrieval evidence). Legacy and not
+  // configured keep the first-stage behavior: the bigram term applies when
+  // gamma > 0.
+  const bool evidence_active =
+      (config_source_ == SwitchConfigSource::kV2)
+          ? (evidence_enabled_ && gamma_ > 0.0)
+          : (gamma_ > 0.0);
   if (engine_) {
     if (auto component = UserDb::Require("userdb")) {
       string db_name = ticket.schema->schema_id() + ".llm_rerank";
@@ -401,11 +443,12 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
       context_scorer_ =
           New<ContextScorer>(memory_.get(), saturate_k_, verbose_);
       scorer_ = New<CompositeScorer>(
-          weight_scorer, gamma_ > 0.0 ? context_scorer_ : nullptr, llm_scorer_);
+          weight_scorer, evidence_active ? context_scorer_ : nullptr,
+          llm_scorer_);
     } else {
       LOG(WARNING) << name_space_
                    << ": failed to open user db; context scoring unavailable";
-      if (gamma_ > 0.0) {
+      if (evidence_active) {
         scorer_.reset();
       } else if (llm_scorer_) {
         scorer_ = New<CompositeScorer>(weight_scorer, nullptr, llm_scorer_);
@@ -432,7 +475,11 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     LOG(WARNING) << name_space_ << ": LLM scoring unavailable";
     scorer_.reset();
   }
-  LOG(INFO) << name_space_ << ": enable = " << (enabled_ ? "true" : "false")
+  LOG(INFO) << name_space_ << ": source = "
+            << SwitchConfigSourceName(config_source_)
+            << ", reranking = " << (reranking_enabled_ ? "true" : "false")
+            << ", recording = " << (recording_enabled_ ? "true" : "false")
+            << ", evidence = " << (evidence_enabled_ ? "true" : "false")
             << ", window = " << window_ << ", alpha = " << alpha_
             << ", sys_coeff = " << sys_coeff_ << ", usr_coeff = " << usr_coeff_
             << ", gamma = " << gamma_ << ", saturate_k = " << saturate_k_
@@ -452,6 +499,12 @@ void LlmRerankFilter::OnCommit(Context* ctx) {
   if (selected.empty())
     return;
   if (!memory_ || !HasNonAscii(selected))
+    return;
+  // v2 with evidence application off: the personalized evidence pipeline is
+  // disabled as a whole — its private store is not fed either, so no
+  // phase-1 bigram data accumulates silently. Legacy and not_configured keep
+  // the first-stage behavior.
+  if (config_source_ == SwitchConfigSource::kV2 && !evidence_enabled_)
     return;
   memory_->Record(last_word_, selected);
   last_word_ = selected;
@@ -494,7 +547,12 @@ string LlmRerankFilter::BuildContext() {
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
                                        CandidateList* candidates) {
-  if (!enabled_) {
+  // With reranking off, the translation passes through untouched unless the
+  // recorder needs competition snapshots (recording can continue while the
+  // visible reranking is disabled). No synchronous model scoring ever runs
+  // on this path.
+  const bool want_snapshots = recording_enabled_ && recorder_session_;
+  if (!reranking_enabled_ && !want_snapshots) {
     return translation;
   }
   const string preceding_text = BuildContext();
@@ -503,7 +561,13 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   scoring_policy.alpha = alpha_;
   scoring_policy.sys_coeff = sys_coeff_;
   scoring_policy.usr_coeff = usr_coeff_;
-  scoring_policy.gamma = gamma_;
+  // v2 with evidence application off: the plan declares gamma = 0 so the
+  // evidence term is exactly zero. Legacy and not_configured keep the
+  // configured gamma.
+  scoring_policy.gamma =
+      (config_source_ == SwitchConfigSource::kV2 && !evidence_enabled_)
+          ? 0.0
+          : gamma_;
   scoring_policy.saturate_k = saturate_k_;
   string input = input_;
   if (engine_ && engine_->context())
@@ -513,10 +577,10 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
       !engine_->context()->composition().empty()) {
     segment_start = engine_->context()->composition().back().start;
   }
-  return New<LlmRerankTranslation>(translation, scorer_, window_, schema_id_,
-                                   input, preceding_text, last_word_,
-                                   scoring_policy, recorder_session_,
-                                   segment_start);
+  return New<LlmRerankTranslation>(
+      translation, reranking_enabled_ ? scorer_ : nullptr, window_, schema_id_,
+      input, preceding_text, last_word_, scoring_policy, recorder_session_,
+      segment_start, want_snapshots, !reranking_enabled_);
 }
 
 }  // namespace rime
