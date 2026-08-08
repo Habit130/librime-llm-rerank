@@ -23,7 +23,8 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
   endif()
   target_compile_definitions(llm_rerank_test PRIVATE
     LLM_RERANK_DAEMON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../daemon"
-    LLM_RERANK_PYTHON="${Python3_EXECUTABLE}")
+    LLM_RERANK_PYTHON="${Python3_EXECUTABLE}"
+    LLM_RERANK_BUILD_PREDICT="${EXECUTABLE_OUTPUT_PATH}/../../predict/bin/build_predict")
 
   add_test(NAME llm_rerank_test
     COMMAND llm_rerank_test

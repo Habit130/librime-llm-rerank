@@ -35,7 +35,17 @@ const char* kLegacySchema = "e2e_recorder_legacy";
 const char* kV2PrioritySchema = "e2e_recorder_v2priority";
 const char* kEvOnSchema = "e2e_evidence_on";
 const char* kEvOffSchema = "e2e_evidence_off";
+// #90: per-category non-word behavior and user-dictionary word classification.
+const char* kAsciiSchema = "e2e_ascii";
+const char* kRawSchema = "e2e_raw";
+const char* kPunctSchema = "e2e_punct";
+const char* kSentenceSchema = "e2e_sentence";
+const char* kCompletionSchema = "e2e_completion";
+const char* kPredictionSchema = "e2e_prediction";
+const char* kUserDictSchema = "e2e_userdict";
 const char* kDictName = "e2e_recorder";
+const char* kSentenceDictName = "e2e_sentence";
+const char* kUserDictDictName = "e2e_userdict";
 const char* kRimeDirPrefix = "/tmp/llm_rerank_e2e_rime_";
 const char* kHomePrefix = "/tmp/llm_rerank_e2e_home_";
 
@@ -61,6 +71,13 @@ const char* kDefaultYaml =
     "  - schema: e2e_recorder_v2priority\n"
     "  - schema: e2e_evidence_on\n"
     "  - schema: e2e_evidence_off\n"
+    "  - schema: e2e_ascii\n"
+    "  - schema: e2e_raw\n"
+    "  - schema: e2e_punct\n"
+    "  - schema: e2e_sentence\n"
+    "  - schema: e2e_completion\n"
+    "  - schema: e2e_prediction\n"
+    "  - schema: e2e_userdict\n"
     "switcher:\n"
     "  fix_schema_list_order: true\n"
     "menu:\n"
@@ -425,6 +442,334 @@ const char* kEvOffSchemaYaml =
     "  gamma: 4.0\n"
     "  saturate_k: 1.0\n";
 
+// --- #90: per-category non-word behavior ---
+
+// ASCII passthrough: with `ascii_composer` first in the processor chain and
+// the ascii_mode option on, printable keys are rejected straight to the host
+// app (kRejected) — no composition, no candidates, so nothing can be
+// selected. The mode is toggled via the RimeApi option (equivalent to the
+// ascii_composer switch key; librime rejects chord bindings in
+// ascii_composer/switch_key, see load_bindings' `ke.modifier() != 0` guard).
+const char* kAsciiSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_ascii\n"
+    "  name: E2E ASCII passthrough\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - ascii_composer\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
+
+// Raw input: `ascii_segmentor` (ascii mode) and `fallback_segmentor` (any
+// unsegmented input) tag a segment "raw"; `echo_translator` turns it into a
+// SimpleCandidate of type "raw". No `ascii_composer` here so the input can
+// still be pushed in ascii mode. Confirming the raw candidate is a real
+// selection that must not form an event.
+const char* kRawSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_raw\n"
+    "  name: E2E raw input\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "    - echo_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
+
+// Punctuation: the `punctuator` processor pushes the key into the input, the
+// `punct_segmentor` makes a "punct" segment and `punct_translator` emits a
+// SimpleCandidate of type "punct". A plain-value definition auto-confirms via
+// Punctuator::ConfirmUniquePunct -> Context::ConfirmCurrentSelection, which
+// fires select_notifier with the punct candidate selected.
+const char* kPunctSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_punct\n"
+    "  name: E2E punctuation\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - punctuator\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - punct_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "    - punct_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "punctuator:\n"
+    "  half_shape:\n"
+    "    \",\": \"，\"\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
+
+// Sentence candidates: `script_translator` makes a sentence (type "sentence")
+// whenever the input has at least two syllables and no exact-match phrase
+// covers the whole input. The dedicated dictionary has no phrase for
+// "woshijie" while both single words exist, so the poet builds 我世界.
+const char* kSentenceSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_sentence\n"
+    "  name: E2E sentence\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_sentence\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
+
+// Completion candidates: `enable_completion` makes script_translator emit
+// long-word associations — dictionary entries whose code is longer than the
+// input — with type "completion" (librime's tail-index predictive match,
+// e.g. typing "shijiehe" surfaces 世界和平). The dedicated dictionary adds a
+// four-syllable entry so the tail index has a completion to offer.
+const char* kCompletionSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_completion\n"
+    "  name: E2E completion\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_completion\n"
+    "  enable_completion: true\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
+
+// Prediction candidates: librime-predict's `predictor` processor appends a
+// zero-length "prediction" segment after a commit and `predict_translator`
+// emits SimpleCandidates of type "prediction" from the db. The db is built
+// from a tiny corpus by the plugin's build_predict tool into the shared data
+// dir before the suite runs.
+const char* kPredictionSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_prediction\n"
+    "  name: E2E prediction\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - predictor\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "    - predict_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "switches:\n"
+    "  - name: ascii_mode\n"
+    "    reset: 0\n"
+    "  - name: full_shape\n"
+    "    reset: 0\n"
+    "  - name: prediction\n"
+    "    reset: 1\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_recorder\n"
+    "  enable_user_dict: false\n"
+    "\n"
+    "predictor:\n"
+    "  db: predict.db\n"
+    "  max_candidates: 5\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  reranking_enabled: true\n"
+    "  recording_enabled: true\n"
+    "  evidence_enabled: false\n";
+
+// User dictionary: same dictionary as the canonical schema but with
+// `enable_user_dict: true` so committing an exact-match selection learns it
+// into <dict>.userdb (Memory::ProcessSegmentOnCommit saves kConfirmed
+// segments). Recording is on, visible reranking off (v2 partial adoption):
+// the script_translator's user-phrase preference (prefer_user_phrase) then
+// stays visible in the emission order — the learned word leads its homophone
+// group. The dedicated dictionary name isolates the userdb from every other
+// test.
+const char* kUserDictSchemaYaml =
+    "schema:\n"
+    "  schema_id: e2e_userdict\n"
+    "  name: E2E user dictionary\n"
+    "  version: \"1.0\"\n"
+    "\n"
+    "engine:\n"
+    "  processors:\n"
+    "    - llm_rerank_recorder\n"
+    "    - speller\n"
+    "    - selector\n"
+    "    - express_editor\n"
+    "  segmentors:\n"
+    "    - ascii_segmentor\n"
+    "    - abc_segmentor\n"
+    "    - fallback_segmentor\n"
+    "  translators:\n"
+    "    - script_translator\n"
+    "  filters:\n"
+    "    - uniquifier\n"
+    "    - llm_rerank\n"
+    "\n"
+    "speller:\n"
+    "  alphabet: zyxwvutsrqponmlkjihgfedcba\n"
+    "  delimiter: \" '\"\n"
+    "\n"
+    "translator:\n"
+    "  dictionary: e2e_userdict\n"
+    "  enable_user_dict: true\n"
+    "\n"
+    "menu:\n"
+    "  page_size: 10\n"
+    "\n"
+    "llm_rerank:\n"
+    "  recording_enabled: true\n";
+
 const char* kDictYaml =
     "---\n"
     "name: e2e_recorder\n"
@@ -450,6 +795,45 @@ const char* kEvDictYaml =
     "世界\tshi jie\t99\n"
     "时界\tshi jie\t98\n"
     "石阶\tshi jie\t80\n"
+    "我\two\t100\n";
+
+// Sentence dictionary: single words only, so "woshijie" has no exact-match
+// phrase and the poet composes 我世界.
+const char* kSentenceDictYaml =
+    "---\n"
+    "name: e2e_sentence\n"
+    "version: \"1.0\"\n"
+    "sort: by_weight\n"
+    "...\n"
+    "世界\tshi jie\t100\n"
+    "我\two\t100\n";
+
+// User-dictionary schema dictionary: mirrors the canonical dictionary so the
+// user phrase competes with real system homophones.
+const char* kUserDictDictYaml =
+    "---\n"
+    "name: e2e_userdict\n"
+    "version: \"1.0\"\n"
+    "sort: by_weight\n"
+    "...\n"
+    "世界\tshi jie\t100\n"
+    "时界\tshi jie\t90\n"
+    "石阶\tshi jie\t80\n"
+    "我\two\t100\n";
+
+// Completion dictionary: the six-syllable entry 世界和平大会 lives in the
+// tail index; typing its first four syllables makes script_translator emit
+// it as a predictive ("completion") candidate.
+const char* kCompletionDictYaml =
+    "---\n"
+    "name: e2e_completion\n"
+    "version: \"1.0\"\n"
+    "sort: by_weight\n"
+    "...\n"
+    "世界\tshi jie\t100\n"
+    "时界\tshi jie\t90\n"
+    "石阶\tshi jie\t80\n"
+    "世界和平大会\tshi jie he ping da hui\t100\n"
     "我\two\t100\n";
 
 std::string MakeTempDir(const char* prefix) {
@@ -717,8 +1101,45 @@ class RecorderE2ETest : public ::testing::Test {
               kEvOnSchemaYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_evidence_off.schema.yaml",
               kEvOffSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_ascii.schema.yaml", kAsciiSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_raw.schema.yaml", kRawSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_punct.schema.yaml", kPunctSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_sentence.schema.yaml",
+              kSentenceSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_completion.schema.yaml",
+              kCompletionSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_prediction.schema.yaml",
+              kPredictionSchemaYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_userdict.schema.yaml",
+              kUserDictSchemaYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_recorder.dict.yaml", kDictYaml);
     WriteFile(fs::path(g_rime_dir) / "e2e_evidence.dict.yaml", kEvDictYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_sentence.dict.yaml",
+              kSentenceDictYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_userdict.dict.yaml",
+              kUserDictDictYaml);
+    WriteFile(fs::path(g_rime_dir) / "e2e_completion.dict.yaml",
+              kCompletionDictYaml);
+
+    // Build the tiny prediction corpus into predict.db (read by the
+    // predictor of e2e_prediction from the shared data dir).
+    const char* kBuildPredict = LLM_RERANK_BUILD_PREDICT;
+    if (kBuildPredict && *kBuildPredict) {
+      const char* kPredictCorpus =
+          "$\t我\t7\n"
+          "我\t世界\t5\n"
+          "我\t时界\t4\n";
+      std::string cmd = std::string(kBuildPredict) + " " + g_rime_dir +
+                        "/predict.db";
+      FILE* proc = popen(cmd.c_str(), "w");
+      ASSERT_TRUE(proc != nullptr);
+      fputs(kPredictCorpus, proc);
+      ASSERT_EQ(0, pclose(proc));
+      ASSERT_TRUE(fs::exists(fs::path(g_rime_dir) / "predict.db"));
+    } else {
+      FAIL() << "LLM_RERANK_BUILD_PREDICT not defined; prediction e2e "
+                "cannot construct its db";
+    }
 
     RIME_STRUCT(RimeTraits, traits);
     traits.app_name = "llm_rerank_e2e";
@@ -800,6 +1221,43 @@ class RecorderE2ETest : public ::testing::Test {
               sqlite3_open_v2((FactsRoot() / "facts.sqlite3").c_str(), &db,
                               SQLITE_OPEN_READONLY, nullptr));
     return db;
+  }
+
+  // Last committed text without requiring an active composition (punct and
+  // prediction auto-commit during the triggering key event).
+  std::string LastCommitText(RimeSessionId session) {
+    RIME_STRUCT(RimeCommit, commit);
+    std::string text;
+    if (g_rime->get_commit(session, &commit) && commit.text) {
+      text = commit.text;
+    }
+    g_rime->free_commit(&commit);
+    return text;
+  }
+
+  // Absolute index of a candidate by text on the current page, or -1.
+  int IndexOfCandidate(RimeSessionId session, const char* text) {
+    RIME_STRUCT(RimeContext, ctx);
+    if (!g_rime->get_context(session, &ctx))
+      return -1;
+    int index = -1;
+    for (int i = 0; i < ctx.menu.num_candidates; ++i) {
+      if (ctx.menu.candidates[i].text &&
+          strcmp(ctx.menu.candidates[i].text, text) == 0) {
+        index = ctx.menu.page_no * ctx.menu.page_size + i;
+        break;
+      }
+    }
+    g_rime->free_context(&ctx);
+    return index;
+  }
+
+  // Select the candidate at a single-page index with the digit key bound to
+  // it (page_size 10 -> keys 1-9,0 select indices 0-9).
+  bool SelectDigit(RimeSessionId session, int index) {
+    if (index < 0 || index > 9)
+      return false;
+    return g_rime->process_key(session, index == 9 ? '0' : '1' + index, 0);
   }
 
   std::string home_dir_;
@@ -1679,6 +2137,259 @@ TEST_F(RecorderE2ETest, EvidenceOnAppliesBigramHistory) {
   EXPECT_EQ("时界", events[0].final_selection_text);
   EXPECT_EQ("时界", events[1].final_selection_text);
   EXPECT_EQ("explicit_current", events[1].confirmation_source);
+  sqlite3_close(db);
+}
+
+// --- #90: per-category non-word behavior and user-dictionary word class ---
+
+TEST_F(RecorderE2ETest, AsciiModePassthroughFormsNoEvent) {
+  // With ascii_mode on, the ascii_composer rejects printable keys straight to
+  // the host application: no composition is ever created, so no candidate can
+  // be selected and no event may form.
+  RimeSessionId session = NewSession(kAsciiSchema);
+  ASSERT_NE(0, session);
+  g_rime->set_option(session, "ascii_mode", true);
+
+  const char kPassthrough[] = "hello";
+  for (const char* p = kPassthrough; *p; ++p) {
+    EXPECT_FALSE(g_rime->process_key(session, static_cast<int>(*p), 0));
+  }
+  RIME_STRUCT(RimeStatus, status);
+  ASSERT_TRUE(g_rime->get_status(session, &status));
+  EXPECT_FALSE(status.is_composing);
+  g_rime->free_status(&status);
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  // The recorder must survive the ascii detour: normal input still records.
+  session = NewSession(kAsciiSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ("word", event.category);
+  EXPECT_EQ("时界", event.final_selection_text);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, RawEncodingSelectionFormsNoEvent) {
+  // "xyz" has no valid syllable: fallback_segmentor tags it raw and
+  // echo_translator emits a raw candidate; confirming it is a real selection
+  // that must not form an event.
+  RimeSessionId session = NewSession(kRawSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "xyz");
+  EXPECT_EQ(0, IndexOfCandidate(session, "xyz"));
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("xyz", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, AsciiModeRawSegmentCommitFormsNoEvent) {
+  // With ascii_mode on and no ascii_composer in the chain, input still enters
+  // the composition; ascii_segmentor tags it raw and echo_translator emits a
+  // raw candidate (the engine's representation of inline ascii text).
+  RimeSessionId session = NewSession(kRawSchema);
+  ASSERT_NE(0, session);
+  g_rime->set_option(session, "ascii_mode", true);
+
+  TypeString(session, "hello");
+  EXPECT_EQ(0, IndexOfCandidate(session, "hello"));
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("hello", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, PunctuationSelectionFormsNoEvent) {
+  // Typing "," pushes the key, punct_segmentor/punct_translator produce the
+  // "，" candidate (type "punct") and the punctuator processor confirms it via
+  // ConfirmCurrentSelection — a real selection that must not form an event.
+  RimeSessionId session = NewSession(kPunctSchema);
+  ASSERT_NE(0, session);
+
+  ASSERT_TRUE(g_rime->process_key(session, ',', 0));
+  EXPECT_EQ("，", LastCommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, SentenceCandidateSelectionFormsNoEvent) {
+  // "woshijie" has no exact-match phrase, so the poet composes the sentence
+  // 我世界 (type "sentence"); selecting and committing it must not form an
+  // event even though it consumes the whole input.
+  RimeSessionId session = NewSession(kSentenceSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "woshijie");
+  int sentence_index = IndexOfCandidate(session, "我世界");
+  ASSERT_GE(sentence_index, 0);
+  ASSERT_TRUE(SelectDigit(session, sentence_index));
+  EXPECT_EQ("我世界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, CompletionCandidateSelectionFormsNoEvent) {
+  // With enable_completion, typing a code prefix of a longer dictionary entry
+  // emits the entry as type "completion"; selecting it must not form an event.
+  RimeSessionId session = NewSession(kCompletionSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijieheping");
+  int completion_index = IndexOfCandidate(session, "世界和平大会");
+  ASSERT_GE(completion_index, 0);
+  ASSERT_TRUE(SelectDigit(session, completion_index));
+  EXPECT_EQ("世界和平大会", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, PredictionCandidateSelectionFormsNoEvent) {
+  // After committing 我, the predictor appends a prediction segment with
+  // candidates 世界/时界 (type "prediction"); selecting one is a real
+  // selection that must not form an event.
+  RimeSessionId session = NewSession(kPredictionSchema);
+  ASSERT_NE(0, session);
+
+  // Unique candidate 我: no event, and its commit triggers the predictor.
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", LastCommitText(session));
+  // The prediction segment is now in the menu; select 时界 (index 1).
+  EXPECT_EQ(1, IndexOfCandidate(session, "时界"));
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", LastCommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, UserDictCandidateCompetesInWordGroupAndWins) {
+  // Learn 石阶 (lowest system weight) by selecting it: the kConfirmed
+  // segment is saved into the dedicated userdb. On the next identical input
+  // the user phrase leads the homophone group (script_translator prefers the
+  // user phrase on equal code length) and space confirms it: the event must
+  // record the whole word group with the user phrase at the top.
+  RimeSessionId session = NewSession(kUserDictSchema);
+  ASSERT_NE(0, session);
+
+  // Learning selection: 石阶 at index 2 (weights 100/90/80).
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '3', 0));
+  EXPECT_EQ("石阶", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  // The learned user phrase now leads the group; space confirms it.
+  session = NewSession(kUserDictSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  EXPECT_EQ(0, IndexOfCandidate(session, "石阶"));
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("石阶", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+
+  // Learning event: system group in weight order, 石阶 picked by index.
+  const EventRow& learning = events[0];
+  EXPECT_EQ("word", learning.category);
+  EXPECT_EQ("石阶", learning.final_selection_text);
+  EXPECT_EQ("explicit_indexed", learning.confirmation_source);
+  std::vector<std::pair<long long, std::string>> candidates;
+  ASSERT_TRUE(ReadCandidates(db, learning.event_id, &candidates));
+  ASSERT_EQ(3u, candidates.size());
+  EXPECT_EQ("世界", candidates[0].second);
+  EXPECT_EQ("时界", candidates[1].second);
+  EXPECT_EQ("石阶", candidates[2].second);
+
+  // Verification event: the user phrase 石阶 led the same group and was
+  // confirmed with space.
+  const EventRow& verified = events[1];
+  EXPECT_EQ("word", verified.category);
+  EXPECT_EQ("石阶", verified.final_selection_text);
+  EXPECT_EQ("explicit_current", verified.confirmation_source);
+  EXPECT_EQ(1LL, verified.competition_complete);
+  candidates.clear();
+  ASSERT_TRUE(ReadCandidates(db, verified.event_id, &candidates));
+  ASSERT_EQ(3u, candidates.size());
+  EXPECT_EQ("石阶", candidates[0].second);
+  EXPECT_EQ("世界", candidates[1].second);
+  EXPECT_EQ("时界", candidates[2].second);
   sqlite3_close(db);
 }
 
