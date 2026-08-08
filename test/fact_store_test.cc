@@ -2,6 +2,8 @@
 // Copyright RIME Developers
 // Distributed under the BSD License
 //
+#include <mach-o/dyld.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -9,9 +11,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
+
+extern char** environ;
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -168,7 +173,58 @@ std::pair<int64_t, int64_t> ReadMetaClock(const fs::path& db_path) {
   return clock;
 }
 
+// Flag used to relaunch this test binary as the second writer process of
+// ConcurrentWritersBothPersistAtomically (see SpawnConcurrentWriter).
+constexpr const char* kSpawnedWriterFlag = "--llm-rerank-spawned-writer";
+constexpr int kConcurrentBatches = 8;
+
+// Writer loop of the second, independent process of
+// ConcurrentWritersBothPersistAtomically. Exit codes mirror the original
+// fork-based test: 2 = store failed to open, 3 = a batch failed to persist,
+// 0 = all batches persisted. Runs in-process and _exit()s.
+void RunSpawnedWriterLoop(const fs::path& root) {
+  FactStore store{root};
+  if (store.Open() != FactStore::Status::kOk)
+    _exit(2);
+  for (int i = 0; i < kConcurrentBatches; ++i) {
+    std::vector<FactStore::Event> events{MakeEvent(100 + i)};
+    if (!store.PersistBatch(1700000000000LL + i, &events))
+      _exit(3);
+  }
+  _exit(0);
+}
+
 }  // namespace
+
+// Dispatches to the spawned-writer code path when this binary was relaunched
+// with kSpawnedWriterFlag. Invoked from main() before gtest initializes;
+// never returns in that case. External linkage so main() (in another test
+// translation unit) can call it.
+void RunSpawnedWriterMode(int argc, char** argv) {
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::strcmp(argv[i], kSpawnedWriterFlag) != 0)
+      continue;
+    RunSpawnedWriterLoop(fs::path(argv[i + 1]));
+  }
+}
+
+// Launches an independent second writer by re-execing this binary in
+// spawned-writer mode. posix_spawn gives the child a fresh process image;
+// a bare fork() would instead inherit this process's libsystem_trace os_log
+// signpost state, which SIGSEGVs inside sqlite3_open on macOS (the flake
+// tracked in Habit130/squirrel#92). Returns the child pid, or -1 on failure.
+pid_t SpawnConcurrentWriter(const fs::path& root) {
+  char self_path[4096];
+  uint32_t path_size = sizeof(self_path);
+  if (_NSGetExecutablePath(self_path, &path_size) != 0)
+    return -1;
+  char* argv[] = {self_path, const_cast<char*>(kSpawnedWriterFlag),
+                  const_cast<char*>(root.c_str()), nullptr};
+  pid_t pid = -1;
+  if (posix_spawn(&pid, self_path, nullptr, nullptr, argv, environ) != 0)
+    return -1;
+  return pid;
+}
 
 class FactStoreTest : public ::testing::Test {
  protected:
@@ -503,8 +559,7 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
   // Two independent store handles on the same facts root, writing batches
   // concurrently (a multi-process write competition). Each batch must land
   // whole or not at all, and no batch may be lost.
-  const int kBatches = 8;
-  // Establish the database before forking so both writers race on writes
+  // Establish the database before spawning so both writers race on writes
   // only, never on schema/meta initialization.
   {
     FactStore store(root_);
@@ -513,31 +568,20 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
     ASSERT_TRUE(store.PersistBatch(1699999999000LL, &bootstrap));
   }
 
-  pid_t pid = fork();
+  // Second writer as an independent process: this binary relaunched in
+  // spawned-writer mode (see RunSpawnedWriterMode / SpawnConcurrentWriter).
+  pid_t pid = SpawnConcurrentWriter(root_);
   ASSERT_GE(pid, 0);
-  int exit_code = 0;
-  if (pid == 0) {
-    // Child writer: its own store handle; loops, then exits cleanly.
-    FactStore store(root_);
-    FactStore::Status status = store.Open();
-    if (status != FactStore::Status::kOk)
-      _exit(2);
-    for (int i = 0; i < kBatches; ++i) {
-      std::vector<FactStore::Event> events{MakeEvent(100 + i)};
-      if (!store.PersistBatch(1700000000000LL + i, &events))
-        _exit(3);
-    }
-    _exit(0);
-  }
   // Parent writer on the same root, racing the child.
   {
     FactStore store(root_);
     ASSERT_EQ(FactStore::Status::kOk, store.Open());
-    for (int i = 0; i < kBatches; ++i) {
+    for (int i = 0; i < kConcurrentBatches; ++i) {
       std::vector<FactStore::Event> events{MakeEvent(200 + i)};
       ASSERT_TRUE(store.PersistBatch(1700000001000LL + i, &events));
     }
   }
+  int exit_code = 0;
   waitpid(pid, &exit_code, 0);
   ASSERT_TRUE(WIFEXITED(exit_code));
   ASSERT_EQ(0, WEXITSTATUS(exit_code));
@@ -546,11 +590,12 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
   ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
   // Every batch from both writers became exactly one commit row, plus the
   // bootstrap commit.
-  EXPECT_EQ(2LL * kBatches + 1, QueryCount(db, "SELECT COUNT(*) FROM commits;"));
-  EXPECT_EQ(2LL * kBatches + 1,
+  EXPECT_EQ(2LL * kConcurrentBatches + 1,
+            QueryCount(db, "SELECT COUNT(*) FROM commits;"));
+  EXPECT_EQ(2LL * kConcurrentBatches + 1,
             QueryCount(db, "SELECT COUNT(*) FROM selection_events;"));
   // Each event must have its full candidate set — no torn batches.
-  EXPECT_EQ(3LL * (2 * kBatches + 1),
+  EXPECT_EQ(3LL * (2 * kConcurrentBatches + 1),
             QueryCount(db, "SELECT COUNT(*) FROM selection_candidates;"));
   EXPECT_EQ(0LL, QueryCount(db,
       "SELECT COUNT(*) FROM commits c LEFT JOIN selection_events e"

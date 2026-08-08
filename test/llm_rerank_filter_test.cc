@@ -1984,7 +1984,13 @@ TEST(LlmScorerTest, EmptyBatchReturnsNoScores) {
   EXPECT_TRUE(scores.empty());
 }
 
+// Spawned-writer mode of ConcurrentWritersBothPersistAtomically (see
+// fact_store_test.cc): _exit()s inside when this process was relaunched as
+// the second writer, before gtest ever initializes.
+void RunSpawnedWriterMode(int argc, char** argv);
+
 int main(int argc, char** argv) {
+  RunSpawnedWriterMode(argc, argv);
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
