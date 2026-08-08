@@ -36,6 +36,13 @@ string CategoryOfCandidate(const an<Candidate>& cand) {
   return type;
 }
 
+// An unmodified BackSpace: no modifiers except Shift (a soft modifier that
+// does not change the key's meaning), matching the memory.cc precedent.
+bool IsPlainBackspace(const KeyEvent& key) {
+  return key.keycode() == XK_BackSpace &&
+         (key.modifier() & ~kShiftMask) == 0;
+}
+
 }  // namespace
 
 LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
@@ -83,6 +90,8 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
         ctx->abort_notifier().connect([this](Context* c) { OnAbort(c); });
     update_connection_ = ctx->update_notifier().connect(
         [this](Context* c) { OnContextUpdate(c); });
+    unhandled_key_connection_ = ctx->unhandled_key_notifier().connect(
+        [this](Context* c, const KeyEvent& key) { OnUnhandledKey(c, key); });
   }
   UpdateStatusProperties();
 }
@@ -92,6 +101,7 @@ LlmRerankRecorder::~LlmRerankRecorder() {
   commit_connection_.disconnect();
   abort_connection_.disconnect();
   update_connection_.disconnect();
+  unhandled_key_connection_.disconnect();
   RecorderSessionRegistry::Unregister(engine_);
 }
 
@@ -100,6 +110,19 @@ ProcessResult LlmRerankRecorder::ProcessKeyEvent(const KeyEvent& key_event) {
   // notifier can only fire synchronously during the triggering key's
   // processing (mouse clicks and API selections fire outside any key event).
   key_in_flight_ = false;
+  retraction_pending_ = false;
+  if (!key_event.release() && retraction_armed_) {
+    if (IsPlainBackspace(key_event)) {
+      // The key may or may not be handled by the engine; if it ends up
+      // unhandled, OnUnhandledKey retracts the armed commit.
+      retraction_pending_ = true;
+    } else {
+      // Any other key press consumes the window: only the first key after a
+      // commit counts as an immediate undo BackSpace. (Releases, e.g. of the
+      // confirming key, never disarm.)
+      retraction_armed_ = false;
+    }
+  }
   if (!key_event.release() && engine_ && engine_->context() &&
       engine_->context()->HasMenu() && session_ &&
       ClassifyConfirmationSource(key_event.keycode(), true,
@@ -204,8 +227,13 @@ void LlmRerankRecorder::OnSelect(Context* ctx) {
 void LlmRerankRecorder::OnCommit(Context* ctx) {
   if (!session_ || !session_->store)
     return;
-  if (!ctx || session_->pending.empty())
+  if (!ctx || session_->pending.empty()) {
+    // A commit with no tentative events (plain text, auto-selection) still
+    // consumes any earlier retraction window: it is no longer the commit just
+    // before the next BackSpace.
+    retraction_armed_ = false;
     return;
+  }
   // Validate the tentative events against the final composition: the segment
   // must still be selected with the same candidate. Reopened, replaced or
   // dropped segments fail this check and leave no record.
@@ -227,6 +255,7 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
   }
   if (valid.empty()) {
     session_->pending.clear();
+    retraction_armed_ = false;
     return;
   }
   // HLC is assigned in confirmation order inside the commit transaction.
@@ -238,6 +267,7 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
     ReportGap(session_->fault_code.empty() ? "store_unavailable"
                                            : session_->fault_code.c_str());
     session_->pending.clear();
+    retraction_armed_ = false;
     return;
   }
   vector<FactStore::Event> events;
@@ -267,14 +297,19 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
     }
     events.push_back(std::move(event));
   }
-  if (!session_->store->PersistBatch(NowMs(), &events)) {
+  string commit_id;
+  if (!session_->store->PersistBatch(NowMs(), &events, &commit_id)) {
     ReportGap(FactStore::StatusCode(session_->store->status()));
     session_->pending.clear();
+    retraction_armed_ = false;
     return;
   }
   for (const auto& pending : valid) {
     session_->pending.erase(pending.segment_start);
   }
+  // Arm the immediate-undo window for the whole batch just persisted.
+  retraction_commit_id_ = commit_id;
+  retraction_armed_ = true;
   UpdateStatusProperties();
 }
 
@@ -294,6 +329,30 @@ void LlmRerankRecorder::OnContextUpdate(Context* ctx) {
     session_->DropPending();
     session_->ClearSnapshots();
   }
+}
+
+void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
+  if (key.release())
+    return;  // press-only: the confirming key's release must not trigger
+  if (!retraction_pending_ || !retraction_armed_)
+    return;
+  if (!session_ || !session_->store)
+    return;
+  retraction_pending_ = false;
+  retraction_armed_ = false;
+  if (!session_->store->is_open()) {
+    ReportGap(session_->fault_code.empty() ? "store_unavailable"
+                                           : session_->fault_code.c_str());
+    return;
+  }
+  if (!session_->store->AppendRetraction(retraction_commit_id_, NowMs())) {
+    ReportGap(FactStore::StatusCode(session_->store->status()));
+    return;
+  }
+  LOG(INFO) << "llm_rerank recorder: code=retracted_commit"
+            << " commit_id=" << retraction_commit_id_
+            << " schema=" << session_->schema_id;
+  UpdateStatusProperties();
 }
 
 void LlmRerankRecorder::ReportGap(const char* reason) {

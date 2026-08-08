@@ -26,6 +26,13 @@ class KeyEvent;
 // - abort, composition reset (update with empty composition) and commit-time
 //   validation drop tentative events that did not make it into the commit.
 //
+// Immediate undo: a commit that persisted events arms a retraction window
+// bound to that commit. The next key press consumes it — an unmodified,
+// unhandled BackSpace appends a retraction fact for the whole commit; any
+// other key press (or another commit) disarms without retracting. Repeated
+// BackSpace after the first is a no-op, so stepping back across older commits
+// never happens silently.
+//
 // Recording is off by default (`llm_rerank/recording_enabled`, user story 26:
 // upgrades must not start collecting raw preceding text silently).
 class LlmRerankRecorder : public Processor {
@@ -40,6 +47,7 @@ class LlmRerankRecorder : public Processor {
   void OnCommit(Context* ctx);
   void OnAbort(Context* ctx);
   void OnContextUpdate(Context* ctx);
+  void OnUnhandledKey(Context* ctx, const KeyEvent& key_event);
   void ReportGap(const char* reason);
   void UpdateStatusProperties();
 
@@ -48,10 +56,16 @@ class LlmRerankRecorder : public Processor {
   connection commit_connection_;
   connection abort_connection_;
   connection update_connection_;
+  connection unhandled_key_connection_;
   int last_keycode_ = 0;
   bool key_in_flight_ = false;
   string last_fault_property_;
   string last_gap_property_;
+  // Immediate-undo window: armed by the last event-bearing commit, consumed
+  // by the first key press after it.
+  bool retraction_armed_ = false;
+  bool retraction_pending_ = false;  // current key is a plain BackSpace
+  string retraction_commit_id_;
 };
 
 }  // namespace rime
