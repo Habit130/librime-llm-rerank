@@ -84,6 +84,90 @@ FactStore::Event MakeEvent(int seq) {
   return event;
 }
 
+struct RetractionRow {
+  std::string retraction_id;
+  std::string commit_id;
+  long long hlc_physical_ms = 0;
+  long long hlc_logical = 0;
+  long long utc_retracted_at_ms = 0;
+};
+
+bool ReadRetractions(sqlite3* db, std::vector<RetractionRow>* out) {
+  const char* sql = "SELECT retraction_id, commit_id, hlc_physical_ms,"
+      " hlc_logical, utc_retracted_at_ms FROM retractions"
+      " ORDER BY hlc_physical_ms, hlc_logical;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    RetractionRow row;
+    row.retraction_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    row.commit_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    row.hlc_physical_ms = sqlite3_column_int64(stmt, 2);
+    row.hlc_logical = sqlite3_column_int64(stmt, 3);
+    row.utc_retracted_at_ms = sqlite3_column_int64(stmt, 4);
+    out->push_back(std::move(row));
+  }
+  sqlite3_finalize(stmt);
+  return true;
+}
+
+// Canonical dump of all event and candidate rows; used to prove a retraction
+// leaves the original facts byte-for-byte untouched.
+std::string DumpFacts(sqlite3* db) {
+  std::string out;
+  const char* kEvents =
+      "SELECT event_id, commit_id, event_format_version, schema_id,"
+      " canonical_segment_input, span_start, span_end, category,"
+      " preceding_text, competition_complete, final_selection_text,"
+      " confirmation_source, trigger_keycode, display_rank, display_page,"
+      " session_id, session_seq, hlc_physical_ms, hlc_logical,"
+      " utc_confirmed_at_ms, utc_committed_at_ms FROM selection_events"
+      " ORDER BY hlc_physical_ms, hlc_logical, event_id;";
+  sqlite3_stmt* stmt = nullptr;
+  sqlite3_prepare_v2(db, kEvents, -1, &stmt, nullptr);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
+      const unsigned char* text = sqlite3_column_text(stmt, i);
+      out += text ? reinterpret_cast<const char*>(text) : "";
+      out += "|";
+    }
+    out += "\n";
+  }
+  sqlite3_finalize(stmt);
+  const char* kCandidates =
+      "SELECT event_id, merge_order, text FROM selection_candidates"
+      " ORDER BY event_id, merge_order;";
+  stmt = nullptr;
+  sqlite3_prepare_v2(db, kCandidates, -1, &stmt, nullptr);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
+      const unsigned char* text = sqlite3_column_text(stmt, i);
+      out += text ? reinterpret_cast<const char*>(text) : "";
+      out += "|";
+    }
+    out += "\n";
+  }
+  sqlite3_finalize(stmt);
+  return out;
+}
+
+// Reads the persisted HLC clock from meta; used as the "current" replay point.
+std::pair<int64_t, int64_t> ReadMetaClock(const fs::path& db_path) {
+  sqlite3* db = nullptr;
+  std::pair<int64_t, int64_t> clock = {0, 0};
+  if (!OpenDbReadOnly(db_path, &db))
+    return clock;
+  clock.first =
+      QueryCount(db, "SELECT value FROM meta WHERE key='hlc_physical_ms';");
+  clock.second =
+      QueryCount(db, "SELECT value FROM meta WHERE key='hlc_logical';");
+  sqlite3_close(db);
+  return clock;
+}
+
 }  // namespace
 
 class FactStoreTest : public ::testing::Test {
@@ -472,4 +556,205 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
       "SELECT COUNT(*) FROM commits c LEFT JOIN selection_events e"
       " ON c.commit_id = e.commit_id WHERE e.event_id IS NULL;"));
   sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, AppendRetractionKeepsOriginalFactsUntouched) {
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  std::vector<FactStore::Event> events{MakeEvent(1), MakeEvent(2)};
+  std::string commit_id;
+  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events, &commit_id));
+  ASSERT_FALSE(commit_id.empty());
+  ASSERT_EQ(commit_id, events[0].commit_id);
+  ASSERT_EQ(commit_id, events[1].commit_id);
+
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  const std::string before = DumpFacts(db);
+  sqlite3_close(db);
+
+  std::string retraction_id;
+  ASSERT_TRUE(store.AppendRetraction(commit_id, 1700000002000LL,
+                                     &retraction_id));
+  ASSERT_FALSE(retraction_id.empty());
+  ASSERT_NE(retraction_id, commit_id);
+
+  db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  // The retraction is an independent appended fact: the original event and
+  // candidate rows are byte-for-byte identical.
+  EXPECT_EQ(before, DumpFacts(db));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM retractions;"));
+  std::vector<RetractionRow> retractions;
+  ASSERT_TRUE(ReadRetractions(db, &retractions));
+  ASSERT_EQ(1u, retractions.size());
+  EXPECT_EQ(commit_id, retractions[0].commit_id);
+  EXPECT_EQ(retraction_id, retractions[0].retraction_id);
+  EXPECT_EQ(1700000002000LL, retractions[0].utc_retracted_at_ms);
+  // The retraction's HLC is later than every event of the retracted commit.
+  const auto last_event_hlc = std::make_pair(events[1].hlc_physical_ms,
+                                             events[1].hlc_logical);
+  EXPECT_LT(last_event_hlc, std::make_pair(retractions[0].hlc_physical_ms,
+                                           retractions[0].hlc_logical));
+  sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, AppendRetractionIsIdempotent) {
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  std::vector<FactStore::Event> events{MakeEvent(1)};
+  std::string commit_id;
+  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events, &commit_id));
+  ASSERT_TRUE(store.AppendRetraction(commit_id, 1700000002000LL));
+  ASSERT_TRUE(store.AppendRetraction(commit_id, 1700000003000LL));
+  // A repeated retraction is a no-op: exactly one retraction row, no torn
+  // state.
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM retractions;"));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM selection_events;"));
+  sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, AppendRetractionOfUnknownCommitIsNoop) {
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  ASSERT_TRUE(store.AppendRetraction("no-such-commit", 1700000001000LL));
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  EXPECT_EQ(0LL, QueryCount(db, "SELECT COUNT(*) FROM retractions;"));
+  EXPECT_EQ(0LL, QueryCount(db, "SELECT COUNT(*) FROM commits;"));
+  sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, ActiveProjectionIsTemporalAndDeterministic) {
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  std::vector<FactStore::Event> batch_a{MakeEvent(1), MakeEvent(2)};
+  std::string commit_a;
+  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
+  std::vector<FactStore::Event> batch_b{MakeEvent(3)};
+  std::string commit_b;
+  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &batch_b, &commit_b));
+
+  std::string retraction_id;
+  ASSERT_TRUE(store.AppendRetraction(commit_a, 1700000003000LL,
+                                     &retraction_id));
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  std::vector<RetractionRow> retractions;
+  ASSERT_TRUE(ReadRetractions(db, &retractions));
+  ASSERT_EQ(1u, retractions.size());
+  const RetractionRow& r = retractions[0];
+  sqlite3_close(db);
+
+  // Replaying at each retracted event's own HLC still sees it active: a
+  // future retraction never backfills into an earlier replay point.
+  std::vector<FactStore::Event> at_e1;
+  ASSERT_TRUE(store.QueryActiveEventsAsOf(batch_a[0].hlc_physical_ms,
+                                          batch_a[0].hlc_logical, &at_e1));
+  ASSERT_EQ(1u, at_e1.size());
+  EXPECT_EQ(batch_a[0].event_id, at_e1[0].event_id);
+
+  // Replaying at the last committed point before the retraction sees the
+  // whole batch active.
+  const auto last_hlc = std::max(std::make_pair(batch_a[1].hlc_physical_ms,
+                                                batch_a[1].hlc_logical),
+                                 std::make_pair(batch_b[0].hlc_physical_ms,
+                                                batch_b[0].hlc_logical));
+  std::vector<FactStore::Event> before_retraction;
+  ASSERT_TRUE(store.QueryActiveEventsAsOf(last_hlc.first, last_hlc.second,
+                                          &before_retraction));
+  ASSERT_EQ(3u, before_retraction.size());
+
+  // Replaying at/after the retraction point sees only the surviving batch.
+  std::vector<FactStore::Event> at_retraction;
+  ASSERT_TRUE(store.QueryActiveEventsAsOf(r.hlc_physical_ms, r.hlc_logical,
+                                          &at_retraction));
+  ASSERT_EQ(1u, at_retraction.size());
+  EXPECT_EQ(commit_b, at_retraction[0].commit_id);
+  EXPECT_EQ(batch_b[0].event_id, at_retraction[0].event_id);
+}
+
+TEST_F(FactStoreTest, ActiveProjectionIsStableAcrossReopen) {
+  std::vector<FactStore::Event> first_active;
+  int64_t point_phys = 0;
+  int64_t point_log = 0;
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    std::vector<FactStore::Event> batch_a{MakeEvent(1), MakeEvent(2)};
+    std::string commit_a;
+    ASSERT_TRUE(store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
+    ASSERT_TRUE(store.AppendRetraction(commit_a, 1700000002000LL));
+    std::vector<FactStore::Event> batch_b{MakeEvent(3)};
+    std::string commit_b;
+    ASSERT_TRUE(store.PersistBatch(1700000003000LL, &batch_b, &commit_b));
+    sqlite3* db = nullptr;
+    ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+    point_phys =
+        QueryCount(db, "SELECT value FROM meta WHERE key='hlc_physical_ms';");
+    point_log =
+        QueryCount(db, "SELECT value FROM meta WHERE key='hlc_logical';");
+    sqlite3_close(db);
+    ASSERT_TRUE(store.QueryActiveEventsAsOf(point_phys, point_log,
+                                            &first_active));
+  }
+  ASSERT_EQ(1u, first_active.size());
+  // A fresh store handle derives the same projection from the facts alone:
+  // the active set is a deterministic derivation, not in-memory residue.
+  FactStore reopened(root_);
+  ASSERT_EQ(FactStore::Status::kOk, reopened.Open());
+  std::vector<FactStore::Event> second_active;
+  ASSERT_TRUE(reopened.QueryActiveEventsAsOf(point_phys, point_log,
+                                             &second_active));
+  ASSERT_EQ(first_active.size(), second_active.size());
+  EXPECT_EQ(first_active[0].event_id, second_active[0].event_id);
+  EXPECT_EQ(first_active[0].commit_id, second_active[0].commit_id);
+  sqlite3* db = nullptr;
+  ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM active_events;"));
+  sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, RetractionExitsWholeBatchFromAgeClockAtOnce) {
+  FactStore store(root_);
+  ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  // All events share one choice problem key (schema "test", word, "shijie").
+  std::vector<FactStore::Event> batch_a{MakeEvent(1), MakeEvent(2)};
+  std::string commit_a;
+  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
+  std::vector<FactStore::Event> batch_b{MakeEvent(3)};
+  std::string commit_b;
+  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &batch_b, &commit_b));
+
+  auto previous_event_count = [](const std::vector<FactStore::Event>& active,
+                                 const FactStore::Event& target) {
+    int count = 0;
+    for (const auto& e : active) {
+      if (std::make_pair(e.hlc_physical_ms, e.hlc_logical) >
+          std::make_pair(target.hlc_physical_ms, target.hlc_logical))
+        ++count;
+    }
+    return count;
+  };
+
+  auto point = ReadMetaClock(root_ / "facts.sqlite3");
+  std::vector<FactStore::Event> active;
+  ASSERT_TRUE(store.QueryActiveEventsAsOf(point.first, point.second, &active));
+  ASSERT_EQ(3u, active.size());
+  EXPECT_EQ(2, previous_event_count(active, batch_a[0]));  // e2 and e3 follow
+  EXPECT_EQ(1, previous_event_count(active, batch_a[1]));
+  EXPECT_EQ(0, previous_event_count(active, batch_b[0]));
+
+  ASSERT_TRUE(store.AppendRetraction(commit_a, 1700000003000LL));
+
+  point = ReadMetaClock(root_ / "facts.sqlite3");
+  active.clear();
+  ASSERT_TRUE(store.QueryActiveEventsAsOf(point.first, point.second, &active));
+  // One retraction removed BOTH events of the batch from the active set and
+  // the age clock simultaneously; the surviving event's age re-projects.
+  ASSERT_EQ(1u, active.size());
+  EXPECT_EQ(commit_b, active[0].commit_id);
+  EXPECT_EQ(0, previous_event_count(active, batch_b[0]));
 }

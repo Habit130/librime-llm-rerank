@@ -50,10 +50,11 @@ class FactStore {
     kDbWriteFailed,     // a persist transaction failed
   };
 
-  // One immutable selection event destined for the fact store. HLC fields are
-  // filled in by PersistBatch inside the transaction.
+  // One immutable selection event destined for the fact store. HLC fields and
+  // commit_id are filled in by PersistBatch inside the transaction.
   struct Event {
     string event_id;
+    string commit_id;
     string schema_id;
     string canonical_segment_input;
     size_t span_start = 0;
@@ -95,8 +96,32 @@ class FactStore {
   // Persists a commit batch: one commit row, the events in the given order
   // (HLC assigned in that order), their candidate rows, and the advanced
   // clock, in a single BEGIN IMMEDIATE transaction. Returns false (and leaves
-  // the database untouched) on any failure.
-  bool PersistBatch(int64_t utc_committed_at_ms, vector<Event>* events);
+  // the database untouched) on any failure. When `commit_id` is non-null the
+  // generated commit identifier is written back so the caller can later
+  // retract the whole batch.
+  bool PersistBatch(int64_t utc_committed_at_ms,
+                    vector<Event>* events,
+                    string* commit_id = nullptr);
+
+  // Appends a retraction fact for `commit_id` in one short transaction,
+  // advancing the HLC. Retraction is an independent append-only fact: the
+  // original commit and event rows are never modified or deleted. Idempotent:
+  // retracting an already-retracted (or unknown) commit is a no-op that
+  // leaves the facts untouched and returns true. Returns false only when the
+  // store cannot write (status_ set to a stable fault code).
+  bool AppendRetraction(const string& commit_id,
+                        int64_t utc_retracted_at_ms,
+                        string* retraction_id = nullptr);
+
+  // Deterministic projection of the active event set as of the given HLC
+  // point: an event is active iff it was committed at or before the point and
+  // no retraction of its commit took effect at or before the point. Future
+  // retractions (HLC after the point) never backfill into an earlier replay.
+  // Returns events in HLC order. All state is derived from the fact tables;
+  // nothing is cached in memory.
+  bool QueryActiveEventsAsOf(int64_t hlc_physical_ms,
+                             int64_t hlc_logical,
+                             vector<Event>* out);
 
   // Stable code strings for diagnostics; never contains raw text.
   static const char* StatusCode(Status status);

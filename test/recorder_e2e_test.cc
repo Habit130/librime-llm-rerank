@@ -380,6 +380,77 @@ bool ReadCandidates(sqlite3* db,
   return true;
 }
 
+struct RetractionRow {
+  std::string retraction_id;
+  std::string commit_id;
+  long long hlc_physical_ms = 0;
+  long long hlc_logical = 0;
+  long long utc_retracted_at_ms = 0;
+};
+
+bool ReadRetractions(sqlite3* db, std::vector<RetractionRow>* out) {
+  const char* sql =
+      "SELECT retraction_id, commit_id, hlc_physical_ms, hlc_logical,"
+      " utc_retracted_at_ms FROM retractions"
+      " ORDER BY hlc_physical_ms, hlc_logical;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    RetractionRow row;
+    row.retraction_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    row.commit_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    row.hlc_physical_ms = sqlite3_column_int64(stmt, 2);
+    row.hlc_logical = sqlite3_column_int64(stmt, 3);
+    row.utc_retracted_at_ms = sqlite3_column_int64(stmt, 4);
+    out->push_back(std::move(row));
+  }
+  sqlite3_finalize(stmt);
+  return true;
+}
+
+// Canonical dump of all event and candidate rows; used to prove a retraction
+// leaves the original facts byte-for-byte untouched.
+std::string DumpEventFacts(sqlite3* db) {
+  std::string out;
+  const char* kEvents =
+      "SELECT event_id, commit_id, event_format_version, schema_id,"
+      " canonical_segment_input, span_start, span_end, category,"
+      " preceding_text, competition_complete, final_selection_text,"
+      " confirmation_source, trigger_keycode, display_rank, display_page,"
+      " session_id, session_seq, hlc_physical_ms, hlc_logical,"
+      " utc_confirmed_at_ms, utc_committed_at_ms FROM selection_events"
+      " ORDER BY hlc_physical_ms, hlc_logical, event_id;";
+  sqlite3_stmt* stmt = nullptr;
+  sqlite3_prepare_v2(db, kEvents, -1, &stmt, nullptr);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
+      const unsigned char* text = sqlite3_column_text(stmt, i);
+      out += text ? reinterpret_cast<const char*>(text) : "";
+      out += "|";
+    }
+    out += "\n";
+  }
+  sqlite3_finalize(stmt);
+  const char* kCandidates =
+      "SELECT event_id, merge_order, text FROM selection_candidates"
+      " ORDER BY event_id, merge_order;";
+  stmt = nullptr;
+  sqlite3_prepare_v2(db, kCandidates, -1, &stmt, nullptr);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
+      const unsigned char* text = sqlite3_column_text(stmt, i);
+      out += text ? reinterpret_cast<const char*>(text) : "";
+      out += "|";
+    }
+    out += "\n";
+  }
+  sqlite3_finalize(stmt);
+  return out;
+}
+
 class RecorderE2ETest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
@@ -871,6 +942,244 @@ TEST_F(RecorderE2ETest, AbortDropsWholePendingBatch) {
   ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
   EXPECT_EQ(0LL, count);
   ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, UnhandledBackspaceAfterCommitRetractsWholeBatch) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // The composition is empty now; a plain unhandled BackSpace must append a
+  // retraction for the whole just-committed batch.
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  std::vector<RetractionRow> retractions;
+  ASSERT_TRUE(ReadRetractions(db, &retractions));
+  ASSERT_EQ(1u, retractions.size());
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ(event.commit_id, retractions[0].commit_id);
+  // The retraction's HLC is later than the retracted event's HLC.
+  EXPECT_LT(std::make_pair(event.hlc_physical_ms, event.hlc_logical),
+            std::make_pair(retractions[0].hlc_physical_ms,
+                           retractions[0].hlc_logical));
+  // The event row survives as an audit fact but exits the active projection.
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, UnhandledBackspaceRetractsWholeMultiEventCommit) {
+  RimeSessionId session = NewSession(kFluidSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));  // 时界
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '3', 0));  // 石阶
+  EXPECT_EQ("时界石阶", CommitText(session));
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  const std::string before = DumpEventFacts(db);
+  sqlite3_close(db);
+
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  // The retraction is an independent appended fact: original rows untouched.
+  EXPECT_EQ(before, DumpEventFacts(db));
+  std::vector<RetractionRow> retractions;
+  ASSERT_TRUE(ReadRetractions(db, &retractions));
+  ASSERT_EQ(1u, retractions.size());
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+  EXPECT_EQ(events[0].commit_id, retractions[0].commit_id);
+  EXPECT_EQ(events[1].commit_id, retractions[0].commit_id);
+  // Both events of the batch exit the active projection simultaneously.
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, UnhandledBackspaceWithNoRetractableCommitHasNoSideEffect) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  // Commit without any explicit selection: no event and no undo window, so
+  // the BackSpace must leave the fact base completely untouched.
+  TypeString(session, "shijie");
+  CommitText(session);
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, RepeatedUnhandledBackspaceRetractsAtMostOnce) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  // The window is consumed: a second BackSpace must not retract an older
+  // commit or append a duplicate retraction.
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, ReselectAfterRetractionFormsNewEventWithNewCommitId) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));  // 时界
+  EXPECT_EQ("时界", CommitText(session));
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+
+  // The same problem chosen again after the undo: a fresh commit and a fresh
+  // event, still active, with a new commit id.
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '3', 0));  // 石阶
+  EXPECT_EQ("石阶", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(2LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;", &count));
+  EXPECT_EQ(1LL, count);
+  std::vector<RetractionRow> retractions;
+  ASSERT_TRUE(ReadRetractions(db, &retractions));
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+  // The retraction targets the first commit; the fresh event is its own new
+  // commit and stays active.
+  EXPECT_EQ(events[0].commit_id, retractions[0].commit_id);
+  EXPECT_NE(events[0].commit_id, events[1].commit_id);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, InterveningKeyConsumesTheUndoWindow) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // A new composition starts: the first key after the commit is not the undo
+  // BackSpace, so the window is consumed and later BackSpaces do nothing.
+  TypeString(session, "a");
+  ASSERT_TRUE(g_rime->process_key(session, XK_Escape, 0));  // clear composition
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, ModifiedBackSpaceDoesNotRetract) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // Ctrl+BackSpace is not the unmodified undo key: it consumes the window
+  // without retracting.
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, kControlMask));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;", &count));
+  EXPECT_EQ(0LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, ConfirmingKeyReleaseDoesNotConsumeUndoWindow) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // The confirming key's release event must not be mistaken for the next key
+  // press, or the very next BackSpace would no longer be "immediate".
+  g_rime->process_key(session, '2', kReleaseMask);
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = 0;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM active_events;", &count));
   EXPECT_EQ(0LL, count);
   sqlite3_close(db);
 }

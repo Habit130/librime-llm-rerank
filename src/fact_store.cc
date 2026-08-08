@@ -175,6 +175,45 @@ bool QueryQuickCheck(sqlite3* db, bool* ok) {
 
 }  // namespace
 
+namespace {
+
+// Advances an HLC by one tick against the wall clock: the physical component
+// jumps forward only when the wall clock moved ahead; otherwise just the
+// logical component advances, so a clock rollback never rewinds old facts.
+void GiveTick(int64_t& physical_ms, int64_t& logical) {
+  int64_t now = NowMs();
+  if (now > physical_ms) {
+    physical_ms = now;
+    logical = 0;
+  } else {
+    logical += 1;
+  }
+}
+
+// Persists the two meta clock rows; must run inside the batch transaction.
+bool RecordMetaClock(sqlite3* db, int64_t physical_ms, int64_t logical) {
+  const char* update_clock = "UPDATE meta SET value = ? WHERE key = ?;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, update_clock, -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  bool ok = true;
+  sqlite3_bind_text(stmt, 1, std::to_string(physical_ms).c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, kMetaClockPhysicalMs, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(stmt) != SQLITE_DONE)
+    ok = false;
+  sqlite3_reset(stmt);
+  sqlite3_bind_text(stmt, 1, std::to_string(logical).c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, kMetaClockLogical, -1, SQLITE_TRANSIENT);
+  if (ok && sqlite3_step(stmt) != SQLITE_DONE)
+    ok = false;
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+}  // namespace
+
 FactStore::Status FactStore::InitializeMeta() {
   int64_t now = NowMs();
   const std::pair<const char*, string> entries[] = {
@@ -343,7 +382,26 @@ FactStore::Status FactStore::Open() {
       " merge_order INTEGER NOT NULL,"
       " text TEXT NOT NULL,"
       " PRIMARY KEY (event_id, merge_order)"
-      ");";
+      ");"
+      "CREATE TABLE IF NOT EXISTS retractions ("
+      " retraction_id TEXT PRIMARY KEY NOT NULL,"
+      " commit_id TEXT NOT NULL REFERENCES commits(commit_id),"
+      " hlc_physical_ms INTEGER NOT NULL,"
+      " hlc_logical INTEGER NOT NULL,"
+      " utc_retracted_at_ms INTEGER NOT NULL"
+      ");"
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_retractions_commit_id"
+      " ON retractions(commit_id);"
+      "CREATE VIEW IF NOT EXISTS active_events AS"
+      " SELECT e.event_id, e.commit_id, e.event_format_version, e.schema_id,"
+      "  e.canonical_segment_input, e.span_start, e.span_end, e.category,"
+      "  e.preceding_text, e.competition_complete, e.final_selection_text,"
+      "  e.confirmation_source, e.trigger_keycode, e.display_rank,"
+      "  e.display_page, e.session_id, e.session_seq, e.hlc_physical_ms,"
+      "  e.hlc_logical, e.utc_confirmed_at_ms, e.utc_committed_at_ms"
+      " FROM selection_events e"
+      " WHERE NOT EXISTS (SELECT 1 FROM retractions r"
+      "                   WHERE r.commit_id = e.commit_id);";
   if (Exec(db_, kSchemaV1) != SQLITE_OK) {
     status_ = Status::kDbOpenFailed;
     sqlite3_close(db_);
@@ -376,7 +434,8 @@ FactStore::Status FactStore::Open() {
 }
 
 bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
-                             vector<Event>* events) {
+                             vector<Event>* events,
+                             string* commit_id_out) {
   if (!db_ || !events || events->empty()) {
     status_ = Status::kDbWriteFailed;
     return false;
@@ -420,15 +479,10 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
     int64_t physical = clock_physical_ms_;
     int64_t logical = clock_logical_;
     for (Event& event : *events) {
-      int64_t now = NowMs();
-      if (now > physical) {
-        physical = now;
-        logical = 0;
-      } else {
-        logical += 1;
-      }
+      GiveTick(physical, logical);
       event.hlc_physical_ms = physical;
       event.hlc_logical = logical;
+      event.commit_id = commit_id;
 
       sqlite3_reset(event_stmt);
       sqlite3_bind_text(event_stmt, 1, event.event_id.c_str(), -1,
@@ -486,30 +540,7 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
     if (ok) {
       clock_physical_ms_ = physical;
       clock_logical_ = logical;
-      const char* update_clock =
-          "UPDATE meta SET value = ? WHERE key = ?;";
-      sqlite3_stmt* clock_stmt = nullptr;
-      if (sqlite3_prepare_v2(db_, update_clock, -1, &clock_stmt, nullptr) ==
-          SQLITE_OK) {
-        sqlite3_bind_text(clock_stmt, 1, std::to_string(physical).c_str(), -1,
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(clock_stmt, 2, kMetaClockPhysicalMs, -1,
-                          SQLITE_TRANSIENT);
-        if (sqlite3_step(clock_stmt) != SQLITE_DONE) {
-          ok = false;
-        }
-        sqlite3_reset(clock_stmt);
-        sqlite3_bind_text(clock_stmt, 1, std::to_string(logical).c_str(), -1,
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(clock_stmt, 2, kMetaClockLogical, -1,
-                          SQLITE_TRANSIENT);
-        if (ok && sqlite3_step(clock_stmt) != SQLITE_DONE) {
-          ok = false;
-        }
-        sqlite3_finalize(clock_stmt);
-      } else {
-        ok = false;
-      }
+      ok = RecordMetaClock(db_, physical, logical);
     }
   }
   if (commit_stmt)
@@ -527,7 +558,155 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
     status_ = Status::kDbWriteFailed;
     return false;
   }
+  if (commit_id_out)
+    *commit_id_out = commit_id;
   EnsureFileModes();
+  return true;
+}
+
+bool FactStore::AppendRetraction(const string& commit_id,
+                                 int64_t utc_retracted_at_ms,
+                                 string* retraction_id_out) {
+  if (!db_) {
+    status_ = Status::kDbWriteFailed;
+    return false;
+  }
+  // A single short transaction: decide retractability, append the fact and
+  // advance the clock atomically. Retracting an unknown or already-retracted
+  // commit is a no-op (idempotency), not a failure.
+  if (Exec(db_, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+    status_ = Status::kDbWriteFailed;
+    return false;
+  }
+  bool ok = true;
+  sqlite3_stmt* check = nullptr;
+  const char* kCheckRetractable = "SELECT EXISTS("
+      "SELECT 1 FROM commits c"
+      " WHERE c.commit_id = ?1"
+      "   AND NOT EXISTS(SELECT 1 FROM retractions r"
+      "                  WHERE r.commit_id = c.commit_id));";
+  if (sqlite3_prepare_v2(db_, kCheckRetractable, -1, &check, nullptr) !=
+      SQLITE_OK) {
+    ok = false;
+  }
+  int retractable = 0;
+  if (ok) {
+    sqlite3_bind_text(check, 1, commit_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(check) != SQLITE_ROW) {
+      ok = false;
+    } else {
+      retractable = sqlite3_column_int(check, 0);
+    }
+  }
+  sqlite3_finalize(check);
+  if (!ok) {
+    Exec(db_, "ROLLBACK;");
+    status_ = Status::kDbWriteFailed;
+    return false;
+  }
+  if (!retractable) {
+    Exec(db_, "COMMIT;");
+    return true;
+  }
+  int64_t physical = clock_physical_ms_;
+  int64_t logical = clock_logical_;
+  GiveTick(physical, logical);
+  string retraction_id = RandomUuid();
+  sqlite3_stmt* insert = nullptr;
+  const char* kInsertRetraction =
+      "INSERT INTO retractions(retraction_id, commit_id, hlc_physical_ms,"
+      " hlc_logical, utc_retracted_at_ms) VALUES(?1,?2,?3,?4,?5);";
+  if (sqlite3_prepare_v2(db_, kInsertRetraction, -1, &insert, nullptr) ==
+      SQLITE_OK) {
+    sqlite3_bind_text(insert, 1, retraction_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert, 2, commit_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert, 3, physical);
+    sqlite3_bind_int64(insert, 4, logical);
+    sqlite3_bind_int64(insert, 5, utc_retracted_at_ms);
+    ok = sqlite3_step(insert) == SQLITE_DONE;
+    sqlite3_finalize(insert);
+  } else {
+    ok = false;
+  }
+  if (ok) {
+    clock_physical_ms_ = physical;
+    clock_logical_ = logical;
+    ok = RecordMetaClock(db_, physical, logical);
+  }
+  if (ok) {
+    ok = Exec(db_, "COMMIT;") == SQLITE_OK;
+  } else {
+    Exec(db_, "ROLLBACK;");
+  }
+  if (!ok) {
+    status_ = Status::kDbWriteFailed;
+    return false;
+  }
+  if (retraction_id_out)
+    *retraction_id_out = retraction_id;
+  EnsureFileModes();
+  return true;
+}
+
+bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
+                                      int64_t hlc_logical,
+                                      vector<Event>* out) {
+  if (!db_ || !out)
+    return false;
+  const char* kQueryActiveAsOf =
+      "SELECT e.event_id, e.commit_id, e.event_format_version, e.schema_id,"
+      " e.canonical_segment_input, e.span_start, e.span_end, e.category,"
+      " e.preceding_text, e.competition_complete, e.final_selection_text,"
+      " e.confirmation_source, e.display_rank, e.display_page, e.session_id,"
+      " e.session_seq, e.hlc_physical_ms, e.hlc_logical,"
+      " e.utc_confirmed_at_ms, e.utc_committed_at_ms"
+      " FROM selection_events e"
+      " WHERE (e.hlc_physical_ms < ?1 OR (e.hlc_physical_ms = ?1"
+      "        AND e.hlc_logical <= ?2))"
+      " AND NOT EXISTS(SELECT 1 FROM retractions r"
+      "                WHERE r.commit_id = e.commit_id"
+      "                  AND (r.hlc_physical_ms < ?1 OR (r.hlc_physical_ms = ?1"
+      "                       AND r.hlc_logical <= ?2)))"
+      " ORDER BY e.hlc_physical_ms, e.hlc_logical, e.event_id;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, kQueryActiveAsOf, -1, &stmt, nullptr) !=
+      SQLITE_OK)
+    return false;
+  sqlite3_bind_int64(stmt, 1, hlc_physical_ms);
+  sqlite3_bind_int64(stmt, 2, hlc_logical);
+  out->clear();
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    Event event;
+    event.event_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    event.commit_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    event.schema_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+    event.canonical_segment_input =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+    event.span_start = static_cast<size_t>(sqlite3_column_int64(stmt, 5));
+    event.span_end = static_cast<size_t>(sqlite3_column_int64(stmt, 6));
+    event.category =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+    event.preceding_text =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+    event.competition_complete = sqlite3_column_int64(stmt, 9) != 0;
+    event.final_selection_text =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+    event.confirmation_source =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+    event.display_rank = static_cast<int>(sqlite3_column_int64(stmt, 12));
+    event.display_page = static_cast<int>(sqlite3_column_int64(stmt, 13));
+    event.session_id =
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14));
+    event.session_seq = static_cast<int>(sqlite3_column_int64(stmt, 15));
+    event.hlc_physical_ms = sqlite3_column_int64(stmt, 16);
+    event.hlc_logical = sqlite3_column_int64(stmt, 17);
+    event.utc_confirmed_at_ms = sqlite3_column_int64(stmt, 18);
+    out->push_back(std::move(event));
+  }
+  sqlite3_finalize(stmt);
   return true;
 }
 
