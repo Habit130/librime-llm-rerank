@@ -61,6 +61,7 @@ Design contract (spec #43 "长操作、进度与幂等", "错误协议", "权限
 """
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -96,6 +97,11 @@ OUTCOMES = ("succeeded", "failed", "cancelled", "blocked")
 SAFE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 MAX_ID_LENGTH = 64
+
+# A claim older than this is treated as stale even if its pid was recycled
+# by the OS (the holder refreshes the claim on every step persist, so a live
+# executor never ages out).
+CLAIM_STALENESS_SECONDS = 300
 
 _STABLE_MESSAGES = {
     "operation_not_found": "no such operation",
@@ -498,6 +504,33 @@ def _pid_alive(pid):
     return True
 
 
+def _claim_age_seconds(claim):
+    claimed_at = claim.get("claimed_at") if isinstance(claim, dict) else None
+    if not isinstance(claimed_at, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(claimed_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
+def _claim_stale(claim):
+    """A claim is stale when its pid is gone or its age exceeds the
+    staleness window (a recycled pid therefore cannot wedge an operation
+    forever)."""
+    if not isinstance(claim, dict):
+        return True
+    if not _pid_alive(claim.get("pid")):
+        return True
+    age = _claim_age_seconds(claim)
+    if age is not None and age > CLAIM_STALENESS_SECONDS:
+        return True
+    return False
+
+
 class OperationStore:
     """Directory-backed operation persistence.
 
@@ -599,7 +632,11 @@ class OperationStore:
         except OSError as error:
             if error.errno == errno.ELOOP:
                 raise StoreBlocked("op_dir_symlink")
-            raise StoreBlocked("op_dir_unavailable")
+            if error.errno == errno.ENOENT:
+                # A store that has never held operations cannot hold this
+                # operation either; callers map this to not-found.
+                raise StoreBlocked("op_dir_unavailable")
+            raise StoreBlocked("op_dir_unreadable")
         try:
             st = os.fstat(fd)
             if not stat.S_ISDIR(st.st_mode):
@@ -608,6 +645,47 @@ class OperationStore:
                 raise StoreBlocked("op_dir_owner")
             if not stat.S_IMODE(st.st_mode) == 0o700:
                 raise StoreBlocked("op_dir_permission")
+        except StoreBlocked:
+            os.close(fd)
+            raise
+        return fd
+
+    def _acquire_record_lock(self, dfd, name):
+        """Take the per-operation advisory lock (`<id>.lock`, flock,
+        kernel-released on process death). The lock serializes the CAS
+        revision check with the atomic rename in `_write_record`, so no
+        writer can slip between the check and the rename; it also
+        serializes racing creators. The lock file is owner-only (0600) and
+        opened with O_NOFOLLOW via the directory fd."""
+        lock_name = "%s.lock" % name[: -len(".json")]
+        try:
+            # O_EXCL create with a plain-open fallback: concurrent O_CREAT
+            # of the same name through two directory fds intermittently
+            # returns ENOENT on macOS (kernel lookup race) even though the
+            # file exists; a racing create here surfaces as EEXIST instead,
+            # which is handled by reopening the existing lock file.
+            try:
+                fd = os.open(lock_name,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            except OSError as error:
+                if error.errno != errno.EEXIST:
+                    raise
+                fd = os.open(lock_name, os.O_WRONLY | os.O_NOFOLLOW,
+                             dir_fd=dfd)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise StoreBlocked("operation_lock_symlink")
+            raise StoreBlocked("operation_lock_unavailable")
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise StoreBlocked("operation_lock_not_regular")
+            if st.st_uid != self.euid:
+                raise StoreBlocked("operation_lock_owner")
+            if not stat.S_IMODE(st.st_mode) == 0o600:
+                raise StoreBlocked("operation_lock_permission")
+            fcntl.flock(fd, fcntl.LOCK_EX)
         except StoreBlocked:
             os.close(fd)
             raise
@@ -672,22 +750,23 @@ class OperationStore:
                 raise OSError("short write stalled")
             view = view[written:]
 
-    def _write_record(self, record, operation_id, expected_rev=None,
-                      dfd=None):
+    def _write_record(self, record, operation_id, expected_rev=None):
         """Atomic persist: temp file (0600, O_NOFOLLOW) -> fsync -> rename
-        -> directory fsync, all relative to the operations directory fd. A
-        crash at any point leaves the previous complete record (or no
-        record for a fresh create) in place.
+        -> directory fsync, all relative to the operations directory fd and
+        under the per-operation advisory lock. A crash at any point leaves
+        the previous complete record (or no record for a fresh create) in
+        place.
 
-        With `expected_rev` the write is a compare-and-swap: if the record
-        on disk has moved past that revision the write is refused with
-        OperationConflict and nothing is changed.
+        With `expected_rev` the write is a compare-and-swap: the revision
+        check and the rename happen under the per-operation flock, so a
+        concurrent writer can neither slip between them nor overwrite the
+        record; a lost CAS raises OperationConflict and changes nothing.
         """
-        owned_dfd = dfd is None
-        if owned_dfd:
-            dfd = self._open_operations_dir()
+        dfd = self._open_operations_dir()
+        lock_fd = None
         try:
             name = self._record_name(operation_id)
+            lock_fd = self._acquire_record_lock(dfd, name)
             if expected_rev is not None:
                 try:
                     current = self._read_via_dfd(dfd, name)
@@ -717,19 +796,23 @@ class OperationStore:
                 raise
             os.fsync(dfd)
         finally:
-            if owned_dfd:
-                os.close(dfd)
+            if lock_fd is not None:
+                os.close(lock_fd)
+            os.close(dfd)
 
     def create(self, record):
         """Exclusive create: the record is linked into place with a
-        hard-link rename that never overwrites. A racing creator either
-        loses (and idempotently returns the existing record, or is rejected
-        with OperationIdConflict for different parameters) or wins."""
+        hard-link rename that never overwrites, under the per-operation
+        advisory lock. A racing creator either loses (and idempotently
+        returns the existing record, or is rejected with
+        OperationIdConflict for different parameters) or wins."""
         operation_id = record["operation_id"]
         validate_operation_id(operation_id)
         dfd = self._open_operations_dir()
+        lock_fd = None
         try:
             name = self._record_name(operation_id)
+            lock_fd = self._acquire_record_lock(dfd, name)
             tmp = "%s.tmp-%d-%s" % (name, os.getpid(), uuid.uuid4().hex[:8])
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                          | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
@@ -753,6 +836,10 @@ class OperationStore:
                 # Lost the creation race: return the winner under the
                 # idempotency contract.
                 try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                try:
                     existing = self._read_via_dfd(dfd, name)
                 except OperationNotFound:
                     raise OperationConflict(operation_id)
@@ -763,6 +850,8 @@ class OperationStore:
             os.unlink(tmp, dir_fd=dfd)
             os.fsync(dfd)
         finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
             os.close(dfd)
         return self._read_record(operation_id)
 
@@ -771,12 +860,21 @@ class OperationStore:
 
     def list_ids(self):
         try:
-            names = os.listdir(self.operations_dir)
+            dfd = self._open_operations_dir()
+        except StoreBlocked as error:
+            if error.fault_code == "op_dir_unavailable":
+                # A store that never held operations has no operations.
+                return []
+            raise
+        try:
+            names = os.listdir(dfd)
         except OSError:
             return []
+        finally:
+            os.close(dfd)
         result = []
         for name in names:
-            if name.endswith(".json") and not name.endswith(".tmp-"):
+            if name.endswith(".json"):
                 result.append(name[: -len(".json")])
         return sorted(result)
 
@@ -927,13 +1025,12 @@ def _claim_held_by_other(record, claim):
         return False
     if current.get("pid") == claim["pid"]:
         return False
-    return _pid_alive(current.get("pid"))
+    return not _claim_stale(current)
 
 
 def claim_held_by_other(record, pid=None):
-    """True when another live process currently holds the operation's
-    executor claim (used by the CLI to report why a run invocation yielded).
-    """
+    """True when another process currently holds the operation's executor
+    claim (used by the CLI to report why a run invocation yielded)."""
     return _claim_held_by_other(
         record, {"pid": os.getpid() if pid is None else pid,
                  "token": "", "claimed_at": ""})
@@ -943,7 +1040,7 @@ def _runner_guard(record, claim, fn):
     """Wrap a runner mutation: yield (no write) while another live executor
     holds the claim; otherwise take over the claim and apply `fn`. This is
     what makes executor ownership exclusive across processes and
-    crash-recoverable (a dead executor's claim is taken over)."""
+    crash-recoverable (a dead or stale executor's claim is taken over)."""
     if _claim_held_by_other(record, claim):
         return False
     record["runner_claim"] = claim
@@ -992,26 +1089,16 @@ def _fail_unsupported(record, claim):
     return _runner_guard(record, claim, fail)
 
 
-def _mark_blocked(record, claim, phase, error):
+def _mark_terminal(record, claim, phase, error, state):
     def mark(record):
-        if record["phase"] != phase:
+        if record["phase"] != phase or record["state"] != "running":
+            # A concurrent writer moved the operation; the loop re-evaluates
+            # (re-application safety: never clobber a terminal state).
             return False
         record["error"] = error.to_error_object()
-        _append_event(record, "terminal", state="blocked",
-                      phase=phase, outcome="blocked", error_code=error.code)
-        record["state"] = "blocked"
-        return True
-    return _runner_guard(record, claim, mark)
-
-
-def _mark_failed(record, claim, phase, error):
-    def mark(record):
-        if record["phase"] != phase:
-            return False
-        record["error"] = error.to_error_object()
-        _append_event(record, "terminal", state="failed",
-                      phase=phase, outcome="failed", error_code=error.code)
-        record["state"] = "failed"
+        _append_event(record, "terminal", state=state, phase=phase,
+                      outcome=state, error_code=error.code)
+        record["state"] = state
         return True
     return _runner_guard(record, claim, mark)
 
@@ -1029,6 +1116,12 @@ def _apply_step_result(record, claim, phase, result):
             _append_event(record, "progress", state=record["state"],
                           phase=phase, progress=dict(progress))
         if result.get("advance"):
+            if record["cancel_requested"] and is_cancelable(record):
+                # A cancel landed while this step executed; the advance into
+                # the next phase is held so the runner's checkpoint can
+                # cancel before the irreversible point (the progress made
+                # by the step is still real and stays persisted).
+                return True
             if phase == record["phases"][-1]:
                 record["result"] = result.get("result") or {"completed": True}
                 record["error"] = None
@@ -1095,6 +1188,14 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
         if spec is None:
             return store.mutate(operation_id, lambda r: _fail_unsupported(
                 r, claim))
+        # Re-acquire the claim atomically: only the claim holder executes a
+        # step. Two executors resuming a stale claim race here; exactly one
+        # wins the CAS and the loser re-evaluates and yields, so step side
+        # effects are exclusive while the holder is alive.
+        record = store.mutate(operation_id, lambda r: _runner_guard(
+            r, claim, lambda r: True))
+        if _claim_held_by_other(record, claim):
+            return record
         phase = record["phase"]
         step_index = _step_index_in_phase(record, phase)
         try:
@@ -1106,12 +1207,12 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
         except SimulatedCrash:
             raise
         except OperationBlocked as error:
-            store.mutate(operation_id, lambda r: _mark_blocked(
-                r, claim, phase, error))
+            store.mutate(operation_id, lambda r: _mark_terminal(
+                r, claim, phase, error, "blocked"))
             return store.load(operation_id)
         except OperationFailed as error:
-            store.mutate(operation_id, lambda r: _mark_failed(
-                r, claim, phase, error))
+            store.mutate(operation_id, lambda r: _mark_terminal(
+                r, claim, phase, error, "failed"))
             return store.load(operation_id)
         steps_executed += 1
         record = store.mutate(operation_id, lambda r: _apply_step_result(
@@ -1158,13 +1259,23 @@ def operation_outcome_exit_code(outcome):
     return 2
 
 
+def _scrub_private(node):
+    """Recursively drop `parameters` (the idempotency credential) from any
+    output-bound structure, including error `cause` and `result` payloads,
+    so a future step can never leak private input through CLI output."""
+    if isinstance(node, dict):
+        return {key: _scrub_private(value) for key, value in node.items()
+                if key != "parameters"}
+    if isinstance(node, list):
+        return [_scrub_private(item) for item in node]
+    return node
+
+
 def public_record(record):
     """The sanitized snapshot for CLI output: everything except the
     parameters, which are the idempotency credential and must never leave
     the owner-only store (privacy contract). The fingerprint stays."""
-    public = dict(record)
-    public.pop("parameters", None)
-    return public
+    return _scrub_private(record)
 
 
 if __name__ == "__main__":
