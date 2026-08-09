@@ -33,6 +33,8 @@ import time
 SOCKET_PATH = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock"
 )
+FACTS_ROOT = os.path.expanduser(
+    "~/Library/Application Support/Squirrel/SemanticMemory")
 MODEL_PATH = "/Users/habit/Models/Qwen/Qwen3-0.6B-Base"
 IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
@@ -697,10 +699,16 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
 
     # Maintenance coordination (#53): the control socket and the quiesce
     # lease live next to the scoring socket. `coordinator` stays None when
-    # no facts root is configured (single-purpose/test servers).
+    # no facts root is configured (single-purpose/test servers). The control
+    # socket defaults to `<facts root>/llm-rerank-control.sock`, which is a
+    # verified owner-only directory.
     coordinator = None
     control_server = None
-    if control_socket and facts_root:
+    if facts_root:
+        if control_socket is None:
+            from control import default_control_socket
+
+            control_socket = default_control_socket(facts_root)
         from coordinator import MaintenanceCoordinator
 
         coordinator = MaintenanceCoordinator(facts_root)
@@ -901,6 +909,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--facts-root",
+        default=FACTS_ROOT,
         help="facts root for the maintenance coordinator (control socket "
              "peer UID verification and last-fact-HLC reporting)",
     )

@@ -26,9 +26,6 @@ constexpr const char* kGapReasonShutdown = "shutdown_unpersisted";
 constexpr const char* kGapReasonStoreFault = "store_write_failed";
 constexpr const char* kGapReasonLockFault = "store_lock_failed";
 
-// Stable code for "no fault / not yet classified".
-constexpr const char* kFaultNone = "";
-
 }  // namespace
 
 int64_t RecorderCoordinator::BatchByteSize(
