@@ -61,8 +61,8 @@ from operations import (  # noqa: E402
     OperationRegistry,
     OperationStore,
     cancel_operation,
-    claim_held_by_other,
     make_error,
+    make_runner_claim,
     operation_outcome_exit_code,
     public_record,
     run_pending_steps,
@@ -510,9 +510,10 @@ def _cmd_operation_run(args, paths):
         store.open()
         record = store.load(args.operation_id)
         last_seq = len(record["log"])
+        claim = make_runner_claim()
         while True:
             record = run_pending_steps(
-                store, args.registry, args.operation_id,
+                store, args.registry, args.operation_id, claim=claim,
                 max_steps=1 if args.once else None,
                 retry_blocked=args.retry)
             for entry in record["log"][last_seq:]:
@@ -525,12 +526,12 @@ def _cmd_operation_run(args, paths):
                 break
     except OperationError as error:
         return _store_operation_error(error, "human")
+    current_claim = record.get("runner_claim") or {}
     if (record["state"] not in ("succeeded", "failed", "cancelled")
-            and claim_held_by_other(record)):
+            and current_claim.get("pid") not in (None, os.getpid())):
         print("operation %s is being executed by another process (pid %s); "
               "this invocation did not execute steps"
-              % (args.operation_id,
-                 (record.get("runner_claim") or {}).get("pid")),
+              % (args.operation_id, current_claim.get("pid")),
               file=sys.stderr)
     if record["state"] in ("succeeded", "cancelled"):
         return 0

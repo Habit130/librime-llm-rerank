@@ -26,6 +26,7 @@ from fixture_operations import (  # noqa: E402
     FIXTURE_CHUNKS,
     FIXTURE_IRREVERSIBLE_PHASE,
     FIXTURE_PHASES,
+    fixture_restore_spec,
     fixture_spec,
 )
 from operations import (  # noqa: E402
@@ -43,6 +44,7 @@ from operations import (  # noqa: E402
     cancel_operation,
     create_operation,
     is_cancelable,
+    make_runner_claim,
     new_operation,
     operation_outcome_exit_code,
     parameters_fingerprint,
@@ -639,7 +641,8 @@ class OperationEngineTest(unittest.TestCase):
         current = self.store().load(record["operation_id"])
         self.assertEqual(proc.pid, current["runner_claim"]["pid"])
         second = self.run_steps(record["operation_id"])
-        self.assertEqual("running", second["state"])
+        # The second executor never took over the operation, whether the
+        # subprocess was still running or had just finished.
         self.assertEqual(proc.pid, second["runner_claim"]["pid"])
         proc.wait(timeout=20)
         final = self.store().load(record["operation_id"])
@@ -701,6 +704,164 @@ class OperationEngineTest(unittest.TestCase):
         final = self.run_steps(record["operation_id"])
         self.assertEqual("succeeded", final["state"])
         self.assertEqual(1, len(self.read_work("publish.count").split()))
+
+    def test_same_process_threads_do_not_duplicate_steps(self):
+        # The acceptance reproduction: two threads in one process both
+        # invoking the runner. The run lock makes ownership exclusive, so
+        # the second thread must yield and the irreversible effect runs
+        # exactly once.
+        record = self.create()
+        gate = threading.Event()
+
+        def gate_hook(phase, step_index, point):
+            if (phase, step_index, point) == ("preflight", 0, "before_step"):
+                gate.wait(timeout=10)
+
+        holder_claim = make_runner_claim()
+        holder = threading.Thread(target=lambda: run_pending_steps(
+            self.store(), self.registry, record["operation_id"],
+            claim=holder_claim, fault_hook=gate_hook))
+        holder.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            current = self.store().load(record["operation_id"])
+            if current["runner_claim"]:
+                break
+            time.sleep(0.01)
+        second = self.run_steps(record["operation_id"])
+        self.assertEqual(holder_claim["token"],
+                         second["runner_claim"]["token"])
+        gate.set()
+        holder.join(timeout=10)
+        final = self.store().load(record["operation_id"])
+        self.assertEqual("succeeded", final["state"])
+        # The acceptance reproduction: exactly one preflight effect and one
+        # publish effect, never two.
+        self.assertEqual(1, len(self.read_work("preflight.count").split()))
+        self.assertEqual(1, len(self.read_work("publish.count").split()))
+
+    def test_live_executor_is_never_taken_over_during_long_step(self):
+        # The acceptance reproduction: a long-running step must not let a
+        # second executor take over a live operation. The run lock is held
+        # across the whole step and released only on process death; the
+        # second executor yields and the record is untouched by it.
+        record = self.create(sleep_s=1.5)
+        runner = (
+            "import sys; sys.path.insert(0, %r);"
+            "from fixture_operations import fixture_spec;"
+            "from operations import (OperationRegistry, OperationStore,"
+            " run_pending_steps);"
+            "r = OperationRegistry(); r.register(fixture_spec());"
+            "run_pending_steps(OperationStore(%r), r, %r)"
+            % (os.path.dirname(__file__), self.root, record["operation_id"])
+        )
+        proc = subprocess.Popen([sys.executable, "-c", runner])
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            current = self.store().load(record["operation_id"])
+            if current["state"] == "running" and current["runner_claim"]:
+                break
+            time.sleep(0.02)
+        before = self.store().load(record["operation_id"])
+        started = time.monotonic()
+        second = self.run_steps(record["operation_id"])
+        elapsed = time.monotonic() - started
+        after = self.store().load(record["operation_id"])
+        # The second executor wrote nothing and did not take over.
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(proc.pid, second["runner_claim"]["pid"])
+        self.assertEqual(before["rev"], after["rev"])
+        self.assertEqual(before["log"], after["log"])
+        proc.wait(timeout=30)
+        final = self.store().load(record["operation_id"])
+        self.assertEqual("succeeded", final["state"])
+        self.assertEqual(1, len(self.read_work("publish.count").split()))
+
+    def test_cancel_blocked_operation_takes_effect_immediately(self):
+        # The acceptance reproduction: cancelling a blocked operation must
+        # take effect without retrying failed work.
+        record = self.create()
+        self.run_steps(record["operation_id"],
+                       fault_hook=raising_hook(
+                           lambda phase: OperationBlocked(
+                               code="fixture_preflight_failed", phase=phase)))
+        cancelled, disposition = cancel_operation(
+            self.store(), record["operation_id"])
+        self.assertEqual("requested", disposition)
+        self.assertEqual("cancelled", cancelled["state"])
+        # A second cancel sees it already cancelled.
+        _, disposition = cancel_operation(self.store(),
+                                          record["operation_id"])
+        self.assertEqual("already_cancelled", disposition)
+
+    def test_cancel_runs_reopen_seam_before_terminal(self):
+        # The acceptance reproduction: cancellation of a restore-shaped
+        # operation must run its compensation (reopen) phase before going
+        # terminal cancelled, and never reach the irreversible publishing
+        # phase.
+        registry = OperationRegistry()
+        registry.register(fixture_spec())
+        registry.register(fixture_restore_spec())
+        claim = make_runner_claim()
+        record = create_operation(self.store(), registry, "fixture.restore",
+                                  {"work_dir": self.work})
+        run_pending_steps(self.store(), registry, record["operation_id"],
+                          claim=claim, max_steps=1)
+        updated, disposition = cancel_operation(self.store(),
+                                                record["operation_id"])
+        self.assertEqual("requested", disposition)
+        final = run_pending_steps(self.store(), registry,
+                                  record["operation_id"], claim=claim)
+        self.assertEqual("cancelled", final["state"])
+        self.assertEqual("ok", self.read_work("reopened.marker"))
+        self.assertIsNone(self.read_work("published.marker"))
+
+    def test_operations_dir_swap_after_open_is_blocked(self):
+        # The acceptance reproduction: replacing the operations directory
+        # with a symlink after open() must not redirect access; the root
+        # fd anchors the traversal.
+        self.create()
+        operations_dir = os.path.join(self.root, "operations")
+        moved = os.path.join(self._tmp, "moved_ops")
+        os.rename(operations_dir, moved)
+        os.symlink(os.path.join(self._tmp, "elsewhere"),
+                   operations_dir)
+        with self.assertRaises(StoreBlocked) as raised:
+            self.store().load(self.store().list_ids()[0])
+        self.assertEqual("op_dir_symlink", raised.exception.fault_code)
+
+    def test_validate_record_is_total_on_malformed_input(self):
+        # The acceptance reproduction: malformed records must produce a
+        # stable false, never a TypeError.
+        good = new_operation("t", {}, list(FIXTURE_PHASES),
+                             FIXTURE_IRREVERSIBLE_PHASE)
+        malformed = [
+            dict(good, phases=[["not", "hashable"]]),
+            dict(good, phases=["preflight", {"a": 1}]),
+            dict(good, state=["not", "hashable"]),
+            dict(good, log=[{"seq": ["x"], "kind": "transition"}]),
+            dict(good, runner_claim={"pid": "x"}),
+            dict(good, cancel_phase={"a": 1}),
+            dict(good, progress={"events": "x"}),
+            dict(good, log=[{"event_version": 1, "seq": 1, "at": "x",
+                             "kind": "terminal", "state": "running",
+                             "phase": "preflight", "outcome": ["x"]}]),
+            "not even a dict",
+            [1, 2, 3],
+        ]
+        for bad in malformed:
+            with self.subTest(record=bad):
+                self.assertFalse(validate_record(bad))
+
+    def test_updated_at_advances_on_every_write(self):
+        record = self.create()
+        created = record["updated_at"]
+        self.run_steps(record["operation_id"], max_steps=1)
+        after_step = self.store().load(record["operation_id"])
+        self.assertGreater(after_step["updated_at"], created)
+        self.run_steps(record["operation_id"])
+        final = self.store().load(record["operation_id"])
+        self.assertGreater(final["updated_at"], after_step["updated_at"])
 
     # -- security boundary --------------------------------------------------
 

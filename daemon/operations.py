@@ -98,11 +98,6 @@ SAFE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 MAX_ID_LENGTH = 64
 
-# A claim older than this is treated as stale even if its pid was recycled
-# by the OS (the holder refreshes the claim on every step persist, so a live
-# executor never ages out).
-CLAIM_STALENESS_SECONDS = 300
-
 _STABLE_MESSAGES = {
     "operation_not_found": "no such operation",
     "operation_id_conflict": "operation id already used with different "
@@ -324,9 +319,10 @@ def is_cancelable(record):
 
 REQUIRED_RECORD_FIELDS = (
     "operation_version", "operation_id", "type", "state", "phase", "phases",
-    "irreversible_phase", "parameters", "parameters_fingerprint",
-    "created_at", "updated_at", "cancel_requested", "cancel_requested_at",
-    "progress", "result", "error", "log", "rev", "runner_claim",
+    "irreversible_phase", "cancel_phase", "parameters",
+    "parameters_fingerprint", "created_at", "updated_at",
+    "cancel_requested", "cancel_requested_at", "progress", "result", "error",
+    "log", "rev", "runner_claim",
 )
 
 
@@ -340,9 +336,17 @@ def parameters_fingerprint(operation_type, normalized_parameters):
 
 
 def new_operation(operation_type, normalized_parameters, phases,
-                  irreversible_phase, operation_id=None):
+                  irreversible_phase, operation_id=None, cancel_phase=None):
     """Build the initial operation record. The ID is generated before any
-    work starts so it can be printed immediately (spec #43)."""
+    work starts so it can be printed immediately (spec #43).
+
+    `cancel_phase` is the extension seam for cancelled operations that must
+    run compensation before going terminal (spec #43: restore/clear
+    cancelled before the fact replacement reopen the old state): when a
+    cancel is honored, the operation moves into `cancel_phase`, its steps
+    run, and advancing from it goes to terminal `cancelled` instead of the
+    next phase.
+    """
     operation_id = operation_id or str(uuid.uuid4())
     validate_operation_id(operation_id)
     if not phases or irreversible_phase not in phases:
@@ -352,6 +356,9 @@ def new_operation(operation_type, normalized_parameters, phases,
     for phase in phases:
         if phase not in CANONICAL_PHASES:
             raise ValueError("phase %s not in the canonical phase set" % phase)
+    if cancel_phase is not None and cancel_phase not in phases:
+        raise ValueError("cancel phase %s not in the operation machine"
+                         % cancel_phase)
     now = _now_iso()
     return {
         "operation_version": OPERATION_VERSION,
@@ -361,6 +368,7 @@ def new_operation(operation_type, normalized_parameters, phases,
         "phase": phases[0],
         "phases": list(phases),
         "irreversible_phase": irreversible_phase,
+        "cancel_phase": cancel_phase,
         "parameters": normalized_parameters,
         "parameters_fingerprint": parameters_fingerprint(
             operation_type, normalized_parameters),
@@ -378,20 +386,25 @@ def new_operation(operation_type, normalized_parameters, phases,
 
 
 def _valid_claim(value):
-    return (value is None or (isinstance(value, dict)
-                              and isinstance(value.get("pid"), int)
-                              and isinstance(value.get("token"), str)
-                              and value["token"]))
+    if value is None:
+        return True
+    return (isinstance(value, dict)
+            and isinstance(value.get("pid"), int)
+            and isinstance(value.get("token"), str) and value["token"]
+            and isinstance(value.get("claimed_at"), str)
+            and value["claimed_at"])
 
 
 def validate_record(record):
     """Structural validation of a persisted record.
 
-    Rejects unsupported versions, unknown states/phases, broken or
-    duplicated phase machines, non-contiguous log sequences (which would
-    corrupt the next appended event), missing per-event fields, malformed
-    progress units and invalid claims, so a corrupted or hostile record can
-    never drive the state machine.
+    Total: for any bytes read from disk this returns True/False and never
+    raises (all membership tests are guarded by type checks first, so
+    malformed records produce a stable `operation_invalid` error instead of
+    a TypeError). Rejects unsupported versions, unknown states/phases,
+    broken or duplicated phase machines, non-contiguous log sequences
+    (which would corrupt the next appended event), missing per-event
+    fields, malformed progress units and invalid claims.
     """
     if not isinstance(record, dict):
         return False
@@ -400,22 +413,32 @@ def validate_record(record):
     for field in REQUIRED_RECORD_FIELDS:
         if field not in record:
             return False
-    if record["state"] not in STATES:
+    state = record["state"]
+    if not isinstance(state, str) or state not in STATES:
         return False
-    if not isinstance(record.get("rev"), int) or record["rev"] < 1:
+    rev = record.get("rev")
+    if not isinstance(rev, int) or rev < 1:
         return False
     if not _valid_claim(record.get("runner_claim")):
         return False
     phases = record["phases"]
     if not isinstance(phases, list) or not phases:
         return False
+    if any(not isinstance(phase, str) for phase in phases):
+        return False
     if len(set(phases)) != len(phases):
         return False
     if any(phase not in CANONICAL_PHASES for phase in phases):
         return False
-    if record["irreversible_phase"] not in phases:
+    irreversible = record.get("irreversible_phase")
+    if not isinstance(irreversible, str) or irreversible not in phases:
         return False
-    if record["phase"] not in phases:
+    cancel_phase = record.get("cancel_phase")
+    if cancel_phase is not None and (not isinstance(cancel_phase, str)
+                                     or cancel_phase not in phases):
+        return False
+    phase = record["phase"]
+    if not isinstance(phase, str) or phase not in phases:
         return False
     progress = record["progress"]
     if not isinstance(progress, dict):
@@ -430,19 +453,24 @@ def validate_record(record):
     for index, entry in enumerate(log):
         if not isinstance(entry, dict):
             return False
+        seq = entry.get("seq")
+        if not isinstance(seq, int) or seq != index + 1:
+            return False
         if entry.get("event_version") != EVENT_VERSION:
             return False
-        if entry.get("seq") != index + 1:
+        at = entry.get("at")
+        if not isinstance(at, str) or not at:
             return False
-        if not isinstance(entry.get("at"), str) or not entry["at"]:
+        kind = entry.get("kind")
+        if not isinstance(kind, str) or kind not in LOG_KINDS:
             return False
-        if entry.get("kind") not in LOG_KINDS:
+        entry_state = entry.get("state")
+        if not isinstance(entry_state, str) or entry_state not in STATES:
             return False
-        if entry.get("state") not in STATES:
+        entry_phase = entry.get("phase")
+        if not isinstance(entry_phase, str) or entry_phase not in phases:
             return False
-        if entry.get("phase") not in phases:
-            return False
-        if entry["kind"] == "progress":
+        if kind == "progress":
             delta = entry.get("progress")
             if not isinstance(delta, dict) or not delta:
                 return False
@@ -450,9 +478,10 @@ def validate_record(record):
                 if (unit not in PROGRESS_UNITS or not isinstance(value, int)
                         or value < 0):
                     return False
-        if entry["kind"] == "terminal" and entry.get("outcome") not in \
-                OUTCOMES:
-            return False
+        if kind == "terminal":
+            outcome = entry.get("outcome")
+            if not isinstance(outcome, str) or outcome not in OUTCOMES:
+                return False
     return True
 
 
@@ -504,52 +533,40 @@ def _pid_alive(pid):
     return True
 
 
-def _claim_age_seconds(claim):
-    claimed_at = claim.get("claimed_at") if isinstance(claim, dict) else None
-    if not isinstance(claimed_at, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(claimed_at)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-    return (datetime.now(timezone.utc) - parsed).total_seconds()
-
-
-def _claim_stale(claim):
-    """A claim is stale when its pid is gone or its age exceeds the
-    staleness window (a recycled pid therefore cannot wedge an operation
-    forever)."""
-    if not isinstance(claim, dict):
-        return True
-    if not _pid_alive(claim.get("pid")):
-        return True
-    age = _claim_age_seconds(claim)
-    if age is not None and age > CLAIM_STALENESS_SECONDS:
-        return True
-    return False
-
-
 class OperationStore:
     """Directory-backed operation persistence.
 
     One JSON record per operation under `<root>/operations/`, written
     atomically (temp file -> fsync -> rename -> directory fsync). Record
-    access is anchored to a directory fd opened with O_NOFOLLOW (all reads,
-    links and renames pass dir_fd), so a concurrent swap of the operations
-    directory or of a record path cannot redirect an access; the final
-    component is additionally opened with O_NOFOLLOW. Owner and exact mode
-    (0700 dir / 0600 file) are verified per access. Operation IDs are
-    validated as single safe filename components before every access.
+    access is anchored to directory fds (the root is opened by fd, the
+    operations directory is opened relative to it, and every record is
+    opened relative to that), so no path-based lookup happens between a
+    security check and an access — a path swap cannot redirect anything;
+    the final component is additionally opened with O_NOFOLLOW. Owner and
+    exact mode (0700 dir / 0600 file) are verified per access. Operation
+    IDs are validated as single safe filename components before every
+    access.
 
     Mutation is linearizable: every read-modify-write goes through
     `mutate()`, which re-reads the record, re-applies the mutation to the
-    freshest state and writes with a compare-and-swap on `rev`; creation is
-    exclusive via a hard-link rename that never overwrites an existing
-    record. The store holds no in-memory state: every call re-reads the
-    record, which is what makes the runner crash-recoverable by
-    construction.
+    freshest state and writes with a compare-and-swap on `rev`; the
+    revision check and the atomic rename happen under a per-operation
+    advisory lock (`<id>.lock`), so no writer can slip between them.
+    Creation is exclusive via a hard-link rename that never overwrites an
+    existing record.
+
+    Executor ownership is a separate per-operation advisory lock
+    (`<id>.run`) held by the runner for its whole invocation: a second
+    executor probes it non-blocking and yields instead of executing, and
+    because flock is kernel-released on process death, a crashed executor's
+    ownership is reclaimed automatically — no wall-clock lease exists, so a
+    live executor can never be taken over mid-step and a recycled pid can
+    never wedge an operation. The record's `runner_claim` (pid/token/
+    claimed_at) is advisory diagnostics: it identifies the current
+    executor and is refreshed on every runner write.
+
+    The store holds no in-memory state: every call re-reads the record,
+    which is what makes the runner crash-recoverable by construction.
     """
 
     def __init__(self, root_dir, euid=None):
@@ -621,75 +638,138 @@ class OperationStore:
         return self
 
     def _open_operations_dir(self):
-        """Re-verify the root and open the operations directory by fd,
-        refusing symlinks. Every record access anchors to this fd, so path
-        swaps after the open cannot redirect reads or writes, and a
-        misconfigured root or directory can never be read or written
+        """Open the root by fd and then `operations/` relative to it: the
+        whole chain is verified and anchored by directory fds, so no
+        path-based lookup happens between a security check and an access,
+        and a concurrent swap of the root or operations directory cannot
+        redirect reads or writes. Every record access goes through here,
+        so a misconfigured root or directory can never be read or written
         through."""
-        self._verify_root_entry(False)
+        if self.euid == 0:
+            raise UnsupportedPrivilege()
         try:
-            fd = os.open(self.operations_dir, os.O_RDONLY | os.O_NOFOLLOW)
+            root_fd = os.open(self.root_dir, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError as error:
             if error.errno == errno.ELOOP:
-                raise StoreBlocked("op_dir_symlink")
-            if error.errno == errno.ENOENT:
-                # A store that has never held operations cannot hold this
-                # operation either; callers map this to not-found.
-                raise StoreBlocked("op_dir_unavailable")
-            raise StoreBlocked("op_dir_unreadable")
+                raise StoreBlocked("root_symlink")
+            raise StoreBlocked("root_unavailable")
         try:
-            st = os.fstat(fd)
+            st = os.fstat(root_fd)
             if not stat.S_ISDIR(st.st_mode):
-                raise StoreBlocked("op_dir_not_directory")
+                raise StoreBlocked("root_not_directory")
             if st.st_uid != self.euid:
-                raise StoreBlocked("op_dir_owner")
+                raise StoreBlocked("root_owner")
             if not stat.S_IMODE(st.st_mode) == 0o700:
-                raise StoreBlocked("op_dir_permission")
-        except StoreBlocked:
-            os.close(fd)
-            raise
-        return fd
-
-    def _acquire_record_lock(self, dfd, name):
-        """Take the per-operation advisory lock (`<id>.lock`, flock,
-        kernel-released on process death). The lock serializes the CAS
-        revision check with the atomic rename in `_write_record`, so no
-        writer can slip between the check and the rename; it also
-        serializes racing creators. The lock file is owner-only (0600) and
-        opened with O_NOFOLLOW via the directory fd."""
-        lock_name = "%s.lock" % name[: -len(".json")]
-        try:
-            # O_EXCL create with a plain-open fallback: concurrent O_CREAT
-            # of the same name through two directory fds intermittently
-            # returns ENOENT on macOS (kernel lookup race) even though the
-            # file exists; a racing create here surfaces as EEXIST instead,
-            # which is handled by reopening the existing lock file.
+                raise StoreBlocked("root_permission")
             try:
-                fd = os.open(lock_name,
-                             os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                             | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                dfd = os.open(OPERATIONS_DIRNAME, os.O_RDONLY | os.O_NOFOLLOW,
+                              dir_fd=root_fd)
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    raise StoreBlocked("op_dir_symlink")
+                if error.errno == errno.ENOENT:
+                    # A store that has never held operations cannot hold
+                    # this operation either; callers map this to not-found.
+                    raise StoreBlocked("op_dir_unavailable")
+                raise StoreBlocked("op_dir_unreadable")
+            try:
+                st = os.fstat(dfd)
+                if not stat.S_ISDIR(st.st_mode):
+                    raise StoreBlocked("op_dir_not_directory")
+                if st.st_uid != self.euid:
+                    raise StoreBlocked("op_dir_owner")
+                if not stat.S_IMODE(st.st_mode) == 0o700:
+                    raise StoreBlocked("op_dir_permission")
+            except StoreBlocked:
+                os.close(dfd)
+                raise
+        finally:
+            os.close(root_fd)
+        return dfd
+
+    def _open_lock_file(self, dfd, lock_name):
+        """Open an advisory lock file (0600, O_NOFOLLOW) via the directory
+        fd. O_EXCL create with a plain-open fallback: concurrent O_CREAT of
+        the same name through two directory fds intermittently returns
+        ENOENT on macOS (kernel lookup race) even though the file exists; a
+        racing create here surfaces as EEXIST instead, which is handled by
+        reopening the existing lock file."""
+        try:
+            try:
+                return os.open(lock_name,
+                               os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                               | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
             except OSError as error:
                 if error.errno != errno.EEXIST:
                     raise
-                fd = os.open(lock_name, os.O_WRONLY | os.O_NOFOLLOW,
-                             dir_fd=dfd)
+                return os.open(lock_name, os.O_WRONLY | os.O_NOFOLLOW,
+                               dir_fd=dfd)
         except OSError as error:
             if error.errno == errno.ELOOP:
                 raise StoreBlocked("operation_lock_symlink")
             raise StoreBlocked("operation_lock_unavailable")
+
+    def _verify_lock_file(self, fd):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise StoreBlocked("operation_lock_not_regular")
+        if st.st_uid != self.euid:
+            raise StoreBlocked("operation_lock_owner")
+        if not stat.S_IMODE(st.st_mode) == 0o600:
+            raise StoreBlocked("operation_lock_permission")
+
+    def _acquire_record_lock(self, dfd, name):
+        """Take the per-operation write lock (`<id>.lock`, flock EX). The
+        lock serializes the CAS revision check with the atomic rename in
+        `_write_record`, so no writer can slip between the check and the
+        rename; it also serializes racing creators. Kernel-released on
+        process death."""
+        lock_fd = self._open_lock_file(
+            dfd, "%s.lock" % name[: -len(".json")])
         try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise StoreBlocked("operation_lock_not_regular")
-            if st.st_uid != self.euid:
-                raise StoreBlocked("operation_lock_owner")
-            if not stat.S_IMODE(st.st_mode) == 0o600:
-                raise StoreBlocked("operation_lock_permission")
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._verify_lock_file(lock_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except StoreBlocked:
-            os.close(fd)
+            os.close(lock_fd)
             raise
-        return fd
+        return lock_fd
+
+    def acquire_run_lock(self, operation_id):
+        """Take the per-operation executor lock (`<id>.run`, flock EX,
+        non-blocking). Returns the lock handle while this process owns the
+        operation, or None when another live executor holds it. Held for
+        the whole runner invocation; kernel-released on process death, so
+        a crashed executor's ownership is reclaimed automatically and no
+        wall-clock lease exists. A single probe suffices: the holder keeps
+        the lock for its entire invocation, and flock hands ownership
+        atomically."""
+        dfd = self._open_operations_dir()
+        try:
+            name = self._record_name(operation_id)
+            lock_fd = self._open_lock_file(
+                dfd, "%s.run" % name[: -len(".json")])
+        except StoreBlocked:
+            os.close(dfd)
+            raise
+        try:
+            self._verify_lock_file(lock_fd)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return (dfd, lock_fd)
+            except BlockingIOError:
+                os.close(lock_fd)
+                os.close(dfd)
+                return None
+        except StoreBlocked:
+            os.close(lock_fd)
+            os.close(dfd)
+            raise
+
+    @staticmethod
+    def release_run_lock(lock):
+        dfd, lock_fd = lock
+        os.close(lock_fd)
+        os.close(dfd)
 
     def _record_name(self, operation_id):
         validate_operation_id(operation_id)
@@ -718,7 +798,13 @@ class OperationStore:
             record = json.loads(payload)
         except (ValueError, UnicodeDecodeError):
             raise StoreBlocked("operation_unreadable")
-        if not validate_record(record):
+        try:
+            valid = validate_record(record)
+        except Exception:
+            # Validation must be total; a validator bug must still surface
+            # as the stable invalid-record error, never a traceback.
+            valid = False
+        if not valid:
             raise StoreBlocked("operation_invalid")
         if record["operation_id"] != name[: -len(".json")]:
             raise StoreBlocked("operation_invalid")
@@ -732,7 +818,7 @@ class OperationStore:
         try:
             dfd = self._open_operations_dir()
         except StoreBlocked as error:
-            if error.fault_code == "op_dir_unavailable":
+            if error.fault_code in ("op_dir_unavailable", "root_unavailable"):
                 # A store that has never held operations cannot have this
                 # operation either.
                 raise OperationNotFound(operation_id)
@@ -753,15 +839,20 @@ class OperationStore:
     def _write_record(self, record, operation_id, expected_rev=None):
         """Atomic persist: temp file (0600, O_NOFOLLOW) -> fsync -> rename
         -> directory fsync, all relative to the operations directory fd and
-        under the per-operation advisory lock. A crash at any point leaves
-        the previous complete record (or no record for a fresh create) in
+        under the per-operation write lock. A crash at any point leaves the
+        previous complete record (or no record for a fresh create) in
         place.
 
         With `expected_rev` the write is a compare-and-swap: the revision
         check and the rename happen under the per-operation flock, so a
         concurrent writer can neither slip between them nor overwrite the
         record; a lost CAS raises OperationConflict and changes nothing.
+        The record is validated before it is published, so a malformed
+        mutation can never reach disk.
         """
+        if not validate_record(record):
+            raise OperationError("invalid_operation_record", phase="runner")
+        record["updated_at"] = _now_iso()
         dfd = self._open_operations_dir()
         lock_fd = None
         try:
@@ -862,7 +953,7 @@ class OperationStore:
         try:
             dfd = self._open_operations_dir()
         except StoreBlocked as error:
-            if error.fault_code == "op_dir_unavailable":
+            if error.fault_code in ("op_dir_unavailable", "root_unavailable"):
                 # A store that never held operations has no operations.
                 return []
             raise
@@ -923,14 +1014,17 @@ class OperationTypeSpec:
     Failed (transient -> failed) or SimulatedCrash (test seam: abort without
     persisting anything). Steps must be idempotent by construction; the
     irreversible-publish pattern is to check the persistent artifact the
-    step itself created before creating it.
+    step itself created before creating it. `cancel_phase` names the phase
+    a cancelled operation moves into so its compensation steps run before
+    terminal `cancelled` (restore/clear reopen their old state there).
     """
 
     def __init__(self, operation_type, phases, irreversible_phase,
-                 normalize, steps):
+                 normalize, steps, cancel_phase=None):
         self.operation_type = operation_type
         self.phases = tuple(phases)
         self.irreversible_phase = irreversible_phase
+        self.cancel_phase = cancel_phase
         self.normalize = normalize
         self.steps = dict(steps)
 
@@ -938,7 +1032,8 @@ class OperationTypeSpec:
         return new_operation(self.operation_type,
                              self.normalize(parameters),
                              self.phases, self.irreversible_phase,
-                             operation_id=operation_id)
+                             operation_id=operation_id,
+                             cancel_phase=self.cancel_phase)
 
 
 class OperationRegistry:
@@ -980,17 +1075,33 @@ def _classify_cancel(record):
 
 
 def cancel_operation(store, operation_id):
-    """Request cancellation. Honored by the runner only in cancelable
-    (pre-irreversible) phases; otherwise an explicit uncancellable result is
-    returned and the operation continues to finish. The request is written
-    with the store's CAS, so a concurrently running executor can never
-    overwrite it."""
+    """Request cancellation. Honored by the runner at its cancel checkpoint
+    in cancelable (pre-irreversible) phases — moving into the operation's
+    `cancel_phase` when one is recorded — or immediately for a `blocked`
+    operation without a cancel phase (no executor is in flight, so the
+    cancel takes effect without waiting for a retry); past the irreversible
+    point an explicit uncancellable result is returned and the operation
+    continues to finish. The request is written with the store's CAS, so a
+    concurrently running executor can never overwrite it."""
     store.open(create=False)
     while True:
         record = store.load(operation_id)
         disposition = _classify_cancel(record)
         if disposition != "requested":
             return record, disposition
+        if record["state"] == "blocked" and not record.get("cancel_phase"):
+            def cancel_blocked(record):
+                if record["state"] != "blocked" or not is_cancelable(record):
+                    return False
+                validate_state_transition(record["state"], "cancelled")
+                _append_event(record, "terminal", state="cancelled",
+                              phase=record["phase"], outcome="cancelled")
+                record["state"] = "cancelled"
+                return True
+            updated = store.mutate(operation_id, cancel_blocked)
+            if updated["state"] == "cancelled":
+                return updated, "requested"
+            continue
 
         def apply(record):
             if _classify_cancel(record) != "requested":
@@ -1014,209 +1125,222 @@ def _step_index_in_phase(record, phase):
                 and entry.get("phase") == phase])
 
 
-def _runner_claim():
+def make_runner_claim():
+    """A fresh executor identity (pid, token, claimed_at). Sequential
+    runner invocations of one executor (the CLI `operation run` loop) pass
+    the same claim; concurrent invocations use distinct ones. The claim is
+    advisory — ownership is the per-operation run lock — but it identifies
+    the current executor in the record for diagnostics."""
     return {"pid": os.getpid(), "token": str(uuid.uuid4()),
             "claimed_at": _now_iso()}
 
 
-def _claim_held_by_other(record, claim):
-    current = record.get("runner_claim")
-    if not current:
+def _refresh_claim(record, claim):
+    """Advisory executor identity, refreshed on every runner write so the
+    record always shows the current owner's pid, token and time."""
+    record["runner_claim"] = {"pid": claim["pid"], "token": claim["token"],
+                              "claimed_at": _now_iso()}
+
+
+def _claim_and_start_transform(record, claim, retry_blocked):
+    if record["state"] == "queued":
+        _refresh_claim(record, claim)
+        record["state"] = "running"
+        _append_event(record, "transition", state="running",
+                      phase=record["phase"])
+        return True
+    if record["state"] == "blocked" and retry_blocked:
+        # Explicit operator retry: clear the stale error.
+        _refresh_claim(record, claim)
+        record["state"] = "running"
+        record["error"] = None
+        _append_event(record, "transition", state="running",
+                      phase=record["phase"])
+        return True
+    return False
+
+
+def _cancel_checkpoint_transform(record):
+    """Honor a pending cancel. With a `cancel_phase` the operation moves
+    there so its compensation steps (reopen/cleanup) run before terminal
+    `cancelled` (spec #43: restore/clear cancelled before the fact
+    replacement reopen the old state); without one, the operation goes
+    terminal immediately."""
+    if not (record["cancel_requested"] and is_cancelable(record)):
         return False
-    if current.get("pid") == claim["pid"]:
+    cancel_phase = record.get("cancel_phase")
+    if cancel_phase and record["phase"] != cancel_phase:
+        _append_event(record, "transition", state="running",
+                      phase=cancel_phase)
+        record["phase"] = cancel_phase
+        return True
+    if cancel_phase and record["phase"] == cancel_phase:
+        # The compensation steps are running; terminal comes from their
+        # advance.
         return False
-    return not _claim_stale(current)
+    validate_state_transition(record["state"], "cancelled")
+    _append_event(record, "terminal", state="cancelled",
+                  phase=record["phase"], outcome="cancelled")
+    record["state"] = "cancelled"
+    return True
 
 
-def claim_held_by_other(record, pid=None):
-    """True when another process currently holds the operation's executor
-    claim (used by the CLI to report why a run invocation yielded)."""
-    return _claim_held_by_other(
-        record, {"pid": os.getpid() if pid is None else pid,
-                 "token": "", "claimed_at": ""})
+def _fail_unsupported_transform(record, claim):
+    _refresh_claim(record, claim)
+    record["error"] = make_error("unsupported_operation_type",
+                                 phase=record["phase"])
+    _append_event(record, "terminal", state="failed",
+                  phase=record["phase"], outcome="failed",
+                  error_code="unsupported_operation_type")
+    record["state"] = "failed"
+    return True
 
 
-def _runner_guard(record, claim, fn):
-    """Wrap a runner mutation: yield (no write) while another live executor
-    holds the claim; otherwise take over the claim and apply `fn`. This is
-    what makes executor ownership exclusive across processes and
-    crash-recoverable (a dead or stale executor's claim is taken over)."""
-    if _claim_held_by_other(record, claim):
+def _mark_terminal_transform(record, claim, phase, error, state):
+    if record["phase"] != phase or record["state"] != "running":
+        # A concurrent writer moved the operation; the loop re-evaluates
+        # (re-application safety: never clobber a terminal state).
         return False
-    record["runner_claim"] = claim
-    return fn(record)
+    _refresh_claim(record, claim)
+    record["error"] = error.to_error_object()
+    _append_event(record, "terminal", state=state, phase=phase,
+                  outcome=state, error_code=error.code)
+    record["state"] = state
+    return True
 
 
-def _claim_and_start(record, claim, retry_blocked):
-    def start(record):
-        if record["state"] == "queued":
-            record["state"] = "running"
-            _append_event(record, "transition", state="running",
-                          phase=record["phase"])
+def _apply_step_result_transform(record, claim, phase, result):
+    if record["phase"] != phase:
+        # A concurrent writer moved the phase; the loop re-evaluates.
+        return False
+    _refresh_claim(record, claim)
+    progress = result.get("progress")
+    if progress:
+        for unit in PROGRESS_UNITS:
+            if unit in progress:
+                record["progress"][unit] += int(progress[unit])
+        _append_event(record, "progress", state=record["state"],
+                      phase=phase, progress=dict(progress))
+    if result.get("advance"):
+        if (record["cancel_requested"] and is_cancelable(record)
+                and record["phase"] != record.get("cancel_phase")):
+            # A cancel landed while this step executed; the advance into
+            # the next phase is held so the runner's checkpoint can cancel
+            # before the irreversible point (the progress made by the step
+            # is still real and stays persisted).
             return True
-        if record["state"] == "blocked" and retry_blocked:
-            # Explicit operator retry: clear the stale error.
-            record["state"] = "running"
+        if phase == record.get("cancel_phase"):
+            # Advancing from the compensation phase finishes the cancel.
             record["error"] = None
-            _append_event(record, "transition", state="running",
-                          phase=record["phase"])
-            return True
-        return False
-    return _runner_guard(record, claim, start)
-
-
-def _cancel_checkpoint(record, claim):
-    def cancel(record):
-        if record["cancel_requested"] and is_cancelable(record):
-            validate_state_transition(record["state"], "cancelled")
             _append_event(record, "terminal", state="cancelled",
-                          phase=record["phase"], outcome="cancelled")
+                          phase=phase, outcome="cancelled")
             record["state"] = "cancelled"
-            return True
-        return False
-    return _runner_guard(record, claim, cancel)
-
-
-def _fail_unsupported(record, claim):
-    def fail(record):
-        record["error"] = make_error("unsupported_operation_type",
-                                     phase=record["phase"])
-        _append_event(record, "terminal", state="failed",
-                      phase=record["phase"], outcome="failed",
-                      error_code="unsupported_operation_type")
-        record["state"] = "failed"
-        return True
-    return _runner_guard(record, claim, fail)
-
-
-def _mark_terminal(record, claim, phase, error, state):
-    def mark(record):
-        if record["phase"] != phase or record["state"] != "running":
-            # A concurrent writer moved the operation; the loop re-evaluates
-            # (re-application safety: never clobber a terminal state).
-            return False
-        record["error"] = error.to_error_object()
-        _append_event(record, "terminal", state=state, phase=phase,
-                      outcome=state, error_code=error.code)
-        record["state"] = state
-        return True
-    return _runner_guard(record, claim, mark)
-
-
-def _apply_step_result(record, claim, phase, result):
-    def apply(record):
-        if record["phase"] != phase:
-            # A concurrent writer moved the phase; the loop re-evaluates.
-            return False
-        progress = result.get("progress")
-        if progress:
-            for unit in PROGRESS_UNITS:
-                if unit in progress:
-                    record["progress"][unit] += int(progress[unit])
-            _append_event(record, "progress", state=record["state"],
-                          phase=phase, progress=dict(progress))
-        if result.get("advance"):
-            if record["cancel_requested"] and is_cancelable(record):
-                # A cancel landed while this step executed; the advance into
-                # the next phase is held so the runner's checkpoint can
-                # cancel before the irreversible point (the progress made
-                # by the step is still real and stays persisted).
-                return True
-            if phase == record["phases"][-1]:
-                record["result"] = result.get("result") or {"completed": True}
-                record["error"] = None
-                _append_event(record, "terminal", state="succeeded",
-                              phase=phase, outcome="succeeded")
-                record["state"] = "succeeded"
-            else:
-                new_phase = record["phases"][
-                    _phase_index(record, phase) + 1]
-                validate_phase_transition(record, new_phase)
-                _append_event(record, "transition", state="running",
-                              phase=new_phase)
-                record["phase"] = new_phase
-        return True
-    return _runner_guard(record, claim, apply)
+        elif phase == record["phases"][-1]:
+            record["result"] = result.get("result") or {"completed": True}
+            record["error"] = None
+            _append_event(record, "terminal", state="succeeded",
+                          phase=phase, outcome="succeeded")
+            record["state"] = "succeeded"
+        else:
+            new_phase = record["phases"][_phase_index(record, phase) + 1]
+            validate_phase_transition(record, new_phase)
+            _append_event(record, "transition", state="running",
+                          phase=new_phase)
+            record["phase"] = new_phase
+    return True
 
 
 def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
-                      max_steps=None, retry_blocked=False):
+                      max_steps=None, retry_blocked=False, claim=None):
     """Execute pending work for one operation.
 
-    Stateless loop: read record -> (queued -> running; blocked -> running
-    only on an explicit retry) -> cancel checkpoint -> execute one step ->
-    CAS-persist -> repeat. A crash anywhere only loses the step that had not
-    finished persisting, so restarting the runner resumes from the persisted
-    phase and progress. Every write is CAS'd on the record revision, so a
-    concurrent cancel is never overwritten and the phase machine can never
-    move backwards; if another live executor process holds the operation's
-    claim the runner yields without executing (exclusive ownership), and a
-    dead executor's claim is taken over (crash recovery). `fault_hook(phase,
-    step_index, point)` is the crash/fault injection seam used by tests
-    (point is "before_step" or "after_step"); raising SimulatedCrash aborts
-    without persisting, raising OperationBlocked/Failed injects those
-    outcomes. `max_steps` bounds the number of step executions (transitions
-    are not counted) for deterministic test stepping. `retry_blocked` marks
-    this invocation as the explicit operator retry that a `blocked`
-    operation requires (spec: blocked is deterministic and never
-    auto-retries; `wait` and any other observer never retry).
+    The runner first takes the per-operation executor lock (`<id>.run`,
+    flock): while another live executor holds it the runner yields without
+    executing anything, and because flock is kernel-released on process
+    death, a crashed executor's ownership is reclaimed automatically and no
+    wall-clock lease can ever let a live executor be taken over mid-step.
+    `claim` is the executor identity recorded on the operation (advisory
+    diagnostics); sequential continuation passes the same claim.
+
+    Loop: read record -> cancel checkpoint -> (queued -> running; blocked ->
+    running only on an explicit retry) -> execute one step -> CAS-persist ->
+    repeat. A crash anywhere only loses the step that had not finished
+    persisting, so restarting the runner resumes from the persisted phase
+    and progress. Every write is CAS'd on the record revision under the
+    per-operation write lock, so a concurrent cancel is never overwritten
+    and the phase machine can never move backwards; a cancel that lands
+    while a step runs holds that step's phase advance so the checkpoint can
+    cancel before the irreversible point. `fault_hook(phase, step_index,
+    point)` is the crash/fault injection seam used by tests (point is
+    "before_step" or "after_step"); raising SimulatedCrash aborts without
+    persisting, raising OperationBlocked/Failed injects those outcomes.
+    `max_steps` bounds the number of step executions (transitions are not
+    counted) for deterministic test stepping. `retry_blocked` marks this
+    invocation as the explicit operator retry that a `blocked` operation
+    requires (spec: blocked is deterministic and never auto-retries; `wait`
+    and any other observer never retry).
 
     Returns the record when no more immediate work remains.
     """
     store.open()
-    claim = _runner_claim()
-    steps_executed = 0
-    while True:
-        record = store.load(operation_id)
-        if record["state"] in TERMINAL_STATES:
-            return record
-        if record["state"] == "blocked" and not retry_blocked:
-            return record
-        if _claim_held_by_other(record, claim):
-            return record
-        if record["state"] in ("queued", "blocked"):
-            record = store.mutate(operation_id, lambda r: _claim_and_start(
-                r, claim, retry_blocked))
-            continue
-        if record["cancel_requested"] and is_cancelable(record):
-            record = store.mutate(operation_id, lambda r: _cancel_checkpoint(
-                r, claim))
-            return record
-        if max_steps is not None and steps_executed >= max_steps:
-            return record
-        spec = registry.get(record["type"])
-        if spec is None:
-            return store.mutate(operation_id, lambda r: _fail_unsupported(
-                r, claim))
-        # Re-acquire the claim atomically: only the claim holder executes a
-        # step. Two executors resuming a stale claim race here; exactly one
-        # wins the CAS and the loser re-evaluates and yields, so step side
-        # effects are exclusive while the holder is alive.
-        record = store.mutate(operation_id, lambda r: _runner_guard(
-            r, claim, lambda r: True))
-        if _claim_held_by_other(record, claim):
-            return record
-        phase = record["phase"]
-        step_index = _step_index_in_phase(record, phase)
-        try:
-            if fault_hook is not None:
-                fault_hook(phase, step_index, "before_step")
-            result = spec.steps[phase](record)
-            if fault_hook is not None:
-                fault_hook(phase, step_index, "after_step")
-        except SimulatedCrash:
-            raise
-        except OperationBlocked as error:
-            store.mutate(operation_id, lambda r: _mark_terminal(
-                r, claim, phase, error, "blocked"))
-            return store.load(operation_id)
-        except OperationFailed as error:
-            store.mutate(operation_id, lambda r: _mark_terminal(
-                r, claim, phase, error, "failed"))
-            return store.load(operation_id)
-        steps_executed += 1
-        record = store.mutate(operation_id, lambda r: _apply_step_result(
-            r, claim, phase, result))
+    claim = claim or make_runner_claim()
+    lock = store.acquire_run_lock(operation_id)
+    if lock is None:
+        # Another live executor holds the operation; yield without
+        # executing (exclusive ownership).
+        return store.load(operation_id)
+    try:
+        steps_executed = 0
+        while True:
+            record = store.load(operation_id)
+            if record["state"] in TERMINAL_STATES:
+                return record
+            if record["cancel_requested"] and is_cancelable(record):
+                record = store.mutate(operation_id,
+                                      _cancel_checkpoint_transform)
+                if record["state"] == "cancelled":
+                    return record
+                # A cancel_phase was entered: continue so the compensation
+                # steps run before the terminal cancelled.
+                continue
+            if record["state"] == "blocked" and not retry_blocked:
+                return record
+            if record["state"] in ("queued", "blocked"):
+                record = store.mutate(
+                    operation_id, lambda r: _claim_and_start_transform(
+                        r, claim, retry_blocked))
+                continue
+            if max_steps is not None and steps_executed >= max_steps:
+                return record
+            spec = registry.get(record["type"])
+            if spec is None:
+                return store.mutate(
+                    operation_id, lambda r: _fail_unsupported_transform(
+                        r, claim))
+            phase = record["phase"]
+            step_index = _step_index_in_phase(record, phase)
+            try:
+                if fault_hook is not None:
+                    fault_hook(phase, step_index, "before_step")
+                result = spec.steps[phase](record)
+                if fault_hook is not None:
+                    fault_hook(phase, step_index, "after_step")
+            except SimulatedCrash:
+                raise
+            except OperationBlocked as error:
+                store.mutate(operation_id, lambda r: _mark_terminal_transform(
+                    r, claim, phase, error, "blocked"))
+                return store.load(operation_id)
+            except OperationFailed as error:
+                store.mutate(operation_id, lambda r: _mark_terminal_transform(
+                    r, claim, phase, error, "failed"))
+                return store.load(operation_id)
+            steps_executed += 1
+            record = store.mutate(
+                operation_id, lambda r: _apply_step_result_transform(
+                    r, claim, phase, result))
+    finally:
+        store.release_run_lock(lock)
 
 
 def wait_for_terminal(store, operation_id, *, poll_interval=0.25,

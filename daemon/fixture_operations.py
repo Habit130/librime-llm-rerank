@@ -46,6 +46,16 @@ FIXTURE_PHASES = ("preflight", "staging", "publishing", "cleanup")
 FIXTURE_IRREVERSIBLE_PHASE = "publishing"
 FIXTURE_CHUNKS = 3
 
+# A restore-shaped type proving the cancellation compensation seam: cancelling
+# before the irreversible publishing phase moves the operation into the
+# `reopening` phase, whose step restores the previous state (work_dir/
+# reopened.marker) before the operation goes terminal `cancelled`.
+RESTORE_TYPE = "fixture.restore"
+RESTORE_PHASES = ("preflight", "staging", "publishing", "reopening",
+                  "cleanup")
+RESTORE_IRREVERSIBLE_PHASE = "publishing"
+RESTORE_CANCEL_PHASE = "reopening"
+
 
 def _nfc(value):
     return unicodedata.normalize("NFC", value)
@@ -83,6 +93,9 @@ def _step_preflight(record):
     if not os.path.isfile(marker):
         with open(marker, "w", encoding="utf-8") as f:
             f.write("ok\n")
+    with open(os.path.join(work_dir, "preflight.count"), "a",
+              encoding="utf-8") as f:
+        f.write("1\n")
     return {"progress": {"events": 1}, "advance": True}
 
 
@@ -128,6 +141,16 @@ def _step_cleanup(record):
                        "chunks": record["progress"].get("chunks")}}
 
 
+def _step_reopening(record):
+    _sleep(record)
+    work_dir = _work_dir(record)
+    marker = os.path.join(work_dir, "reopened.marker")
+    if not os.path.isfile(marker):
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+    return {"progress": {"events": 1}, "advance": True}
+
+
 def fixture_spec():
     return OperationTypeSpec(
         operation_type=FIXTURE_TYPE,
@@ -138,6 +161,23 @@ def fixture_spec():
             "preflight": _step_preflight,
             "staging": _step_staging,
             "publishing": _step_publishing,
+            "cleanup": _step_cleanup,
+        },
+    )
+
+
+def fixture_restore_spec():
+    return OperationTypeSpec(
+        operation_type=RESTORE_TYPE,
+        phases=RESTORE_PHASES,
+        irreversible_phase=RESTORE_IRREVERSIBLE_PHASE,
+        normalize=_normalize,
+        cancel_phase=RESTORE_CANCEL_PHASE,
+        steps={
+            "preflight": _step_preflight,
+            "staging": _step_staging,
+            "publishing": _step_publishing,
+            "reopening": _step_reopening,
             "cleanup": _step_cleanup,
         },
     )
