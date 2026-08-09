@@ -66,6 +66,7 @@ class LlmRerankRecorder : public Processor {
   bool retraction_armed_ = false;
   bool retraction_pending_ = false;  // current key is a plain BackSpace
   string retraction_commit_id_;
+  bool recording_enabled_ = false;
 };
 
 }  // namespace rime

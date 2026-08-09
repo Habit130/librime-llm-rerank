@@ -10,6 +10,7 @@
 
 #include "llm_rerank_filter.h"
 #include "llm_rerank_recorder.h"
+#include "recorder_coordinator.h"
 
 static void rime_llm_rerank_initialize() {
   using namespace rime;
@@ -20,6 +21,8 @@ static void rime_llm_rerank_initialize() {
   r.Register("llm_rerank_recorder", new Component<LlmRerankRecorder>);
 }
 
-static void rime_llm_rerank_finalize() {}
+static void rime_llm_rerank_finalize() {
+  rime::RecorderCoordinator::ShutdownAll();
+}
 
 RIME_REGISTER_MODULE(llm_rerank)

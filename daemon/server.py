@@ -30,8 +30,14 @@ import sys
 import threading
 import time
 
+from control import run_control_server, validate_control_path
+from coordinator import MaintenanceCoordinator
+
 SOCKET_PATH = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock"
+)
+FACTS_ROOT = os.path.expanduser(
+    "~/Library/Application Support/Squirrel/SemanticMemory"
 )
 MODEL_PATH = "/Users/habit/Models/Qwen/Qwen3-0.6B-Base"
 IDLE_TIMEOUT = 300  # seconds
@@ -429,6 +435,7 @@ def protocol_error(
         "token_attribution_failed": "candidate token attribution failed",
         "policy_mismatch": "plan policy does not match the daemon scoring mode",
         "server_error": "scoring transport failed",
+        "maintenance_in_progress": "scoring is temporarily quiesced for maintenance",
     }
     response = {
         "version": PROTOCOL_VERSION,
@@ -491,7 +498,7 @@ def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
     return framed[:-1].decode("utf-8")
 
 
-def handle_health(state, request):
+def handle_health(state, request, coordinator=None):
     """Model-free serving observation (issue #51 status core).
 
     Never loads the model: `model_loaded` is the daemon's own current state,
@@ -499,7 +506,7 @@ def handle_health(state, request):
     load. Response carries no context, candidate text or embedding.
     """
     strategy = getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN)
-    return {
+    response = {
         "version": PROTOCOL_VERSION,
         "request_id": request["request_id"],
         "kind": "health",
@@ -514,9 +521,12 @@ def handle_health(state, request):
             "started_at": getattr(state, "started_at", None),
         },
     }
+    if coordinator is not None:
+        response["health"].update(coordinator.health())
+    return response
 
 
-def handle_request(state, data):
+def handle_request(state, data, coordinator=None):
     try:
         decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_object_fields)
         req, parsed_end = decoder.raw_decode(data)
@@ -536,7 +546,7 @@ def handle_request(state, data):
             or not req["request_id"]
         ):
             return protocol_error("invalid_request")
-        return handle_health(state, req)
+        return handle_health(state, req, coordinator)
 
     if (
         not isinstance(req, dict)
@@ -571,6 +581,10 @@ def handle_request(state, data):
             plan_identity=req["plan_identity"],
         )
 
+    if coordinator is not None and not coordinator.begin_request():
+        return protocol_error(
+            "maintenance_in_progress", phase="maintenance", retryable=True,
+            request_id=req["request_id"], plan_identity=req["plan_identity"])
     try:
         scores = state.score(req["context"], req["candidates"])
     except TimeoutError:
@@ -602,6 +616,9 @@ def handle_request(state, data):
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
         )
+    finally:
+        if coordinator is not None:
+            coordinator.end_request()
 
     if not isinstance(scores, list) or any(
         isinstance(score, bool) or not isinstance(score, (int, float))
@@ -636,7 +653,10 @@ def handle_request(state, data):
     }
 
 
-def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False):
+def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
+               cache_limit_mb=CACHE_LIMIT_MB,
+               scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False,
+               control_socket=None, facts_root=None):
     import mlx.core as mx
 
     if cache_limit_mb > 0:
@@ -645,15 +665,27 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
     state = ModelState(model_path, context_window, scoring_strategy)
     state.cache_limit_mb = cache_limit_mb
     state.started_at = datetime.now(timezone.utc).isoformat()
+    facts_root = (facts_root or os.environ.get("SQUIRREL_SEMANTIC_MEMORY_ROOT")
+                  or FACTS_ROOT)
+    control_socket = control_socket or os.path.join(facts_root,
+                                                     "llm-rerank-control.sock")
+    coordinator = (MaintenanceCoordinator(facts_root) if facts_root else None)
+    if control_socket and coordinator is None:
+        raise ValueError("--control-socket requires --facts-root")
+    if control_socket and os.path.abspath(control_socket) == os.path.abspath(sock_path):
+        raise ValueError("scoring and control sockets must differ")
+    if control_socket:
+        validate_control_path(control_socket)
     last_activity = time.time()
     lock = threading.Lock()
 
-    os.makedirs(os.path.dirname(sock_path), exist_ok=True)
-    if os.path.exists(sock_path):
-        os.unlink(sock_path)
+    # Scoring and control endpoints are distinct, but both need the same
+    # owner-only, symlink-safe parent guarantee.
+    validate_control_path(sock_path)
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock_path)
+    os.chmod(sock_path, 0o600)
     srv.listen(5)
     srv.settimeout(1.0)
 
@@ -672,6 +704,9 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
 
     watchdog = threading.Thread(target=idle_watchdog, daemon=True)
     watchdog.start()
+    if control_socket:
+        threading.Thread(target=run_control_server,
+                         args=(control_socket, coordinator), daemon=True).start()
 
     try:
         while True:
@@ -685,7 +720,7 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
                 if data is not None:
                     with lock:
                         last_activity = time.time()
-                    resp = handle_request(state, data)
+                    resp = handle_request(state, data, coordinator)
                     with lock:
                         last_activity = time.time()
                     conn.sendall(
@@ -820,6 +855,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM rerank daemon")
     parser.add_argument("--socket", default=SOCKET_PATH)
     parser.add_argument("--model", default=MODEL_PATH)
+    parser.add_argument("--facts-root")
+    parser.add_argument("--control-socket")
     parser.add_argument(
         "--context-window",
         type=int,
@@ -855,5 +892,6 @@ if __name__ == "__main__":
     else:
         run_server(
             args.socket, args.model, args.context_window, args.cache_limit_mb,
-            args.scoring, test_mode=True
+            args.scoring, test_mode=True, control_socket=args.control_socket,
+            facts_root=args.facts_root
         )

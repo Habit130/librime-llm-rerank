@@ -13,6 +13,8 @@
 
 #include <rime/common.h>
 
+#include "maintenance_lock.h"
+
 namespace rime {
 
 constexpr int kFactSchemaVersion = 1;
@@ -48,6 +50,7 @@ class FactStore {
     kDbClockInvalid,    // meta clock/history rows are missing or malformed
     kDbOpenFailed,      // sqlite could not open the database
     kDbWriteFailed,     // a persist transaction failed
+    kMaintenanceLocked, // an exclusive maintenance lease is active
   };
 
   // One immutable selection event destined for the fact store. HLC fields and
@@ -101,7 +104,8 @@ class FactStore {
   // retract the whole batch.
   bool PersistBatch(int64_t utc_committed_at_ms,
                     vector<Event>* events,
-                    string* commit_id = nullptr);
+                    string* commit_id = nullptr,
+                    const string* assigned_commit_id = nullptr);
 
   // Appends a retraction fact for `commit_id` in one short transaction,
   // advancing the HLC. Retraction is an independent append-only fact: the
@@ -121,7 +125,13 @@ class FactStore {
   // nothing is cached in memory.
   bool QueryActiveEventsAsOf(int64_t hlc_physical_ms,
                              int64_t hlc_logical,
-                             vector<Event>* out);
+                              vector<Event>* out);
+
+  // Reads the current durable identity and clock while holding a shared lock.
+  // Used by maintenance reopen checks and never exposes private event text.
+  Status ReadStoreIdentity(int64_t* hlc_physical_ms,
+                           int64_t* hlc_logical,
+                           string* store_epoch);
 
   // Stable code strings for diagnostics; never contains raw text.
   static const char* StatusCode(Status status);
@@ -140,6 +150,7 @@ class FactStore {
   int64_t clock_physical_ms_ = 0;
   int64_t clock_logical_ = 0;
   bool meta_initialized_ = false;
+  MaintenanceLock maintenance_lock_;
 };
 
 }  // namespace rime

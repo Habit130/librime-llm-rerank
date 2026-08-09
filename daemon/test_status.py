@@ -118,6 +118,12 @@ class StatusCoreTest(unittest.TestCase):
         db_path = os.path.join(self.facts_root, "facts.sqlite3")
         os.makedirs(self.facts_root)
         os.chmod(self.facts_root, 0o700)
+        # A real fact root is initialized by FactStore, which establishes the
+        # read/write maintenance lease before creating SQLite.
+        lock_fd = os.open(os.path.join(self.facts_root, "maintenance.lock"),
+                          os.O_WRONLY | os.O_CREAT, 0o600)
+        os.fchmod(lock_fd, 0o600)
+        os.close(lock_fd)
         conn = sqlite3.connect(db_path)
         conn.executescript(FACT_DDL)
         conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
@@ -458,7 +464,7 @@ class StatusCoreTest(unittest.TestCase):
                          facts["fact_high_water"])
         # Last write = max(commit time 1002, retraction time 2000).
         self.assertEqual(2000, facts["last_write_at_ms"])
-        self.assertEqual("unknown", facts["recording_gaps"])
+        self.assertEqual({"state": "none"}, facts["recording_gaps"])
         self.assertEqual(0, report["exit_code"])
 
     def test_facts_not_created_is_zero_evidence_not_fault(self):

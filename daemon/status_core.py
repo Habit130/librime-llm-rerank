@@ -56,6 +56,8 @@ from datetime import datetime, timezone
 
 import yaml
 
+from maintenance import MaintenanceError, MaintenanceLock, read_recording_gap
+
 STATUS_VERSION = 1
 NAMESPACE = "llm_rerank"
 SWITCH_KEYS = ("reranking_enabled", "recording_enabled", "evidence_enabled")
@@ -211,12 +213,23 @@ def _read_facts(facts_root):
         return _facts_section(observed_at, "blocked", "db_permission")
 
     try:
-        conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=2.0
-        )
-    except sqlite3.Error:
-        return _facts_section(observed_at, "degraded", "db_open_failed")
+        # A daemon/status fact handle has the same shared lease for its full
+        # SQLite lifetime as a C++ reader. An exclusive maintainer therefore
+        # sees no hidden WAL reader when prepare has completed.
+        lease = MaintenanceLock(facts_root, exclusive=False, nonblocking=True,
+                                create=False)
+        lease.acquire()
+    except MaintenanceError as error:
+        if error.code == "maintenance_locked":
+            return _facts_section(observed_at, "degraded", "maintenance_in_progress")
+        return _facts_section(observed_at, "unknown", error.code)
     try:
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=0
+            )
+        except sqlite3.Error:
+            return _facts_section(observed_at, "degraded", "db_open_failed")
         try:
             row = conn.execute("PRAGMA quick_check;").fetchone()
         except sqlite3.Error:
@@ -286,12 +299,12 @@ def _read_facts(facts_root):
             },
             "last_write_at_ms": last_write,
             "last_write_at": _iso(last_write),
-            # Recording gaps are session-local and not yet persisted; the
-            # status cannot prove them from disk.
-            "recording_gaps": "unknown",
+            "recording_gaps": read_recording_gap(facts_root),
         }
     finally:
-        conn.close()
+        if "conn" in locals():
+            conn.close()
+        lease.release()
 
 
 def _facts_section(observed_at, health, fault_code):
@@ -362,9 +375,12 @@ def probe_daemon(socket_path, deadline_s=HEALTH_DEADLINE_SECONDS):
             or not isinstance(health, dict)
         ):
             return _serving_section(observed_at, "unknown")
+        state = "up"
+        if health.get("maintenance_state") not in (None, "serving"):
+            state = "unknown"
         return {
             "observed_at": observed_at,
-            "state": "up",
+            "state": state,
             "model_loaded": bool(health.get("model_loaded")),
             "policy_id": health.get("policy_id"),
             "scoring_strategy": health.get("scoring_strategy"),
