@@ -42,12 +42,11 @@ Design contract (spec #43 "长操作、进度与幂等", "错误协议", "权限
   irreversible-publish pattern is to check the persistent artifact the step
   itself created before re-creating it (this is the "已完成不可逆步骤不会因
   重启重复执行" guarantee).
-- Executor ownership is exclusive and crash-recoverable: the runner records
-  a per-process claim (`runner_claim`) in the operation; a second live
-  executor process yields instead of executing; a dead executor's claim is
-  taken over on the next invocation (crash recovery). Within one process,
-  repeated runner invocations continue the operation (the CLI `operation
-  run` loop and test stepping rely on this).
+- Executor ownership is exclusive and crash-recoverable: a run lock under
+  the stable semantic-memory root is held across the entire side-effecting
+  invocation, and every record access is pinned to the operations-directory
+  identity observed when that lock was acquired. A second executor yields;
+  process death releases ownership automatically.
 - Progress reports only real units (`events`, `bytes`, `chunks`, `phase`);
   a percentage is never fabricated when the total is unknown.
 - The operation log stores only IDs, hashes, phases, progress units, states
@@ -359,6 +358,10 @@ def new_operation(operation_type, normalized_parameters, phases,
     if cancel_phase is not None and cancel_phase not in phases:
         raise ValueError("cancel phase %s not in the operation machine"
                          % cancel_phase)
+    if (cancel_phase is not None
+            and phases.index(cancel_phase) <= phases.index(
+                irreversible_phase)):
+        raise ValueError("cancel phase must follow the irreversible phase")
     now = _now_iso()
     return {
         "operation_version": OPERATION_VERSION,
@@ -389,10 +392,46 @@ def _valid_claim(value):
     if value is None:
         return True
     return (isinstance(value, dict)
-            and isinstance(value.get("pid"), int)
+            and type(value.get("pid")) is int and value["pid"] > 0
             and isinstance(value.get("token"), str) and value["token"]
-            and isinstance(value.get("claimed_at"), str)
-            and value["claimed_at"])
+            and _valid_timestamp(value.get("claimed_at")))
+
+
+def _valid_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _valid_error(value):
+    if value is None:
+        return True
+    required = {
+        "error_version", "code", "message", "occurred_at", "retryable",
+        "phase", "remediation", "cause",
+    }
+    return (isinstance(value, dict) and set(value) == required
+            and value.get("error_version") == ERROR_VERSION
+            and isinstance(value.get("code"), str) and value["code"]
+            and isinstance(value.get("message"), str) and value["message"]
+            and _valid_timestamp(value.get("occurred_at"))
+            and isinstance(value.get("retryable"), bool)
+            and isinstance(value.get("phase"), str) and value["phase"]
+            and isinstance(value.get("remediation"), str)
+            and isinstance(value.get("cause"), (dict, type(None))))
+
+
+def _reject_duplicate_object_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def validate_record(record):
@@ -410,14 +449,49 @@ def validate_record(record):
         return False
     if record.get("operation_version") != OPERATION_VERSION:
         return False
-    for field in REQUIRED_RECORD_FIELDS:
-        if field not in record:
-            return False
+    if set(record) != set(REQUIRED_RECORD_FIELDS):
+        return False
+    operation_id = record.get("operation_id")
+    try:
+        validate_operation_id(operation_id)
+    except ValueError:
+        return False
+    operation_type = record.get("type")
+    if not isinstance(operation_type, str) or not operation_type:
+        return False
+    parameters = record.get("parameters")
+    if not isinstance(parameters, dict):
+        return False
+    fingerprint = record.get("parameters_fingerprint")
+    try:
+        expected_fingerprint = parameters_fingerprint(operation_type,
+                                                       parameters)
+    except (TypeError, ValueError):
+        return False
+    if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+            or any(ch not in "0123456789abcdef" for ch in fingerprint)
+            or fingerprint != expected_fingerprint):
+        return False
+    if (not _valid_timestamp(record.get("created_at"))
+            or not _valid_timestamp(record.get("updated_at"))):
+        return False
+    if not isinstance(record.get("cancel_requested"), bool):
+        return False
+    cancel_requested_at = record.get("cancel_requested_at")
+    if cancel_requested_at is not None and not _valid_timestamp(
+            cancel_requested_at):
+        return False
+    if record["cancel_requested"] and cancel_requested_at is None:
+        return False
+    if not isinstance(record.get("result"), (dict, type(None))):
+        return False
+    if not _valid_error(record.get("error")):
+        return False
     state = record["state"]
     if not isinstance(state, str) or state not in STATES:
         return False
     rev = record.get("rev")
-    if not isinstance(rev, int) or rev < 1:
+    if type(rev) is not int or rev < 1:
         return False
     if not _valid_claim(record.get("runner_claim")):
         return False
@@ -430,6 +504,9 @@ def validate_record(record):
         return False
     if any(phase not in CANONICAL_PHASES for phase in phases):
         return False
+    canonical_indexes = [CANONICAL_PHASES.index(phase) for phase in phases]
+    if canonical_indexes != sorted(canonical_indexes):
+        return False
     irreversible = record.get("irreversible_phase")
     if not isinstance(irreversible, str) or irreversible not in phases:
         return False
@@ -437,15 +514,19 @@ def validate_record(record):
     if cancel_phase is not None and (not isinstance(cancel_phase, str)
                                      or cancel_phase not in phases):
         return False
+    if (cancel_phase is not None
+            and phases.index(cancel_phase) <= phases.index(irreversible)):
+        return False
     phase = record["phase"]
     if not isinstance(phase, str) or phase not in phases:
         return False
     progress = record["progress"]
-    if not isinstance(progress, dict):
+    if (not isinstance(progress, dict)
+            or set(progress) != set(PROGRESS_UNITS)):
         return False
     for unit in PROGRESS_UNITS:
         value = progress.get(unit)
-        if not isinstance(value, int) or value < 0:
+        if type(value) is not int or value < 0:
             return False
     log = record["log"]
     if not isinstance(log, list):
@@ -453,8 +534,14 @@ def validate_record(record):
     for index, entry in enumerate(log):
         if not isinstance(entry, dict):
             return False
+        allowed_event_fields = {
+            "event_version", "seq", "at", "kind", "state", "phase",
+            "progress", "error_code", "outcome",
+        }
+        if any(key not in allowed_event_fields for key in entry):
+            return False
         seq = entry.get("seq")
-        if not isinstance(seq, int) or seq != index + 1:
+        if type(seq) is not int or seq != index + 1:
             return False
         if entry.get("event_version") != EVENT_VERSION:
             return False
@@ -476,12 +563,15 @@ def validate_record(record):
                 return False
             for unit, value in delta.items():
                 if (unit not in PROGRESS_UNITS or not isinstance(value, int)
-                        or value < 0):
+                        or isinstance(value, bool) or value < 0):
                     return False
         if kind == "terminal":
             outcome = entry.get("outcome")
             if not isinstance(outcome, str) or outcome not in OUTCOMES:
                 return False
+        error_code = entry.get("error_code")
+        if error_code is not None and not isinstance(error_code, str):
+            return False
     return True
 
 
@@ -517,20 +607,6 @@ def _exact_mode(path, mode):
         return stat.S_IMODE(os.lstat(path).st_mode) == mode
     except OSError:
         return False
-
-
-def _pid_alive(pid):
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 class OperationStore:
@@ -573,6 +649,7 @@ class OperationStore:
         self.root_dir = root_dir
         self.euid = os.geteuid() if euid is None else euid
         self.operations_dir = os.path.join(root_dir, OPERATIONS_DIRNAME)
+        self._pinned_operations_identity = None
 
     def _verify_root_entry(self, create):
         """Verify the semantic-memory root is an owner-only real directory,
@@ -637,14 +714,7 @@ class OperationStore:
             self._verify_operations_entry(create)
         return self
 
-    def _open_operations_dir(self):
-        """Open the root by fd and then `operations/` relative to it: the
-        whole chain is verified and anchored by directory fds, so no
-        path-based lookup happens between a security check and an access,
-        and a concurrent swap of the root or operations directory cannot
-        redirect reads or writes. Every record access goes through here,
-        so a misconfigured root or directory can never be read or written
-        through."""
+    def _open_root_dir(self):
         if self.euid == 0:
             raise UnsupportedPrivilege()
         try:
@@ -661,31 +731,54 @@ class OperationStore:
                 raise StoreBlocked("root_owner")
             if not stat.S_IMODE(st.st_mode) == 0o700:
                 raise StoreBlocked("root_permission")
-            try:
-                dfd = os.open(OPERATIONS_DIRNAME, os.O_RDONLY | os.O_NOFOLLOW,
-                              dir_fd=root_fd)
-            except OSError as error:
-                if error.errno == errno.ELOOP:
-                    raise StoreBlocked("op_dir_symlink")
-                if error.errno == errno.ENOENT:
-                    # A store that has never held operations cannot hold
-                    # this operation either; callers map this to not-found.
-                    raise StoreBlocked("op_dir_unavailable")
-                raise StoreBlocked("op_dir_unreadable")
-            try:
-                st = os.fstat(dfd)
-                if not stat.S_ISDIR(st.st_mode):
-                    raise StoreBlocked("op_dir_not_directory")
-                if st.st_uid != self.euid:
-                    raise StoreBlocked("op_dir_owner")
-                if not stat.S_IMODE(st.st_mode) == 0o700:
-                    raise StoreBlocked("op_dir_permission")
-            except StoreBlocked:
-                os.close(dfd)
-                raise
+        except StoreBlocked:
+            os.close(root_fd)
+            raise
+        except OSError:
+            os.close(root_fd)
+            raise StoreBlocked("root_unavailable")
+        return root_fd
+
+    def _open_operations_from_root(self, root_fd):
+        try:
+            dfd = os.open(OPERATIONS_DIRNAME, os.O_RDONLY | os.O_NOFOLLOW,
+                          dir_fd=root_fd)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise StoreBlocked("op_dir_symlink")
+            if error.errno == errno.ENOENT:
+                # A store that has never held operations cannot hold this
+                # operation either; callers map this to not-found.
+                raise StoreBlocked("op_dir_unavailable")
+            raise StoreBlocked("op_dir_unreadable")
+        try:
+            st = os.fstat(dfd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise StoreBlocked("op_dir_not_directory")
+            if st.st_uid != self.euid:
+                raise StoreBlocked("op_dir_owner")
+            if not stat.S_IMODE(st.st_mode) == 0o700:
+                raise StoreBlocked("op_dir_permission")
+            identity = (st.st_dev, st.st_ino)
+            if (self._pinned_operations_identity is not None
+                    and identity != self._pinned_operations_identity):
+                raise StoreBlocked("op_dir_replaced")
+        except StoreBlocked:
+            os.close(dfd)
+            raise
+        except OSError:
+            os.close(dfd)
+            raise StoreBlocked("op_dir_unreadable")
+        return dfd
+
+    def _open_operations_dir(self):
+        """Open root and `operations/` by fd, enforcing a runner's pinned
+        directory identity when one is active on this store instance."""
+        root_fd = self._open_root_dir()
+        try:
+            return self._open_operations_from_root(root_fd)
         finally:
             os.close(root_fd)
-        return dfd
 
     def _open_lock_file(self, dfd, lock_name):
         """Open an advisory lock file (0600, O_NOFOLLOW) via the directory
@@ -696,9 +789,15 @@ class OperationStore:
         reopening the existing lock file."""
         try:
             try:
-                return os.open(lock_name,
-                               os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                               | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                fd = os.open(lock_name,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    os.close(fd)
+                    raise
+                return fd
             except OSError as error:
                 if error.errno != errno.EEXIST:
                     raise
@@ -732,44 +831,69 @@ class OperationStore:
         except StoreBlocked:
             os.close(lock_fd)
             raise
+        except OSError:
+            os.close(lock_fd)
+            raise StoreBlocked("operation_lock_unavailable")
         return lock_fd
 
     def acquire_run_lock(self, operation_id):
-        """Take the per-operation executor lock (`<id>.run`, flock EX,
-        non-blocking). Returns the lock handle while this process owns the
-        operation, or None when another live executor holds it. Held for
-        the whole runner invocation; kernel-released on process death, so
-        a crashed executor's ownership is reclaimed automatically and no
-        wall-clock lease exists. A single probe suffices: the holder keeps
-        the lock for its entire invocation, and flock hands ownership
-        atomically."""
-        dfd = self._open_operations_dir()
+        """Take the root-anchored per-operation executor lock.
+
+        The lock lives outside the replaceable `operations/` directory. The
+        directory identity observed here is pinned for every runner access,
+        so swapping the directory cannot fork ownership across lock inodes.
+        """
         try:
+            validate_operation_id(operation_id)
+        except ValueError:
+            raise OperationNotFound(operation_id)
+        root_fd = self._open_root_dir()
+        dfd = None
+        try:
+            dfd = self._open_operations_from_root(root_fd)
+            st = os.fstat(dfd)
+            identity = (st.st_dev, st.st_ino)
             name = self._record_name(operation_id)
             lock_fd = self._open_lock_file(
-                dfd, "%s.run" % name[: -len(".json")])
+                root_fd, ".operation-%s.run" % name[: -len(".json")])
         except StoreBlocked:
-            os.close(dfd)
+            if dfd is not None:
+                os.close(dfd)
+            os.close(root_fd)
             raise
+        except OSError:
+            if dfd is not None:
+                os.close(dfd)
+            os.close(root_fd)
+            raise StoreBlocked("operation_lock_unavailable")
         try:
             self._verify_lock_file(lock_fd)
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return (dfd, lock_fd)
+                self._pinned_operations_identity = identity
+                return (root_fd, dfd, lock_fd)
             except BlockingIOError:
                 os.close(lock_fd)
                 os.close(dfd)
+                os.close(root_fd)
                 return None
         except StoreBlocked:
             os.close(lock_fd)
             os.close(dfd)
+            os.close(root_fd)
             raise
+        except OSError:
+            os.close(lock_fd)
+            os.close(dfd)
+            os.close(root_fd)
+            raise StoreBlocked("operation_lock_unavailable")
 
-    @staticmethod
-    def release_run_lock(lock):
-        dfd, lock_fd = lock
+    def release_run_lock(self, lock):
+        root_fd, dfd, lock_fd = lock
+        self._pinned_operations_identity = None
         os.close(lock_fd)
         os.close(dfd)
+        os.close(root_fd)
 
     def _record_name(self, operation_id):
         validate_operation_id(operation_id)
@@ -783,19 +907,22 @@ class OperationStore:
                 raise StoreBlocked("operation_symlink")
             raise OperationNotFound(name[: -len(".json")])
         try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise StoreBlocked("operation_not_regular")
-            if st.st_uid != self.euid:
-                raise StoreBlocked("operation_owner")
-            if not stat.S_IMODE(st.st_mode) == 0o600:
-                raise StoreBlocked("operation_permission")
             with os.fdopen(fd, "r", encoding="utf-8") as f:
+                st = os.fstat(f.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    raise StoreBlocked("operation_not_regular")
+                if st.st_uid != self.euid:
+                    raise StoreBlocked("operation_owner")
+                if not stat.S_IMODE(st.st_mode) == 0o600:
+                    raise StoreBlocked("operation_permission")
                 payload = f.read()
-        except OSError:
+        except StoreBlocked:
+            raise
+        except (OSError, UnicodeError):
             raise StoreBlocked("operation_unreadable")
         try:
-            record = json.loads(payload)
+            record = json.loads(
+                payload, object_pairs_hook=_reject_duplicate_object_pairs)
         except (ValueError, UnicodeDecodeError):
             raise StoreBlocked("operation_unreadable")
         try:
@@ -897,6 +1024,8 @@ class OperationStore:
         advisory lock. A racing creator either loses (and idempotently
         returns the existing record, or is rejected with
         OperationIdConflict for different parameters) or wins."""
+        if not validate_record(record):
+            raise OperationError("invalid_operation_record", phase="runner")
         operation_id = record["operation_id"]
         validate_operation_id(operation_id)
         dfd = self._open_operations_dir()
@@ -1170,6 +1299,10 @@ def _cancel_checkpoint_transform(record):
         return False
     cancel_phase = record.get("cancel_phase")
     if cancel_phase and record["phase"] != cancel_phase:
+        if record["state"] in ("queued", "blocked"):
+            validate_state_transition(record["state"], "running")
+            record["state"] = "running"
+            record["error"] = None
         _append_event(record, "transition", state="running",
                       phase=cancel_phase)
         record["phase"] = cancel_phase
@@ -1196,12 +1329,14 @@ def _fail_unsupported_transform(record, claim):
     return True
 
 
-def _mark_terminal_transform(record, claim, phase, error, state):
+def _mark_step_error_transform(record, claim, phase, error, state):
     if record["phase"] != phase or record["state"] != "running":
         # A concurrent writer moved the operation; the loop re-evaluates
         # (re-application safety: never clobber a terminal state).
         return False
     _refresh_claim(record, claim)
+    if record["cancel_requested"] and is_cancelable(record):
+        return _cancel_checkpoint_transform(record)
     record["error"] = error.to_error_object()
     _append_event(record, "terminal", state=state, phase=phase,
                   outcome=state, error_code=error.code)
@@ -1250,8 +1385,8 @@ def _apply_step_result_transform(record, claim, phase, result):
     return True
 
 
-def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
-                      max_steps=None, retry_blocked=False, claim=None):
+def try_run_pending_steps(store, registry, operation_id, *, fault_hook=None,
+                          max_steps=None, retry_blocked=False, claim=None):
     """Execute pending work for one operation.
 
     The runner first takes the per-operation executor lock (`<id>.run`,
@@ -1280,7 +1415,8 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
     requires (spec: blocked is deterministic and never auto-retries; `wait`
     and any other observer never retry).
 
-    Returns the record when no more immediate work remains.
+    Returns `(record, acquired)`. `acquired` is False only when another
+    executor owns the run lock; callers must yield rather than retry-loop.
     """
     store.open()
     claim = claim or make_runner_claim()
@@ -1288,35 +1424,36 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
     if lock is None:
         # Another live executor holds the operation; yield without
         # executing (exclusive ownership).
-        return store.load(operation_id)
+        return store.load(operation_id), False
     try:
         steps_executed = 0
         while True:
             record = store.load(operation_id)
             if record["state"] in TERMINAL_STATES:
-                return record
+                return record, True
             if record["cancel_requested"] and is_cancelable(record):
                 record = store.mutate(operation_id,
                                       _cancel_checkpoint_transform)
                 if record["state"] == "cancelled":
-                    return record
+                    return record, True
                 # A cancel_phase was entered: continue so the compensation
                 # steps run before the terminal cancelled.
                 continue
             if record["state"] == "blocked" and not retry_blocked:
-                return record
+                return record, True
             if record["state"] in ("queued", "blocked"):
                 record = store.mutate(
                     operation_id, lambda r: _claim_and_start_transform(
                         r, claim, retry_blocked))
                 continue
             if max_steps is not None and steps_executed >= max_steps:
-                return record
+                return record, True
             spec = registry.get(record["type"])
             if spec is None:
-                return store.mutate(
+                record = store.mutate(
                     operation_id, lambda r: _fail_unsupported_transform(
                         r, claim))
+                return record, True
             phase = record["phase"]
             step_index = _step_index_in_phase(record, phase)
             try:
@@ -1328,19 +1465,34 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
             except SimulatedCrash:
                 raise
             except OperationBlocked as error:
-                store.mutate(operation_id, lambda r: _mark_terminal_transform(
-                    r, claim, phase, error, "blocked"))
-                return store.load(operation_id)
+                record = store.mutate(
+                    operation_id, lambda r: _mark_step_error_transform(
+                        r, claim, phase, error, "blocked"))
+                if record["state"] == "running":
+                    continue
+                return record, True
             except OperationFailed as error:
-                store.mutate(operation_id, lambda r: _mark_terminal_transform(
-                    r, claim, phase, error, "failed"))
-                return store.load(operation_id)
+                record = store.mutate(
+                    operation_id, lambda r: _mark_step_error_transform(
+                        r, claim, phase, error, "failed"))
+                if record["state"] == "running":
+                    continue
+                return record, True
             steps_executed += 1
             record = store.mutate(
                 operation_id, lambda r: _apply_step_result_transform(
                     r, claim, phase, result))
     finally:
         store.release_run_lock(lock)
+
+
+def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
+                      max_steps=None, retry_blocked=False, claim=None):
+    """Compatibility wrapper returning only the operation record."""
+    record, _ = try_run_pending_steps(
+        store, registry, operation_id, fault_hook=fault_hook,
+        max_steps=max_steps, retry_blocked=retry_blocked, claim=claim)
+    return record
 
 
 def wait_for_terminal(store, operation_id, *, poll_interval=0.25,

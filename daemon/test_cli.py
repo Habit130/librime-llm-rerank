@@ -8,6 +8,8 @@ temporary directories; the live Rime dir and the live facts root are never
 touched.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -379,6 +381,40 @@ class CliTest(unittest.TestCase):
         self.assertEqual(0, rc)
         record = OperationStore(self.root).load(op["operation_id"])
         self.assertEqual("staging", record["phase"])
+
+    def test_operation_run_yields_when_executor_lock_is_held(self):
+        op = self.create_op(operation_id="run-yield")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def pause(phase, step_index, point):
+            if point == "before_step":
+                entered.set()
+                release.wait(timeout=10)
+
+        holder = threading.Thread(target=run_pending_steps, args=(
+            OperationStore(self.root), self.registry(), op["operation_id"]),
+            kwargs={"fault_hook": pause})
+        holder.start()
+        entered.wait(timeout=10)
+
+        output = io.StringIO()
+        error = io.StringIO()
+        started = time.monotonic()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(
+                error):
+            rc = cli.main(["operation", "run", op["operation_id"]],
+                          registry=self.registry())
+        elapsed = time.monotonic() - started
+        self.assertEqual(0, rc)
+        self.assertLess(elapsed, 1.0)
+        self.assertIn("another executor", error.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(
+            self._tmp, "work", "preflight.count")))
+
+        release.set()
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
 
     def test_operation_run_does_not_auto_retry_blocked(self):
         op = self.create_op(operation_id="run-blocked")

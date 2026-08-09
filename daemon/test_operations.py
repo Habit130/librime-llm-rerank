@@ -32,6 +32,7 @@ from fixture_operations import (  # noqa: E402
 from operations import (  # noqa: E402
     OPERATION_VERSION,
     OperationBlocked,
+    OperationError,
     OperationFailed,
     OperationIdConflict,
     OperationNotFound,
@@ -654,8 +655,9 @@ class OperationEngineTest(unittest.TestCase):
         self.run_steps(record["operation_id"], max_steps=1)
 
         def plant_dead_claim(record):
-            record["runner_claim"] = {"pid": 999999999, "token": "dead",
-                                      "claimed_at": "now"}
+            record["runner_claim"] = make_runner_claim()
+            record["runner_claim"]["pid"] = 999999999
+            record["runner_claim"]["token"] = "dead"
             return True
 
         self.store().mutate(record["operation_id"], plant_dead_claim)
@@ -816,6 +818,88 @@ class OperationEngineTest(unittest.TestCase):
         self.assertEqual("ok", self.read_work("reopened.marker"))
         self.assertIsNone(self.read_work("published.marker"))
 
+    def test_queued_cancel_runs_reopen_seam(self):
+        registry = OperationRegistry()
+        registry.register(fixture_restore_spec())
+        record = create_operation(self.store(), registry, "fixture.restore",
+                                  {"work_dir": self.work})
+        _, disposition = cancel_operation(self.store(),
+                                          record["operation_id"])
+        self.assertEqual("requested", disposition)
+        final = run_pending_steps(self.store(), registry,
+                                  record["operation_id"])
+        self.assertEqual("cancelled", final["state"])
+        self.assertEqual("reopening", final["phase"])
+        self.assertEqual("ok", self.read_work("reopened.marker"))
+        self.assertIsNone(self.read_work("published.marker"))
+
+    def test_blocked_cancel_runs_reopen_seam_without_retry(self):
+        registry = OperationRegistry()
+        registry.register(fixture_restore_spec())
+        record = create_operation(self.store(), registry, "fixture.restore",
+                                  {"work_dir": self.work})
+        run_pending_steps(
+            self.store(), registry, record["operation_id"],
+            fault_hook=raising_hook(
+                lambda phase: OperationBlocked(phase=phase)))
+        _, disposition = cancel_operation(self.store(),
+                                          record["operation_id"])
+        self.assertEqual("requested", disposition)
+        final = run_pending_steps(self.store(), registry,
+                                  record["operation_id"])
+        self.assertEqual("cancelled", final["state"])
+        self.assertEqual("ok", self.read_work("reopened.marker"))
+
+    def test_cancel_wins_when_inflight_step_blocks(self):
+        record = self.create()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def block_after_cancel(phase, step_index, point):
+            if point == "before_step":
+                entered.set()
+                release.wait(timeout=10)
+                raise OperationBlocked(phase=phase)
+
+        holder = threading.Thread(target=lambda: self.run_steps(
+            record["operation_id"], fault_hook=block_after_cancel))
+        holder.start()
+        entered.wait(timeout=10)
+        _, disposition = cancel_operation(self.store(),
+                                          record["operation_id"])
+        self.assertEqual("requested", disposition)
+        release.set()
+        holder.join(timeout=10)
+        final = self.store().load(record["operation_id"])
+        self.assertEqual("cancelled", final["state"])
+        self.assertTrue(final["cancel_requested"])
+
+    def test_cancel_wins_when_restore_step_fails(self):
+        registry = OperationRegistry()
+        registry.register(fixture_restore_spec())
+        record = create_operation(self.store(), registry, "fixture.restore",
+                                  {"work_dir": self.work})
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fail_after_cancel(phase, step_index, point):
+            if phase == "preflight" and point == "before_step":
+                entered.set()
+                release.wait(timeout=10)
+                raise OperationFailed(phase=phase)
+
+        holder = threading.Thread(target=lambda: run_pending_steps(
+            self.store(), registry, record["operation_id"],
+            fault_hook=fail_after_cancel))
+        holder.start()
+        entered.wait(timeout=10)
+        cancel_operation(self.store(), record["operation_id"])
+        release.set()
+        holder.join(timeout=10)
+        final = self.store().load(record["operation_id"])
+        self.assertEqual("cancelled", final["state"])
+        self.assertEqual("ok", self.read_work("reopened.marker"))
+
     def test_operations_dir_swap_after_open_is_blocked(self):
         # The acceptance reproduction: replacing the operations directory
         # with a symlink after open() must not redirect access; the root
@@ -830,6 +914,51 @@ class OperationEngineTest(unittest.TestCase):
             self.store().load(self.store().list_ids()[0])
         self.assertEqual("op_dir_symlink", raised.exception.fault_code)
 
+    def test_run_lock_survives_operations_directory_replacement(self):
+        record = self.create()
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def pause_before_step(phase, step_index, point):
+            if point == "before_step":
+                entered.set()
+                release.wait(timeout=10)
+
+        def hold_old_directory():
+            try:
+                self.run_steps(record["operation_id"],
+                               fault_hook=pause_before_step, max_steps=1)
+            except OperationError as error:
+                errors.append(error.code)
+
+        holder = threading.Thread(target=hold_old_directory)
+        holder.start()
+        entered.wait(timeout=10)
+
+        operations_dir = os.path.join(self.root, "operations")
+        moved = os.path.join(self.root, "operations-old")
+        os.rename(operations_dir, moved)
+        os.makedirs(operations_dir, mode=0o700)
+        source = os.path.join(moved, "%s.json" % record["operation_id"])
+        target = os.path.join(operations_dir,
+                              "%s.json" % record["operation_id"])
+        shutil.copy2(source, target)
+        os.chmod(target, 0o600)
+
+        contender = threading.Thread(target=lambda: self.run_steps(
+            record["operation_id"], max_steps=1))
+        contender.start()
+        contender.join(timeout=2)
+        self.assertFalse(contender.is_alive())
+        self.assertIsNone(self.read_work("preflight.count"))
+
+        release.set()
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(["store_blocked"], errors)
+        self.assertEqual(1, len(self.read_work("preflight.count").split()))
+
     def test_validate_record_is_total_on_malformed_input(self):
         # The acceptance reproduction: malformed records must produce a
         # stable false, never a TypeError.
@@ -843,6 +972,9 @@ class OperationEngineTest(unittest.TestCase):
             dict(good, runner_claim={"pid": "x"}),
             dict(good, cancel_phase={"a": 1}),
             dict(good, progress={"events": "x"}),
+            dict(good, type=[]),
+            dict(good, cancel_requested="yes"),
+            dict(good, updated_at=0),
             dict(good, log=[{"event_version": 1, "seq": 1, "at": "x",
                              "kind": "terminal", "state": "running",
                              "phase": "preflight", "outcome": ["x"]}]),
@@ -852,6 +984,18 @@ class OperationEngineTest(unittest.TestCase):
         for bad in malformed:
             with self.subTest(record=bad):
                 self.assertFalse(validate_record(bad))
+
+    def test_create_rejects_invalid_record_before_publish(self):
+        record = new_operation("t", {}, list(FIXTURE_PHASES),
+                               FIXTURE_IRREVERSIBLE_PHASE,
+                               operation_id="invalid-create")
+        record["type"] = []
+        store = self.store()
+        store.open()
+        with self.assertRaises(OperationError):
+            store.create(record)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.root, "operations", "invalid-create.json")))
 
     def test_updated_at_advances_on_every_write(self):
         record = self.create()

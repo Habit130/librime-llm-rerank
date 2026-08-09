@@ -65,7 +65,7 @@ from operations import (  # noqa: E402
     make_runner_claim,
     operation_outcome_exit_code,
     public_record,
-    run_pending_steps,
+    try_run_pending_steps,
     wait_for_terminal,
 )
 
@@ -512,10 +512,17 @@ def _cmd_operation_run(args, paths):
         last_seq = len(record["log"])
         claim = make_runner_claim()
         while True:
-            record = run_pending_steps(
+            record, acquired = try_run_pending_steps(
                 store, args.registry, args.operation_id, claim=claim,
                 max_steps=1 if args.once else None,
                 retry_blocked=args.retry)
+            if not acquired:
+                current_claim = record.get("runner_claim") or {}
+                print("operation %s is being executed by another executor "
+                      "(pid %s); this invocation did not execute steps"
+                      % (args.operation_id, current_claim.get("pid")),
+                      file=sys.stderr)
+                return 0
             for entry in record["log"][last_seq:]:
                 print(_json_line(entry), flush=True)
                 last_seq = len(record["log"])
@@ -526,13 +533,6 @@ def _cmd_operation_run(args, paths):
                 break
     except OperationError as error:
         return _store_operation_error(error, "human")
-    current_claim = record.get("runner_claim") or {}
-    if (record["state"] not in ("succeeded", "failed", "cancelled")
-            and current_claim.get("pid") not in (None, os.getpid())):
-        print("operation %s is being executed by another process (pid %s); "
-              "this invocation did not execute steps"
-              % (args.operation_id, current_claim.get("pid")),
-              file=sys.stderr)
     if record["state"] in ("succeeded", "cancelled"):
         return 0
     if record["state"] in ("failed", "blocked"):
