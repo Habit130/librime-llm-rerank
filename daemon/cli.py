@@ -61,8 +61,10 @@ from operations import (  # noqa: E402
     OperationRegistry,
     OperationStore,
     cancel_operation,
+    claim_held_by_other,
     make_error,
     operation_outcome_exit_code,
+    public_record,
     run_pending_steps,
     wait_for_terminal,
 )
@@ -116,9 +118,11 @@ def build_parser():
     wait = op_sub.add_parser("wait", help="observe an operation until "
                                           "terminal; Ctrl-C only detaches")
     wait.add_argument("operation_id")
-    wait.add_argument("--json", action="store_true")
-    wait.add_argument("--json-lines", action="store_true",
-                      help="stream operation events as versioned JSON lines")
+    wait_mode = wait.add_mutually_exclusive_group()
+    wait_mode.add_argument("--json", action="store_true")
+    wait_mode.add_argument("--json-lines", action="store_true",
+                           help="stream operation events as versioned JSON "
+                                "lines")
     wait.set_defaults(handler=_cmd_operation_wait)
 
     cancel = op_sub.add_parser("cancel", help="request cancellation in "
@@ -127,9 +131,12 @@ def build_parser():
     cancel.add_argument("--json", action="store_true")
     cancel.set_defaults(handler=_cmd_operation_cancel)
 
+    # Internal executor entry point: deliberately hidden from the public
+    # help surface (documented as not a public interface).
     run = op_sub.add_parser(
-        "run", help="INTERNAL: execute pending steps for an operation "
-                    "(not a public interface)")
+        "run", help=argparse.SUPPRESS,
+        description="INTERNAL: execute pending steps for an operation "
+                    "(not a public interface).")
     run.add_argument("operation_id")
     run.add_argument("--once", action="store_true",
                      help="execute at most one step")
@@ -218,9 +225,14 @@ def _not_implemented_error(command):
         cause={"command": command})
 
 
-def _render_error(error, json_mode):
-    if json_mode:
-        print(_json_dump(error))
+def _render_error(error, mode):
+    """mode is "human", "json" or "json-lines". JSON Lines errors are a
+    single compact JSON document on one line, so a stream consumer never
+    sees multi-line pretty output or mixed formats."""
+    if mode == "json":
+        print(_json_dump(error), flush=True)
+    elif mode == "json-lines":
+        print(_json_line(error), flush=True)
     else:
         cause = error.get("cause")
         cause_text = "" if not cause else " (cause: %s)" % json.dumps(
@@ -235,8 +247,8 @@ def _operation_store(paths):
     return OperationStore(paths["semantic_memory_root"])
 
 
-def _store_operation_error(error, json_mode):
-    _render_error(error.to_error_object(), json_mode)
+def _store_operation_error(error, mode):
+    _render_error(error.to_error_object(), mode)
     return 2
 
 
@@ -294,19 +306,17 @@ def _cmd_status(args, paths):
                 }
     # Additive operation dimension (spec status contract): the latest
     # maintenance operation. Additive only; status_version stays 1. Status
-    # never creates the root (a pristine machine has no operations yet).
+    # never creates the root and never writes (a pristine machine has no
+    # operations yet).
     store = _operation_store(paths)
     operation_section = {"state": "unknown"}
     operation_fault = None
-    if os.path.isdir(paths["semantic_memory_root"]):
-        try:
-            store.open()
-        except OperationError as error:
-            operation_fault = error
-        else:
-            operation_section, operation_fault = _latest_operation(store)
+    try:
+        store.open(create=False)
+    except OperationError as error:
+        operation_fault = error
     else:
-        operation_section = None
+        operation_section, operation_fault = _latest_operation(store)
     if operation_fault is not None:
         operation_section = {"state": "unknown",
                              "error": operation_fault.to_error_object()}
@@ -410,11 +420,13 @@ def _print_operation_human(record):
 def _cmd_operation_show(args, paths):
     store = _operation_store(paths)
     try:
+        store.open(create=False)
         record = store.load(args.operation_id)
     except OperationError as error:
-        return _store_operation_error(error, args.json)
+        return _store_operation_error(
+            error, "json" if args.json else "human")
     if args.json:
-        print(_json_dump(record))
+        print(_json_dump(public_record(record)), flush=True)
     else:
         _print_operation_human(record)
     return 0
@@ -422,24 +434,26 @@ def _cmd_operation_show(args, paths):
 
 def _emit_wait_entry(entry, args):
     if args.json_lines:
-        print(_json_line(entry))
+        print(_json_line(entry), flush=True)
     elif not args.json:
-        print(_human_event_line(entry))
+        print(_human_event_line(entry), flush=True)
 
 
 def _cmd_operation_wait(args, paths):
     store = _operation_store(paths)
+    mode = "json-lines" if args.json_lines else (
+        "json" if args.json else "human")
     try:
-        store.open()
+        store.open(create=False)
         record = store.load(args.operation_id)
     except OperationError as error:
-        return _store_operation_error(error, args.json or args.json_lines)
+        return _store_operation_error(error, mode)
     if record["state"] not in ("queued", "running", "blocked"):
         # Already terminal: stream every event once, then report.
         for entry in record["log"]:
             _emit_wait_entry(entry, args)
         if args.json:
-            print(_json_dump(record))
+            print(_json_dump(public_record(record)), flush=True)
         return operation_outcome_exit_code(record["state"])
     try:
         final, outcome = wait_for_terminal(
@@ -453,7 +467,7 @@ def _cmd_operation_wait(args, paths):
               file=sys.stderr)
         return 130
     if args.json:
-        print(_json_dump(final))
+        print(_json_dump(public_record(final)), flush=True)
     return operation_outcome_exit_code(outcome)
 
 
@@ -462,7 +476,8 @@ def _cmd_operation_cancel(args, paths):
     try:
         record, disposition = cancel_operation(store, args.operation_id)
     except OperationError as error:
-        return _store_operation_error(error, args.json)
+        return _store_operation_error(
+            error, "json" if args.json else "human")
     payload = {
         "operation_version": OPERATION_VERSION,
         "operation_id": record["operation_id"],
@@ -471,7 +486,7 @@ def _cmd_operation_cancel(args, paths):
         "phase": record["phase"],
     }
     if args.json:
-        print(_json_dump(payload))
+        print(_json_dump(payload), flush=True)
     elif disposition == "requested":
         print("cancel requested for operation %s (state %s, phase %s)"
               % (record["operation_id"], record["state"], record["phase"]))
@@ -501,7 +516,7 @@ def _cmd_operation_run(args, paths):
                 max_steps=1 if args.once else None,
                 retry_blocked=args.retry)
             for entry in record["log"][last_seq:]:
-                print(_json_line(entry))
+                print(_json_line(entry), flush=True)
                 last_seq = len(record["log"])
             if record["state"] in ("succeeded", "failed", "blocked",
                                    "cancelled"):
@@ -509,7 +524,14 @@ def _cmd_operation_run(args, paths):
             if args.once:
                 break
     except OperationError as error:
-        return _store_operation_error(error, False)
+        return _store_operation_error(error, "human")
+    if (record["state"] not in ("succeeded", "failed", "cancelled")
+            and claim_held_by_other(record)):
+        print("operation %s is being executed by another process (pid %s); "
+              "this invocation did not execute steps"
+              % (args.operation_id,
+                 (record.get("runner_claim") or {}).get("pid")),
+              file=sys.stderr)
     if record["state"] in ("succeeded", "cancelled"):
         return 0
     if record["state"] in ("failed", "blocked"):
@@ -525,7 +547,7 @@ def _cmd_operation_run(args, paths):
 def _cmd_reserved(args, paths):
     command = _reserved_command_name(args)
     error = _not_implemented_error(command)
-    _render_error(error, getattr(args, "json", False))
+    _render_error(error, "json" if getattr(args, "json", False) else "human")
     return 2
 
 

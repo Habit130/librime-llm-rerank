@@ -13,9 +13,11 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -117,11 +119,42 @@ class OperationEngineTest(unittest.TestCase):
         self.assertIsNone(self.read_work("preflight.marker"))
 
     def test_fingerprint_is_deterministic_and_key_order_free(self):
-        a = parameters_fingerprint({"work_dir": "/x", "k": 1})
-        b = parameters_fingerprint({"k": 1, "work_dir": "/x"})
-        c = parameters_fingerprint({"work_dir": "/x", "k": 2})
+        a = parameters_fingerprint("t", {"work_dir": "/x", "k": 1})
+        b = parameters_fingerprint("t", {"k": 1, "work_dir": "/x"})
+        c = parameters_fingerprint("t", {"work_dir": "/x", "k": 2})
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
+
+    def test_fingerprint_includes_operation_type(self):
+        a = parameters_fingerprint("backup", {"output": "/x"})
+        b = parameters_fingerprint("clear", {"output": "/x"})
+        self.assertNotEqual(a, b)
+
+    def test_same_id_different_type_is_rejected(self):
+        from operations import OperationTypeSpec
+        other = OperationTypeSpec(
+            operation_type="fixture.other",
+            phases=FIXTURE_PHASES,
+            irreversible_phase=FIXTURE_IRREVERSIBLE_PHASE,
+            normalize=fixture_spec().normalize,
+            steps=fixture_spec().steps)
+        self.registry.register(other)
+        self.create(operation_id="type-1")
+        with self.assertRaises(OperationIdConflict):
+            create_operation(self.store(), self.registry, "fixture.other",
+                             self.params(), operation_id="type-1")
+
+    def test_operation_id_path_escape_is_rejected(self):
+        for evil in ("../evil", "a/b", "a/../../b", ".", "..", "a b",
+                     "a%2fb"):
+            with self.subTest(operation_id=evil):
+                with self.assertRaises(ValueError):
+                    self.create(operation_id=evil)
+                with self.assertRaises(OperationNotFound):
+                    self.store().load(evil)
+        # No record ever landed outside the operations directory.
+        outside = os.path.join(self._tmp, "evil.json")
+        self.assertFalse(os.path.exists(outside))
 
     def test_parameters_are_normalized(self):
         # Relative path -> absolute, NFC-normalized; int sleep -> float.
@@ -222,12 +255,37 @@ class OperationEngineTest(unittest.TestCase):
         self.assertFalse(validate_record(bad_state))
         bad_version = dict(good, operation_version=99)
         self.assertFalse(validate_record(bad_version))
-        non_monotonic = dict(good)
-        non_monotonic["log"] = [
-            {"event_version": 1, "seq": 5, "kind": "x"},
-            {"event_version": 1, "seq": 3, "kind": "x"},
+        no_rev = dict(good)
+        del no_rev["rev"]
+        self.assertFalse(validate_record(no_rev))
+        duplicate_phase = dict(good, phases=["preflight", "preflight"])
+        self.assertFalse(validate_record(duplicate_phase))
+        bad_claim = dict(good, runner_claim={"pid": "not-an-int"})
+        self.assertFalse(validate_record(bad_claim))
+
+    def test_validate_record_requires_contiguous_seq_from_one(self):
+        good = new_operation("t", {}, list(FIXTURE_PHASES),
+                             FIXTURE_IRREVERSIBLE_PHASE)
+        good["log"] = [
+            {"event_version": 1, "seq": 2, "at": "now", "kind": "transition",
+             "state": "running", "phase": "preflight"},
         ]
-        self.assertFalse(validate_record(non_monotonic))
+        self.assertFalse(validate_record(good))
+        good["log"] = [
+            {"event_version": 1, "seq": 1, "at": "now", "kind": "transition",
+             "state": "running", "phase": "preflight"},
+            {"event_version": 1, "seq": 3, "at": "now", "kind": "transition",
+             "state": "running", "phase": "preflight"},
+        ]
+        self.assertFalse(validate_record(good))
+        # Missing per-event fields are rejected too.
+        good["log"] = [{"seq": 1}]
+        self.assertFalse(validate_record(good))
+        # A malformed progress delta is rejected.
+        good["log"] = [{"event_version": 1, "seq": 1, "at": "now",
+                        "kind": "progress", "state": "running",
+                        "phase": "preflight", "progress": {"events": "x"}}]
+        self.assertFalse(validate_record(good))
 
     # -- full run -----------------------------------------------------------
 
@@ -352,9 +410,10 @@ class OperationEngineTest(unittest.TestCase):
         still = self.run_steps(record["operation_id"])
         self.assertEqual("blocked", still["state"])
         # The explicit retry (the fault being "fixed" by removing it)
-        # resumes and completes.
+        # resumes, completes, and clears the stale error.
         final = self.run_steps(record["operation_id"], retry_blocked=True)
         self.assertEqual("succeeded", final["state"])
+        self.assertIsNone(final["error"])
 
     def test_transient_error_fails_and_stays_terminal(self):
         record = self.create()
@@ -509,6 +568,140 @@ class OperationEngineTest(unittest.TestCase):
         self.assertEqual(1, operation_outcome_exit_code("blocked"))
         self.assertEqual(2, operation_outcome_exit_code(None))
 
+    def test_wait_returns_blocked_with_exit_one(self):
+        record = self.create()
+        self.run_steps(record["operation_id"],
+                       fault_hook=raising_hook(
+                           lambda phase: OperationBlocked(
+                               code="fixture_preflight_failed", phase=phase)))
+        final, outcome = wait_for_terminal(self.store(),
+                                           record["operation_id"])
+        self.assertEqual("blocked", outcome)
+        self.assertEqual("blocked", final["state"])
+        self.assertEqual(1, operation_outcome_exit_code(outcome))
+
+    # -- linearizability and executor ownership -----------------------------
+
+    def test_concurrent_cancel_is_not_lost(self):
+        # The exact reproduction from acceptance: a cancel lands while the
+        # executor is mid-step; the executor's next persist must not
+        # overwrite it. The gate freezes the runner inside its step so the
+        # cancel is guaranteed to be in flight.
+        record = self.create()
+        gate = threading.Event()
+
+        def gate_hook(phase, step_index, point):
+            if (phase, step_index, point) == ("preflight", 0, "before_step"):
+                gate.wait(timeout=10)
+
+        holder = threading.Thread(target=lambda: self.run_steps(
+            record["operation_id"], fault_hook=gate_hook))
+        holder.start()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            current = self.store().load(record["operation_id"])
+            if (current["state"] == "running"
+                    and current["phase"] == "preflight"
+                    and current["runner_claim"]):
+                break
+            time.sleep(0.01)
+        updated, disposition = cancel_operation(self.store(),
+                                                record["operation_id"])
+        self.assertEqual("requested", disposition)
+        gate.set()
+        holder.join(timeout=10)
+        final = self.store().load(record["operation_id"])
+        self.assertEqual("cancelled", final["state"])
+        self.assertTrue(final["cancel_requested"])
+        self.assertIsNone(self.read_work("published.marker"))
+
+    def test_second_executor_yields_to_live_claim(self):
+        # A subprocess executor holds the claim; a second executor in this
+        # process must yield without executing a single step, and the
+        # irreversible effect runs exactly once.
+        record = self.create(sleep_s=0.05)
+        runner = (
+            "import sys; sys.path.insert(0, %r);"
+            "from fixture_operations import fixture_spec;"
+            "from operations import (OperationRegistry, OperationStore,"
+            " run_pending_steps);"
+            "r = OperationRegistry(); r.register(fixture_spec());"
+            "run_pending_steps(OperationStore(%r), r, %r)"
+            % (os.path.dirname(__file__), self.root, record["operation_id"])
+        )
+        proc = subprocess.Popen([sys.executable, "-c", runner])
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            current = self.store().load(record["operation_id"])
+            if current["state"] == "running" and current["runner_claim"]:
+                break
+            time.sleep(0.02)
+        current = self.store().load(record["operation_id"])
+        self.assertEqual(proc.pid, current["runner_claim"]["pid"])
+        second = self.run_steps(record["operation_id"])
+        self.assertEqual("running", second["state"])
+        self.assertEqual(proc.pid, second["runner_claim"]["pid"])
+        proc.wait(timeout=20)
+        final = self.store().load(record["operation_id"])
+        self.assertEqual("succeeded", final["state"])
+        self.assertEqual(1, len(self.read_work("publish.count").split()))
+
+    def test_stale_claim_is_recovered_after_executor_crash(self):
+        record = self.create()
+        self.run_steps(record["operation_id"], max_steps=1)
+
+        def plant_dead_claim(record):
+            record["runner_claim"] = {"pid": 999999999, "token": "dead",
+                                      "claimed_at": "now"}
+            return True
+
+        self.store().mutate(record["operation_id"], plant_dead_claim)
+        final = self.run_steps(record["operation_id"])
+        self.assertEqual("succeeded", final["state"])
+        self.assertEqual(os.getpid(), final["runner_claim"]["pid"])
+
+    def test_racing_creates_do_not_overwrite(self):
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def worker(label):
+            barrier.wait()
+            try:
+                results[label] = create_operation(
+                    self.store(), self.registry, "fixture.maintenance",
+                    self.params(private_label=label),
+                    operation_id="race-1")
+            except OperationIdConflict:
+                results[label] = "conflict"
+
+        threads = [threading.Thread(target=worker, args=(label,))
+                   for label in ("A", "B")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        # Exactly one record exists; exactly one creator won and the loser
+        # was rejected (different parameters), never overwritten.
+        self.assertEqual(["race-1"], self.store().list_ids())
+        winners = [value for value in results.values()
+                   if value != "conflict"]
+        self.assertEqual(1, len(winners))
+        self.assertEqual(1, len([value for value in results.values()
+                                 if value == "conflict"]))
+        winner_label = "A" if results["A"] != "conflict" else "B"
+        self.assertEqual("race-1",
+                         results[winner_label]["operation_id"])
+
+    def test_repeated_runner_invocations_same_process_continue(self):
+        # The CLI's `operation run` loop and test stepping rely on a new
+        # invocation in the same process continuing the operation.
+        record = self.create()
+        self.run_steps(record["operation_id"], max_steps=1)
+        self.run_steps(record["operation_id"], max_steps=1)
+        final = self.run_steps(record["operation_id"])
+        self.assertEqual("succeeded", final["state"])
+        self.assertEqual(1, len(self.read_work("publish.count").split()))
+
     # -- security boundary --------------------------------------------------
 
     def test_store_dirs_and_files_are_owner_only(self):
@@ -544,6 +737,16 @@ class OperationEngineTest(unittest.TestCase):
         os.chmod(self.root, 0o755)
         with self.assertRaises(StoreBlocked) as raised:
             self.store().open()
+        self.assertEqual("root_permission", raised.exception.fault_code)
+
+    def test_loose_root_blocks_even_unopened_access(self):
+        # Every record access re-verifies the root; a caller that skips
+        # open() is still gated (the acceptance reproduction: show on a
+        # 0755 root must not read records).
+        self.create()
+        os.chmod(self.root, 0o755)
+        with self.assertRaises(StoreBlocked) as raised:
+            self.store().load(self.store().list_ids()[0])
         self.assertEqual("root_permission", raised.exception.fault_code)
 
     def test_operations_dir_symlink_refused(self):

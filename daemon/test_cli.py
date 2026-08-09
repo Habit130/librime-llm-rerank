@@ -230,6 +230,58 @@ class CliTest(unittest.TestCase):
         self.assertIn("retryable", error)
         self.assertIn("remediation", error)
 
+    def test_show_enforces_store_security(self):
+        # A loose-permission root must block every data command, including
+        # show (the acceptance reproduction).
+        op = self.create_op(operation_id="loose-root")
+        os.chmod(self.root, 0o755)
+        rc, out, _ = self.run_cli("operation", "show", "loose-root", "--json")
+        self.assertEqual(2, rc)
+        error = json.loads(out)
+        self.assertEqual("store_blocked", error["code"])
+        self.assertEqual("root_permission",
+                         error["cause"]["fault_code"])
+
+    def test_show_path_escape_is_not_found(self):
+        rc, out, _ = self.run_cli("operation", "show", "../evil", "--json")
+        self.assertEqual(2, rc)
+        self.assertEqual("operation_not_found", json.loads(out)["code"])
+        self.assertFalse(os.path.exists(os.path.join(self._tmp, "evil.json")))
+
+    def test_wait_blocked_operation_exits_one(self):
+        # `blocked` is a waitable outcome: wait must return with exit 1 so
+        # the operator can fix the cause and explicitly retry, never poll
+        # forever.
+        op = self.create_op(operation_id="blocked-wait")
+        self.run_op(op["operation_id"], fault_hook=self._block_hook())
+        rc, out, _ = self.run_cli("operation", "wait",
+                                  op["operation_id"])
+        self.assertEqual(1, rc)
+        self.assertIn("terminal: blocked", out)
+
+    def test_wait_json_lines_error_is_single_line(self):
+        # Errors on a JSON Lines stream are exactly one compact JSON
+        # document on one line, never pretty-printed across many lines.
+        rc, out, _ = self.run_cli("operation", "wait", "nope",
+                                  "--json-lines")
+        self.assertEqual(2, rc)
+        lines = out.splitlines()
+        self.assertEqual(1, len(lines))
+        error = json.loads(lines[0])
+        self.assertEqual("operation_not_found", error["code"])
+        self.assertEqual(1, error["error_version"])
+
+    def test_wait_json_and_json_lines_are_mutually_exclusive(self):
+        rc, _, _ = self.run_cli("operation", "wait", "x", "--json",
+                                "--json-lines")
+        self.assertEqual(2, rc)
+
+    def test_operation_run_is_not_in_public_help(self):
+        rc, out, _ = self.run_cli("operation", "--help")
+        self.assertEqual(0, rc)
+        self.assertNotIn("execute pending steps", out)
+        self.assertNotIn("operation run", out)
+
     def test_wait_on_succeeded_operation_exit_zero(self):
         op = self.create_op()
         self.run_op(op["operation_id"])
@@ -421,6 +473,7 @@ class CliTest(unittest.TestCase):
         op = self.create_op(operation_id="priv-1")
         self.run_op(op["operation_id"])
         for args in (("operation", "show", "priv-1"),
+                     ("operation", "show", "priv-1", "--json"),
                      ("operation", "wait", "priv-1"),
                      ("operation", "wait", "priv-1", "--json-lines"),
                      ("operation", "cancel", "priv-1", "--json"),
@@ -431,17 +484,18 @@ class CliTest(unittest.TestCase):
                 self.assertNotIn(MARKER, err, args)
                 self.assertNotIn("上文", out, args)
                 self.assertNotIn("候选", out, args)
-        # The record JSON legitimately carries the parameters (the
-        # idempotency credential), but never in the log/result/error.
+        # The sanitized JSON snapshot never carries the parameters (the
+        # idempotency credential stays inside the owner-only store); only
+        # the fingerprint is reportable.
         rc, out, _ = self.run_cli("operation", "show", "priv-1", "--json")
         record = json.loads(out)
-        self.assertIn(MARKER, json.dumps(record["parameters"],
-                                         ensure_ascii=False))
-        self.assertNotIn(MARKER, json.dumps(record["log"],
+        self.assertNotIn("parameters", record)
+        self.assertIn("parameters_fingerprint", record)
+        # The persisted record's log/result/error stay clean too.
+        persisted = OperationStore(self.root).load("priv-1")
+        self.assertNotIn(MARKER, json.dumps(persisted["log"],
                                             ensure_ascii=False))
-        self.assertNotIn(MARKER, json.dumps(record["result"],
-                                            ensure_ascii=False))
-        self.assertNotIn(MARKER, json.dumps(record["error"],
+        self.assertNotIn(MARKER, json.dumps(persisted["result"],
                                             ensure_ascii=False))
 
     # -- security -----------------------------------------------------------
