@@ -76,7 +76,7 @@ def _work_dir(record):
     return work_dir
 
 
-def _step_preflight(record, ctx):
+def _step_preflight(record):
     _sleep(record)
     work_dir = _work_dir(record)
     marker = os.path.join(work_dir, "preflight.marker")
@@ -86,7 +86,7 @@ def _step_preflight(record, ctx):
     return {"progress": {"events": 1}, "advance": True}
 
 
-def _step_staging(record, ctx):
+def _step_staging(record):
     _sleep(record)
     work_dir = _work_dir(record)
     chunks = record["progress"].get("chunks") or 0
@@ -100,7 +100,7 @@ def _step_staging(record, ctx):
     return {"progress": {"chunks": 1, "events": 1}, "advance": True}
 
 
-def _step_publishing(record, ctx):
+def _step_publishing(record):
     _sleep(record)
     work_dir = _work_dir(record)
     marker = os.path.join(work_dir, "published.marker")
@@ -116,7 +116,7 @@ def _step_publishing(record, ctx):
     return {"progress": {"bytes": size}, "advance": True}
 
 
-def _step_cleanup(record, ctx):
+def _step_cleanup(record):
     _sleep(record)
     work_dir = _work_dir(record)
     marker = os.path.join(work_dir, "cleanup.marker")

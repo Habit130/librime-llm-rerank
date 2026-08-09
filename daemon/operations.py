@@ -34,15 +34,19 @@ Design contract (spec #43 "长操作、进度与幂等", "错误协议", "权限
   and error codes. It never stores 上文, candidate text, embeddings or other
   private input (parameters are stored once for the idempotency comparison,
   never echoed into log entries or error objects).
-- The operations directory and files are owner-only (0700 / 0600); symlinks,
-  foreign owners, loose permissions and root/sudo execution are refused.
+- The operations directory and files are owner-only (0700 / 0600), access
+  is anchored to the operations directory fd (no symlink or path swap can
+  redirect it), symlinks, foreign owners, loose permissions and root/sudo
+  execution are refused.
 """
 
+import errno
 import hashlib
 import json
 import os
 import stat
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -86,6 +90,7 @@ _STABLE_MESSAGES = {
                               "condition",
     "not_implemented": "this command is reserved by the spec and not "
                        "implemented in this build",
+    "unknown_schema": "no deployed schema matches the filter",
     "fixture_preflight_failed": "fixture preflight failed (test-only)",
 }
 
@@ -271,8 +276,6 @@ REQUIRED_RECORD_FIELDS = (
     "progress", "result", "error", "log",
 )
 
-FINGERPRINT_PARAMETERS = 1
-
 
 def parameters_fingerprint(normalized_parameters):
     """Deterministic hash of the canonical parameter JSON."""
@@ -386,30 +389,24 @@ def _exact_mode(path, mode):
         return False
 
 
-def _fsync_dir(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 class OperationStore:
     """Directory-backed operation persistence.
 
     One JSON record per operation under `<root>/operations/`, written
-    atomically (temp file in the same directory -> fsync -> rename ->
-    directory fsync). Reads open with O_NOFOLLOW and verify owner and exact
-    mode, so a symlink swap or a foreign-owner file is refused. The store
-    holds no in-memory state: every call re-reads the record, which is what
-    makes the runner crash-recoverable by construction.
+    atomically (temp file -> fsync -> rename -> directory fsync). Record
+    access is anchored to a directory fd opened with O_NOFOLLOW (all reads
+    and renames pass dir_fd), so a concurrent swap of the operations
+    directory or of a record path cannot redirect an access; the final
+    component is additionally opened with O_NOFOLLOW. Owner and exact mode
+    (0700 dir / 0600 file) are verified per access. The store holds no
+    in-memory state: every call re-reads the record, which is what makes
+    the runner crash-recoverable by construction.
     """
 
     def __init__(self, root_dir, euid=None):
         self.root_dir = root_dir
         self.euid = os.geteuid() if euid is None else euid
         self.operations_dir = os.path.join(root_dir, OPERATIONS_DIRNAME)
-        self._opened = False
 
     def open(self):
         """Verify/create the root and operations directory with owner-only
@@ -447,32 +444,65 @@ class OperationStore:
                 raise StoreBlocked("op_dir_permission")
         else:
             os.makedirs(self.operations_dir, mode=0o700)
-        self._opened = True
         return self
 
-    def _record_path(self, operation_id):
-        return os.path.join(self.operations_dir, "%s.json" % operation_id)
-
-    def _read_record(self, operation_id):
-        path = self._record_path(operation_id)
+    def _open_operations_dir(self):
+        """Open the operations directory by fd, refusing symlinks. All
+        record reads/writes anchor to this fd, so path swaps after the open
+        cannot redirect them."""
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
-            if os.path.islink(path):
-                raise StoreBlocked("operation_symlink")
-            raise OperationNotFound(operation_id)
+            fd = os.open(self.operations_dir, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise StoreBlocked("op_dir_symlink")
+            raise StoreBlocked("op_dir_unavailable")
         try:
             st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise StoreBlocked("operation_not_regular")
+            if not stat.S_ISDIR(st.st_mode):
+                raise StoreBlocked("op_dir_not_directory")
             if st.st_uid != self.euid:
-                raise StoreBlocked("operation_owner")
-            if not stat.S_IMODE(st.st_mode) == 0o600:
-                raise StoreBlocked("operation_permission")
-            with os.fdopen(fd, "r", encoding="utf-8") as f:
-                payload = f.read()
-        except OSError:
-            raise StoreBlocked("operation_unreadable")
+                raise StoreBlocked("op_dir_owner")
+            if not stat.S_IMODE(st.st_mode) == 0o700:
+                raise StoreBlocked("op_dir_permission")
+        except StoreBlocked:
+            os.close(fd)
+            raise
+        return fd
+
+    def _record_name(self, operation_id):
+        return "%s.json" % operation_id
+
+    def _read_record(self, operation_id):
+        try:
+            dfd = self._open_operations_dir()
+        except StoreBlocked as error:
+            if error.fault_code == "op_dir_unavailable":
+                # A store that has never held operations cannot have this
+                # operation either.
+                raise OperationNotFound(operation_id)
+            raise
+        try:
+            name = self._record_name(operation_id)
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    raise StoreBlocked("operation_symlink")
+                raise OperationNotFound(operation_id)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise StoreBlocked("operation_not_regular")
+                if st.st_uid != self.euid:
+                    raise StoreBlocked("operation_owner")
+                if not stat.S_IMODE(st.st_mode) == 0o600:
+                    raise StoreBlocked("operation_permission")
+                with os.fdopen(fd, "r", encoding="utf-8") as f:
+                    payload = f.read()
+            except OSError:
+                raise StoreBlocked("operation_unreadable")
+        finally:
+            os.close(dfd)
         try:
             record = json.loads(payload)
         except (ValueError, UnicodeDecodeError):
@@ -485,31 +515,38 @@ class OperationStore:
 
     def _write_record(self, record, operation_id):
         """Atomic persist: temp file (0600, O_NOFOLLOW) -> fsync -> rename
-        -> directory fsync. A crash at any point leaves the previous complete
-        record (or no record for a fresh create) in place."""
-        path = self._record_path(operation_id)
-        tmp = "%s.tmp-%d-%s" % (path, os.getpid(), uuid.uuid4().hex[:8])
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                     | os.O_NOFOLLOW, 0o600)
+        -> directory fsync, all relative to the operations directory fd. A
+        crash at any point leaves the previous complete record (or no
+        record for a fresh create) in place."""
+        dfd = self._open_operations_dir()
         try:
-            os.fchmod(fd, 0o600)
-            payload = json.dumps(record, ensure_ascii=False, indent=2)
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        try:
-            os.rename(tmp, path)
-        except OSError:
+            name = self._record_name(operation_id)
+            tmp = "%s.tmp-%d-%s" % (name, os.getpid(), uuid.uuid4().hex[:8])
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
             try:
-                os.unlink(tmp)
+                os.fchmod(fd, 0o600)
+                payload = json.dumps(record, ensure_ascii=False, indent=2)
+                os.write(fd, payload.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
             except OSError:
-                pass
-            raise
-        _fsync_dir(self.operations_dir)
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def exists(self, operation_id):
-        return os.path.isfile(self._record_path(operation_id))
+        return os.path.isfile(
+            os.path.join(self.operations_dir,
+                         self._record_name(operation_id)))
 
     def create(self, record):
         operation_id = record["operation_id"]
@@ -553,7 +590,7 @@ class OperationTypeSpec:
     Later tickets (#54/#55/#57/#68) register their types here; #52 ships no
     production type. `normalize` returns the canonical parameter dict that is
     persisted (and fingerprinted) for the idempotency comparison; a step
-    returns a dict with any of:
+    receives the current record and returns a dict with any of:
 
       progress: delta of real units {events|bytes|chunks: int}
       advance:  True to move to the recorded successor phase
@@ -562,7 +599,9 @@ class OperationTypeSpec:
 
     A step may raise OperationBlocked (deterministic -> blocked), Operation
     Failed (transient -> failed) or SimulatedCrash (test seam: abort without
-    persisting anything).
+    persisting anything). Steps must be idempotent by construction; the
+    irreversible-publish pattern is to check the persistent artifact the
+    step itself created before creating it.
     """
 
     def __init__(self, operation_type, phases, irreversible_phase,
@@ -696,7 +735,7 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
         try:
             if fault_hook is not None:
                 fault_hook(phase, step_index, "before_step")
-            result = spec.steps[phase](record, _StepContext(store))
+            result = spec.steps[phase](record)
             if fault_hook is not None:
                 fault_hook(phase, step_index, "after_step")
         except SimulatedCrash:
@@ -742,14 +781,6 @@ def run_pending_steps(store, registry, operation_id, *, fault_hook=None,
         record = store.update(record)
 
 
-class _StepContext:
-    """Handed to step functions; carries the store for steps that need
-    cross-operation state (future tickets: locks, quarantine, manifests)."""
-
-    def __init__(self, store):
-        self.store = store
-
-
 def wait_for_terminal(store, operation_id, *, poll_interval=0.25,
                       timeout_s=None, emit=None):
     """Observe an operation until it reaches a terminal state.
@@ -762,7 +793,6 @@ def wait_for_terminal(store, operation_id, *, poll_interval=0.25,
     last_seq = 0
     deadline = None
     if timeout_s is not None:
-        import time
         deadline = time.monotonic() + timeout_s
     while True:
         record = store.load(operation_id)
@@ -773,11 +803,8 @@ def wait_for_terminal(store, operation_id, *, poll_interval=0.25,
                 last_seq = entry["seq"]
         if record["state"] in TERMINAL_STATES:
             return record, record["state"]
-        if deadline is not None:
-            import time
-            if time.monotonic() >= deadline:
-                return record, None
-        import time
+        if deadline is not None and time.monotonic() >= deadline:
+            return record, None
         time.sleep(poll_interval)
 
 

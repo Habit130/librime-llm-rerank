@@ -61,6 +61,7 @@ from operations import (  # noqa: E402
     OperationRegistry,
     OperationStore,
     cancel_operation,
+    make_error,
     operation_outcome_exit_code,
     run_pending_steps,
     wait_for_terminal,
@@ -74,12 +75,6 @@ DEFAULT_ROOT = os.path.expanduser(
 DEFAULT_RIME_DIR = os.path.expanduser("~/Library/Rime")
 DEFAULT_DAEMON_SOCKET = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock")
-
-# Reserved maintenance command surface (spec #43): parsed, never executed.
-RESERVED_COMMANDS = (
-    "backup create", "backup verify", "restore", "clear", "rebuild",
-    "quarantine list", "quarantine purge",
-)
 
 
 def default_paths():
@@ -138,6 +133,8 @@ def build_parser():
     run.add_argument("operation_id")
     run.add_argument("--once", action="store_true",
                      help="execute at most one step")
+    run.add_argument("--retry", action="store_true",
+                     help="explicitly retry a blocked operation")
     run.set_defaults(handler=_cmd_operation_run)
 
     # -- reserved maintenance commands (spec #43 contract surface) --------
@@ -214,7 +211,6 @@ def _json_line(payload):
 
 
 def _not_implemented_error(command):
-    from operations import make_error
     return make_error(
         "not_implemented", phase="cli",
         remediation="this command is reserved by the spec and not "
@@ -240,10 +236,7 @@ def _operation_store(paths):
 
 
 def _store_operation_error(error, json_mode):
-    if isinstance(error, OperationError):
-        _render_error(error.to_error_object(), json_mode)
-    else:
-        _render_error(_not_implemented_error("internal"), json_mode)
+    _render_error(error.to_error_object(), json_mode)
     return 2
 
 
@@ -252,17 +245,23 @@ def _store_operation_error(error, json_mode):
 # ---------------------------------------------------------------------------
 
 def _latest_operation(store):
+    """Latest operation by creation time plus the first load fault, so a
+    corrupt/symlinked/loose-permission record is reported instead of being
+    silently skipped."""
     operation_ids = store.list_ids()
     latest = None
+    fault = None
     for operation_id in operation_ids:
         try:
             record = store.load(operation_id)
-        except OperationError:
+        except OperationError as error:
+            if fault is None:
+                fault = error
             continue
         if latest is None or record["created_at"] > latest["created_at"]:
             latest = record
     if latest is None:
-        return None
+        return None, fault
     return {
         "operation_id": latest["operation_id"],
         "type": latest["type"],
@@ -270,7 +269,7 @@ def _latest_operation(store):
         "phase": latest["phase"],
         "created_at": latest["created_at"],
         "updated_at": latest["updated_at"],
-    }
+    }, fault
 
 
 def _cmd_status(args, paths):
@@ -286,10 +285,8 @@ def _cmd_status(args, paths):
                     "status_version": status_core.STATUS_VERSION,
                     "generated_at": report["generated_at"],
                     "snapshot_ok": False,
-                    "error": {
-                        "code": "unknown_schema",
-                        "message": "no deployed schema matches the filter",
-                    },
+                    "error": make_error("unknown_schema", phase="cli",
+                                        cause={"schema": args.schema}),
                     "schemas": [],
                     "facts": report["facts"],
                     "serving": report["serving"],
@@ -300,19 +297,24 @@ def _cmd_status(args, paths):
     # never creates the root (a pristine machine has no operations yet).
     store = _operation_store(paths)
     operation_section = {"state": "unknown"}
+    operation_fault = None
     if os.path.isdir(paths["semantic_memory_root"]):
         try:
             store.open()
         except OperationError as error:
-            operation_section["error"] = error.to_error_object()
+            operation_fault = error
         else:
-            operation_section = _latest_operation(store)
+            operation_section, operation_fault = _latest_operation(store)
     else:
         operation_section = None
+    if operation_fault is not None:
+        operation_section = {"state": "unknown",
+                             "error": operation_fault.to_error_object()}
     report["operation"] = operation_section
     exit_code = status_core.compute_exit_code(report)
     if (isinstance(operation_section, dict)
-            and operation_section.get("state") in ("failed", "blocked")):
+            and (operation_section.get("state") in ("failed", "blocked")
+                 or "error" in operation_section)):
         exit_code = max(exit_code, 1)
     report["exit_code"] = exit_code
     if args.json:
@@ -496,7 +498,8 @@ def _cmd_operation_run(args, paths):
         while True:
             record = run_pending_steps(
                 store, args.registry, args.operation_id,
-                max_steps=1 if args.once else None, retry_blocked=True)
+                max_steps=1 if args.once else None,
+                retry_blocked=args.retry)
             for entry in record["log"][last_seq:]:
                 print(_json_line(entry))
                 last_seq = len(record["log"])
@@ -511,6 +514,7 @@ def _cmd_operation_run(args, paths):
         return 0
     if record["state"] in ("failed", "blocked"):
         return 1
+    # running with --once: work was done, more remains; nothing is wrong.
     return 0
 
 

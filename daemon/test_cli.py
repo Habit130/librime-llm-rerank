@@ -185,6 +185,19 @@ class CliTest(unittest.TestCase):
         self.assertEqual("blocked", report["operation"]["state"])
         self.assertEqual(1, report["exit_code"])
 
+    def test_status_unreadable_operation_store_is_exit_one(self):
+        self.write_schema()
+        op = self.create_op()
+        record_path = os.path.join(self.root, "operations", "%s.json"
+                                   % op["operation_id"])
+        os.chmod(record_path, 0o644)
+        rc, out, _ = self.run_cli("status", "--json")
+        self.assertEqual(1, rc)
+        report = json.loads(out)
+        self.assertEqual("unknown", report["operation"]["state"])
+        self.assertEqual("operation_permission",
+                         report["operation"]["error"]["cause"]["fault_code"])
+
     def _cancel(self, operation_id):
         rc, out, err = self.run_cli("operation", "cancel", operation_id,
                                     "--json")
@@ -314,6 +327,22 @@ class CliTest(unittest.TestCase):
         self.assertEqual(0, rc)
         record = OperationStore(self.root).load(op["operation_id"])
         self.assertEqual("staging", record["phase"])
+
+    def test_operation_run_does_not_auto_retry_blocked(self):
+        op = self.create_op(operation_id="run-blocked")
+        self.run_op(op["operation_id"], fault_hook=self._block_hook())
+        # A plain run must NOT retry a deterministic blocked operation.
+        rc = cli.main(["operation", "run", op["operation_id"]],
+                      registry=self.registry())
+        self.assertEqual(1, rc)
+        record = OperationStore(self.root).load(op["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        # The explicit --retry is the operator's retry after the fix.
+        rc = cli.main(["operation", "run", "--retry", op["operation_id"]],
+                      registry=self.registry())
+        self.assertEqual(0, rc)
+        record = OperationStore(self.root).load(op["operation_id"])
+        self.assertEqual("succeeded", record["state"])
 
     # -- Ctrl-C detach ------------------------------------------------------
 
