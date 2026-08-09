@@ -458,7 +458,8 @@ class StatusCoreTest(unittest.TestCase):
                          facts["fact_high_water"])
         # Last write = max(commit time 1002, retraction time 2000).
         self.assertEqual(2000, facts["last_write_at_ms"])
-        self.assertEqual("unknown", facts["recording_gaps"])
+        # No recording_gap.json exists: provably no known missing events.
+        self.assertEqual({"state": "none"}, facts["recording_gaps"])
         self.assertEqual(0, report["exit_code"])
 
     def test_facts_not_created_is_zero_evidence_not_fault(self):
@@ -642,6 +643,101 @@ class StatusCoreTest(unittest.TestCase):
             "evidence": {"state": "off", "reason": None},
         }}}]
         self.assertEqual(1, compute_exit_code(report))
+
+    # -- persistent recording gaps (#53) --------------------------------------
+
+    def write_gap_record(self, content):
+        """Writes recording_gap.json as the C++ plugin does (atomic, 0600)."""
+        path = os.path.join(self.facts_root, "recording_gap.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(path, 0o600)
+
+    def test_persistent_gap_is_reported_and_degrades_exit_code(self):
+        self.canonical_schema()
+        self.write_facts()
+        self.write_gap_record(
+            '{"gap_version":"1","reason":"buffer_overflow_batches",'
+            '"dropped_batches":3,"dropped_events":5,"buffer_bytes":2048,'
+            '"first_occurred_at_ms":1700000000000,'
+            '"last_occurred_at_ms":1700000001000,'
+            '"store_epoch":"epoch-1"}\n')
+        report = self.report()
+        gaps = report["facts"]["recording_gaps"]
+        self.assertEqual("present", gaps["state"])
+        self.assertEqual(3, gaps["dropped_batches"])
+        self.assertEqual(5, gaps["dropped_events"])
+        self.assertEqual("buffer_overflow_batches", gaps["reason"])
+        # A provable recording gap forces exit code 1 (spec exit-code rule).
+        self.assertEqual(1, report["exit_code"])
+        # The human rendering names the gap; only stable codes, counts and
+        # the store epoch (a UUID) appear, never raw text.
+        text = render_human(report)
+        self.assertIn("recording gaps", text)
+        self.assertEqual("epoch-1", gaps["store_epoch"])
+
+    def test_gap_privacy_markers_never_leak_into_output(self):
+        self.canonical_schema()
+        self.write_facts()
+        self.write_gap_record(
+            '{"gap_version":"1","reason":"buffer_overflow_batches",'
+            '"dropped_batches":1,"dropped_events":1,"buffer_bytes":1,'
+            '"first_occurred_at_ms":1,"last_occurred_at_ms":1,'
+            '"store_epoch":"epoch-1"}\n')
+        report = self.report()
+        rendered = json.dumps(report, ensure_ascii=False)
+        for marker in ("PRIVATE_上文", "PRIVATE_候选", "PRIVATE_输入",
+                       "世界", "shijie", "cand-0", "prev-0"):
+            self.assertNotIn(marker, rendered)
+        self.assertNotIn("PRIVATE", render_human(report))
+
+    def test_malformed_gap_record_is_unknown_not_zero_evidence(self):
+        self.canonical_schema()
+        self.write_facts()
+        self.write_gap_record("not-json\n")
+        report = self.report()
+        gaps = report["facts"]["recording_gaps"]
+        self.assertEqual("unknown", gaps["state"])
+        self.assertEqual("gap_record_invalid", gaps["fault_code"])
+
+    def test_gap_record_with_wrong_mode_is_unknown(self):
+        self.canonical_schema()
+        self.write_facts()
+        self.write_gap_record('{"gap_version":"1","reason":"x",'
+                              '"dropped_batches":1,"dropped_events":1,'
+                              '"buffer_bytes":1,"first_occurred_at_ms":1,'
+                              '"last_occurred_at_ms":1,"store_epoch":""}\n')
+        os.chmod(os.path.join(self.facts_root, "recording_gap.json"), 0o644)
+        report = self.report()
+        self.assertEqual("unknown",
+                         report["facts"]["recording_gaps"]["state"])
+
+    def test_no_gap_file_is_provable_none_not_unknown(self):
+        self.canonical_schema()
+        self.write_facts()
+        report = self.report()
+        self.assertEqual({"state": "none"},
+                         report["facts"]["recording_gaps"])
+        self.assertEqual(0, report["exit_code"])
+
+    def test_exclusive_maintenance_lock_degrades_facts_read(self):
+        # While the exclusive lock is held the status cannot prove the
+        # facts: it must report degraded maintenance_in_progress, never
+        # zero evidence, and exit 1.
+        import fcntl
+        self.canonical_schema()
+        self.write_facts()
+        lock_path = os.path.join(self.facts_root, "maintenance.lock")
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            report = self.report()
+            self.assertEqual("degraded", report["facts"]["health"])
+            self.assertEqual("maintenance_in_progress",
+                             report["facts"]["fault_code"])
+            self.assertEqual(1, report["exit_code"])
+        finally:
+            os.close(fd)
 
 
 if __name__ == "__main__":

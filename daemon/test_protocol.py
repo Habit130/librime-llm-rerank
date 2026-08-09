@@ -284,6 +284,19 @@ class ProtocolTest(unittest.TestCase):
         self.assertNotIn("candidate-a", str(response))
         self.assertNotIn("first-stage-base-v1", str(response["error"]))
 
+    def test_control_shaped_request_is_rejected_by_scoring_endpoint(self):
+        # The control protocol never rides the scoring socket: a control
+        # request (kind + operation_id, no baseline_policy_id) is an
+        # invalid scoring request.
+        control_request = {
+            "version": 1,
+            "kind": "prepare_maintenance",
+            "operation_id": "op-1",
+        }
+        response = handle_request(
+            FakeState(), encode(control_request))
+        self.assert_protocol_error(response, "invalid_request")
+
     def test_score_count_mismatch_is_not_emitted_as_success(self):
         response = handle_request(FakeState(result=[1.0]), encode(request()))
         self.assert_protocol_error(response, "score_count_mismatch")

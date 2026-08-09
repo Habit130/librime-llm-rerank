@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -37,6 +38,56 @@ from operations import (  # noqa: E402
 DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(DAEMON_DIR, "squirrel-semantic-memory")
 MARKER = "PRIVATE_MARKER_上文_候选_embedding_%s" % "cli_secret"
+
+FACT_DDL = """
+CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+CREATE TABLE commits (
+  commit_id TEXT PRIMARY KEY NOT NULL,
+  utc_committed_at_ms INTEGER NOT NULL);
+CREATE TABLE selection_events (
+  event_id TEXT PRIMARY KEY NOT NULL,
+  commit_id TEXT NOT NULL REFERENCES commits(commit_id),
+  event_format_version INTEGER NOT NULL,
+  schema_id TEXT NOT NULL,
+  canonical_segment_input TEXT NOT NULL,
+  span_start INTEGER NOT NULL,
+  span_end INTEGER NOT NULL,
+  category TEXT NOT NULL,
+  preceding_text TEXT NOT NULL,
+  competition_complete INTEGER NOT NULL,
+  final_selection_text TEXT NOT NULL,
+  confirmation_source TEXT NOT NULL,
+  trigger_keycode INTEGER,
+  display_rank INTEGER NOT NULL,
+  display_page INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  session_seq INTEGER NOT NULL,
+  hlc_physical_ms INTEGER NOT NULL,
+  hlc_logical INTEGER NOT NULL,
+  utc_confirmed_at_ms INTEGER NOT NULL,
+  utc_committed_at_ms INTEGER NOT NULL);
+CREATE TABLE selection_candidates (
+  event_id TEXT NOT NULL REFERENCES selection_events(event_id),
+  merge_order INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  PRIMARY KEY (event_id, merge_order));
+CREATE TABLE retractions (
+  retraction_id TEXT PRIMARY KEY NOT NULL,
+  commit_id TEXT NOT NULL REFERENCES commits(commit_id),
+  hlc_physical_ms INTEGER NOT NULL,
+  hlc_logical INTEGER NOT NULL,
+  utc_retracted_at_ms INTEGER NOT NULL);
+CREATE VIEW active_events AS
+  SELECT e.event_id, e.commit_id, e.event_format_version, e.schema_id,
+    e.canonical_segment_input, e.span_start, e.span_end, e.category,
+    e.preceding_text, e.competition_complete, e.final_selection_text,
+    e.confirmation_source, e.trigger_keycode, e.display_rank, e.display_page,
+    e.session_id, e.session_seq, e.hlc_physical_ms, e.hlc_logical,
+    e.utc_confirmed_at_ms, e.utc_committed_at_ms
+  FROM selection_events e
+  WHERE NOT EXISTS (SELECT 1 FROM retractions r
+                    WHERE r.commit_id = e.commit_id);
+"""
 
 SCHEMA = {
     "schema": {"schema_id": "alpha"},
@@ -146,6 +197,51 @@ class CliTest(unittest.TestCase):
         report = json.loads(out)
         self.assertFalse(report["snapshot_ok"])
         self.assertEqual("unknown_schema", report["error"]["code"])
+
+    def test_status_persistent_gap_is_exit_one_json_and_human(self):
+        self.write_schema()
+        facts_root = self.root
+        os.makedirs(facts_root)
+        os.chmod(facts_root, 0o700)
+        db_path = os.path.join(facts_root, "facts.sqlite3")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(FACT_DDL)
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("fact_schema_version", "1"))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("event_format_version", "1"))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("history_id", "history-1"))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("store_epoch", "epoch-1"))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("hlc_physical_ms", "1000"))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("hlc_logical", "0"))
+        conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)",
+                     ("created_at_ms", "900"))
+        conn.commit()
+        conn.close()
+        os.chmod(db_path, 0o600)
+        gap_path = os.path.join(facts_root, "recording_gap.json")
+        with open(gap_path, "w", encoding="utf-8") as f:
+            f.write('{"gap_version":"1","reason":"shutdown_unpersisted",'
+                    '"dropped_batches":2,"dropped_events":2,'
+                    '"buffer_bytes":0,"first_occurred_at_ms":1,'
+                    '"last_occurred_at_ms":1,"store_epoch":"epoch-1"}\n')
+        os.chmod(gap_path, 0o600)
+        rc, out, _ = self.run_cli("status", "--json")
+        self.assertEqual(1, rc)
+        report = json.loads(out)
+        gaps = report["facts"]["recording_gaps"]
+        self.assertEqual("present", gaps["state"])
+        self.assertEqual(2, gaps["dropped_batches"])
+        rc, out, _ = self.run_cli("status")
+        self.assertEqual(1, rc)
+        self.assertIn("recording gaps", out)
+        # No dropped content ever leaks into CLI output.
+        self.assertNotIn("cand", out)
+        self.assertNotIn("prev", out)
 
     def test_status_blocked_facts_is_exit_one(self):
         self.write_schema()

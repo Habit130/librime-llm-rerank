@@ -56,15 +56,19 @@ from datetime import datetime, timezone
 
 import yaml
 
+from maintenance_lock import MaintenanceLock, MaintenanceLockError
+
 STATUS_VERSION = 1
 NAMESPACE = "llm_rerank"
 SWITCH_KEYS = ("reranking_enabled", "recording_enabled", "evidence_enabled")
 LEGACY_KEY = "enable"
 FACT_DB_FILENAME = "facts.sqlite3"
+GAP_FILENAME = "recording_gap.json"
 FACT_SCHEMA_VERSION = 1
 DEFAULT_GAMMA = 2.0
 DEFAULT_ALPHA = 0.0
 HEALTH_DEADLINE_SECONDS = 2.0
+FACTS_READ_LOCK_TIMEOUT_MS = 2000
 
 
 def _now_iso():
@@ -168,8 +172,61 @@ def _exact_mode(path, mode):
         return False
 
 
+def _read_recording_gap(facts_root):
+    """Reads the persistent recording-gap record (written by the C++ plugin
+    as recording_gap.json, 0600). Returns a section describing the gap state:
+
+      none    — no record exists (no known missing events)
+      present — a valid record with real dropped counts
+      unknown — a record exists but cannot be proven (malformed / wrong
+                owner or mode)
+
+    The record carries only stable codes, counts and timestamps — never
+    上文, candidate text or embeddings.
+    """
+    gap_path = os.path.join(facts_root, GAP_FILENAME)
+    if not os.path.lexists(gap_path):
+        return {"state": "none"}
+    try:
+        st = os.lstat(gap_path)
+    except OSError:
+        return {"state": "unknown", "fault_code": "gap_record_unreadable"}
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return {"state": "unknown", "fault_code": "gap_record_invalid"}
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        return {"state": "unknown", "fault_code": "gap_record_invalid"}
+    try:
+        with open(gap_path, encoding="utf-8") as f:
+            record = json.load(f)
+        dropped_batches = record.get("dropped_batches")
+        dropped_events = record.get("dropped_events")
+        reason = record.get("reason")
+        epoch = record.get("store_epoch")
+        if (not isinstance(dropped_batches, int)
+                or not isinstance(dropped_events, int)
+                or not isinstance(reason, str)
+                or not reason):
+            return {"state": "unknown", "fault_code": "gap_record_invalid"}
+        return {
+            "state": "present",
+            "dropped_batches": dropped_batches,
+            "dropped_events": dropped_events,
+            "reason": reason,
+            "first_occurred_at": _iso(record.get("first_occurred_at_ms")),
+            "last_occurred_at": _iso(record.get("last_occurred_at_ms")),
+            "store_epoch": epoch or None,
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"state": "unknown", "fault_code": "gap_record_invalid"}
+
+
 def _read_facts(facts_root):
     """Read the fact store state without ever writing to it.
+
+    The read holds the shared maintenance lock (bounded wait): while the
+    exclusive maintenance lock is held the facts cannot be proven and are
+    reported degraded with `maintenance_in_progress`, never as zero
+    evidence.
 
     Returns a dict with health, fault_code and the provable facts fields.
     `not_created` means no store exists yet: pristine zero-evidence state,
@@ -210,6 +267,24 @@ def _read_facts(facts_root):
     if not _exact_mode(db_path, 0o600):
         return _facts_section(observed_at, "blocked", "db_permission")
 
+    # The read is provable only under the shared maintenance lock (spec:
+    # "daemon 离线时 CLI 在共享锁下读取事实库"); an exclusive maintenance
+    # holder means the facts are temporarily unavailable, not absent.
+    lock = MaintenanceLock(facts_root)
+    try:
+        guard = lock.shared(timeout_ms=FACTS_READ_LOCK_TIMEOUT_MS)
+    except MaintenanceLockError:
+        return _facts_section(observed_at, "degraded",
+                              "maintenance_in_progress")
+    try:
+        return _read_facts_locked(facts_root, db_path, observed_at)
+    finally:
+        guard.close()
+
+
+def _read_facts_locked(facts_root, db_path, observed_at):
+    """The lock-holding half of _read_facts; also reads the persistent
+    recording-gap record so the whole facts section is one consistent view."""
     try:
         conn = sqlite3.connect(
             f"file:{db_path}?mode=ro", uri=True, timeout=2.0
@@ -269,7 +344,7 @@ def _read_facts(facts_root):
             (ms for ms in (last_commit_ms, last_retraction_ms) if ms),
             default=None,
         )
-        return {
+        section = {
             "observed_at": observed_at,
             "health": "healthy",
             "fault_code": None,
@@ -286,10 +361,12 @@ def _read_facts(facts_root):
             },
             "last_write_at_ms": last_write,
             "last_write_at": _iso(last_write),
-            # Recording gaps are session-local and not yet persisted; the
-            # status cannot prove them from disk.
-            "recording_gaps": "unknown",
+            # Persistent recording gaps (Habit130/squirrel#53): the plugin
+            # persists buffer overflow / store fault / shutdown leftovers as
+            # recording_gap.json; a valid record means known missing events.
+            "recording_gaps": _read_recording_gap(facts_root),
         }
+        return section
     finally:
         conn.close()
 
@@ -587,9 +664,16 @@ _STABLE_MESSAGES = {
 
 def compute_exit_code(report):
     """0 healthy (intentional off / suppressed / zero evidence included);
-    1 some enabled duty degraded/blocked/unknown; 2 snapshot not formed."""
+    1 some enabled duty degraded/blocked/unknown, or a provable persistent
+    recording gap; 2 snapshot not formed."""
     if not report.get("snapshot_ok", False):
         return 2
+    facts = report.get("facts", {})
+    gaps = facts.get("recording_gaps")
+    if isinstance(gaps, dict) and gaps.get("state") == "present":
+        # A known missing slice of history is a recording gap (spec exit
+        # code 1), never zero evidence.
+        return 1
     for entry in report.get("schemas", []):
         duties = entry["config"]["runtime_effective"]
         for duty in ("reranking", "recording", "evidence"):
@@ -642,6 +726,17 @@ def render_human(report):
             else ""
         )
     )
+    gaps = facts.get("recording_gaps")
+    if isinstance(gaps, dict) and gaps.get("state") == "present":
+        lines.append(
+            f"recording gaps: {gaps['dropped_batches']} batches / "
+            f"{gaps['dropped_events']} events lost (reason "
+            f"{gaps['reason']})"
+        )
+    elif isinstance(gaps, dict) and gaps.get("state") == "unknown":
+        lines.append(
+            "recording gaps: unknown (%s)" % gaps.get("fault_code", "unknown")
+        )
     serving = report.get("serving", {})
     serving_line = f"serving: {serving.get('state', 'unknown')}"
     if serving.get("state") == "up":

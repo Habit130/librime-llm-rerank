@@ -429,6 +429,8 @@ def protocol_error(
         "token_attribution_failed": "candidate token attribution failed",
         "policy_mismatch": "plan policy does not match the daemon scoring mode",
         "server_error": "scoring transport failed",
+        "maintenance_in_progress": "the daemon is quiesced for maintenance; "
+                                   "scoring is temporarily unavailable",
     }
     response = {
         "version": PROTOCOL_VERSION,
@@ -636,7 +638,52 @@ def handle_request(state, data):
     }
 
 
-def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False):
+def serve_connection(state, coordinator, conn):
+    """Serves one scoring connection.
+
+    `coordinator` may be None (tests and single-purpose servers): request
+    tracking and the maintenance quiesce gate are then skipped. While the
+    coordinator is preparing/prepared, new scoring requests are refused with
+    `maintenance_in_progress` — stale derived state never serves a request.
+    """
+    conn.settimeout(5.0)
+    data = read_request(conn)
+    if data is None:
+        return
+    request_id = None
+    try:
+        request_id = json.loads(data).get("request_id")
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    if coordinator is not None and not coordinator.begin_request(request_id):
+        resp = protocol_error(
+            "maintenance_in_progress",
+            phase="maintenance",
+            retryable=True,
+            request_id=request_id if isinstance(request_id, str) else None,
+            plan_identity=None,
+        )
+        try:
+            conn.sendall(
+                (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
+            )
+        except OSError:
+            pass
+        return
+    try:
+        resp = handle_request(state, data)
+    finally:
+        if coordinator is not None:
+            coordinator.end_request(request_id)
+    try:
+        conn.sendall(
+            (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
+        )
+    except OSError:
+        pass
+
+
+def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit_mb=CACHE_LIMIT_MB, scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False, control_socket=None, facts_root=None):
     import mlx.core as mx
 
     if cache_limit_mb > 0:
@@ -648,12 +695,26 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
     last_activity = time.time()
     lock = threading.Lock()
 
+    # Maintenance coordination (#53): the control socket and the quiesce
+    # lease live next to the scoring socket. `coordinator` stays None when
+    # no facts root is configured (single-purpose/test servers).
+    coordinator = None
+    control_server = None
+    if control_socket and facts_root:
+        from coordinator import MaintenanceCoordinator
+
+        coordinator = MaintenanceCoordinator(facts_root)
+        from control import run_control_server
+
+        control_server = run_control_server(control_socket, coordinator)
+
     os.makedirs(os.path.dirname(sock_path), exist_ok=True)
     if os.path.exists(sock_path):
         os.unlink(sock_path)
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock_path)
+    os.chmod(sock_path, 0o600)
     srv.listen(5)
     srv.settimeout(1.0)
 
@@ -680,18 +741,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
             except socket.timeout:
                 continue
             try:
-                conn.settimeout(5.0)
-                data = read_request(conn)
-                if data is not None:
-                    with lock:
-                        last_activity = time.time()
-                    resp = handle_request(state, data)
-                    with lock:
-                        last_activity = time.time()
-                    conn.sendall(
-                        (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
-                    )
-            except socket.timeout:
+                serve_connection(state, coordinator, conn)
+            except (socket.timeout, TimeoutError):
                 try:
                     conn.sendall(
                         (
@@ -728,6 +779,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW, cache_limit
         pass
     finally:
         srv.close()
+        if control_server is not None:
+            control_server["stop"]()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
@@ -841,6 +894,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--test", action="store_true")
+    parser.add_argument(
+        "--control-socket",
+        help="owner-only private control socket (maintenance quiesce); "
+             "enabled together with --facts-root",
+    )
+    parser.add_argument(
+        "--facts-root",
+        help="facts root for the maintenance coordinator (control socket "
+             "peer UID verification and last-fact-HLC reporting)",
+    )
     args = parser.parse_args()
 
     if args.context_window < 1:
@@ -855,5 +918,6 @@ if __name__ == "__main__":
     else:
         run_server(
             args.socket, args.model, args.context_window, args.cache_limit_mb,
-            args.scoring, test_mode=True
+            args.scoring, test_mode=True, control_socket=args.control_socket,
+            facts_root=args.facts_root
         )
