@@ -13,6 +13,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     switch_config_test.cc
     fact_store_test.cc
     recorder_e2e_test.cc
+    recorder_coordinator_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
   target_link_libraries(llm_rerank_test
     ${rime_library}

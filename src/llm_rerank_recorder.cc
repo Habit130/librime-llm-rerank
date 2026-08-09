@@ -76,9 +76,15 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
               << " schema=" << schema_id;
     session_->fault_code = "";
   } else {
-    session_->store = std::make_unique<FactStore>(FactStore::DefaultRootDir());
-    FactStore::Status status = session_->store->Open();
-    if (status != FactStore::Status::kOk) {
+    // The process-wide coordinator persists (or buffers) every commit batch
+    // under the maintenance lock; the recorder itself never owns a SQLite
+    // connection. The eager probe reports deterministic store faults so
+    // recording stops before the first commit, without auto-relaxing.
+    coordinator_ = RecorderCoordinator::Instance();
+    session_->coordinator = coordinator_;
+    FactStore::Status status = coordinator_->VerifyStore();
+    if (status != FactStore::Status::kOk &&
+        FactStore::IsFatalStatus(status)) {
       session_->fault_code = FactStore::StatusCode(status);
       LOG(WARNING) << "llm_rerank recorder: code=recording_disabled"
                    << " reason=" << session_->fault_code
@@ -145,7 +151,7 @@ ProcessResult LlmRerankRecorder::ProcessKeyEvent(const KeyEvent& key_event) {
 }
 
 void LlmRerankRecorder::OnSelect(Context* ctx) {
-  if (!session_ || !session_->store)
+  if (!session_ || !coordinator_)
     return;
   if (!ctx)
     return;
@@ -235,7 +241,7 @@ void LlmRerankRecorder::OnSelect(Context* ctx) {
 }
 
 void LlmRerankRecorder::OnCommit(Context* ctx) {
-  if (!session_ || !session_->store)
+  if (!session_ || !coordinator_)
     return;
   if (!ctx || session_->pending.empty()) {
     // A commit with no tentative events (plain text, auto-selection) still
@@ -273,13 +279,6 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
             [](const PendingEvent& a, const PendingEvent& b) {
               return a.confirm_seq < b.confirm_seq;
             });
-  if (!session_->store->is_open()) {
-    ReportGap(session_->fault_code.empty() ? "store_unavailable"
-                                           : session_->fault_code.c_str());
-    session_->pending.clear();
-    retraction_armed_ = false;
-    return;
-  }
   vector<FactStore::Event> events;
   events.reserve(valid.size());
   for (const auto& pending : valid) {
@@ -307,9 +306,17 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
     }
     events.push_back(std::move(event));
   }
-  string commit_id;
-  if (!session_->store->PersistBatch(NowMs(), &events, &commit_id)) {
-    ReportGap(FactStore::StatusCode(session_->store->status()));
+  // The coordinator persists the whole batch synchronously when the shared
+  // maintenance lock is free, and buffers it whole while the exclusive lock
+  // is held — the commit never waits on maintenance. A commit_id is assigned
+  // either way so the immediate-undo window can reference the batch.
+  RecorderCoordinator::SubmitResult result =
+      coordinator_->SubmitBatch(NowMs(), &events);
+  if (result.outcome == RecorderCoordinator::Outcome::kGap) {
+    if (result.fatal)
+      session_->fault_code = result.fault_code;
+    ReportGap(result.fault_code.empty() ? "store_unavailable"
+                                        : result.fault_code.c_str());
     session_->pending.clear();
     retraction_armed_ = false;
     return;
@@ -317,8 +324,9 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
   for (const auto& pending : valid) {
     session_->pending.erase(pending.segment_start);
   }
-  // Arm the immediate-undo window for the whole batch just persisted.
-  retraction_commit_id_ = commit_id;
+  // Arm the immediate-undo window for the whole batch just persisted (or
+  // buffered): the commit_id is stable in both cases.
+  retraction_commit_id_ = result.commit_id;
   retraction_armed_ = true;
   UpdateStatusProperties();
 }
@@ -346,17 +354,21 @@ void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
     return;  // press-only: the confirming key's release must not trigger
   if (!retraction_pending_ || !retraction_armed_)
     return;
-  if (!session_ || !session_->store)
+  if (!session_ || !coordinator_)
     return;
   retraction_pending_ = false;
   retraction_armed_ = false;
-  if (!session_->store->is_open()) {
-    ReportGap(session_->fault_code.empty() ? "store_unavailable"
-                                           : session_->fault_code.c_str());
-    return;
-  }
-  if (!session_->store->AppendRetraction(retraction_commit_id_, NowMs())) {
-    ReportGap(FactStore::StatusCode(session_->store->status()));
+  // Whole-commit retraction. When the exclusive maintenance lock is held the
+  // retraction is queued behind the batch it targets (never cancels it
+  // early, never retracts an earlier commit); the coordinator flushes both
+  // in order once maintenance ends.
+  RecorderCoordinator::SubmitResult result =
+      coordinator_->SubmitRetraction(retraction_commit_id_, NowMs());
+  if (result.outcome == RecorderCoordinator::Outcome::kGap) {
+    if (result.fatal)
+      session_->fault_code = result.fault_code;
+    ReportGap(result.fault_code.empty() ? "store_unavailable"
+                                        : result.fault_code.c_str());
     return;
   }
   LOG(INFO) << "llm_rerank recorder: code=retracted_commit"

@@ -22,6 +22,9 @@
 #include <rime/key_table.h>
 #include <sqlite3.h>
 
+#include "maintenance_lock.h"
+#include "recorder_session.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -2390,6 +2393,120 @@ TEST_F(RecorderE2ETest, UserDictCandidateCompetesInWordGroupAndWins) {
   EXPECT_EQ("石阶", candidates[0].second);
   EXPECT_EQ("世界", candidates[1].second);
   EXPECT_EQ("时界", candidates[2].second);
+  sqlite3_close(db);
+}
+
+// ---------------------------------------------------------------------------
+// #53: maintenance quiesce — commits and immediate undo during the exclusive
+// maintenance window are buffered whole, never block, and flush in order
+// once maintenance releases, without any new user input.
+// ---------------------------------------------------------------------------
+
+TEST_F(RecorderE2ETest, CommitDuringMaintenanceBuffersAndFlushesAfterRelease) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  // Maintenance takes the exclusive lock (the session's recorder already
+  // created the store and the lock file at 0600).
+  rime::MaintenanceLock lock(FactsRoot());
+  ASSERT_EQ(rime::MaintenanceLock::Status::kOk, lock.TryAcquireExclusive());
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  // The commit completes immediately even though maintenance is exclusive.
+  EXPECT_EQ("时界", CommitText(session));
+
+  // Nothing hit the disk while the exclusive lock was held (the batch is in
+  // the process-wide buffer).
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+
+  // Maintenance finishes: the buffered batch lands with no further input.
+  lock.Release();
+  int64_t deadline = rime::NowMs() + 5000;
+  while (rime::NowMs() < deadline) {
+    db = OpenFactsDb();
+    ASSERT_TRUE(db != nullptr);
+    ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+    sqlite3_close(db);
+    if (count >= 1)
+      break;
+    usleep(20000);
+  }
+  EXPECT_EQ(1LL, count);
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  EventRow event;
+  ASSERT_TRUE(ReadEvent(db, &event));
+  EXPECT_EQ("时界", event.final_selection_text);
+  EXPECT_EQ("explicit_indexed", event.confirmation_source);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, UnhandledBackspaceOnBufferedBatchRetractsWholeCommit) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  rime::MaintenanceLock lock(FactsRoot());
+  ASSERT_EQ(rime::MaintenanceLock::Status::kOk, lock.TryAcquireExclusive());
+
+  // Commit a selection while maintenance is exclusive: the whole batch
+  // buffers, and the immediate-undo window arms against the buffered
+  // commit id.
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  // The immediate BackSpace is not handled by the engine (composition is
+  // empty) and must retract the buffered commit, never an earlier one.
+  EXPECT_FALSE(g_rime->process_key(session, XK_BackSpace, 0));
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  // Nothing on disk yet (both the batch and its retraction are buffered).
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(0LL, count);
+  sqlite3_close(db);
+
+  lock.Release();
+  int64_t deadline = rime::NowMs() + 5000;
+  long long retractions = -1;
+  while (rime::NowMs() < deadline) {
+    db = OpenFactsDb();
+    ASSERT_TRUE(db != nullptr);
+    ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM retractions;",
+                           &retractions));
+    sqlite3_close(db);
+    if (retractions >= 1)
+      break;
+    usleep(20000);
+  }
+
+  // The commit and its retraction both landed, in order: the batch is
+  // retracted whole (no partial undo, no orphan events), and the original
+  // facts are untouched.
+  db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM commits;", &count));
+  EXPECT_EQ(1LL, count);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;",
+                         &count));
+  EXPECT_EQ(1LL, count);
+  EXPECT_EQ(1LL, retractions);
+  std::vector<rime::FactStore::Event> active;
+  rime::FactStore store(FactsRoot());
+  ASSERT_TRUE(store.QueryActiveEventsAsOf(rime::NowMs() + 1000000, 0,
+                                          &active));
+  EXPECT_TRUE(active.empty());
   sqlite3_close(db);
 }
 

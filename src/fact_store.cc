@@ -37,6 +37,43 @@ bool IsExactMode(const struct stat& st, mode_t mode) {
   return (st.st_mode & 0777) == mode;
 }
 
+// Maps a maintenance-lock status to the store status vocabulary (the lock
+// file lives in the facts root, so its faults are store faults). The mapping
+// is 1:1 so diagnostics keep the specific stable code.
+FactStore::Status LockFaultToStoreStatus(MaintenanceLock::Status status) {
+  switch (status) {
+    case MaintenanceLock::Status::kNoHome:
+      return FactStore::Status::kNoHome;
+    case MaintenanceLock::Status::kRootCreateFailed:
+      return FactStore::Status::kRootCreateFailed;
+    case MaintenanceLock::Status::kRootNotDirectory:
+      return FactStore::Status::kRootNotDirectory;
+    case MaintenanceLock::Status::kRootSymlink:
+      return FactStore::Status::kRootSymlink;
+    case MaintenanceLock::Status::kRootOwner:
+      return FactStore::Status::kRootOwner;
+    case MaintenanceLock::Status::kRootPermission:
+      return FactStore::Status::kRootPermission;
+    case MaintenanceLock::Status::kLockSymlink:
+      return FactStore::Status::kLockSymlink;
+    case MaintenanceLock::Status::kLockNotRegular:
+      return FactStore::Status::kLockNotRegular;
+    case MaintenanceLock::Status::kLockOwner:
+      return FactStore::Status::kLockOwner;
+    case MaintenanceLock::Status::kLockPermission:
+      return FactStore::Status::kLockPermission;
+    case MaintenanceLock::Status::kLockOpenFailed:
+      return FactStore::Status::kLockOpenFailed;
+    case MaintenanceLock::Status::kLockTimeout:
+      return FactStore::Status::kLockTimeout;
+    case MaintenanceLock::Status::kMaintenanceLocked:
+      return FactStore::Status::kMaintenanceLocked;
+    case MaintenanceLock::Status::kOk:
+      return FactStore::Status::kOk;
+  }
+  return FactStore::Status::kLockOpenFailed;
+}
+
 // Creates each missing ancestor of `dir` with mode 0700, bottom-up, so the
 // facts root can be established under a freshly provisioned HOME without
 // touching any pre-existing directory.
@@ -55,81 +92,6 @@ bool CreateAncestors(const path& dir) {
   }
   return true;
 }
-
-}  // namespace
-
-path FactStore::DefaultRootDir() {
-  const char* home = getenv("HOME");
-  if (!home)
-    return path();
-  return path(home) / "Library" / "Application Support" / "Squirrel" /
-         "SemanticMemory";
-}
-
-FactStore::FactStore(const path& root_dir) : root_(root_dir) {}
-
-FactStore::~FactStore() {
-  if (db_) {
-    sqlite3_close(db_);
-    db_ = nullptr;
-  }
-}
-
-FactStore::Status FactStore::VerifyRoot() {
-  if (root_.empty())
-    return Status::kNoHome;
-  struct stat st;
-  if (lstat(root_.c_str(), &st) != 0) {
-    if (errno != ENOENT)
-      return Status::kRootNotDirectory;
-    if (!CreateAncestors(root_))
-      return Status::kRootCreateFailed;
-    if (lstat(root_.c_str(), &st) != 0)
-      return Status::kRootCreateFailed;
-  }
-  if (S_ISLNK(st.st_mode))
-    return Status::kRootSymlink;
-  if (!S_ISDIR(st.st_mode))
-    return Status::kRootNotDirectory;
-  if (st.st_uid != getuid())
-    return Status::kRootOwner;
-  if (!IsExactMode(st, kDirMode))
-    return Status::kRootPermission;
-  return Status::kOk;
-}
-
-FactStore::Status FactStore::VerifyDbFile() {
-  path db_path = root_ / kDbFileName;
-  struct stat st;
-  if (lstat(db_path.c_str(), &st) != 0) {
-    if (errno == ENOENT)
-      return Status::kOk;
-    return Status::kDbNotRegular;
-  }
-  if (S_ISLNK(st.st_mode))
-    return Status::kDbSymlink;
-  if (!S_ISREG(st.st_mode))
-    return Status::kDbNotRegular;
-  if (st.st_uid != getuid())
-    return Status::kDbOwner;
-  if (!IsExactMode(st, kFileMode))
-    return Status::kDbPermission;
-  return Status::kOk;
-}
-
-bool FactStore::EnsureFileModes() {
-  path db_path = root_ / kDbFileName;
-  bool ok = chmod(db_path.c_str(), kFileMode) == 0;
-  for (const char* suffix : {"-wal", "-shm"}) {
-    path sidecar = root_ / (string(kDbFileName) + suffix);
-    if (access(sidecar.c_str(), F_OK) == 0) {
-      ok = chmod(sidecar.c_str(), kFileMode) == 0 && ok;
-    }
-  }
-  return ok;
-}
-
-namespace {
 
 // Runs one statement that produces no rows (or whose rows are irrelevant),
 // returning the sqlite result code.
@@ -173,9 +135,33 @@ bool QueryQuickCheck(sqlite3* db, bool* ok) {
   return got_row;
 }
 
-}  // namespace
+// Reads a single meta row; returns false when the key is missing or has a
+// non-text value.
+bool ReadMetaText(sqlite3* db, const char* key, string* value) {
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql = "SELECT value FROM meta WHERE key = ?;";
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
+  if (ok) {
+    const unsigned char* text = sqlite3_column_text(stmt, 0);
+    *value = text ? reinterpret_cast<const char*>(text) : string();
+  }
+  sqlite3_finalize(stmt);
+  return ok;
+}
 
-namespace {
+bool ParseInt64(const string& text, int64_t* value) {
+  if (text.empty())
+    return false;
+  char* end = nullptr;
+  long long parsed = strtoll(text.c_str(), &end, 10);
+  if (end != text.c_str() + text.size())
+    return false;
+  *value = static_cast<int64_t>(parsed);
+  return true;
+}
 
 // Advances an HLC by one tick against the wall clock: the physical component
 // jumps forward only when the wall clock moved ahead; otherwise just the
@@ -214,235 +200,311 @@ bool RecordMetaClock(sqlite3* db, int64_t physical_ms, int64_t logical) {
 
 }  // namespace
 
-FactStore::Status FactStore::InitializeMeta() {
-  int64_t now = NowMs();
-  const std::pair<const char*, string> entries[] = {
-      {kMetaFactSchemaVersion, std::to_string(kFactSchemaVersion)},
-      {kMetaEventFormatVersion, std::to_string(kEventFormatVersion)},
-      {kMetaHistoryId, RandomUuid()},
-      {kMetaStoreEpoch, RandomUuid()},
-      {kMetaClockPhysicalMs, std::to_string(now)},
-      {kMetaClockLogical, "0"},
-      {kMetaCreatedAtMs, std::to_string(now)},
-  };
-  for (const auto& entry : entries) {
-    string sql = "INSERT INTO meta(key, value) VALUES(?, ?);";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-      return Status::kDbWriteFailed;
-    sqlite3_bind_text(stmt, 1, entry.first, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, entry.second.c_str(), -1, SQLITE_TRANSIENT);
-    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    if (!ok)
-      return Status::kDbWriteFailed;
+path FactStore::DefaultRootDir() {
+  const char* home = getenv("HOME");
+  if (!home)
+    return path();
+  return path(home) / "Library" / "Application Support" / "Squirrel" /
+         "SemanticMemory";
+}
+
+FactStore::FactStore(const path& root_dir) : root_(root_dir) {}
+
+FactStore::~FactStore() {}
+
+FactStore::Status FactStore::VerifyRoot() {
+  if (root_.empty())
+    return Status::kNoHome;
+  struct stat st;
+  if (lstat(root_.c_str(), &st) != 0) {
+    if (errno != ENOENT)
+      return Status::kRootNotDirectory;
+    if (!CreateAncestors(root_))
+      return Status::kRootCreateFailed;
+    if (lstat(root_.c_str(), &st) != 0)
+      return Status::kRootCreateFailed;
   }
-  clock_physical_ms_ = now;
-  clock_logical_ = 0;
-  meta_initialized_ = true;
+  if (S_ISLNK(st.st_mode))
+    return Status::kRootSymlink;
+  if (!S_ISDIR(st.st_mode))
+    return Status::kRootNotDirectory;
+  if (st.st_uid != getuid())
+    return Status::kRootOwner;
+  if (!IsExactMode(st, kDirMode))
+    return Status::kRootPermission;
   return Status::kOk;
+}
+
+FactStore::Status FactStore::VerifyDbFile() {
+  path db_path = root_ / kDbFileName;
+  struct stat st;
+  if (lstat(db_path.c_str(), &st) != 0) {
+    if (errno == ENOENT)
+      return Status::kOk;
+    return Status::kDbNotRegular;
+  }
+  if (S_ISLNK(st.st_mode))
+    return Status::kDbSymlink;
+  if (!S_ISREG(st.st_mode))
+    return Status::kDbNotRegular;
+  if (st.st_uid != getuid())
+    return Status::kDbOwner;
+  if (!IsExactMode(st, kFileMode))
+    return Status::kDbPermission;
+  return Status::kOk;
+}
+
+bool EnsureFileModes(const path& root) {
+  path db_path = root / kDbFileName;
+  bool ok = chmod(db_path.c_str(), kFileMode) == 0;
+  for (const char* suffix : {"-wal", "-shm"}) {
+    path sidecar = root / (string(kDbFileName) + suffix);
+    if (access(sidecar.c_str(), F_OK) == 0) {
+      ok = chmod(sidecar.c_str(), kFileMode) == 0 && ok;
+    }
+  }
+  return ok;
 }
 
 namespace {
 
-// Reads a single meta row; returns false when the key is missing or has a
-// non-text value.
-bool ReadMetaText(sqlite3* db, const char* key, string* value) {
-  sqlite3_stmt* stmt = nullptr;
-  const char* sql = "SELECT value FROM meta WHERE key = ?;";
-  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
-    return false;
-  sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
-  if (ok) {
-    const unsigned char* text = sqlite3_column_text(stmt, 0);
-    *value = text ? reinterpret_cast<const char*>(text) : string();
+const char* kSchemaV1 =
+    "CREATE TABLE IF NOT EXISTS meta ("
+    " key TEXT PRIMARY KEY NOT NULL,"
+    " value TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS commits ("
+    " commit_id TEXT PRIMARY KEY NOT NULL,"
+    " utc_committed_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS selection_events ("
+    " event_id TEXT PRIMARY KEY NOT NULL,"
+    " commit_id TEXT NOT NULL REFERENCES commits(commit_id),"
+    " event_format_version INTEGER NOT NULL,"
+    " schema_id TEXT NOT NULL,"
+    " canonical_segment_input TEXT NOT NULL,"
+    " span_start INTEGER NOT NULL,"
+    " span_end INTEGER NOT NULL,"
+    " category TEXT NOT NULL,"
+    " preceding_text TEXT NOT NULL,"
+    " competition_complete INTEGER NOT NULL,"
+    " final_selection_text TEXT NOT NULL,"
+    " confirmation_source TEXT NOT NULL,"
+    " trigger_keycode INTEGER,"
+    " display_rank INTEGER NOT NULL,"
+    " display_page INTEGER NOT NULL,"
+    " session_id TEXT NOT NULL,"
+    " session_seq INTEGER NOT NULL,"
+    " hlc_physical_ms INTEGER NOT NULL,"
+    " hlc_logical INTEGER NOT NULL,"
+    " utc_confirmed_at_ms INTEGER NOT NULL,"
+    " utc_committed_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_selection_events_commit_id"
+    " ON selection_events(commit_id);"
+    "CREATE TABLE IF NOT EXISTS selection_candidates ("
+    " event_id TEXT NOT NULL REFERENCES selection_events(event_id),"
+    " merge_order INTEGER NOT NULL,"
+    " text TEXT NOT NULL,"
+    " PRIMARY KEY (event_id, merge_order)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS retractions ("
+    " retraction_id TEXT PRIMARY KEY NOT NULL,"
+    " commit_id TEXT NOT NULL REFERENCES commits(commit_id),"
+    " hlc_physical_ms INTEGER NOT NULL,"
+    " hlc_logical INTEGER NOT NULL,"
+    " utc_retracted_at_ms INTEGER NOT NULL"
+    ");"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_retractions_commit_id"
+    " ON retractions(commit_id);"
+    "CREATE VIEW IF NOT EXISTS active_events AS"
+    " SELECT e.event_id, e.commit_id, e.event_format_version, e.schema_id,"
+    "  e.canonical_segment_input, e.span_start, e.span_end, e.category,"
+    "  e.preceding_text, e.competition_complete, e.final_selection_text,"
+    "  e.confirmation_source, e.trigger_keycode, e.display_rank,"
+    "  e.display_page, e.session_id, e.session_seq, e.hlc_physical_ms,"
+    "  e.hlc_logical, e.utc_confirmed_at_ms, e.utc_committed_at_ms"
+    " FROM selection_events e"
+    " WHERE NOT EXISTS (SELECT 1 FROM retractions r"
+    "                   WHERE r.commit_id = e.commit_id);";
+
+// Validates the meta rows and fills the clock and epoch; when the store was
+// just created, initializes a fresh identity instead.
+FactStore::Status ValidateOrInitializeMeta(sqlite3* db,
+                                           int64_t* clock_physical_ms,
+                                           int64_t* clock_logical) {
+  bool has_meta = false;
+  if (!QueryBoolValue(db, "SELECT EXISTS(SELECT 1 FROM meta);", &has_meta))
+    return FactStore::Status::kDbClockInvalid;
+  if (!has_meta) {
+    int64_t now = NowMs();
+    const std::pair<const char*, string> entries[] = {
+        {kMetaFactSchemaVersion, std::to_string(kFactSchemaVersion)},
+        {kMetaEventFormatVersion, std::to_string(kEventFormatVersion)},
+        {kMetaHistoryId, RandomUuid()},
+        {kMetaStoreEpoch, RandomUuid()},
+        {kMetaClockPhysicalMs, std::to_string(now)},
+        {kMetaClockLogical, "0"},
+        {kMetaCreatedAtMs, std::to_string(now)},
+    };
+    for (const auto& entry : entries) {
+      string sql = "INSERT INTO meta(key, value) VALUES(?, ?);";
+      sqlite3_stmt* stmt = nullptr;
+      if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) !=
+          SQLITE_OK)
+        return FactStore::Status::kDbWriteFailed;
+      sqlite3_bind_text(stmt, 1, entry.first, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(stmt, 2, entry.second.c_str(), -1, SQLITE_TRANSIENT);
+      bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+      sqlite3_finalize(stmt);
+      if (!ok)
+        return FactStore::Status::kDbWriteFailed;
+    }
+    *clock_physical_ms = now;
+    *clock_logical = 0;
+    return FactStore::Status::kOk;
   }
-  sqlite3_finalize(stmt);
-  return ok;
+  string value;
+  if (!ReadMetaText(db, kMetaFactSchemaVersion, &value) ||
+      value != std::to_string(kFactSchemaVersion)) {
+    return FactStore::Status::kDbUnsupportedVersion;
+  }
+  if (!ReadMetaText(db, kMetaEventFormatVersion, &value) ||
+      value != std::to_string(kEventFormatVersion)) {
+    return FactStore::Status::kDbUnsupportedVersion;
+  }
+  if (!ReadMetaText(db, kMetaHistoryId, &value) || value.empty() ||
+      !ReadMetaText(db, kMetaStoreEpoch, &value) || value.empty()) {
+    return FactStore::Status::kDbClockInvalid;
+  }
+  if (!ReadMetaText(db, kMetaClockPhysicalMs, &value) ||
+      !ParseInt64(value, clock_physical_ms) ||
+      !ReadMetaText(db, kMetaClockLogical, &value) ||
+      !ParseInt64(value, clock_logical) || *clock_physical_ms < 0 ||
+      *clock_logical < 0) {
+    return FactStore::Status::kDbClockInvalid;
+  }
+  return FactStore::Status::kOk;
 }
 
-bool ParseInt64(const string& text, int64_t* value) {
-  if (text.empty())
-    return false;
-  char* end = nullptr;
-  long long parsed = strtoll(text.c_str(), &end, 10);
-  if (end != text.c_str() + text.size())
-    return false;
-  *value = static_cast<int64_t>(parsed);
-  return true;
+// Opens a fresh verified connection: root and db file checks, sqlite open,
+// pragmas, schema, meta. On failure closes the connection and returns the
+// status; on success leaves `db` open for the caller (who must close it).
+FactStore::Status OpenVerifiedConnection(const path& root,
+                                         sqlite3** db,
+                                         int64_t* clock_physical_ms,
+                                         int64_t* clock_logical) {
+  *db = nullptr;
+  FactStore probe(root);
+  if (FactStore::Status root_status = probe.VerifyRoot();
+      root_status != FactStore::Status::kOk)
+    return root_status;
+  if (FactStore::Status file_status = probe.VerifyDbFile();
+      file_status != FactStore::Status::kOk)
+    return file_status;
+  path db_path = root / kDbFileName;
+  sqlite3* connection = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &connection,
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                      nullptr) != SQLITE_OK) {
+    if (connection) {
+      sqlite3_close(connection);
+    }
+    return FactStore::Status::kDbOpenFailed;
+  }
+  sqlite3_busy_timeout(connection, kBusyTimeoutMs);
+
+  bool quick_check_ok = false;
+  if (!QueryQuickCheck(connection, &quick_check_ok) || !quick_check_ok) {
+    sqlite3_close(connection);
+    return FactStore::Status::kDbCorrupt;
+  }
+  if (Exec(connection, "PRAGMA journal_mode=WAL;") != SQLITE_OK ||
+      Exec(connection, "PRAGMA synchronous=FULL;") != SQLITE_OK ||
+      Exec(connection, "PRAGMA foreign_keys=ON;") != SQLITE_OK) {
+    sqlite3_close(connection);
+    return FactStore::Status::kDbOpenFailed;
+  }
+  if (Exec(connection, kSchemaV1) != SQLITE_OK) {
+    sqlite3_close(connection);
+    return FactStore::Status::kDbOpenFailed;
+  }
+  FactStore::Status meta_status = ValidateOrInitializeMeta(
+      connection, clock_physical_ms, clock_logical);
+  if (meta_status != FactStore::Status::kOk) {
+    sqlite3_close(connection);
+    return meta_status;
+  }
+  *db = connection;
+  return FactStore::Status::kOk;
 }
 
 }  // namespace
 
-FactStore::Status FactStore::ValidateMeta() {
-  string value;
-  if (!ReadMetaText(db_, kMetaFactSchemaVersion, &value) ||
-      value != std::to_string(kFactSchemaVersion)) {
-    return Status::kDbUnsupportedVersion;
+FactStore::Status FactStore::Open() {
+  status_ = Status::kOk;
+  int64_t physical = 0;
+  int64_t logical = 0;
+  sqlite3* db = nullptr;
+  if (Status status = OpenVerifiedConnection(root_, &db, &physical, &logical);
+      status != Status::kOk) {
+    status_ = status;
+    return status_;
   }
-  if (!ReadMetaText(db_, kMetaEventFormatVersion, &value) ||
-      value != std::to_string(kEventFormatVersion)) {
-    return Status::kDbUnsupportedVersion;
+  // Probe the maintenance lock file too: a symlinked or misowned lock file is
+  // a deterministic store fault that must stop recording, and creating it
+  // here with 0600 keeps the root self-contained. When the exclusive lock is
+  // held the probe still succeeds (the exclusive holder is maintenance in
+  // progress, not a store fault).
+  MaintenanceLock lock(root_);
+  MaintenanceLock::Status ensure = lock.TryAcquireShared();
+  if (ensure != MaintenanceLock::Status::kOk &&
+      ensure != MaintenanceLock::Status::kMaintenanceLocked) {
+    sqlite3_close(db);
+    status_ = LockFaultToStoreStatus(ensure);
+    return status_;
   }
-  if (!ReadMetaText(db_, kMetaHistoryId, &value) || value.empty() ||
-      !ReadMetaText(db_, kMetaStoreEpoch, &value) || value.empty()) {
-    return Status::kDbClockInvalid;
+  lock.Release();
+  if (!EnsureFileModes(root_)) {
+    sqlite3_close(db);
+    status_ = Status::kDbPermission;
+    return status_;
   }
-  if (!ReadMetaText(db_, kMetaClockPhysicalMs, &value) ||
-      !ParseInt64(value, &clock_physical_ms_) ||
-      !ReadMetaText(db_, kMetaClockLogical, &value) ||
-      !ParseInt64(value, &clock_logical_) || clock_physical_ms_ < 0 ||
-      clock_logical_ < 0) {
-    return Status::kDbClockInvalid;
-  }
-  meta_initialized_ = true;
+  sqlite3_close(db);
   return Status::kOk;
 }
 
-FactStore::Status FactStore::Open() {
+FactStore::Status FactStore::PersistBatch(int64_t utc_committed_at_ms,
+                                          vector<Event>* events,
+                                          string* commit_id) {
   status_ = Status::kOk;
-  if (db_) {
-    sqlite3_close(db_);
-    db_ = nullptr;
-  }
-  if (Status root_status = VerifyRoot(); root_status != Status::kOk) {
-    status_ = root_status;
-    return status_;
-  }
-  if (Status file_status = VerifyDbFile(); file_status != Status::kOk) {
-    status_ = file_status;
-    return status_;
-  }
-  path db_path = root_ / kDbFileName;
-  if (sqlite3_open_v2(db_path.c_str(), &db_,
-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                      nullptr) != SQLITE_OK) {
-    status_ = Status::kDbOpenFailed;
-    if (db_) {
-      sqlite3_close(db_);
-      db_ = nullptr;
-    }
-    return status_;
-  }
-  sqlite3_busy_timeout(db_, kBusyTimeoutMs);
-
-  bool quick_check_ok = false;
-  if (!QueryQuickCheck(db_, &quick_check_ok) || !quick_check_ok) {
-    status_ = Status::kDbCorrupt;
-    sqlite3_close(db_);
-    db_ = nullptr;
-    return status_;
-  }
-  if (Exec(db_, "PRAGMA journal_mode=WAL;") != SQLITE_OK ||
-      Exec(db_, "PRAGMA synchronous=FULL;") != SQLITE_OK ||
-      Exec(db_, "PRAGMA foreign_keys=ON;") != SQLITE_OK) {
-    status_ = Status::kDbOpenFailed;
-    sqlite3_close(db_);
-    db_ = nullptr;
-    return status_;
-  }
-
-  const char* kSchemaV1 =
-      "CREATE TABLE IF NOT EXISTS meta ("
-      " key TEXT PRIMARY KEY NOT NULL,"
-      " value TEXT NOT NULL"
-      ");"
-      "CREATE TABLE IF NOT EXISTS commits ("
-      " commit_id TEXT PRIMARY KEY NOT NULL,"
-      " utc_committed_at_ms INTEGER NOT NULL"
-      ");"
-      "CREATE TABLE IF NOT EXISTS selection_events ("
-      " event_id TEXT PRIMARY KEY NOT NULL,"
-      " commit_id TEXT NOT NULL REFERENCES commits(commit_id),"
-      " event_format_version INTEGER NOT NULL,"
-      " schema_id TEXT NOT NULL,"
-      " canonical_segment_input TEXT NOT NULL,"
-      " span_start INTEGER NOT NULL,"
-      " span_end INTEGER NOT NULL,"
-      " category TEXT NOT NULL,"
-      " preceding_text TEXT NOT NULL,"
-      " competition_complete INTEGER NOT NULL,"
-      " final_selection_text TEXT NOT NULL,"
-      " confirmation_source TEXT NOT NULL,"
-      " trigger_keycode INTEGER,"
-      " display_rank INTEGER NOT NULL,"
-      " display_page INTEGER NOT NULL,"
-      " session_id TEXT NOT NULL,"
-      " session_seq INTEGER NOT NULL,"
-      " hlc_physical_ms INTEGER NOT NULL,"
-      " hlc_logical INTEGER NOT NULL,"
-      " utc_confirmed_at_ms INTEGER NOT NULL,"
-      " utc_committed_at_ms INTEGER NOT NULL"
-      ");"
-      "CREATE INDEX IF NOT EXISTS idx_selection_events_commit_id"
-      " ON selection_events(commit_id);"
-      "CREATE TABLE IF NOT EXISTS selection_candidates ("
-      " event_id TEXT NOT NULL REFERENCES selection_events(event_id),"
-      " merge_order INTEGER NOT NULL,"
-      " text TEXT NOT NULL,"
-      " PRIMARY KEY (event_id, merge_order)"
-      ");"
-      "CREATE TABLE IF NOT EXISTS retractions ("
-      " retraction_id TEXT PRIMARY KEY NOT NULL,"
-      " commit_id TEXT NOT NULL REFERENCES commits(commit_id),"
-      " hlc_physical_ms INTEGER NOT NULL,"
-      " hlc_logical INTEGER NOT NULL,"
-      " utc_retracted_at_ms INTEGER NOT NULL"
-      ");"
-      "CREATE UNIQUE INDEX IF NOT EXISTS idx_retractions_commit_id"
-      " ON retractions(commit_id);"
-      "CREATE VIEW IF NOT EXISTS active_events AS"
-      " SELECT e.event_id, e.commit_id, e.event_format_version, e.schema_id,"
-      "  e.canonical_segment_input, e.span_start, e.span_end, e.category,"
-      "  e.preceding_text, e.competition_complete, e.final_selection_text,"
-      "  e.confirmation_source, e.trigger_keycode, e.display_rank,"
-      "  e.display_page, e.session_id, e.session_seq, e.hlc_physical_ms,"
-      "  e.hlc_logical, e.utc_confirmed_at_ms, e.utc_committed_at_ms"
-      " FROM selection_events e"
-      " WHERE NOT EXISTS (SELECT 1 FROM retractions r"
-      "                   WHERE r.commit_id = e.commit_id);";
-  if (Exec(db_, kSchemaV1) != SQLITE_OK) {
-    status_ = Status::kDbOpenFailed;
-    sqlite3_close(db_);
-    db_ = nullptr;
-    return status_;
-  }
-
-  bool has_meta = false;
-  if (!QueryBoolValue(db_, "SELECT EXISTS(SELECT 1 FROM meta);", &has_meta)) {
-    status_ = Status::kDbClockInvalid;
-    sqlite3_close(db_);
-    db_ = nullptr;
-    return status_;
-  }
-  Status meta_status =
-      has_meta ? ValidateMeta() : InitializeMeta();
-  if (meta_status != Status::kOk) {
-    status_ = meta_status;
-    sqlite3_close(db_);
-    db_ = nullptr;
-    return status_;
-  }
-  if (!EnsureFileModes()) {
-    status_ = Status::kDbPermission;
-    sqlite3_close(db_);
-    db_ = nullptr;
-    return status_;
-  }
-  return status_;
-}
-
-bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
-                             vector<Event>* events,
-                             string* commit_id_out) {
-  if (!db_ || !events || events->empty()) {
+  if (!events || events->empty()) {
     status_ = Status::kDbWriteFailed;
-    return false;
+    return status_;
   }
-  if (Exec(db_, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+  // Hold the shared maintenance lock across the whole transaction; the
+  // connection is opened under the lock and closed before it is released.
+  MaintenanceLock lock(root_);
+  if (MaintenanceLock::Status lock_status = lock.TryAcquireShared();
+      lock_status != MaintenanceLock::Status::kOk) {
+    status_ = LockFaultToStoreStatus(lock_status);
+    return status_;
+  }
+  int64_t physical = 0;
+  int64_t logical = 0;
+  sqlite3* db = nullptr;
+  Status open_status =
+      OpenVerifiedConnection(root_, &db, &physical, &logical);
+  if (open_status != Status::kOk) {
+    lock.Release();
+    status_ = open_status;
+    return status_;
+  }
+  if (Exec(db, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+    sqlite3_close(db);
+    lock.Release();
     status_ = Status::kDbWriteFailed;
-    return false;
+    return status_;
   }
   bool ok = true;
   const char* insert_commit =
@@ -461,33 +523,38 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
   sqlite3_stmt* commit_stmt = nullptr;
   sqlite3_stmt* event_stmt = nullptr;
   sqlite3_stmt* candidate_stmt = nullptr;
-  if (sqlite3_prepare_v2(db_, insert_commit, -1, &commit_stmt, nullptr) !=
+  if (sqlite3_prepare_v2(db, insert_commit, -1, &commit_stmt, nullptr) !=
           SQLITE_OK ||
-      sqlite3_prepare_v2(db_, insert_event, -1, &event_stmt, nullptr) !=
+      sqlite3_prepare_v2(db, insert_event, -1, &event_stmt, nullptr) !=
           SQLITE_OK ||
-      sqlite3_prepare_v2(db_, insert_candidate, -1, &candidate_stmt, nullptr) !=
+      sqlite3_prepare_v2(db, insert_candidate, -1, &candidate_stmt, nullptr) !=
           SQLITE_OK) {
     ok = false;
   }
-  string commit_id = RandomUuid();
+  string generated;
   if (ok) {
-    sqlite3_bind_text(commit_stmt, 1, commit_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (commit_id && !commit_id->empty()) {
+      generated = *commit_id;
+    } else {
+      generated = RandomUuid();
+    }
+    sqlite3_bind_text(commit_stmt, 1, generated.c_str(), -1,
+                      SQLITE_TRANSIENT);
     sqlite3_bind_int64(commit_stmt, 2, utc_committed_at_ms);
     ok = sqlite3_step(commit_stmt) == SQLITE_DONE;
   }
   if (ok) {
-    int64_t physical = clock_physical_ms_;
-    int64_t logical = clock_logical_;
     for (Event& event : *events) {
       GiveTick(physical, logical);
       event.hlc_physical_ms = physical;
       event.hlc_logical = logical;
-      event.commit_id = commit_id;
+      event.commit_id = generated;
 
       sqlite3_reset(event_stmt);
       sqlite3_bind_text(event_stmt, 1, event.event_id.c_str(), -1,
                         SQLITE_TRANSIENT);
-      sqlite3_bind_text(event_stmt, 2, commit_id.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(event_stmt, 2, generated.c_str(), -1,
+                        SQLITE_TRANSIENT);
       sqlite3_bind_int(event_stmt, 3, kEventFormatVersion);
       sqlite3_bind_text(event_stmt, 4, event.schema_id.c_str(), -1,
                         SQLITE_TRANSIENT);
@@ -537,11 +604,8 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
       if (!ok)
         break;
     }
-    if (ok) {
-      clock_physical_ms_ = physical;
-      clock_logical_ = logical;
-      ok = RecordMetaClock(db_, physical, logical);
-    }
+    if (ok)
+      ok = RecordMetaClock(db, physical, logical);
   }
   if (commit_stmt)
     sqlite3_finalize(commit_stmt);
@@ -550,33 +614,52 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
   if (candidate_stmt)
     sqlite3_finalize(candidate_stmt);
   if (ok) {
-    ok = Exec(db_, "COMMIT;") == SQLITE_OK;
+    ok = Exec(db, "COMMIT;") == SQLITE_OK;
   } else {
-    Exec(db_, "ROLLBACK;");
+    Exec(db, "ROLLBACK;");
   }
+  // The connection must be closed before the shared lock is released: an
+  // exclusive maintenance holder may replace the store immediately after.
+  sqlite3_close(db);
+  lock.Release();
   if (!ok) {
     status_ = Status::kDbWriteFailed;
-    return false;
+    return status_;
   }
-  if (commit_id_out)
-    *commit_id_out = commit_id;
-  EnsureFileModes();
-  return true;
+  if (commit_id)
+    *commit_id = generated;
+  EnsureFileModes(root_);
+  return Status::kOk;
 }
 
-bool FactStore::AppendRetraction(const string& commit_id,
-                                 int64_t utc_retracted_at_ms,
-                                 string* retraction_id_out) {
-  if (!db_) {
-    status_ = Status::kDbWriteFailed;
-    return false;
+FactStore::Status FactStore::AppendRetraction(const string& commit_id,
+                                              int64_t utc_retracted_at_ms,
+                                              string* retraction_id_out) {
+  status_ = Status::kOk;
+  MaintenanceLock lock(root_);
+  if (MaintenanceLock::Status lock_status = lock.TryAcquireShared();
+      lock_status != MaintenanceLock::Status::kOk) {
+    status_ = LockFaultToStoreStatus(lock_status);
+    return status_;
+  }
+  int64_t physical = 0;
+  int64_t logical = 0;
+  sqlite3* db = nullptr;
+  Status open_status =
+      OpenVerifiedConnection(root_, &db, &physical, &logical);
+  if (open_status != Status::kOk) {
+    lock.Release();
+    status_ = open_status;
+    return status_;
   }
   // A single short transaction: decide retractability, append the fact and
   // advance the clock atomically. Retracting an unknown or already-retracted
   // commit is a no-op (idempotency), not a failure.
-  if (Exec(db_, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+  if (Exec(db, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+    sqlite3_close(db);
+    lock.Release();
     status_ = Status::kDbWriteFailed;
-    return false;
+    return status_;
   }
   bool ok = true;
   sqlite3_stmt* check = nullptr;
@@ -585,7 +668,7 @@ bool FactStore::AppendRetraction(const string& commit_id,
       " WHERE c.commit_id = ?1"
       "   AND NOT EXISTS(SELECT 1 FROM retractions r"
       "                  WHERE r.commit_id = c.commit_id));";
-  if (sqlite3_prepare_v2(db_, kCheckRetractable, -1, &check, nullptr) !=
+  if (sqlite3_prepare_v2(db, kCheckRetractable, -1, &check, nullptr) !=
       SQLITE_OK) {
     ok = false;
   }
@@ -600,23 +683,25 @@ bool FactStore::AppendRetraction(const string& commit_id,
   }
   sqlite3_finalize(check);
   if (!ok) {
-    Exec(db_, "ROLLBACK;");
+    Exec(db, "ROLLBACK;");
+    sqlite3_close(db);
+    lock.Release();
     status_ = Status::kDbWriteFailed;
-    return false;
+    return status_;
   }
   if (!retractable) {
-    Exec(db_, "COMMIT;");
-    return true;
+    Exec(db, "COMMIT;");
+    sqlite3_close(db);
+    lock.Release();
+    return Status::kOk;
   }
-  int64_t physical = clock_physical_ms_;
-  int64_t logical = clock_logical_;
   GiveTick(physical, logical);
   string retraction_id = RandomUuid();
   sqlite3_stmt* insert = nullptr;
   const char* kInsertRetraction =
       "INSERT INTO retractions(retraction_id, commit_id, hlc_physical_ms,"
       " hlc_logical, utc_retracted_at_ms) VALUES(?1,?2,?3,?4,?5);";
-  if (sqlite3_prepare_v2(db_, kInsertRetraction, -1, &insert, nullptr) ==
+  if (sqlite3_prepare_v2(db, kInsertRetraction, -1, &insert, nullptr) ==
       SQLITE_OK) {
     sqlite3_bind_text(insert, 1, retraction_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(insert, 2, commit_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -628,31 +713,41 @@ bool FactStore::AppendRetraction(const string& commit_id,
   } else {
     ok = false;
   }
+  if (ok)
+    ok = RecordMetaClock(db, physical, logical);
   if (ok) {
-    clock_physical_ms_ = physical;
-    clock_logical_ = logical;
-    ok = RecordMetaClock(db_, physical, logical);
-  }
-  if (ok) {
-    ok = Exec(db_, "COMMIT;") == SQLITE_OK;
+    ok = Exec(db, "COMMIT;") == SQLITE_OK;
   } else {
-    Exec(db_, "ROLLBACK;");
+    Exec(db, "ROLLBACK;");
   }
+  sqlite3_close(db);
+  lock.Release();
   if (!ok) {
     status_ = Status::kDbWriteFailed;
-    return false;
+    return status_;
   }
   if (retraction_id_out)
     *retraction_id_out = retraction_id;
-  EnsureFileModes();
-  return true;
+  EnsureFileModes(root_);
+  return Status::kOk;
 }
 
 bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
                                       int64_t hlc_logical,
                                       vector<Event>* out) {
-  if (!db_ || !out)
+  if (!out)
     return false;
+  MaintenanceLock lock(root_);
+  if (lock.TryAcquireShared() != MaintenanceLock::Status::kOk)
+    return false;
+  sqlite3* db = nullptr;
+  int64_t physical = 0;
+  int64_t logical = 0;
+  if (OpenVerifiedConnection(root_, &db, &physical, &logical) !=
+      Status::kOk) {
+    lock.Release();
+    return false;
+  }
   const char* kQueryActiveAsOf =
       "SELECT e.event_id, e.commit_id, e.event_format_version, e.schema_id,"
       " e.canonical_segment_input, e.span_start, e.span_end, e.category,"
@@ -669,45 +764,101 @@ bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
       "                       AND r.hlc_logical <= ?2)))"
       " ORDER BY e.hlc_physical_ms, e.hlc_logical, e.event_id;";
   sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(db_, kQueryActiveAsOf, -1, &stmt, nullptr) !=
-      SQLITE_OK)
-    return false;
-  sqlite3_bind_int64(stmt, 1, hlc_physical_ms);
-  sqlite3_bind_int64(stmt, 2, hlc_logical);
-  out->clear();
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
-    Event event;
-    event.event_id =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    event.commit_id =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    event.schema_id =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-    event.canonical_segment_input =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-    event.span_start = static_cast<size_t>(sqlite3_column_int64(stmt, 5));
-    event.span_end = static_cast<size_t>(sqlite3_column_int64(stmt, 6));
-    event.category =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-    event.preceding_text =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
-    event.competition_complete = sqlite3_column_int64(stmt, 9) != 0;
-    event.final_selection_text =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
-    event.confirmation_source =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
-    event.display_rank = static_cast<int>(sqlite3_column_int64(stmt, 12));
-    event.display_page = static_cast<int>(sqlite3_column_int64(stmt, 13));
-    event.session_id =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14));
-    event.session_seq = static_cast<int>(sqlite3_column_int64(stmt, 15));
-    event.hlc_physical_ms = sqlite3_column_int64(stmt, 16);
-    event.hlc_logical = sqlite3_column_int64(stmt, 17);
-    event.utc_confirmed_at_ms = sqlite3_column_int64(stmt, 18);
-    out->push_back(std::move(event));
+  bool ok = false;
+  if (sqlite3_prepare_v2(db, kQueryActiveAsOf, -1, &stmt, nullptr) ==
+      SQLITE_OK) {
+    sqlite3_bind_int64(stmt, 1, hlc_physical_ms);
+    sqlite3_bind_int64(stmt, 2, hlc_logical);
+    out->clear();
+    ok = true;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      Event event;
+      event.event_id =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+      event.commit_id =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+      event.schema_id =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+      event.canonical_segment_input =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+      event.span_start = static_cast<size_t>(sqlite3_column_int64(stmt, 5));
+      event.span_end = static_cast<size_t>(sqlite3_column_int64(stmt, 6));
+      event.category =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+      event.preceding_text =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+      event.competition_complete = sqlite3_column_int64(stmt, 9) != 0;
+      event.final_selection_text =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+      event.confirmation_source =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+      event.display_rank = static_cast<int>(sqlite3_column_int64(stmt, 12));
+      event.display_page = static_cast<int>(sqlite3_column_int64(stmt, 13));
+      event.session_id =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14));
+      event.session_seq = static_cast<int>(sqlite3_column_int64(stmt, 15));
+      event.hlc_physical_ms = sqlite3_column_int64(stmt, 16);
+      event.hlc_logical = sqlite3_column_int64(stmt, 17);
+      event.utc_confirmed_at_ms = sqlite3_column_int64(stmt, 18);
+      out->push_back(std::move(event));
+    }
+    sqlite3_finalize(stmt);
   }
-  sqlite3_finalize(stmt);
-  return true;
+  sqlite3_close(db);
+  lock.Release();
+  return ok;
+}
+
+FactStore::Status FactStore::ReadStoreIdentity(int64_t* hlc_physical_ms,
+                                               int64_t* hlc_logical,
+                                               string* store_epoch) {
+  if (!hlc_physical_ms || !hlc_logical || !store_epoch)
+    return Status::kDbClockInvalid;
+  MaintenanceLock lock(root_);
+  if (lock.TryAcquireShared() != MaintenanceLock::Status::kOk)
+    return Status::kMaintenanceLocked;
+  sqlite3* db = nullptr;
+  int64_t physical = 0;
+  int64_t logical = 0;
+  Status status = OpenVerifiedConnection(root_, &db, &physical, &logical);
+  if (status != Status::kOk) {
+    lock.Release();
+    return status;
+  }
+  string epoch;
+  bool ok = ReadMetaText(db, kMetaStoreEpoch, &epoch) && !epoch.empty();
+  sqlite3_close(db);
+  lock.Release();
+  if (!ok)
+    return Status::kDbClockInvalid;
+  *hlc_physical_ms = physical;
+  *hlc_logical = logical;
+  *store_epoch = epoch;
+  return Status::kOk;
+}
+
+bool FactStore::IsFatalStatus(Status status) {
+  switch (status) {
+    case Status::kNoHome:
+    case Status::kRootNotDirectory:
+    case Status::kRootSymlink:
+    case Status::kRootOwner:
+    case Status::kRootPermission:
+    case Status::kDbSymlink:
+    case Status::kDbNotRegular:
+    case Status::kDbOwner:
+    case Status::kDbPermission:
+    case Status::kDbCorrupt:
+    case Status::kDbUnsupportedVersion:
+    case Status::kDbClockInvalid:
+    case Status::kLockSymlink:
+    case Status::kLockNotRegular:
+    case Status::kLockOwner:
+    case Status::kLockPermission:
+      return true;
+    default:
+      return false;
+  }
 }
 
 const char* FactStore::StatusCode(Status status) {
@@ -744,6 +895,20 @@ const char* FactStore::StatusCode(Status status) {
       return "db_open_failed";
     case Status::kDbWriteFailed:
       return "db_write_failed";
+    case Status::kMaintenanceLocked:
+      return "maintenance_locked";
+    case Status::kLockSymlink:
+      return "lock_symlink";
+    case Status::kLockNotRegular:
+      return "lock_not_regular";
+    case Status::kLockOwner:
+      return "lock_owner";
+    case Status::kLockPermission:
+      return "lock_permission";
+    case Status::kLockOpenFailed:
+      return "lock_open_failed";
+    case Status::kLockTimeout:
+      return "lock_timeout";
   }
   return "unknown";
 }
@@ -782,6 +947,20 @@ const char* FactStore::StatusMessage(Status status) {
       return "facts.sqlite3 could not be opened";
     case Status::kDbWriteFailed:
       return "facts.sqlite3 commit transaction failed";
+    case Status::kMaintenanceLocked:
+      return "exclusive maintenance lock is held; the write was buffered";
+    case Status::kLockSymlink:
+      return "maintenance.lock is a symlink";
+    case Status::kLockNotRegular:
+      return "maintenance.lock is not a regular file";
+    case Status::kLockOwner:
+      return "maintenance.lock is owned by another user";
+    case Status::kLockPermission:
+      return "maintenance.lock permissions are not 0600";
+    case Status::kLockOpenFailed:
+      return "maintenance.lock could not be opened";
+    case Status::kLockTimeout:
+      return "maintenance.lock exclusive acquisition timed out";
   }
   return "unknown fault";
 }

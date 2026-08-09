@@ -188,7 +188,8 @@ void RunSpawnedWriterLoop(const fs::path& root) {
     _exit(2);
   for (int i = 0; i < kConcurrentBatches; ++i) {
     std::vector<FactStore::Event> events{MakeEvent(100 + i)};
-    if (!store.PersistBatch(1700000000000LL + i, &events))
+    if (store.PersistBatch(1700000000000LL + i, &events) !=
+        FactStore::Status::kOk)
       _exit(3);
   }
   _exit(0);
@@ -273,7 +274,7 @@ TEST_F(FactStoreTest, PersistBatchWritesCommitEventAndCandidates) {
   FactStore store(root_);
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> events{MakeEvent(1)};
-  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &events));
 
   sqlite3* db = nullptr;
   ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
@@ -299,13 +300,13 @@ TEST_F(FactStoreTest, HlcAdvancesInConfirmationOrderAndAcrossBatches) {
   FactStore store(root_);
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> first{MakeEvent(1), MakeEvent(2)};
-  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &first));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000002000LL, &first));
   ASSERT_GT(first[1].hlc_physical_ms, 0LL);
   ASSERT_LT(std::make_pair(first[0].hlc_physical_ms, first[0].hlc_logical),
             std::make_pair(first[1].hlc_physical_ms, first[1].hlc_logical));
 
   std::vector<FactStore::Event> second{MakeEvent(3)};
-  ASSERT_TRUE(store.PersistBatch(1700000003000LL, &second));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000003000LL, &second));
   ASSERT_LT(std::make_pair(first[1].hlc_physical_ms, first[1].hlc_logical),
             std::make_pair(second[0].hlc_physical_ms, second[0].hlc_logical));
   sqlite3* db = nullptr;
@@ -322,7 +323,7 @@ TEST_F(FactStoreTest, ReopenContinuesTheSameHistoryAndClock) {
     FactStore store(root_);
     ASSERT_EQ(FactStore::Status::kOk, store.Open());
     std::vector<FactStore::Event> events{MakeEvent(1)};
-    ASSERT_TRUE(store.PersistBatch(1700000004000LL, &events));
+    ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000004000LL, &events));
     saved_physical = events[0].hlc_physical_ms;
     saved_logical = events[0].hlc_logical;
   }
@@ -330,7 +331,7 @@ TEST_F(FactStoreTest, ReopenContinuesTheSameHistoryAndClock) {
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   ASSERT_TRUE(store.is_open());
   std::vector<FactStore::Event> events{MakeEvent(2)};
-  ASSERT_TRUE(store.PersistBatch(1700000005000LL, &events));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000005000LL, &events));
   ASSERT_LT(std::make_pair(saved_physical, saved_logical),
             std::make_pair(events[0].hlc_physical_ms, events[0].hlc_logical));
   sqlite3* db = nullptr;
@@ -343,23 +344,19 @@ TEST_F(FactStoreTest, WriteFailureIsReportedWithoutTouchingExistingRows) {
   FactStore store(root_);
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> first{MakeEvent(1)};
-  ASSERT_TRUE(store.PersistBatch(1700000006000LL, &first));
-  // Break the schema out from under the open connection: any insert inside
-  // the transaction must fail, roll back, and report a write fault.
-  sqlite3* tamper = nullptr;
-  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((root_ / "facts.sqlite3").c_str(),
-                                       &tamper, SQLITE_OPEN_READWRITE,
-                                       nullptr));
-  ASSERT_EQ(SQLITE_OK,
-            sqlite3_exec(tamper, "DROP TABLE selection_events;", nullptr,
-                         nullptr, nullptr));
-  sqlite3_close(tamper);
-  std::vector<FactStore::Event> second{MakeEvent(2)};
-  ASSERT_FALSE(store.PersistBatch(1700000007000LL, &second));
+  ASSERT_EQ(FactStore::Status::kOk,
+            store.PersistBatch(1700000006000LL, &first));
+  // A second batch re-using an event_id violates the primary key inside the
+  // transaction: it must fail, roll back, and report a write fault without
+  // touching the existing rows.
+  std::vector<FactStore::Event> second{MakeEvent(1)};
+  ASSERT_EQ(FactStore::Status::kDbWriteFailed,
+            store.PersistBatch(1700000007000LL, &second));
   ASSERT_EQ(FactStore::Status::kDbWriteFailed, store.status());
   sqlite3* db = nullptr;
   ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
   ASSERT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM commits;"));
+  ASSERT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM selection_events;"));
   sqlite3_close(db);
 }
 
@@ -461,7 +458,7 @@ TEST_F(FactStoreTest, ClockRollbackOnlyAdvancesLogicalComponent) {
     FactStore store(root_);
     ASSERT_EQ(FactStore::Status::kOk, store.Open());
     std::vector<FactStore::Event> events{MakeEvent(1)};
-    ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events));
+    ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &events));
   }
   sqlite3* tamper = nullptr;
   ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((root_ / "facts.sqlite3").c_str(),
@@ -478,7 +475,7 @@ TEST_F(FactStoreTest, ClockRollbackOnlyAdvancesLogicalComponent) {
   FactStore store(root_);
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> events{MakeEvent(2)};
-  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &events));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000002000LL, &events));
   // The wall clock is behind the persisted clock, so the physical component
   // is untouched; only the logical component advances.
   EXPECT_EQ(7000000000000LL, events[0].hlc_physical_ms);
@@ -499,7 +496,7 @@ TEST_F(FactStoreTest, CrashMidBatchLeavesNothingVisible) {
   FactStore store(root_);
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> first{MakeEvent(1)};
-  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &first));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &first));
 
   // Simulate a second writer that dies right after BEGIN IMMEDIATE with a
   // commit row and events inserted but never COMMITted.
@@ -548,7 +545,7 @@ TEST_F(FactStoreTest, CrashMidBatchLeavesNothingVisible) {
   FactStore store2(root_);
   ASSERT_EQ(FactStore::Status::kOk, store2.Open());
   std::vector<FactStore::Event> second{MakeEvent(2)};
-  ASSERT_TRUE(store2.PersistBatch(1700000004000LL, &second));
+  ASSERT_EQ(FactStore::Status::kOk, store2.PersistBatch(1700000004000LL, &second));
   sqlite3* db2 = nullptr;
   ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db2));
   EXPECT_EQ(2LL, QueryCount(db2, "SELECT COUNT(*) FROM commits;"));
@@ -565,7 +562,7 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
     FactStore store(root_);
     ASSERT_EQ(FactStore::Status::kOk, store.Open());
     std::vector<FactStore::Event> bootstrap{MakeEvent(0)};
-    ASSERT_TRUE(store.PersistBatch(1699999999000LL, &bootstrap));
+    ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1699999999000LL, &bootstrap));
   }
 
   // Second writer as an independent process: this binary relaunched in
@@ -578,7 +575,7 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
     ASSERT_EQ(FactStore::Status::kOk, store.Open());
     for (int i = 0; i < kConcurrentBatches; ++i) {
       std::vector<FactStore::Event> events{MakeEvent(200 + i)};
-      ASSERT_TRUE(store.PersistBatch(1700000001000LL + i, &events));
+      ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL + i, &events));
     }
   }
   int exit_code = 0;
@@ -608,7 +605,7 @@ TEST_F(FactStoreTest, AppendRetractionKeepsOriginalFactsUntouched) {
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> events{MakeEvent(1), MakeEvent(2)};
   std::string commit_id;
-  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events, &commit_id));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &events, &commit_id));
   ASSERT_FALSE(commit_id.empty());
   ASSERT_EQ(commit_id, events[0].commit_id);
   ASSERT_EQ(commit_id, events[1].commit_id);
@@ -619,7 +616,7 @@ TEST_F(FactStoreTest, AppendRetractionKeepsOriginalFactsUntouched) {
   sqlite3_close(db);
 
   std::string retraction_id;
-  ASSERT_TRUE(store.AppendRetraction(commit_id, 1700000002000LL,
+  ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction(commit_id, 1700000002000LL,
                                      &retraction_id));
   ASSERT_FALSE(retraction_id.empty());
   ASSERT_NE(retraction_id, commit_id);
@@ -649,9 +646,9 @@ TEST_F(FactStoreTest, AppendRetractionIsIdempotent) {
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> events{MakeEvent(1)};
   std::string commit_id;
-  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &events, &commit_id));
-  ASSERT_TRUE(store.AppendRetraction(commit_id, 1700000002000LL));
-  ASSERT_TRUE(store.AppendRetraction(commit_id, 1700000003000LL));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &events, &commit_id));
+  ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction(commit_id, 1700000002000LL));
+  ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction(commit_id, 1700000003000LL));
   // A repeated retraction is a no-op: exactly one retraction row, no torn
   // state.
   sqlite3* db = nullptr;
@@ -664,7 +661,7 @@ TEST_F(FactStoreTest, AppendRetractionIsIdempotent) {
 TEST_F(FactStoreTest, AppendRetractionOfUnknownCommitIsNoop) {
   FactStore store(root_);
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
-  ASSERT_TRUE(store.AppendRetraction("no-such-commit", 1700000001000LL));
+  ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction("no-such-commit", 1700000001000LL));
   sqlite3* db = nullptr;
   ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
   EXPECT_EQ(0LL, QueryCount(db, "SELECT COUNT(*) FROM retractions;"));
@@ -677,13 +674,13 @@ TEST_F(FactStoreTest, ActiveProjectionIsTemporalAndDeterministic) {
   ASSERT_EQ(FactStore::Status::kOk, store.Open());
   std::vector<FactStore::Event> batch_a{MakeEvent(1), MakeEvent(2)};
   std::string commit_a;
-  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
   std::vector<FactStore::Event> batch_b{MakeEvent(3)};
   std::string commit_b;
-  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &batch_b, &commit_b));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000002000LL, &batch_b, &commit_b));
 
   std::string retraction_id;
-  ASSERT_TRUE(store.AppendRetraction(commit_a, 1700000003000LL,
+  ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction(commit_a, 1700000003000LL,
                                      &retraction_id));
   sqlite3* db = nullptr;
   ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
@@ -730,11 +727,11 @@ TEST_F(FactStoreTest, ActiveProjectionIsStableAcrossReopen) {
     ASSERT_EQ(FactStore::Status::kOk, store.Open());
     std::vector<FactStore::Event> batch_a{MakeEvent(1), MakeEvent(2)};
     std::string commit_a;
-    ASSERT_TRUE(store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
-    ASSERT_TRUE(store.AppendRetraction(commit_a, 1700000002000LL));
+    ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
+    ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction(commit_a, 1700000002000LL));
     std::vector<FactStore::Event> batch_b{MakeEvent(3)};
     std::string commit_b;
-    ASSERT_TRUE(store.PersistBatch(1700000003000LL, &batch_b, &commit_b));
+    ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000003000LL, &batch_b, &commit_b));
     sqlite3* db = nullptr;
     ASSERT_TRUE(OpenDbReadOnly(root_ / "facts.sqlite3", &db));
     point_phys =
@@ -768,10 +765,10 @@ TEST_F(FactStoreTest, RetractionExitsWholeBatchFromAgeClockAtOnce) {
   // All events share one choice problem key (schema "test", word, "shijie").
   std::vector<FactStore::Event> batch_a{MakeEvent(1), MakeEvent(2)};
   std::string commit_a;
-  ASSERT_TRUE(store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000001000LL, &batch_a, &commit_a));
   std::vector<FactStore::Event> batch_b{MakeEvent(3)};
   std::string commit_b;
-  ASSERT_TRUE(store.PersistBatch(1700000002000LL, &batch_b, &commit_b));
+  ASSERT_EQ(FactStore::Status::kOk, store.PersistBatch(1700000002000LL, &batch_b, &commit_b));
 
   auto previous_event_count = [](const std::vector<FactStore::Event>& active,
                                  const FactStore::Event& target) {
@@ -792,7 +789,7 @@ TEST_F(FactStoreTest, RetractionExitsWholeBatchFromAgeClockAtOnce) {
   EXPECT_EQ(1, previous_event_count(active, batch_a[1]));
   EXPECT_EQ(0, previous_event_count(active, batch_b[0]));
 
-  ASSERT_TRUE(store.AppendRetraction(commit_a, 1700000003000LL));
+  ASSERT_EQ(FactStore::Status::kOk, store.AppendRetraction(commit_a, 1700000003000LL));
 
   point = ReadMetaClock(root_ / "facts.sqlite3");
   active.clear();

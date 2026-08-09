@@ -21,17 +21,20 @@ class KeyEvent;
 // event lifecycle follows the spec "选择事件生命周期 seam":
 //
 // - `select_notifier` creates or replaces a tentative per-segment event.
-// - `commit_notifier` validates the final composition and persists still-valid
-//   events atomically with the HLC advance, in one short transaction.
+// - `commit_notifier` validates the final composition and hands the still-
+//   valid events to the process-wide RecorderCoordinator, which persists
+//   them atomically with the HLC advance (fast path) or buffers the whole
+//   commit batch while the maintenance exclusive lock is held (#53). A
+//   commit never waits on the maintenance lock.
 // - abort, composition reset (update with empty composition) and commit-time
 //   validation drop tentative events that did not make it into the commit.
 //
-// Immediate undo: a commit that persisted events arms a retraction window
+// Immediate undo: a commit that produced events arms a retraction window
 // bound to that commit. The next key press consumes it — an unmodified,
-// unhandled BackSpace appends a retraction fact for the whole commit; any
-// other key press (or another commit) disarms without retracting. Repeated
-// BackSpace after the first is a no-op, so stepping back across older commits
-// never happens silently.
+// unhandled BackSpace appends a retraction fact for the whole commit (or
+// queues it behind the buffered batch); any other key press (or another
+// commit) disarms without retracting. Repeated BackSpace after the first is
+// a no-op, so stepping back across older commits never happens silently.
 //
 // Recording is off by default (`llm_rerank/recording_enabled`, user story 26:
 // upgrades must not start collecting raw preceding text silently).
@@ -52,6 +55,7 @@ class LlmRerankRecorder : public Processor {
   void UpdateStatusProperties();
 
   std::shared_ptr<RecorderSession> session_;
+  std::shared_ptr<RecorderCoordinator> coordinator_;
   connection select_connection_;
   connection commit_connection_;
   connection abort_connection_;
