@@ -73,8 +73,12 @@ std::string QueryText(sqlite3* db, const char* sql) {
 // removed on last close and a read-only open cannot rebuild it), so
 // verification opens read-write like the store itself does.
 bool OpenDbReadOnly(const fs::path& db_path, sqlite3** db) {
-  return sqlite3_open_v2(db_path.c_str(), db,
-                         SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK;
+  if (sqlite3_open_v2(db_path.c_str(), db,
+                      SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK)
+    return false;
+  if (*db)
+    sqlite3_busy_timeout(*db, 2000);
+  return true;
 }
 
 // One-event batch with the given text sizes; preceding_text is the main

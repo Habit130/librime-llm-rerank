@@ -1220,9 +1220,17 @@ class RecorderE2ETest : public ::testing::Test {
 
   sqlite3* OpenFactsDb() {
     sqlite3* db = nullptr;
+    // Read-write like the store itself: a pure READONLY connection cannot
+    // read an uncheckpointed WAL after the last writer connection closed
+    // (the -shm file is removed and a read-only open cannot rebuild it),
+    // which would make verification reads see stale counts. The busy
+    // timeout makes a poll retry against the flush thread's short
+    // transactions instead of failing.
     EXPECT_EQ(SQLITE_OK,
               sqlite3_open_v2((FactsRoot() / "facts.sqlite3").c_str(), &db,
-                              SQLITE_OPEN_READONLY, nullptr));
+                              SQLITE_OPEN_READWRITE, nullptr));
+    if (db)
+      sqlite3_busy_timeout(db, 2000);
     return db;
   }
 

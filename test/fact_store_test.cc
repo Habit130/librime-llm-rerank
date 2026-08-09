@@ -63,8 +63,12 @@ long long QueryCount(sqlite3* db, const char* sql) {
 }
 
 bool OpenDbReadOnly(const fs::path& db_path, sqlite3** db) {
-  return sqlite3_open_v2(db_path.c_str(), db,
-                         SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK;
+  if (sqlite3_open_v2(db_path.c_str(), db,
+                      SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+    return false;
+  if (*db)
+    sqlite3_busy_timeout(*db, 2000);
+  return true;
 }
 
 FactStore::Event MakeEvent(int seq) {
