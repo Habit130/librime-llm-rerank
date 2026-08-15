@@ -525,10 +525,20 @@ def _component_schemas(rime_dir):
     A schema counts as configured-component when its resolved build config
     has an `llm_rerank` section or lists llm_rerank / llm_rerank_recorder in
     its engine processors or filters.
+
+    The schema list comes from the resolved default config: a deployed
+    Squirrel user data dir keeps the merged result under `build/default.yaml`
+    and does not carry a root-level `default.yaml` (that file is a shared
+    data artifact). Prefer the root file when present (test fixtures), then
+    the deployment-resolved build file.
     """
     build_dir = os.path.join(rime_dir, "build")
-    default_path = os.path.join(rime_dir, "default.yaml")
-    if not os.path.isfile(default_path):
+    for candidate in (os.path.join(rime_dir, "default.yaml"),
+                      os.path.join(build_dir, "default.yaml")):
+        if os.path.isfile(candidate):
+            default_path = candidate
+            break
+    else:
         return None
     try:
         with open(default_path, encoding="utf-8") as f:

@@ -723,6 +723,28 @@ class StatusCoreTest(unittest.TestCase):
         self.assertIsNone(report["schemas"][0]["config"]["baseline_policy_id"])
         self.assertNotIn("; policy ", render_human(report))
 
+    def test_deployed_rime_dir_uses_build_default_yaml(self):
+        # A live Squirrel deployment has no root-level default.yaml: the
+        # resolved config lives under build/default.yaml (shared-data
+        # default.yaml is not copied to the user data dir).
+        self.write_default(["alpha"])
+        self.write_schema(
+            "alpha",
+            llm_rerank={"reranking_enabled": True, "recording_enabled": True,
+                        "evidence_enabled": False},
+            engine={"filters": ["uniquifier", "llm_rerank"],
+                    "processors": ["llm_rerank_recorder"]})
+        self.write_facts(active_events=0)
+        os.remove(os.path.join(self.rime_dir, "default.yaml"))
+        with open(os.path.join(self.rime_dir, "build", "default.yaml"),
+                  "w", encoding="utf-8") as f:
+            f.write("config_version: \"0.1\"\n")
+            f.write("schema_list:\n  - schema: alpha\n")
+        report = self.report()
+        self.assertTrue(report["snapshot_ok"])
+        self.assertEqual(["alpha"], [e["schema_id"] for e in report["schemas"]])
+        self.assertEqual(0, report["exit_code"])
+
     def test_daemon_offline_with_daemon_dependency_is_exit_one(self):
         self.write_default(["m"])
         self.write_schema("m", llm_rerank={
