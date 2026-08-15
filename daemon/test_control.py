@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import tempfile
@@ -29,6 +30,31 @@ class ControlTest(unittest.TestCase):
             self.assertEqual(2345, control.peer_uid(object()))
         finally:
             maintenance.socket_module = original
+
+    def test_peer_uid_ctypes_fallback_verifies_a_real_kernel_fd(self):
+        left, _right = socket.socketpair()
+
+        class ModuleWithoutNative:
+            pass
+
+        class ShallowPeer:
+            """Real kernel fd without a socket.getpeereid method, forcing the
+            libc ctypes path against the actual peer credential."""
+
+            def __init__(self, sock):
+                self._sock = sock
+
+            def fileno(self):
+                return self._sock.fileno()
+
+        original = maintenance.socket_module
+        try:
+            maintenance.socket_module = lambda: ModuleWithoutNative
+            self.assertEqual(os.getuid(),
+                             control.peer_uid(ShallowPeer(left)))
+        finally:
+            maintenance.socket_module = original
+            left.close()
 
     def test_rejects_non_owner_only_or_symlinked_control_root(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -78,6 +104,42 @@ class ControlTest(unittest.TestCase):
         self.assertEqual("serving", coordinator.health()["maintenance_state"])
         self.assertEqual(0, coordinator.health()["open_handles"])
 
+    def test_rejected_second_prepare_does_not_orphan_the_live_lease(self):
+        left, right = socket.socketpair()
+        coordinator = MaintenanceCoordinator(
+            "/unused", identity_reader=lambda _root: {
+                "store_epoch": "epoch", "hlc_physical_ms": 0,
+                "hlc_logical": 0})
+        worker = threading.Thread(target=control._serve_connection,
+                                  args=(left, coordinator))
+        worker.start()
+        reader = right.makefile("rb")
+        try:
+            right.sendall(b'{"version":1,"action":"prepare",'
+                          b'"operation_id":"op-a"}\n')
+            first = json.loads(reader.readline())
+            self.assertTrue(first["ok"])
+            self.assertEqual("prepared",
+                             coordinator.health()["maintenance_state"])
+            # The coordinator keeps the first lease; the second prepare is
+            # rejected. The connection must keep serving the first lease, so
+            # EOF below has to recover it rather than a stale id.
+            right.sendall(b'{"version":1,"action":"prepare",'
+                          b'"operation_id":"op-b"}\n')
+            second = json.loads(reader.readline())
+            self.assertFalse(second["ok"])
+            self.assertEqual("maintenance_in_progress", second["code"])
+            self.assertEqual("prepared",
+                             coordinator.health()["maintenance_state"])
+        finally:
+            reader.close()
+            right.close()
+        # EOF is kernel-delivered once the peer closes, so the server thread
+        # must observe it, drop the op-a lease and return to serving.
+        worker.join()
+        self.assertEqual("serving", coordinator.health()["maintenance_state"])
+        self.assertEqual(0, coordinator.health()["open_handles"])
+
     def test_eof_during_prepare_does_not_leave_preparing_state(self):
         left, right = socket.socketpair()
         preparing = threading.Event()
@@ -91,9 +153,11 @@ class ControlTest(unittest.TestCase):
         worker.start()
         right.sendall(b'{"version":1,"action":"prepare",'
                       b'"operation_id":"op"}\n')
-        self.assertTrue(preparing.wait(2))
+        self.assertTrue(preparing.wait())
         right.close()
-        worker.join(2)
+        # The close is delivered as EOF by the kernel; the server thread must
+        # then cancel the draining prepare and exit deterministically.
+        worker.join()
         self.assertFalse(worker.is_alive())
         self.assertEqual("blocked", coordinator.health()["maintenance_state"])
         request_lease.complete()

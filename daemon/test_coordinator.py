@@ -232,7 +232,7 @@ class CoordinatorTest(unittest.TestCase):
                 root, fact_handle_factory=delayed_factory)
             opening = threading.Thread(target=coordinator.open_fact_handle)
             opening.start()
-            self.assertTrue(factory_opened.wait(2))
+            self.assertTrue(factory_opened.wait())
             close_started = threading.Event()
             closed = threading.Event()
 
@@ -243,10 +243,12 @@ class CoordinatorTest(unittest.TestCase):
 
             closing = threading.Thread(target=close_coordinator)
             closing.start()
-            self.assertTrue(close_started.wait(2))
+            self.assertTrue(close_started.wait())
+            # close() blocks until the in-flight factory returns; releasing it
+            # causally unblocks close(), so both joins are deterministic.
             allow_factory_return.set()
-            opening.join(2)
-            closing.join(2)
+            opening.join()
+            closing.join()
             self.assertTrue(closed.is_set())
             self.assertEqual(0, coordinator.health()["open_handles"])
             exclusive = MaintenanceLock(root, exclusive=True,

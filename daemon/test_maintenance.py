@@ -2,6 +2,8 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -9,8 +11,8 @@ import unittest
 import control
 from coordinator import MaintenanceCoordinator
 from maintenance import (MaintenanceError, MaintenanceLock, acquire_exclusive,
-                         read_recording_gap, run_fact_replacement,
-                         run_maintenance)
+                         read_recording_gap, replace_fact_database,
+                         run_fact_replacement, run_maintenance)
 
 
 class _FakeClock:
@@ -59,6 +61,131 @@ class MaintenanceTest(unittest.TestCase):
     def read_target(self, name):
         with open(os.path.join(self.root, name), "rb") as stream:
             return stream.read()
+
+    def _write_store(self, epoch):
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        connection.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            [("store_epoch", epoch), ("hlc_physical_ms", "9"),
+             ("hlc_logical", "1")],
+        )
+        connection.commit()
+        connection.close()
+        os.chmod(db_path, 0o600)
+        return db_path
+
+    def _write_replacement(self, epoch, name="replacement.sqlite3"):
+        path = os.path.join(self.temp.name, name)
+        connection = sqlite3.connect(path)
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        connection.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            [("store_epoch", epoch), ("hlc_physical_ms", "10"),
+             ("hlc_logical", "0")],
+        )
+        connection.commit()
+        connection.close()
+        os.chmod(path, 0o600)
+        return path
+
+    def _read_epoch(self):
+        connection = sqlite3.connect(
+            f"file:{os.path.join(self.root, 'facts.sqlite3')}?mode=ro", uri=True)
+        try:
+            return connection.execute(
+                "SELECT value FROM meta WHERE key='store_epoch'").fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_sidecar_removal_failure_aborts_before_publication(self):
+        self._write_store("epoch-a")
+        with open(os.path.join(self.root, "facts.sqlite3-shm"), "wb") as stream:
+            stream.write(b"stale")
+        os.chmod(os.path.join(self.root, "facts.sqlite3-shm"), 0o600)
+        replacement = self._write_replacement("epoch-b")
+        replaced = []
+
+        def failing_unlink(path):
+            if path.endswith("-shm"):
+                raise OSError(13, "injected unlink failure")
+            return os.unlink(path)
+
+        with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+            replace_fact_database(self.root, replacement,
+                                  _unlink=failing_unlink,
+                                  _replace=lambda *_: replaced.append(True))
+        # The failed attempt must leave the complete old store untouched and
+        # must never have published the new main database.
+        self.assertEqual([], replaced)
+        self.assertEqual("epoch-a", self._read_epoch())
+        self.assertTrue(os.path.exists(replacement))
+
+    def test_checkpoint_failure_aborts_before_publication(self):
+        self._write_store("epoch-a")
+        replacement = self._write_replacement("epoch-b")
+
+        def failing_connect(path, **kwargs):
+            del path, kwargs
+            raise sqlite3.DatabaseError("injected checkpoint failure")
+
+        with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+            replace_fact_database(self.root, replacement,
+                                  _connect=failing_connect)
+        self.assertEqual("epoch-a", self._read_epoch())
+        self.assertTrue(os.path.exists(replacement))
+
+    def test_successful_replacement_removes_stale_sidecars(self):
+        self._write_store("epoch-a")
+        for suffix in ("-shm",):
+            with open(os.path.join(self.root, "facts.sqlite3" + suffix),
+                      "wb") as stream:
+                stream.write(b"stale")
+            os.chmod(os.path.join(self.root, "facts.sqlite3" + suffix), 0o600)
+        replacement = self._write_replacement("epoch-b")
+        replace_fact_database(self.root, replacement)
+        self.assertEqual("epoch-b", self._read_epoch())
+        self.assertFalse(os.path.exists(replacement))
+        self.assertFalse(os.path.exists(os.path.join(self.root,
+                                                     "facts.sqlite3-shm")))
+        self.assertFalse(os.path.exists(os.path.join(self.root,
+                                                     "facts.sqlite3-wal")))
+
+    def test_crash_between_checkpoint_and_publication_leaves_complete_old_store(self):
+        self._write_store("epoch-a")
+        replacement = self._write_replacement("epoch-b")
+        daemon_dir = os.path.dirname(os.path.abspath(__import__(
+            "maintenance").__file__))
+        script = (
+            "import os, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import maintenance\n"
+            "def crash():\n"
+            "    os._exit(9)\n"
+            "maintenance.replace_fact_database(%r, %r,"
+            " _after_checkpoint=crash)\n"
+            "os._exit(0)\n" % (daemon_dir, self.root, replacement)
+        )
+        completed = subprocess.run([sys.executable, "-c", script],
+                                   check=False, timeout=60)
+        # The child died after the checkpoint and sidecar cleanup but before
+        # the atomic rename: only the complete old store may be observable.
+        self.assertEqual(9, completed.returncode)
+        self.assertEqual("epoch-a", self._read_epoch())
+        self.assertTrue(os.path.exists(replacement))
+        self.assertFalse(os.path.exists(os.path.join(self.root,
+                                                     "facts.sqlite3-wal")))
+
+    def test_gap_lock_unknown_state_is_reported_unknown(self):
+        self._write_store("epoch-a")
+        lock = os.path.join(self.root, "recording_gap.lock")
+        with open(lock, "wb") as stream:
+            stream.write(b"unknown\n")
+        os.chmod(lock, 0o600)
+        gap = read_recording_gap(self.root)
+        self.assertEqual("unknown", gap["state"])
+        self.assertEqual("gap_missing_after_initialization", gap["reason"])
 
     def test_default_timeout_preserves_every_maintenance_target(self):
         targets = ["facts.sqlite3", "facts.sqlite3-wal", "facts.sqlite3-shm",

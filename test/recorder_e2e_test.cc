@@ -12,10 +12,12 @@
 
 #include <dlfcn.h>
 
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -1081,6 +1083,71 @@ std::string DumpEventFacts(sqlite3* db) {
   return out;
 }
 
+// Dylib-side recorder I/O hook for the marker-fsync blocking test. The hook
+// runs on the production dylib's worker thread; the test main thread controls
+// it through these barriers.
+std::mutex g_hook_mutex;
+std::condition_variable g_hook_entered_cv;
+std::condition_variable g_hook_release_cv;
+bool g_hook_entered = false;
+bool g_hook_release = false;
+bool g_hook_blocked_once = false;
+
+int BlockingMarkerFsyncHook(const char* op) {
+  if (strcmp(op, "marker_state_write") != 0)
+    return 0;
+  std::unique_lock<std::mutex> lock(g_hook_mutex);
+  if (g_hook_blocked_once)
+    return 0;
+  g_hook_blocked_once = true;
+  g_hook_entered = true;
+  g_hook_entered_cv.notify_all();
+  g_hook_release_cv.wait(lock, [] { return g_hook_release; });
+  return 0;
+}
+
+// Installs the hook into the loaded production dylib and restores it on
+// destruction, releasing any parked worker first.
+class DylibIOHookGuard {
+ public:
+  DylibIOHookGuard() {
+    {
+      std::lock_guard<std::mutex> lock(g_hook_mutex);
+      g_hook_entered = false;
+      g_hook_release = false;
+      g_hook_blocked_once = false;
+    }
+    SetDylibHook(BlockingMarkerFsyncHook);
+  }
+  ~DylibIOHookGuard() {
+    Release();
+    SetDylibHook(nullptr);
+  }
+  void WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(g_hook_mutex);
+    g_hook_entered_cv.wait(lock, [] { return g_hook_entered; });
+  }
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(g_hook_mutex);
+      g_hook_release = true;
+    }
+    g_hook_release_cv.notify_all();
+  }
+
+ private:
+  void SetDylibHook(int (*hook)(const char*)) {
+    void* plugin = dlopen(LLM_RERANK_PLUGIN_DYLIB, RTLD_LAZY | RTLD_NOLOAD);
+    ASSERT_NE(nullptr, plugin);
+    using Setter = void (*)(int (*)(const char*));
+    auto setter = reinterpret_cast<Setter>(
+        dlsym(plugin, "rime_llm_rerank_set_io_hook_for_testing"));
+    ASSERT_NE(nullptr, setter);
+    setter(hook);
+    ASSERT_EQ(0, dlclose(plugin));
+  }
+};
+
 class RecorderE2ETest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
@@ -1428,6 +1495,34 @@ TEST_F(RecorderE2ETest, EngineCommitDuringExclusiveMaintenanceIsBuffered) {
   exclusive.Release();
   g_rime->destroy_session(session);
   session_ = 0;
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, EngineCommitDoesNotWaitForMarkerFsync) {
+  DylibIOHookGuard hook;
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  // The first commit constructs the production coordinator, whose worker
+  // then parks inside the marker fsync (blocked by the installed hook). The
+  // commit itself must complete from the in-memory queue alone; a commit
+  // that waited on the worker's durable I/O would never return here.
+  EXPECT_EQ("时界", CommitText(session));
+  // Barrier: the worker has provably entered the blocked marker fsync. This
+  // arrives after the commit already returned, proving the two never met.
+  hook.WaitUntilEntered();
+  g_rime->destroy_session(session);
+  session_ = 0;
+
+  hook.Release();
+  FlushLoadedRecorder();
   sqlite3* db = OpenFactsDb();
   ASSERT_TRUE(db != nullptr);
   long long count = -1;

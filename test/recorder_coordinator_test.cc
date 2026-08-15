@@ -10,8 +10,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -26,6 +29,60 @@ using namespace rime;
 extern char** environ;
 
 namespace {
+
+// Installs a process-wide recorder I/O hook and restores the no-hook state on
+// destruction. Tests must release any blocking hook before the guard dies.
+class IOHookGuard {
+ public:
+  explicit IOHookGuard(RecorderIOHook hook) {
+    RecorderCoordinator::SetIOHookForTesting(std::move(hook));
+  }
+  ~IOHookGuard() { RecorderCoordinator::SetIOHookForTesting(nullptr); }
+};
+
+// Blocks the worker at the first observed recorder I/O operation until
+// Release() is called; later operations pass through untouched. Deterministic
+// via barriers: WaitUntilEntered() returns exactly when the worker is parked
+// inside the hook, and Release() is the only event that lets it proceed.
+class BlockingIOHook {
+ public:
+  BlockingIOHook() {
+    RecorderCoordinator::SetIOHookForTesting([this](const char* op) -> int {
+      (void)op;
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (blocked_once_)
+        return 0;
+      blocked_once_ = true;
+      entered_ = true;
+      entered_cv_.notify_all();
+      release_cv_.wait(lock, [this] { return release_; });
+      return 0;
+    });
+  }
+  ~BlockingIOHook() {
+    Release();
+    RecorderCoordinator::SetIOHookForTesting(nullptr);
+  }
+  void WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_cv_.wait(lock, [this] { return entered_; });
+  }
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      release_ = true;
+    }
+    release_cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable entered_cv_;
+  std::condition_variable release_cv_;
+  bool entered_ = false;
+  bool release_ = false;
+  bool blocked_once_ = false;
+};
 
 std::string MakeTempDir() {
   char template_path[] = "/tmp/llm_rerank_coordinator_XXXXXX";
@@ -150,6 +207,8 @@ std::string ReadFile(const fs::path& path) {
 
 constexpr const char* kSpawnedGapWriterFlag =
     "--llm-rerank-spawned-gap-writer";
+constexpr const char* kSpawnedCrashWriterFlag =
+    "--llm-rerank-spawned-crash-writer";
 
 void RunSpawnedGapWriter(const fs::path& root) {
   MaintenanceLock exclusive;
@@ -171,12 +230,58 @@ void RunSpawnedGapWriter(const fs::path& root) {
   _exit(0);
 }
 
+void RunSpawnedCrashWriter(const fs::path& root) {
+  // The crash point is deterministic: the child dies exactly after its
+  // process marker was created and written, while a buffered batch is still
+  // unpersisted behind the exclusive maintenance lease.
+  std::mutex sync;
+  std::condition_variable marker_written;
+  bool written = false;
+  RecorderCoordinator::SetIOHookForTesting([&](const char* op) -> int {
+    if (strcmp(op, "marker_state_write") == 0) {
+      std::lock_guard<std::mutex> lock(sync);
+      written = true;
+      marker_written.notify_all();
+    }
+    return 0;
+  });
+  MaintenanceLock exclusive;
+  if (!exclusive.Acquire(root, MaintenanceLock::Mode::kExclusive))
+    _exit(2);
+  auto coordinator = RecorderCoordinator::ForRoot(root);
+  std::vector<FactStore::Event> events{MakeEvent("crash-event")};
+  if (coordinator->SubmitBatch(1700000000000LL, &events).outcome !=
+      RecorderCoordinator::Outcome::kBuffered) {
+    _exit(3);
+  }
+  {
+    std::unique_lock<std::mutex> lock(sync);
+    marker_written.wait(lock, [&] { return written; });
+  }
+  // Crash: no shutdown, no marker cleanup. The kernel releases the marker
+  // flock; the stale file is the durable crash evidence.
+  _exit(9);
+}
+
 pid_t SpawnGapWriter(const fs::path& root) {
   char self_path[4096];
   uint32_t path_size = sizeof(self_path);
   if (_NSGetExecutablePath(self_path, &path_size) != 0)
     return -1;
   char* argv[] = {self_path, const_cast<char*>(kSpawnedGapWriterFlag),
+                  const_cast<char*>(root.c_str()), nullptr};
+  pid_t pid = -1;
+  if (posix_spawn(&pid, self_path, nullptr, nullptr, argv, environ) != 0)
+    return -1;
+  return pid;
+}
+
+pid_t SpawnCrashWriter(const fs::path& root) {
+  char self_path[4096];
+  uint32_t path_size = sizeof(self_path);
+  if (_NSGetExecutablePath(self_path, &path_size) != 0)
+    return -1;
+  char* argv[] = {self_path, const_cast<char*>(kSpawnedCrashWriterFlag),
                   const_cast<char*>(root.c_str()), nullptr};
   pid_t pid = -1;
   if (posix_spawn(&pid, self_path, nullptr, nullptr, argv, environ) != 0)
@@ -192,6 +297,8 @@ void RunSpawnedRecorderGapMode(int argc, char** argv) {
   for (int index = 1; index + 1 < argc; ++index) {
     if (std::string(argv[index]) == kSpawnedGapWriterFlag)
       RunSpawnedGapWriter(fs::path(argv[index + 1]));
+    if (std::string(argv[index]) == kSpawnedCrashWriterFlag)
+      RunSpawnedCrashWriter(fs::path(argv[index + 1]));
   }
 }
 
@@ -282,17 +389,46 @@ TEST_F(RecorderCoordinatorTest, NewCommitCannotOvertakeAnOlderBufferedBatch) {
   ASSERT_TRUE(exclusive.Acquire(root_, MaintenanceLock::Mode::kExclusive));
   auto coordinator = RecorderCoordinator::ForRoot(root_);
   std::vector<FactStore::Event> first{MakeEvent("fifo-first")};
-  std::vector<FactStore::Event> second{MakeEvent("fifo-second")};
   ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
             coordinator->SubmitBatch(1700000000000LL, &first).outcome);
+  // The maintenance lease is released before the second commit arrives, so
+  // the worker may already be flushing while the newer batch lands in the
+  // queue. The FIFO enqueue order must still win.
+  exclusive.Release();
+  std::vector<FactStore::Event> second{MakeEvent("fifo-second")};
   ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
             coordinator->SubmitBatch(1700000000001LL, &second).outcome);
-  exclusive.Release();
   coordinator->FlushForTesting();
   const auto order = QueryEventOrder(root_ / "facts.sqlite3");
   ASSERT_EQ(2u, order.size());
   EXPECT_EQ("fifo-first", order[0]);
   EXPECT_EQ("fifo-second", order[1]);
+}
+
+TEST_F(RecorderCoordinatorTest,
+       RetractionAfterReleaseAppliesToEarlierBufferedBatch) {
+  {
+    FactStore initial(root_);
+    ASSERT_EQ(FactStore::Status::kOk, initial.Open());
+  }
+  MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(root_, MaintenanceLock::Mode::kExclusive));
+  auto coordinator = RecorderCoordinator::ForRoot(root_);
+  std::vector<FactStore::Event> events{MakeEvent("late-retraction")};
+  auto commit = coordinator->SubmitBatch(1700000000000LL, &events);
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered, commit.outcome);
+  exclusive.Release();
+  // The retraction arrives after the lease release, while its target batch
+  // may still be buffered. It must follow the batch in FIFO order and take
+  // effect instead of becoming an unknown no-op.
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitRetraction(commit.commit_id, 1700000000001LL)
+                .outcome);
+  coordinator->FlushForTesting();
+  const fs::path db_path = root_ / "facts.sqlite3";
+  EXPECT_EQ(1, QueryCount(db_path, "SELECT COUNT(*) FROM commits;"));
+  EXPECT_EQ(1, QueryCount(db_path, "SELECT COUNT(*) FROM retractions;"));
+  EXPECT_EQ(0, QueryCount(db_path, "SELECT COUNT(*) FROM active_events;"));
 }
 
 TEST_F(RecorderCoordinatorTest, OverflowPreservesQueuedBatchesAndPublishesGap) {
@@ -366,6 +502,35 @@ TEST_F(RecorderCoordinatorTest, GapAccumulatesAcrossIndependentProcesses) {
   const std::string gap = ReadFile(root_ / "recording_gap.json");
   EXPECT_NE(std::string::npos, gap.find("\"dropped_batches\":2"));
   EXPECT_NE(std::string::npos, gap.find("\"dropped_events\":2"));
+}
+
+TEST_F(RecorderCoordinatorTest, CrashedRecorderLeavesDurableCrashEvidence) {
+  {
+    FactStore initial(root_);
+    ASSERT_EQ(FactStore::Status::kOk, initial.Open());
+  }
+  const pid_t child = SpawnCrashWriter(root_);
+  ASSERT_GE(child, 0);
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = waitpid(child, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  ASSERT_EQ(child, waited);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(9, WEXITSTATUS(status));
+  // The crashed child performed no marker cleanup: the stale marker file is
+  // the durable crash evidence. The status reader interprets a non-live
+  // marker as unknown (daemon/test_maintenance.py), and the buffered batch
+  // never reached the store.
+  bool marker_found = false;
+  for (const auto& entry : fs::directory_iterator(root_)) {
+    if (entry.path().filename().string().rfind(".recording_process.", 0) == 0)
+      marker_found = true;
+  }
+  EXPECT_TRUE(marker_found);
+  EXPECT_EQ(0, QueryCount(root_ / "facts.sqlite3",
+                          "SELECT COUNT(*) FROM selection_events;"));
 }
 
 TEST_F(RecorderCoordinatorTest, FailedGapPublicationLeavesAnIntentMarker) {
@@ -454,6 +619,9 @@ TEST_F(RecorderCoordinatorTest, RecorderProcessMarkerIsPrivateAndCleaned) {
     ASSERT_EQ(FactStore::Status::kOk, initial.Open());
   }
   auto coordinator = RecorderCoordinator::ForRoot(root_);
+  // The marker is established by the worker before the first flush; the
+  // drain point makes its existence deterministic.
+  coordinator->FlushForTesting();
   fs::path marker;
   for (const auto& entry : fs::directory_iterator(root_)) {
     if (entry.path().filename().string().rfind(".recording_process.", 0) == 0) {
@@ -569,6 +737,120 @@ TEST_F(RecorderCoordinatorTest, LogicalBytesAreIndependentOfVectorCapacity) {
   reserved.front().candidates.reserve(128);
   EXPECT_EQ(RecorderCoordinator::BatchLogicalBytes(compact),
             RecorderCoordinator::BatchLogicalBytes(reserved));
+}
+
+TEST_F(RecorderCoordinatorTest, MarkerFsyncCannotBlockACommitSubmission) {
+  {
+    FactStore initial(root_);
+    ASSERT_EQ(FactStore::Status::kOk, initial.Open());
+  }
+  BlockingIOHook hook;
+  auto coordinator = RecorderCoordinator::ForRoot(root_);
+  hook.WaitUntilEntered();
+  // The worker is deterministically parked inside marker fsync right now. A
+  // commit must still complete from memory alone; if the input path waited
+  // on the worker's durable I/O, this submission would never return and the
+  // test deadlocks instead of asserting.
+  std::vector<FactStore::Event> events{MakeEvent("hot-path")};
+  EXPECT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitBatch(1700000000000LL, &events).outcome);
+  hook.Release();
+  coordinator->FlushForTesting();
+  EXPECT_EQ(1, QueryCount(root_ / "facts.sqlite3",
+                          "SELECT COUNT(*) FROM selection_events;"));
+}
+
+TEST_F(RecorderCoordinatorTest, MarkerCreationFailureDoesNotRejectEvents) {
+  {
+    FactStore initial(root_);
+    ASSERT_EQ(FactStore::Status::kOk, initial.Open());
+  }
+  // The marker is crash evidence, not a precondition for recording: while it
+  // cannot be created the healthy store keeps receiving every committed
+  // batch, so no artificial loss is created.
+  IOHookGuard hook([](const char* op) -> int {
+    return strcmp(op, "marker_create") == 0 ? -1 : 0;
+  });
+  auto coordinator = RecorderCoordinator::ForRoot(root_);
+  std::vector<FactStore::Event> events{MakeEvent("marker-down")};
+  EXPECT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitBatch(1700000000000LL, &events).outcome);
+  coordinator->FlushForTesting();
+  EXPECT_EQ(1, QueryCount(root_ / "facts.sqlite3",
+                          "SELECT COUNT(*) FROM selection_events;"));
+  bool marker_found = false;
+  for (const auto& entry : fs::directory_iterator(root_)) {
+    if (entry.path().filename().string().rfind(".recording_process.", 0) == 0)
+      marker_found = true;
+  }
+  EXPECT_FALSE(marker_found);
+}
+
+TEST_F(RecorderCoordinatorTest,
+       GapPersistenceFailureLeavesDurableUnknownLockState) {
+  {
+    FactStore initial(root_);
+    ASSERT_EQ(FactStore::Status::kOk, initial.Open());
+  }
+  auto coordinator = RecorderCoordinator::ForRoot(root_);
+  // Establish the evidence primitives (marker, gap lock, gap record) before
+  // any loss can occur.
+  coordinator->FlushForTesting();
+  ASSERT_TRUE(fs::is_regular_file(root_ / "recording_gap.lock"));
+  ASSERT_TRUE(fs::is_regular_file(root_ / "recording_gap.json"));
+
+  // Every gap publication attempt now fails, including the intent fallback.
+  // The pre-existing gap lock must still carry the durable unknown state, so
+  // after a process restart status reads unknown instead of none.
+  IOHookGuard hook([](const char* op) -> int {
+    return (strcmp(op, "gap_json_write") == 0 ||
+            strcmp(op, "intent_create") == 0)
+               ? -1
+               : 0;
+  });
+  MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(root_, MaintenanceLock::Mode::kExclusive));
+  for (int index = 0; index < 257; ++index) {
+    std::vector<FactStore::Event> events{
+        MakeEvent("failed-gap-" + std::to_string(index))};
+    ASSERT_EQ(index < 256 ? RecorderCoordinator::Outcome::kBuffered
+                          : RecorderCoordinator::Outcome::kGap,
+              coordinator->SubmitBatch(1700000003000LL + index, &events)
+                  .outcome);
+  }
+  exclusive.Release();
+  coordinator->FlushForTesting();
+
+  EXPECT_EQ("unknown\n", ReadFile(root_ / "recording_gap.lock"));
+  // The durable unknown marker survives a clean coordinator shutdown: it is
+  // the restart evidence, not a live process handle.
+  bool marker_found = false;
+  for (const auto& entry : fs::directory_iterator(root_)) {
+    if (entry.path().filename().string().rfind(".recording_process.", 0) == 0)
+      marker_found = true;
+  }
+  EXPECT_TRUE(marker_found);
+}
+
+TEST_F(RecorderCoordinatorTest,
+       FirstCommitDoesNotCreateStoreOrEvidenceSynchronously) {
+  BlockingIOHook hook;
+  // The coordinator is constructed exactly where the commit notifier builds
+  // it; the worker immediately parks at its first evidence step.
+  auto coordinator = RecorderCoordinator::ForRoot(root_);
+  hook.WaitUntilEntered();
+  // The first commit must return having touched nothing durable: no store,
+  // no marker, no gap record. Initialization belongs to the worker.
+  std::vector<FactStore::Event> events{MakeEvent("first-commit")};
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitBatch(1700000000000LL, &events).outcome);
+  EXPECT_FALSE(fs::exists(root_ / "facts.sqlite3"));
+  EXPECT_FALSE(fs::exists(root_ / "recording_gap.json"));
+  EXPECT_FALSE(fs::exists(root_ / "recording_gap.lock"));
+  hook.Release();
+  coordinator->FlushForTesting();
+  EXPECT_EQ(1, QueryCount(root_ / "facts.sqlite3",
+                          "SELECT COUNT(*) FROM selection_events;"));
 }
 
 }  // namespace
