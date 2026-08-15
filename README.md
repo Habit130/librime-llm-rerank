@@ -118,6 +118,69 @@ application does not manage; clear never creates an implicit backup of the
 old facts, so back up explicitly first if you may want the old history
 later.
 
+## Online fact backup and offline verify
+
+`backup create` makes a consistent snapshot of the live fact store while
+you keep typing — it never requests a quiesce, never takes the exclusive
+maintenance lock and never blocks the recorder — and publishes it as a
+single versioned `.squirrel-memory-backup` ZIP:
+
+```text
+squirrel-semantic-memory backup create --output <path>
+squirrel-semantic-memory backup verify <backup>
+```
+
+The container holds exactly two members, `facts.sqlite3` and
+`manifest.json`. The manifest records the backup format and backup ID, the
+fact schema and event-format range, `history_id`, source `store_epoch`,
+commit/event/retraction counts, the HLC and event high-water marks, the
+creation time, the producer version, the database size and its SHA-256, and
+whether the destination was explicitly confirmed as insecure. The snapshot
+comes from the SQLite Online Backup API through the C++ `fact_store_tool`
+seam (Python never interprets fact rows); it is fully integrity-checked,
+checkpointed into a single file with no WAL/SHM dependency, fsynced and
+re-verified before publication.
+
+The destination must not exist — an existing path (or a symlink) returns
+`destination_exists` and there is deliberately no `--force`. The container
+is staged as an exclusive owner-only `0600` temp file in the destination
+parent, fsynced, re-opened and self-verified, then published with a
+hard-link rename that can never overwrite a concurrently created
+destination, and the parent directory is fsynced. Staging is durable under
+`<root>/.backup/<operation-id>/`, so a crash mid-publication resumes with
+the same backup ID and never re-snapshots or overwrites.
+
+The backup is **plaintext private input history**; it is not encrypted.
+The destination medium must prove owner-only file permissions, otherwise
+the create is refused. To accept a medium that cannot (for example a
+filesystem without real Unix permissions), run with
+`--allow-insecure-destination` and type the exact confirmation string
+`ALLOW INSECURE BACKUP AT <absolute-path>`; the operation, the manifest and
+any later verify permanently mark the container
+`insecure_destination: true`. The flag alone is not a bypass — it is the
+entry to a second, exact-string confirmation, and no-overwrite, integrity
+and checksum guarantees still apply.
+
+`backup verify` is completely offline: it never reads the live fact root,
+never creates or touches the operation store, never connects to or starts
+the daemon, never loads the model and never modifies application state. It
+strictly parses the container (exact member set, safe names, no
+directory/symlink/device members, no encryption, supported compression,
+documented size and compression-ratio limits, CRC), extracts both members
+into an owner-only temporary directory, re-computes the database checksum
+and size and cross-checks every manifest identity/count/HLC field against
+the C++ fact-store interpretation of the extracted database. Malformed,
+tampered, corrupt or unsupported containers are rejected with a stable
+error code and no state change.
+
+Like `clear`, `backup create` is a persistent operation: the operation ID
+is printed before any snapshot work, `operation show/wait/cancel` observe
+it, a cancel honored before publishing cleans the staged snapshot and temp
+without leaving a target, a publish makes the operation uncancellable, and
+Ctrl-C in the foreground CLI only detaches (exit 130) while the detached
+executor continues. The same operation ID with the same parameters reuses
+the same backup; the same ID with different parameters is rejected.
+
 ## License
 
 BSD-3-Clause, matching librime.
