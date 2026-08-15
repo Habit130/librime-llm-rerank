@@ -51,6 +51,25 @@ CoordinatorRegistry& Registry() {
   return registry;
 }
 
+// Deterministic test seam: a process-wide observer/failure injector for the
+// worker's durable I/O. Non-zero return injects a failure; the hook may also
+// block to hold the worker at a chosen I/O point. Only tests install it.
+std::mutex& IOHookMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+RecorderIOHook& IOHook() {
+  static RecorderIOHook hook;
+  return hook;
+}
+
+int RunIOHook(const char* operation) {
+  std::lock_guard<std::mutex> lock(IOHookMutex());
+  const RecorderIOHook& hook = IOHook();
+  return hook ? hook(operation) : 0;
+}
+
 bool WriteAll(int fd, const string& text) {
   const char* data = text.data();
   size_t remaining = text.size();
@@ -237,6 +256,8 @@ bool WriteGapFile(int root_fd,
                   const char* state,
                   const char* reason,
                   const GapFile& gap) {
+  if (RunIOHook("gap_json_write") != 0)
+    return false;
   const string temp = ".recording_gap." + RandomUuid() + ".tmp";
   int fd = openat(root_fd, temp.c_str(), O_WRONLY | O_CREAT | O_EXCL |
                   O_NOFOLLOW, kFileMode);
@@ -271,11 +292,15 @@ bool OpenGapRoot(const path& root, int* root_fd) {
 }
 
 bool WriteProcessMarkerState(int fd, const char* state) {
+  if (RunIOHook("marker_state_write") != 0)
+    return false;
   return ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0 &&
          WriteAll(fd, state) && fsync(fd) == 0;
 }
 
 bool OpenProcessMarker(const path& root, int* marker_fd, string* marker_name) {
+  if (RunIOHook("marker_create") != 0)
+    return false;
   *marker_fd = -1;
   marker_name->clear();
   int root_fd = -1;
@@ -357,6 +382,8 @@ string CurrentStoreEpoch(const path& root) {
 
 GapUpdateStatus OpenGapLock(const path& root, int* root_fd, int* lock_fd) {
   *lock_fd = -1;
+  if (RunIOHook("gap_lock_open") != 0)
+    return GapUpdateStatus::kFailed;
   if (!OpenGapRoot(root, root_fd))
     return GapUpdateStatus::kFailed;
   *lock_fd = openat(*root_fd, kGapLockName,
@@ -440,6 +467,8 @@ bool HasGapIntent(int root_fd, bool* present) {
 }
 
 bool CreateGapIntent(const path& root, string* name) {
+  if (RunIOHook("intent_create") != 0)
+    return false;
   int root_fd = -1;
   if (!OpenGapRoot(root, &root_fd))
     return false;
@@ -575,6 +604,11 @@ GapUpdateStatus MarkGapUnknown(const path& root) {
 
 }  // namespace
 
+void RecorderCoordinator::SetIOHookForTesting(RecorderIOHook hook) {
+  std::lock_guard<std::mutex> lock(IOHookMutex());
+  IOHook() = std::move(hook);
+}
+
 std::shared_ptr<RecorderCoordinator> RecorderCoordinator::ForRoot(
     const path& root) {
   CoordinatorRegistry& registry = Registry();
@@ -605,9 +639,10 @@ void RecorderCoordinator::ShutdownAll() {
 }
 
 RecorderCoordinator::RecorderCoordinator(path root) : root_(std::move(root)) {
-  process_marker_ready_ =
-      OpenProcessMarker(root_, &process_marker_fd_, &process_marker_name_);
-  process_marker_clean_ = process_marker_ready_;
+  // No durable I/O here: a commit notifier calls ForRoot and must return
+  // without touching SQLite, flock, fsync or directory persistence. The
+  // worker establishes the crash-evidence marker and the gap-state files
+  // before flushing anything.
   flush_thread_ = std::thread(&RecorderCoordinator::FlushLoop, this);
 }
 
@@ -616,13 +651,34 @@ RecorderCoordinator::~RecorderCoordinator() {
   CleanupProcessMarker();
 }
 
-void RecorderCoordinator::SetProcessMarkerState(const char* state, bool clean) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  SetProcessMarkerStateLocked(state, clean);
+void RecorderCoordinator::EstablishEvidence() {
+  // Worker thread only. The process marker is per-process crash evidence; the
+  // gap lock plus gap record carry the cross-process "unknown" fallback that
+  // a failed gap update later writes into the pre-existing lock file.
+  AttemptCreateProcessMarker();
+  if (!gap_state_ready_)
+    gap_state_ready_ = EnsureGapState(root_) == GapUpdateStatus::kOk;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    startup_done_ = true;
+    drained_.notify_all();
+  }
 }
 
-void RecorderCoordinator::SetProcessMarkerStateLocked(const char* state,
-                                                       bool clean) {
+void RecorderCoordinator::AttemptCreateProcessMarker() {
+  // Worker thread only. Failure never rejects or drops events: it merely
+  // leaves crash evidence unestablished for now; the worker retries on later
+  // iterations while submissions keep flowing to the store.
+  if (process_marker_ready_)
+    return;
+  process_marker_ready_ =
+      OpenProcessMarker(root_, &process_marker_fd_, &process_marker_name_);
+  process_marker_clean_ = process_marker_ready_;
+}
+
+void RecorderCoordinator::WriteProcessMarkerFromWorker(const char* state,
+                                                        bool clean) {
+  // Worker thread only, never under mutex_ and never on the input path.
   if (!process_marker_ready_ || process_marker_fd_ < 0)
     return;
   if (!WriteProcessMarkerState(process_marker_fd_, state)) {
@@ -630,6 +686,20 @@ void RecorderCoordinator::SetProcessMarkerStateLocked(const char* state,
     return;
   }
   process_marker_clean_ = clean;
+}
+
+void RecorderCoordinator::WorkerCleanup() {
+  // Worker thread only, on shutdown. A clean marker is removed; a marker in
+  // unknown/pending state stays on disk as durable crash/gap evidence.
+  if (process_marker_ready_ && process_marker_clean_)
+    RemoveProcessMarker(root_, process_marker_name_);
+  if (process_marker_fd_ >= 0) {
+    close(process_marker_fd_);
+    process_marker_fd_ = -1;
+  }
+  process_marker_name_.clear();
+  process_marker_ready_ = false;
+  process_marker_clean_ = false;
 }
 
 void RecorderCoordinator::CleanupProcessMarker() {
@@ -756,21 +826,14 @@ void RecorderCoordinator::MoveQueuedItemsToShutdownGapLocked() {
 }
 
 void RecorderCoordinator::EnqueueOrGap(Item item, SubmitResult* result) {
+  // Pure in-memory accounting on the input path: the queue mutex is held for
+  // memory operations only, so a commit or retraction never waits on SQLite,
+  // flock, fsync, directory persistence or the worker's marker I/O.
   std::lock_guard<std::mutex> lock(mutex_);
   if (stopping_) {
     result->outcome = Outcome::kGap;
     result->fault_code = "recorder_stopped";
     AddGapLocked("shutdown_unpersisted", item.kind == Kind::kBatch,
-                 static_cast<int64_t>(item.events.size()),
-                 item.kind == Kind::kRetraction, item.bytes);
-    SetProcessMarkerStateLocked(kProcessMarkerUnknown, false);
-    changed_.notify_all();
-    return;
-  }
-  if (!process_marker_ready_) {
-    result->outcome = Outcome::kGap;
-    result->fault_code = "recording_marker_unavailable";
-    AddGapLocked("recording_gap", item.kind == Kind::kBatch,
                  static_cast<int64_t>(item.events.size()),
                  item.kind == Kind::kRetraction, item.bytes);
     changed_.notify_all();
@@ -840,6 +903,10 @@ RecorderCoordinator::SubmitResult RecorderCoordinator::SubmitRetraction(
 }
 
 void RecorderCoordinator::FlushLoop() {
+  // The worker owns every durable side effect. Evidence primitives are
+  // established before the first flush so a crash or a failed gap update can
+  // never leave a silent hole.
+  EstablishEvidence();
   for (;;) {
     Gap gap;
     Item item;
@@ -859,6 +926,7 @@ void RecorderCoordinator::FlushLoop() {
       } else if (stopping_) {
         worker_stopped_ = true;
         drained_.notify_all();
+        WorkerCleanup();
         return;
       } else {
         item = queue_.front();
@@ -866,8 +934,15 @@ void RecorderCoordinator::FlushLoop() {
       }
     }
 
+    // Retry evidence establishment on later iterations when the first
+    // attempt failed; both are worker-thread-only durable I/O.
+    if (!process_marker_ready_)
+      AttemptCreateProcessMarker();
+    if (!gap_state_ready_)
+      gap_state_ready_ = EnsureGapState(root_) == GapUpdateStatus::kOk;
+
     if (flushing_gap) {
-      SetProcessMarkerState(kProcessMarkerPending, false);
+      WriteProcessMarkerFromWorker(kProcessMarkerPending, false);
       bool intent_created = !gap.intent.empty() || CreateGapIntent(root_, &gap.intent);
       GapUpdateStatus status = GapUpdateStatus::kFailed;
       bool persisted = false;
@@ -885,9 +960,9 @@ void RecorderCoordinator::FlushLoop() {
         persisted = false;
       }
       if (persisted) {
-        SetProcessMarkerState(kProcessMarkerClean, true);
+        WriteProcessMarkerFromWorker(kProcessMarkerClean, true);
       } else {
-        SetProcessMarkerState(kProcessMarkerUnknown, false);
+        WriteProcessMarkerFromWorker(kProcessMarkerUnknown, false);
       }
       std::lock_guard<std::mutex> lock(mutex_);
       processing_ = false;
@@ -900,11 +975,6 @@ void RecorderCoordinator::FlushLoop() {
 
     string fault;
     if (Persist(item, &fault)) {
-      const GapUpdateStatus initialized = EnsureGapState(root_);
-      if (initialized == GapUpdateStatus::kFailed) {
-        MarkGapUnknown(root_);
-        SetProcessMarkerState(kProcessMarkerUnknown, false);
-      }
       std::lock_guard<std::mutex> lock(mutex_);
       RemoveFrontLocked();
       processing_ = false;
@@ -937,7 +1007,8 @@ void RecorderCoordinator::FlushForTesting() {
   changed_.notify_all();
   drained_.wait(lock, [this] {
     return worker_stopped_ ||
-           (queue_.empty() && pending_gap_.empty() && !processing_);
+           (startup_done_ && queue_.empty() && pending_gap_.empty() &&
+            !processing_);
   });
 }
 

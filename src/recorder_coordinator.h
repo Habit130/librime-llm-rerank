@@ -7,6 +7,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -14,6 +15,12 @@
 #include "fact_store.h"
 
 namespace rime {
+
+// Deterministic test seam for the recorder's durable I/O. The hook is invoked
+// around each named operation; returning non-zero injects a failure, and the
+// hook may block to hold the worker at a specific I/O point. It is process
+// wide and must only be installed by tests.
+using RecorderIOHook = std::function<int(const char* operation)>;
 
 // Process-wide recorder coordinator. It is the sole route from a committed
 // composition or its immediate retraction to the fact store, which makes a
@@ -31,6 +38,9 @@ class RecorderCoordinator {
   // plugin shutdown has removed it from the process registry.
   static std::shared_ptr<RecorderCoordinator> ForRoot(const path& root);
   static void ShutdownAll();
+
+  // Test-only: observe or fail the worker's durable I/O by operation name.
+  static void SetIOHookForTesting(RecorderIOHook hook);
 
   ~RecorderCoordinator();
 
@@ -89,8 +99,16 @@ class RecorderCoordinator {
   void MoveQueuedItemsToShutdownGapLocked();
   void FlushLoop();
   void Shutdown();
-  void SetProcessMarkerStateLocked(const char* state, bool clean);
-  void SetProcessMarkerState(const char* state, bool clean);
+  // Durable-evidence establishment. Runs on the worker thread only, before
+  // the first item is flushed: the process marker (crash evidence) and the
+  // gap lock plus gap record (gap-failure evidence) must exist on disk before
+  // any committed event can be silently lost to a crash or a failed update.
+  void EstablishEvidence();
+  void AttemptCreateProcessMarker();
+  // Worker-only marker maintenance: never under mutex_ and never on the input
+  // path. A blocked fsync therefore cannot delay a commit notifier.
+  void WriteProcessMarkerFromWorker(const char* state, bool clean);
+  void WorkerCleanup();
   void CleanupProcessMarker();
 
   path root_;
@@ -103,6 +121,12 @@ class RecorderCoordinator {
   bool stopping_ = false;
   bool processing_ = false;
   bool worker_stopped_ = false;
+  // Set by the worker once evidence establishment has finished; test drains
+  // wait on it so a marker or gap-state observation is deterministic.
+  bool startup_done_ = false;
+  bool gap_state_ready_ = false;
+  // The worker thread is the sole owner of the marker fields below; the input
+  // path never reads or writes them.
   int process_marker_fd_ = -1;
   string process_marker_name_;
   bool process_marker_ready_ = false;

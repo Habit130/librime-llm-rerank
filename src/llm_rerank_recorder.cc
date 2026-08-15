@@ -52,7 +52,7 @@ bool IsFatalRecordingFault(const string& fault) {
          fault == "db_symlink" || fault == "db_not_regular" ||
          fault == "db_owner" || fault == "db_permission" ||
          fault == "db_corrupt" || fault == "db_unsupported_version" ||
-         fault == "db_clock_invalid" || fault == "recording_marker_unavailable";
+         fault == "db_clock_invalid";
 }
 
 }  // namespace

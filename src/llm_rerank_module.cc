@@ -38,4 +38,9 @@ extern "C" void rime_llm_rerank_shutdown_recorder_for_testing() {
   rime::RecorderCoordinator::ShutdownAll();
 }
 
+extern "C" void rime_llm_rerank_set_io_hook_for_testing(int (*hook)(const char*)) {
+  rime::RecorderCoordinator::SetIOHookForTesting(
+      hook ? rime::RecorderIOHook(hook) : rime::RecorderIOHook());
+}
+
 RIME_REGISTER_MODULE(llm_rerank)
