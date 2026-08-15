@@ -171,6 +171,38 @@ class StatusCoreTest(unittest.TestCase):
         conn.commit()
         conn.close()
         os.chmod(db_path, 0o600)
+        with open(os.path.join(self.facts_root, "recording_gap.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({
+                "gap_version": 2,
+                "state": "none",
+                "reason": "none",
+                "dropped_batches": 0,
+                "dropped_events": 0,
+                "dropped_retractions": 0,
+                "dropped_bytes": 0,
+                "updated_at_ms": 1,
+            }, stream)
+        os.chmod(os.path.join(self.facts_root, "recording_gap.json"), 0o600)
+        with open(os.path.join(self.facts_root, "recording_gap.lock"), "wb") as stream:
+            stream.write(b"safe\n")
+        os.chmod(os.path.join(self.facts_root, "recording_gap.lock"), 0o600)
+
+    def write_gap(self, state, reason, batches=0, events=0, retractions=0,
+                  bytes_count=0):
+        with open(os.path.join(self.facts_root, "recording_gap.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({
+                "gap_version": 2,
+                "state": state,
+                "reason": reason,
+                "dropped_batches": batches,
+                "dropped_events": events,
+                "dropped_retractions": retractions,
+                "dropped_bytes": bytes_count,
+                "updated_at_ms": 2,
+            }, stream)
+        os.chmod(os.path.join(self.facts_root, "recording_gap.json"), 0o600)
 
     def break_facts_root(self):
         os.makedirs(self.facts_root)
@@ -310,7 +342,7 @@ class StatusCoreTest(unittest.TestCase):
         self.write_facts(active_events=0)
         report = self.report()
         self.assertTrue(report["snapshot_ok"])
-        self.assertEqual(1, report["status_version"])
+        self.assertEqual(2, report["status_version"])
         self.assertEqual(0, report["exit_code"])
         self.assertEqual(1, len(report["schemas"]))
         entry = report["schemas"][0]
@@ -464,8 +496,115 @@ class StatusCoreTest(unittest.TestCase):
                          facts["fact_high_water"])
         # Last write = max(commit time 1002, retraction time 2000).
         self.assertEqual(2000, facts["last_write_at_ms"])
-        self.assertEqual({"state": "none"}, facts["recording_gaps"])
+        self.assertEqual("none", facts["recording_gaps"]["state"])
         self.assertEqual(0, report["exit_code"])
+
+    def test_initialized_store_without_gap_artifact_is_still_healthy(self):
+        self.canonical_schema()
+        self.write_facts(active_events=0)
+        os.unlink(os.path.join(self.facts_root, "recording_gap.json"))
+        os.unlink(os.path.join(self.facts_root, "recording_gap.lock"))
+        report = self.report()
+        self.assertEqual("none", report["facts"]["recording_gaps"]["state"])
+        self.assertEqual(0, report["exit_code"])
+
+    def test_present_recording_gap_is_human_diagnostic_and_exit_one(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        self.write_gap("present", "buffer_overflow_batches", batches=1,
+                       events=2, bytes_count=128)
+        report = self.report()
+        recording = report["schemas"][0]["config"]["runtime_effective"][
+            "recording"]
+        self.assertEqual("degraded", recording["state"])
+        self.assertEqual("recording_gap_present", recording["reason"])
+        self.assertEqual(1, report["exit_code"])
+        human = render_human(report)
+        self.assertIn("recording gap: present", human)
+        self.assertIn("buffer_overflow_batches", human)
+        self.assertIn("1 batches", human)
+
+    def test_unverifiable_recording_gap_is_not_reported_as_none(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        self.write_gap("unknown", "gap_persistence_failed")
+        report = self.report()
+        recording = report["schemas"][0]["config"]["runtime_effective"][
+            "recording"]
+        self.assertEqual("unknown", recording["state"])
+        self.assertEqual("gap_persistence_failed", recording["reason"])
+        self.assertEqual(1, report["exit_code"])
+        self.assertIn("recording gap: unknown (gap_persistence_failed)",
+                      render_human(report))
+
+    def test_unwritable_gap_target_is_unknown_not_a_zero_gap(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        path = os.path.join(self.facts_root, "recording_gap.json")
+        os.unlink(path)
+        os.mkdir(path, 0o700)
+        report = self.report()
+        recording = report["schemas"][0]["config"]["runtime_effective"][
+            "recording"]
+        self.assertEqual("unknown", recording["state"])
+        self.assertEqual("gap_unsafe", recording["reason"])
+        self.assertEqual("unknown", report["facts"]["recording_gaps"]["state"])
+        self.assertEqual(1, report["exit_code"])
+
+    def test_gap_survives_a_missing_facts_database(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        self.write_gap("present", "buffer_overflow_batches", batches=1)
+        os.unlink(os.path.join(self.facts_root, "facts.sqlite3"))
+        report = self.report()
+        self.assertEqual("not_created", report["facts"]["health"])
+        self.assertEqual("present", report["facts"]["recording_gaps"]["state"])
+        self.assertEqual("degraded", report["schemas"][0]["config"]
+                         ["runtime_effective"]["recording"]["state"])
+        self.assertEqual(1, report["exit_code"])
+
+    def test_gap_reason_is_a_stable_code_not_arbitrary_file_content(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        private_reason = "PRIVATE_REASON_\u4e0a\u4e0b\u6587"
+        self.write_gap("present", private_reason, batches=1)
+        report = self.report()
+        self.assertEqual("unknown", report["facts"]["recording_gaps"]["state"])
+        self.assertEqual("gap_invalid", report["facts"]["recording_gaps"]["reason"])
+        self.assertNotIn(private_reason, json.dumps(report, ensure_ascii=False))
+        self.assertNotIn(private_reason, render_human(report))
+
+    def test_orphaned_gap_intent_is_unknown_even_with_a_none_record(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        intent = os.path.join(self.facts_root, ".recording_gap_intent.test")
+        with open(intent, "wb") as stream:
+            stream.write(b"unknown\n")
+        os.chmod(intent, 0o600)
+        report = self.report()
+        self.assertEqual("unknown", report["facts"]["recording_gaps"]["state"])
+        self.assertEqual("gap_update_in_progress",
+                         report["facts"]["recording_gaps"]["reason"])
+        self.assertEqual(1, report["exit_code"])
+
+    def test_v1_gap_is_retained_as_a_present_gap_during_upgrade(self):
+        self.canonical_schema()
+        self.write_facts(active_events=1)
+        path = os.path.join(self.facts_root, "recording_gap.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump({
+                "gap_version": 1,
+                "reason": "buffer_overflow_batches",
+                "dropped_batches": 1,
+                "dropped_events": 2,
+                "dropped_retractions": 0,
+                "dropped_bytes": 3,
+                "updated_at_ms": 1,
+            }, stream)
+        os.chmod(path, 0o600)
+        report = self.report()
+        self.assertEqual("present", report["facts"]["recording_gaps"]["state"])
+        self.assertEqual(1, report["exit_code"])
 
     def test_facts_not_created_is_zero_evidence_not_fault(self):
         self.canonical_schema()
@@ -598,7 +737,7 @@ class StatusCoreTest(unittest.TestCase):
             "alpha": 1.0,
         })
         report = self.report()
-        thread.join(timeout=5)
+        thread.join()
         self.assertEqual("unknown", report["serving"]["state"])
         self.assertEqual("unknown", report["schemas"][0]["config"][
             "runtime_effective"]["reranking"]["state"])
@@ -641,6 +780,7 @@ class StatusCoreTest(unittest.TestCase):
         self.assertEqual(2, compute_exit_code(report))
         report["snapshot_ok"] = True
         report["schemas"] = []
+        report["facts"]["recording_gaps"] = {"state": "none"}
         self.assertEqual(0, compute_exit_code(report))
         report["schemas"] = [{"config": {"runtime_effective": {
             "reranking": {"state": "blocked", "reason": "db_corrupt"},

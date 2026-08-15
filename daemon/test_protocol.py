@@ -7,7 +7,6 @@ import os
 import socket
 import sys
 import threading
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -24,7 +23,9 @@ from server import (
     handle_health,
     handle_request,
     read_request,
+    serve_scoring_connection,
 )
+from coordinator import MaintenanceCoordinator
 
 
 class FakeState:
@@ -66,6 +67,49 @@ def encode_pairs(pairs):
     ) + "}"
 
 
+class ScriptedSocket:
+    """Deterministic recv script for framing and deadline tests."""
+
+    def __init__(self, chunks, on_recv=None):
+        self.chunks = list(chunks)
+        self.timeouts = []
+        self.on_recv = on_recv
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def recv(self, _size):
+        if self.on_recv is not None:
+            self.on_recv()
+        if not self.chunks:
+            return b""
+        item = self.chunks.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class BlockingResponseConnection:
+    """A connection whose response write is explicitly controlled by the test."""
+
+    def __init__(self, payload):
+        self._chunks = [payload, b""]
+        self.send_started = threading.Event()
+        self.allow_send = threading.Event()
+        self.writes = []
+
+    def settimeout(self, _timeout):
+        pass
+
+    def recv(self, _size):
+        return self._chunks.pop(0)
+
+    def sendall(self, payload):
+        self.writes.append(payload)
+        self.send_started.set()
+        self.allow_send.wait()
+
+
 class ProtocolTest(unittest.TestCase):
     def assert_protocol_error(self, response, code):
         self.assertEqual(PROTOCOL_VERSION, response["version"])
@@ -93,6 +137,61 @@ class ProtocolTest(unittest.TestCase):
             },
             response,
         )
+
+    def test_prepare_waits_until_the_response_write_completes(self):
+        drain_waiting = threading.Event()
+        coordinator = MaintenanceCoordinator(
+            "/unused",
+            identity_reader=lambda _root: {
+                "store_epoch": "epoch-a", "hlc_physical_ms": 1,
+                "hlc_logical": 0,
+            },
+            prepare_wait_hook=drain_waiting.set,
+        )
+        connection = BlockingResponseConnection(
+            (encode(request()) + "\n").encode("utf-8"))
+        serving = threading.Thread(
+            target=serve_scoring_connection,
+            args=(FakeState(), connection, coordinator),
+        )
+        serving.start()
+        connection.send_started.wait()
+
+        prepared = {}
+        preparing = threading.Thread(
+            target=lambda: prepared.update(coordinator.prepare("op-response")))
+        preparing.start()
+        drain_waiting.wait()
+        self.assertEqual("preparing", coordinator.health()["maintenance_state"])
+        self.assertFalse(prepared)
+
+        connection.allow_send.set()
+        serving.join()
+        preparing.join()
+        self.assertTrue(prepared["ok"])
+        self.assertEqual("prepared", coordinator.health()["maintenance_state"])
+        self.assertEqual(1, len(connection.writes))
+
+    def test_scoring_activity_is_touched_at_request_and_response_boundaries(self):
+        connection = BlockingResponseConnection(
+            (encode(request()) + "\n").encode("utf-8"))
+        connection.allow_send.set()
+        activity = []
+        serve_scoring_connection(FakeState(), connection,
+                                  activity_sink=lambda: activity.append(True))
+        self.assertEqual(2, len(activity))
+
+    def test_coordinated_requests_require_a_transport_completion_sink(self):
+        coordinator = MaintenanceCoordinator(
+            "/unused",
+            identity_reader=lambda _root: {
+                "store_epoch": "epoch-a", "hlc_physical_ms": 1,
+                "hlc_logical": 0,
+            },
+        )
+        response = handle_request(FakeState(), encode(request()), coordinator)
+        self.assertEqual("server_error", response["error"]["code"])
+        self.assertTrue(coordinator.prepare("op-no-sink")["ok"])
 
     def test_invalid_json_is_rejected(self):
         self.assert_protocol_error(
@@ -154,23 +253,11 @@ class ProtocolTest(unittest.TestCase):
                 self.assert_protocol_error(response, "invalid_json")
 
     def test_split_trailing_payload_is_rejected_at_socket_framing(self):
-        reader, writer = socket.socketpair()
-
-        def send_split_request():
-            writer.sendall((encode(request()) + "\n").encode("utf-8"))
-            time.sleep(0.01)
-            writer.sendall(b"garbage")
-            writer.shutdown(socket.SHUT_WR)
-
-        thread = threading.Thread(target=send_split_request)
-        thread.start()
-        try:
-            with self.assertRaises(ValueError):
-                read_request(reader)
-        finally:
-            thread.join()
-            reader.close()
-            writer.close()
+        reader = ScriptedSocket([
+            (encode(request()) + "\n").encode("utf-8"), b"garbage", b"",
+        ])
+        with self.assertRaises(ValueError):
+            read_request(reader)
 
     def test_single_terminal_lf_is_accepted_at_socket_framing(self):
         reader, writer = socket.socketpair()
@@ -195,44 +282,22 @@ class ProtocolTest(unittest.TestCase):
             writer.close()
 
     def test_request_read_uses_one_absolute_deadline(self):
-        reader, writer = socket.socketpair()
+        clock = [0.0]
 
-        def drip_request():
-            try:
-                for _ in range(20):
-                    writer.sendall(b"x")
-                    time.sleep(0.01)
-            except OSError:
-                pass
+        def advance():
+            clock[0] += 0.01
 
-        thread = threading.Thread(target=drip_request)
-        thread.start()
-        started = time.monotonic()
-        try:
-            with self.assertRaises(TimeoutError):
-                read_request(reader, deadline_seconds=0.03)
-            self.assertLess(time.monotonic() - started, 0.15)
-        finally:
-            reader.close()
-            writer.close()
-            thread.join()
+        reader = ScriptedSocket([b"x", b"x", b"x", b"x"], on_recv=advance)
+        with self.assertRaises(TimeoutError):
+            read_request(reader, deadline_seconds=0.03, now=lambda: clock[0])
+        self.assertEqual(3, len(reader.timeouts))
+        for actual, expected in zip(reader.timeouts, (0.03, 0.02, 0.01)):
+            self.assertAlmostEqual(expected, actual)
 
     def test_oversized_request_is_rejected_at_socket_framing(self):
-        reader, writer = socket.socketpair()
-
-        def send_oversized_request():
-            writer.sendall(b"x" * (MAX_REQUEST_BYTES + 1))
-            writer.shutdown(socket.SHUT_WR)
-
-        thread = threading.Thread(target=send_oversized_request)
-        thread.start()
-        try:
-            with self.assertRaises(ValueError):
-                read_request(reader)
-        finally:
-            thread.join()
-            reader.close()
-            writer.close()
+        reader = ScriptedSocket([b"x" * (MAX_REQUEST_BYTES + 1)])
+        with self.assertRaises(ValueError):
+            read_request(reader)
 
     def test_extra_field_and_wrong_version_are_rejected(self):
         for damaged in (request(extra=True), request(version=PROTOCOL_VERSION + 1)):

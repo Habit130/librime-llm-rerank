@@ -1988,9 +1988,11 @@ TEST(LlmScorerTest, EmptyBatchReturnsNoScores) {
 // fact_store_test.cc): _exit()s inside when this process was relaunched as
 // the second writer, before gtest ever initializes.
 void RunSpawnedWriterMode(int argc, char** argv);
+void RunSpawnedRecorderGapMode(int argc, char** argv);
 
 int main(int argc, char** argv) {
   RunSpawnedWriterMode(argc, argv);
+  RunSpawnedRecorderGapMode(argc, argv);
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

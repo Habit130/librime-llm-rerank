@@ -469,12 +469,12 @@ def make_request(request_id, plan_identity, context, candidates,
     }
 
 
-def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE):
+def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE, now=time.monotonic):
     chunks = []
     size = 0
-    deadline = time.monotonic() + deadline_seconds
+    deadline = now() + deadline_seconds
     while True:
-        remaining = deadline - time.monotonic()
+        remaining = deadline - now()
         if remaining <= 0:
             raise TimeoutError("request deadline exceeded")
         conn.settimeout(remaining)
@@ -526,7 +526,7 @@ def handle_health(state, request, coordinator=None):
     return response
 
 
-def handle_request(state, data, coordinator=None):
+def handle_request(state, data, coordinator=None, completion_sink=None):
     try:
         decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_object_fields)
         req, parsed_end = decoder.raw_decode(data)
@@ -581,76 +581,143 @@ def handle_request(state, data, coordinator=None):
             plan_identity=req["plan_identity"],
         )
 
-    if coordinator is not None and not coordinator.begin_request():
+    lease = coordinator.begin_request() if coordinator is not None else None
+    if coordinator is not None and lease is None:
         return protocol_error(
             "maintenance_in_progress", phase="maintenance", retryable=True,
             request_id=req["request_id"], plan_identity=req["plan_identity"])
+    # A coordinated request must hand its lease to the transport owner. There
+    # is no safe default completion point before that owner's sendall attempt.
+    if lease is not None and completion_sink is None:
+        lease.complete()
+        return protocol_error(
+            "server_error",
+            phase="transport",
+            retryable=True,
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+
+    def finish(response):
+        if lease is not None:
+            try:
+                completion_sink(lease)
+            except Exception:
+                lease.complete()
+                raise
+        return response
+
     try:
         scores = state.score(req["context"], req["candidates"])
     except TimeoutError:
-        return protocol_error(
+        return finish(protocol_error(
             "inference_failed",
             phase="score",
             retryable=True,
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
+        ))
     except TokenAttributionError:
-        return protocol_error(
+        return finish(protocol_error(
             "token_attribution_failed",
             phase="score",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
+        ))
     except NonFiniteTokenScoreError:
-        return protocol_error(
+        return finish(protocol_error(
             "non_finite_score",
             phase="score",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
+        ))
     except Exception:
-        return protocol_error(
+        return finish(protocol_error(
             "inference_failed",
             phase="score",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
-    finally:
-        if coordinator is not None:
-            coordinator.end_request()
+        ))
 
     if not isinstance(scores, list) or any(
         isinstance(score, bool) or not isinstance(score, (int, float))
         for score in scores
     ):
-        return protocol_error(
+        return finish(protocol_error(
             "invalid_score_result",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
+        ))
     if len(scores) != len(req["candidates"]):
-        return protocol_error(
+        return finish(protocol_error(
             "score_count_mismatch",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
+        ))
     try:
         has_non_finite_score = any(not math.isfinite(score) for score in scores)
     except OverflowError:
         has_non_finite_score = True
     if has_non_finite_score:
-        return protocol_error(
+        return finish(protocol_error(
             "non_finite_score",
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
-        )
-    return {
+        ))
+    return finish({
         "version": PROTOCOL_VERSION,
         "request_id": req["request_id"],
         "plan_identity": req["plan_identity"],
         "scores": scores,
-    }
+    })
+
+
+def serve_scoring_connection(state, conn, coordinator=None,
+                             activity_sink=None):
+    """Serve one scoring connection and complete its request only after send.
+
+    A client acknowledgement is not needed for quiesce. The server-side
+    `sendall()` attempt is the response-delivery linearization point; a broken
+    pipe is terminal too and releases the request lease in the same finally
+    block.
+    """
+    completions = []
+    try:
+        conn.settimeout(5.0)
+        if activity_sink is not None:
+            activity_sink()
+        data = read_request(conn)
+        if data is not None:
+            response = handle_request(state, data, coordinator,
+                                      completion_sink=completions.append)
+            conn.sendall(
+                (json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8")
+            )
+            if activity_sink is not None:
+                activity_sink()
+    except (socket.timeout, TimeoutError):
+        try:
+            conn.sendall(
+                (
+                    json.dumps(protocol_error("server_error", phase="transport",
+                                              retryable=True)) + "\n"
+                ).encode("utf-8")
+            )
+        except Exception:
+            pass
+    except Exception:
+        try:
+            conn.sendall(
+                (
+                    json.dumps(protocol_error("server_error", phase="transport"))
+                    + "\n"
+                ).encode("utf-8")
+            )
+        except Exception:
+            pass
+    finally:
+        for lease in completions:
+            lease.complete()
 
 
 def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
@@ -669,7 +736,10 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
                   or FACTS_ROOT)
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
-    coordinator = (MaintenanceCoordinator(facts_root) if facts_root else None)
+    coordinator = (
+        MaintenanceCoordinator(facts_root, auto_open_fact_handle=True)
+        if facts_root else None
+    )
     if control_socket and coordinator is None:
         raise ValueError("--control-socket requires --facts-root")
     if control_socket and os.path.abspath(control_socket) == os.path.abspath(sock_path):
@@ -678,6 +748,11 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
         validate_control_path(control_socket)
     last_activity = time.time()
     lock = threading.Lock()
+
+    def mark_activity():
+        nonlocal last_activity
+        with lock:
+            last_activity = time.time()
 
     # Scoring and control endpoints are distinct, but both need the same
     # owner-only, symlink-safe parent guarantee.
@@ -704,9 +779,15 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
 
     watchdog = threading.Thread(target=idle_watchdog, daemon=True)
     watchdog.start()
+    control_stop = threading.Event()
+    control_thread = None
     if control_socket:
-        threading.Thread(target=run_control_server,
-                         args=(control_socket, coordinator), daemon=True).start()
+        control_thread = threading.Thread(
+            target=run_control_server,
+            args=(control_socket, coordinator, None, control_stop),
+            daemon=True,
+        )
+        control_thread.start()
 
     try:
         while True:
@@ -715,54 +796,31 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             except socket.timeout:
                 continue
             try:
-                conn.settimeout(5.0)
-                data = read_request(conn)
-                if data is not None:
-                    with lock:
-                        last_activity = time.time()
-                    resp = handle_request(state, data, coordinator)
-                    with lock:
-                        last_activity = time.time()
-                    conn.sendall(
-                        (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
-                    )
-            except socket.timeout:
-                try:
-                    conn.sendall(
-                        (
-                            json.dumps(
-                                protocol_error(
-                                    "server_error",
-                                    phase="transport",
-                                    retryable=True,
-                                )
-                            )
-                            + "\n"
-                        ).encode("utf-8")
-                    )
-                except Exception:
-                    pass
-            except Exception:
-                try:
-                    conn.sendall(
-                        (
-                            json.dumps(
-                                protocol_error(
-                                    "server_error",
-                                    phase="transport",
-                                )
-                            )
-                            + "\n"
-                        ).encode("utf-8")
-                    )
-                except Exception:
-                    pass
+                with lock:
+                    last_activity = time.time()
+                serve_scoring_connection(
+                    state, conn, coordinator,
+                    activity_sink=mark_activity,
+                )
+                with lock:
+                    last_activity = time.time()
             finally:
                 conn.close()
     except KeyboardInterrupt:
         pass
     finally:
         srv.close()
+        if control_thread is not None:
+            control_stop.set()
+            try:
+                wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                wake.connect(control_socket)
+                wake.close()
+            except OSError:
+                pass
+            control_thread.join(2.0)
+        if coordinator is not None:
+            coordinator.close()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 

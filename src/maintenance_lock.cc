@@ -28,6 +28,12 @@ int OpenLockFile(const path& root) {
   int root_fd = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
   if (root_fd < 0)
     return -1;
+  struct stat root_stat;
+  if (fstat(root_fd, &root_stat) != 0 || !S_ISDIR(root_stat.st_mode) ||
+      root_stat.st_uid != getuid() || (root_stat.st_mode & 0777) != 0700) {
+    close(root_fd);
+    return -1;
+  }
   int fd = openat(root_fd, kLockName, O_RDWR | O_CREAT | O_NOFOLLOW,
                   kLockMode);
   close(root_fd);
@@ -65,6 +71,7 @@ bool MaintenanceLock::Acquire(const path& root,
                               Mode mode,
                               bool non_blocking) {
   Release();
+  busy_ = false;
   int fd = OpenLockFile(root);
   if (fd < 0)
     return false;

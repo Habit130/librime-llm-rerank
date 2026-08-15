@@ -25,4 +25,17 @@ static void rime_llm_rerank_finalize() {
   rime::RecorderCoordinator::ShutdownAll();
 }
 
+// The e2e binary links plugin objects for unit coverage while librime loads the
+// production dylib for engine coverage. This C seam reaches the loaded dylib's
+// worker so tests can establish a durable observation point without polling.
+extern "C" void rime_llm_rerank_flush_recorder_for_testing(const char* root) {
+  if (!root)
+    return;
+  rime::RecorderCoordinator::ForRoot(rime::path(root))->FlushForTesting();
+}
+
+extern "C" void rime_llm_rerank_shutdown_recorder_for_testing() {
+  rime::RecorderCoordinator::ShutdownAll();
+}
+
 RIME_REGISTER_MODULE(llm_rerank)

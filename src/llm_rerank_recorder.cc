@@ -45,6 +45,16 @@ bool IsPlainBackspace(const KeyEvent& key) {
          (key.modifier() & ~kShiftMask) == 0;
 }
 
+bool IsFatalRecordingFault(const string& fault) {
+  return fault == "no_home" || fault == "root_create_failed" ||
+         fault == "root_not_directory" || fault == "root_symlink" ||
+         fault == "root_owner" || fault == "root_permission" ||
+         fault == "db_symlink" || fault == "db_not_regular" ||
+         fault == "db_owner" || fault == "db_permission" ||
+         fault == "db_corrupt" || fault == "db_unsupported_version" ||
+         fault == "db_clock_invalid" || fault == "recording_marker_unavailable";
+}
+
 }  // namespace
 
 LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
@@ -84,6 +94,7 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
     FactStore store(FactStore::DefaultRootDir());
     FactStore::Status status = store.Open();
     if (status != FactStore::Status::kOk) {
+      recording_enabled_ = false;
       session_->fault_code = FactStore::StatusCode(status);
       LOG(WARNING) << "llm_rerank recorder: code=recording_disabled"
                    << " reason=" << session_->fault_code
@@ -307,14 +318,17 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
     events.push_back(std::move(event));
   }
   auto result = RecorderCoordinator::ForRoot(FactStore::DefaultRootDir())
-                    .SubmitBatch(NowMs(), &events);
+                     ->SubmitBatch(NowMs(), &events);
   if (result.outcome == RecorderCoordinator::Outcome::kGap) {
     ReportGap(result.fault_code.c_str());
+    if (IsFatalRecordingFault(result.fault_code))
+      recording_enabled_ = false;
     session_->pending.clear();
     retraction_armed_ = false;
     return;
   }
-  session_->fault_code = "";
+  if (session_->gap_count == 0)
+    session_->fault_code = "";
   for (const auto& pending : valid) {
     session_->pending.erase(pending.segment_start);
   }
@@ -352,12 +366,15 @@ void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
   retraction_pending_ = false;
   retraction_armed_ = false;
   auto result = RecorderCoordinator::ForRoot(FactStore::DefaultRootDir())
-                    .SubmitRetraction(retraction_commit_id_, NowMs());
+                     ->SubmitRetraction(retraction_commit_id_, NowMs());
   if (result.outcome == RecorderCoordinator::Outcome::kGap) {
     ReportGap(result.fault_code.c_str());
+    if (IsFatalRecordingFault(result.fault_code))
+      recording_enabled_ = false;
     return;
   }
-  session_->fault_code = "";
+  if (session_->gap_count == 0)
+    session_->fault_code = "";
   LOG(INFO) << "llm_rerank recorder: code=retracted_commit"
             << " commit_id=" << retraction_commit_id_
             << " schema=" << session_->schema_id;
@@ -367,6 +384,8 @@ void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
 void LlmRerankRecorder::ReportGap(const char* reason) {
   if (!session_)
     return;
+  if (reason && *reason)
+    session_->fault_code = reason;
   session_->gap_count += 1;
   LOG(WARNING) << "llm_rerank recorder: code=recording_gap"
                << " reason=" << reason

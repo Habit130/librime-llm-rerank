@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <dlfcn.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +23,9 @@
 #include <rime_api.h>
 #include <rime/key_table.h>
 #include <sqlite3.h>
+
+#include "recorder_coordinator.h"
+#include "maintenance_lock.h"
 
 namespace fs = std::filesystem;
 
@@ -1171,9 +1176,13 @@ class RecorderE2ETest : public ::testing::Test {
   }
 
   void TearDown() override {
-    unsetenv("HOME");
     if (session_)
       g_rime->destroy_session(session_);
+    // Fact recording is intentionally asynchronous. Drain and stop the
+    // process-wide worker before this test removes its temporary HOME.
+    ShutdownLoadedRecorder();
+    rime::RecorderCoordinator::ShutdownAll();
+    unsetenv("HOME");
     fs::remove_all(home_dir_);
   }
 
@@ -1216,11 +1225,34 @@ class RecorderE2ETest : public ::testing::Test {
   }
 
   sqlite3* OpenFactsDb() {
+    FlushLoadedRecorder();
     sqlite3* db = nullptr;
     EXPECT_EQ(SQLITE_OK,
               sqlite3_open_v2((FactsRoot() / "facts.sqlite3").c_str(), &db,
                               SQLITE_OPEN_READONLY, nullptr));
     return db;
+  }
+
+  void FlushLoadedRecorder() {
+    using Flush = void (*)(const char*);
+    void* plugin = dlopen(LLM_RERANK_PLUGIN_DYLIB, RTLD_LAZY | RTLD_NOLOAD);
+    ASSERT_NE(nullptr, plugin);
+    auto flush = reinterpret_cast<Flush>(dlsym(
+        plugin, "rime_llm_rerank_flush_recorder_for_testing"));
+    ASSERT_NE(nullptr, flush);
+    flush(FactsRoot().c_str());
+    ASSERT_EQ(0, dlclose(plugin));
+  }
+
+  void ShutdownLoadedRecorder() {
+    using Shutdown = void (*)();
+    void* plugin = dlopen(LLM_RERANK_PLUGIN_DYLIB, RTLD_LAZY | RTLD_NOLOAD);
+    ASSERT_NE(nullptr, plugin);
+    auto shutdown = reinterpret_cast<Shutdown>(dlsym(
+        plugin, "rime_llm_rerank_shutdown_recorder_for_testing"));
+    ASSERT_NE(nullptr, shutdown);
+    shutdown();
+    ASSERT_EQ(0, dlclose(plugin));
   }
 
   // Last committed text without requiring an active composition (punct and
@@ -1375,6 +1407,32 @@ TEST_F(RecorderE2ETest, ExplicitSelectionIsPersistedExactlyOnceOnCommit) {
   EXPECT_NE(events[0].session_id, events[1].session_id);
   EXPECT_EQ(1LL, current_event.session_seq);
   EXPECT_EQ(1LL, indexed_event.session_seq);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, EngineCommitDuringExclusiveMaintenanceIsBuffered) {
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+
+  // The recorder has already initialized the facts root. Holding the real
+  // maintenance lock forces the production coordinator down its bounded FIFO
+  // path; no SQLite or fsync is reachable from the commit notifier.
+  rime::MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
+                                rime::MaintenanceLock::Mode::kExclusive));
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+
+  // Releasing the lock is the only point at which the worker may touch facts.
+  exclusive.Release();
+  g_rime->destroy_session(session);
+  session_ = 0;
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
   sqlite3_close(db);
 }
 

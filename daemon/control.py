@@ -2,6 +2,7 @@
 
 import json
 import os
+import select
 import socket
 import stat
 import threading
@@ -57,9 +58,103 @@ def _send(connection, payload):
     connection.sendall((json.dumps(payload) + "\n").encode("utf-8"))
 
 
+class MaintenanceControlClient:
+    """One authenticated control connection for a complete maintenance lease.
+
+    `prepare` and `reopen` deliberately share this socket. Closing it without
+    reopening is the daemon's fail-safe lease-loss signal, not a replacement
+    for a successful reopen.
+    """
+
+    def __init__(self, path, operation_id, socket_factory=socket.socket):
+        self.path = path
+        self.operation_id = operation_id
+        self._socket_factory = socket_factory
+        self.connection = None
+        self._reader = None
+
+    def __enter__(self):
+        self.connection = self._socket_factory(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.connection.connect(self.path)
+        self._reader = self.connection.makefile("rb")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def close(self):
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def _request(self, action):
+        if self.connection is None or self._reader is None:
+            raise MaintenanceError("control_unavailable")
+        try:
+            _send(self.connection, {
+                "version": CONTROL_VERSION,
+                "action": action,
+                "operation_id": self.operation_id,
+            })
+            line = self._reader.readline()
+        except (OSError, ValueError) as error:
+            raise MaintenanceError("control_unavailable") from error
+        if not line:
+            raise MaintenanceError("control_unavailable")
+        try:
+            response = json.loads(line.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise MaintenanceError("control_protocol_invalid") from error
+        if (not isinstance(response, dict)
+                or response.get("version") != CONTROL_VERSION
+                or not isinstance(response.get("ok"), bool)):
+            raise MaintenanceError("control_protocol_invalid")
+        return response
+
+    def prepare(self):
+        return self._request("prepare")
+
+    def reopen(self):
+        return self._request("reopen")
+
+    def assert_prepared(self):
+        """Prove the control lease is still live before target mutation."""
+        response = self._request("lease")
+        if (not response.get("ok")
+                or response.get("state") != "prepared"):
+            raise MaintenanceError(response.get("code", "control_unavailable"))
+        return response
+
+
+def _watch_connection_eof(connection, lost, stop):
+    """Observe EOF without consuming bytes from the protocol stream."""
+    flags = getattr(socket, "MSG_DONTWAIT", 0)
+    while not stop.wait(0.05):
+        try:
+            readable, _, _ = select.select([connection], [], [], 0)
+            if not readable:
+                continue
+            data = connection.recv(1, socket.MSG_PEEK | flags)
+            if not data:
+                lost.set()
+                return
+        except (OSError, ValueError):
+            lost.set()
+            return
+
+
 def _serve_connection(connection, coordinator):
     operation_id = None
     lease_id = object()
+    lease_lost = threading.Event()
+    watcher_stop = threading.Event()
+    watcher = threading.Thread(target=_watch_connection_eof,
+                               args=(connection, lease_lost, watcher_stop),
+                               daemon=True)
+    watcher.start()
     try:
         if peer_uid(connection) != os.getuid():
             return
@@ -82,9 +177,13 @@ def _serve_connection(connection, coordinator):
                 continue
             action = request.get("action")
             if action == "prepare":
-                response = coordinator.prepare(request["operation_id"], lease_id)
-                if response.get("ok"):
-                    operation_id = request["operation_id"]
+                operation_id = request["operation_id"]
+                response = coordinator.prepare(
+                    operation_id, lease_id,
+                    lease_alive=lambda: not lease_lost.is_set())
+            elif action == "lease":
+                response = coordinator.assert_prepared(request["operation_id"],
+                                                       lease_id)
             elif action == "reopen":
                 response = coordinator.reopen(request["operation_id"], lease_id)
                 if response.get("ok"):
@@ -92,13 +191,18 @@ def _serve_connection(connection, coordinator):
             else:
                 response = {"ok": False, "code": "invalid_request"}
             _send(connection, {"version": CONTROL_VERSION, **response})
+    except (OSError, ValueError):
+        # A client that drops the lease while prepare is draining may also
+        # close before its failure response can be written.
+        pass
     finally:
+        watcher_stop.set()
         if operation_id is not None:
             coordinator.lease_lost(operation_id, lease_id)
         connection.close()
 
 
-def run_control_server(path, coordinator, ready=None):
+def run_control_server(path, coordinator, ready=None, stop=None):
     validate_control_path(path)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(path)
@@ -109,6 +213,9 @@ def run_control_server(path, coordinator, ready=None):
     try:
         while True:
             connection, _ = server.accept()
+            if stop is not None and stop.is_set():
+                connection.close()
+                break
             threading.Thread(target=_serve_connection,
                              args=(connection, coordinator), daemon=True).start()
     finally:

@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 
 #include "fact_store.h"
 #include "recorder_session.h"
@@ -266,9 +267,10 @@ bool ReadMetaText(sqlite3* db, const char* key, string* value) {
 bool ParseInt64(const string& text, int64_t* value) {
   if (text.empty())
     return false;
+  errno = 0;
   char* end = nullptr;
   long long parsed = strtoll(text.c_str(), &end, 10);
-  if (end != text.c_str() + text.size())
+  if (errno == ERANGE || end != text.c_str() + text.size())
     return false;
   *value = static_cast<int64_t>(parsed);
   return true;
@@ -356,6 +358,18 @@ FactStore::Status FactStore::Open() {
     return status_;
   }
 
+  // Schema creation and first-clock initialization must be one SQLite write
+  // transaction. The maintenance flock is shared by normal writers, so two
+  // fresh processes can both reach this point; BEGIN IMMEDIATE makes one
+  // initializer win and the other re-read the completed metadata.
+  if (Exec(db_, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+    status_ = Status::kDbOpenFailed;
+    sqlite3_close(db_);
+    db_ = nullptr;
+    maintenance_lock_.Release();
+    return status_;
+  }
+
   const char* kSchemaV1 =
       "CREATE TABLE IF NOT EXISTS meta ("
       " key TEXT PRIMARY KEY NOT NULL,"
@@ -416,6 +430,7 @@ FactStore::Status FactStore::Open() {
       " WHERE NOT EXISTS (SELECT 1 FROM retractions r"
       "                   WHERE r.commit_id = e.commit_id);";
   if (Exec(db_, kSchemaV1) != SQLITE_OK) {
+    Exec(db_, "ROLLBACK;");
     status_ = Status::kDbOpenFailed;
     sqlite3_close(db_);
     db_ = nullptr;
@@ -425,6 +440,7 @@ FactStore::Status FactStore::Open() {
 
   bool has_meta = false;
   if (!QueryBoolValue(db_, "SELECT EXISTS(SELECT 1 FROM meta);", &has_meta)) {
+    Exec(db_, "ROLLBACK;");
     status_ = Status::kDbClockInvalid;
     sqlite3_close(db_);
     db_ = nullptr;
@@ -434,7 +450,16 @@ FactStore::Status FactStore::Open() {
   Status meta_status =
       has_meta ? ValidateMeta() : InitializeMeta();
   if (meta_status != Status::kOk) {
+    Exec(db_, "ROLLBACK;");
     status_ = meta_status;
+    sqlite3_close(db_);
+    db_ = nullptr;
+    maintenance_lock_.Release();
+    return status_;
+  }
+  if (Exec(db_, "COMMIT;") != SQLITE_OK) {
+    Exec(db_, "ROLLBACK;");
+    status_ = Status::kDbOpenFailed;
     sqlite3_close(db_);
     db_ = nullptr;
     maintenance_lock_.Release();
