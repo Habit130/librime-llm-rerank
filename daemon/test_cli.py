@@ -349,12 +349,12 @@ class CliTest(unittest.TestCase):
         self.assertEqual(2, rc)
 
     def test_operation_run_without_executor_fails(self):
-        # The production registry registers no type; a planted record for an
-        # unregistered type fails deterministically.
+        # The production registry registers `clear` (#54); a planted record
+        # for a type that no registry registers fails deterministically.
         from operations import new_operation
         store = OperationStore(self.root)
         store.open()
-        record = new_operation("clear", {}, ("preflight", "publishing"),
+        record = new_operation("backup", {}, ("preflight", "publishing"),
                                "publishing", operation_id="ghost-cli")
         store.create(record)
         rc, out, _ = self.run_cli("operation", "run", "ghost-cli")
@@ -473,7 +473,6 @@ class CliTest(unittest.TestCase):
             ("backup", "create", "--output", output_path),
             ("backup", "verify", output_path),
             ("restore",),
-            ("clear",),
             ("rebuild",),
             ("quarantine", "list"),
             ("quarantine", "purge", "op-1", "deadbeef"),
@@ -485,15 +484,6 @@ class CliTest(unittest.TestCase):
                 self.assertIn("not_implemented", out + err)
         # No fake success: the target file was never created.
         self.assertFalse(os.path.exists(output_path))
-
-    def test_reserved_commands_json_error(self):
-        rc, out, _ = self.run_cli("clear", "--yes",
-                                  "--expect-store-epoch", "u-1", "--json")
-        self.assertEqual(2, rc)
-        error = json.loads(out)
-        self.assertEqual("not_implemented", error["code"])
-        self.assertEqual("clear", error["cause"]["command"])
-        self.assertEqual(1, error["error_version"])
 
     def test_unknown_command_is_exit_two(self):
         rc, _, _ = self.run_cli("frobnicate")
