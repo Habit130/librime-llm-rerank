@@ -34,7 +34,6 @@ allowlist, symlink-safe and owner-verified, never a recursive sweep of
 unknown paths.
 """
 
-import errno
 import json
 import os
 import stat
@@ -42,7 +41,6 @@ import stat
 from maintenance import (
     MaintenanceError,
     ROOT_MODE,
-    acquire_exclusive,
     read_identity_under_exclusive,
     read_recording_gap,
     replace_fact_database,
@@ -84,11 +82,6 @@ MEDIA_RESIDUE_DISCLAIMER = (
     "you copied elsewhere.")
 
 _PRISTINE_EPOCH = ""
-
-
-def _now_ms():
-    import time
-    return int(time.time() * 1000)
 
 
 def default_fact_store_helper():

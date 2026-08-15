@@ -49,7 +49,6 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
