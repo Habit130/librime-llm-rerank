@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <fcntl.h>
+#include <time.h>
 
 #include "fact_store.h"
 #include "recorder_session.h"
@@ -798,6 +800,373 @@ FactStore::Status FactStore::CheckpointTruncate() {
     return status_;
   }
   return status_;
+}
+
+namespace {
+
+// Reads the durable meta clock (the HLC high-water persisted by every write
+// transaction). Fails closed on any anomaly.
+bool ReadClock(sqlite3* db, int64_t* physical_ms, int64_t* logical) {
+  string value;
+  if (!ReadMetaText(db, kMetaClockPhysicalMs, &value) ||
+      !ParseInt64(value, physical_ms) || *physical_ms < 0 ||
+      !ReadMetaText(db, kMetaClockLogical, &value) ||
+      !ParseInt64(value, logical) || *logical < 0) {
+    return false;
+  }
+  return true;
+}
+
+// Reads the identity rows; fails closed on any anomaly.
+bool ReadIdentity(sqlite3* db, string* store_epoch, string* history_id) {
+  string value;
+  if (!ReadMetaText(db, kMetaStoreEpoch, &value) || value.empty()) {
+    return false;
+  }
+  *store_epoch = value;
+  if (!ReadMetaText(db, kMetaHistoryId, &value) || value.empty()) {
+    return false;
+  }
+  *history_id = value;
+  return true;
+}
+
+// Full integrity check; any row other than a single "ok" is a corruption
+// signal.
+bool QueryIntegrityCheck(sqlite3* db) {
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return false;
+  }
+  bool ok = true;
+  int rows = 0;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    ++rows;
+    const unsigned char* text = sqlite3_column_text(stmt, 0);
+    const char* value = reinterpret_cast<const char*>(text);
+    if (!value || std::strcmp(value, "ok") != 0) {
+      ok = false;
+    }
+  }
+  sqlite3_finalize(stmt);
+  return ok && rows == 1;
+}
+
+// Foreign-key check must produce zero rows.
+bool QueryForeignKeyCheck(sqlite3* db) {
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, "PRAGMA foreign_key_check;", -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return false;
+  }
+  bool ok = sqlite3_step(stmt) != SQLITE_ROW;
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+// The reported journal mode; a WAL journal means the file alone is not a
+// complete single-file store.
+bool QueryJournalMode(sqlite3* db, string* mode) {
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, "PRAGMA journal_mode;", -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return false;
+  }
+  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
+  if (ok) {
+    const unsigned char* text = sqlite3_column_text(stmt, 0);
+    *mode = text ? reinterpret_cast<const char*>(text) : string();
+  }
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+// Highest event HLC and event-format range. Empty stores report -1 markers
+// so the manifest can distinguish "no events" from an impossible zero.
+bool QueryEventStats(sqlite3* db, int64_t* hlc_physical_ms,
+                     int64_t* hlc_logical, int* format_min, int* format_max) {
+  sqlite3_stmt* stmt = nullptr;
+  const char* kQueryHlc = "SELECT hlc_physical_ms, hlc_logical"
+      " FROM selection_events"
+      " ORDER BY hlc_physical_ms DESC, hlc_logical DESC LIMIT 1;";
+  if (sqlite3_prepare_v2(db, kQueryHlc, -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  bool has_row = sqlite3_step(stmt) == SQLITE_ROW;
+  if (has_row) {
+    *hlc_physical_ms = sqlite3_column_int64(stmt, 0);
+    *hlc_logical = sqlite3_column_int64(stmt, 1);
+  }
+  sqlite3_finalize(stmt);
+  if (!has_row) {
+    *hlc_physical_ms = -1;
+    *hlc_logical = -1;
+  }
+  sqlite3_stmt* range_stmt = nullptr;
+  const char* kQueryRange = "SELECT MIN(event_format_version),"
+      " MAX(event_format_version) FROM selection_events;";
+  if (sqlite3_prepare_v2(db, kQueryRange, -1, &range_stmt, nullptr) !=
+      SQLITE_OK) {
+    return false;
+  }
+  bool got_range = sqlite3_step(range_stmt) == SQLITE_ROW;
+  if (got_range) {
+    if (sqlite3_column_type(range_stmt, 0) == SQLITE_NULL) {
+      *format_min = -1;
+      *format_max = -1;
+    } else {
+      *format_min = sqlite3_column_int(range_stmt, 0);
+      *format_max = sqlite3_column_int(range_stmt, 1);
+    }
+  }
+  sqlite3_finalize(range_stmt);
+  return got_range;
+}
+
+// Counts every fact table. Any failure is a corruption signal.
+bool QueryFactCounts(sqlite3* db, FactStore::SnapshotStats* stats) {
+  int64_t count = 0;
+  if (!QueryCount(db, "commits", &count)) {
+    return false;
+  }
+  stats->commit_count = count;
+  if (!QueryCount(db, "selection_events", &count)) {
+    return false;
+  }
+  stats->event_count = count;
+  if (!QueryCount(db, "selection_candidates", &count)) {
+    return false;
+  }
+  stats->candidate_count = count;
+  if (!QueryCount(db, "retractions", &count)) {
+    return false;
+  }
+  stats->retraction_count = count;
+  return true;
+}
+
+// Full read-only validation and stats of one standalone fact store file.
+// Shared by the snapshot publish path and the offline backup verifier; the
+// verifier never reads live state and never opens the file writable.
+bool InspectSnapshotHandle(sqlite3* db, FactStore::SnapshotStats* stats) {
+  string mode;
+  if (!QueryJournalMode(db, &mode) || mode == "wal") {
+    return false;
+  }
+  if (!QueryIntegrityCheck(db) || !QueryForeignKeyCheck(db)) {
+    return false;
+  }
+  string value;
+  if (!ReadMetaText(db, kMetaFactSchemaVersion, &value) ||
+      value != std::to_string(kFactSchemaVersion) ||
+      !ReadMetaText(db, kMetaEventFormatVersion, &value) ||
+      value != std::to_string(kEventFormatVersion)) {
+    return false;
+  }
+  if (!ReadClock(db, &stats->hlc_physical_ms, &stats->hlc_logical) ||
+      !ReadIdentity(db, &stats->store_epoch, &stats->history_id)) {
+    return false;
+  }
+  if (!QueryFactCounts(db, stats) ||
+      !QueryEventStats(db, &stats->event_hlc_physical_ms,
+                       &stats->event_hlc_logical, &stats->event_format_min,
+                       &stats->event_format_max)) {
+    return false;
+  }
+  // Counts and clock are coherent: events imply a commit, and the durable
+  // clock never falls below the highest event HLC. An empty store must have
+  // no commits either.
+  if (stats->event_count == 0) {
+    if (stats->commit_count != 0 || stats->candidate_count != 0) {
+      return false;
+    }
+  } else {
+    if (stats->commit_count == 0) {
+      return false;
+    }
+    if (stats->event_hlc_physical_ms < 0) {
+      return false;
+    }
+    if (stats->event_hlc_physical_ms > stats->hlc_physical_ms ||
+        (stats->event_hlc_physical_ms == stats->hlc_physical_ms &&
+         stats->event_hlc_logical > stats->hlc_logical)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+FactStore::Status FactStore::SnapshotTo(const path& output_path,
+                                        SnapshotStats* stats) {
+  if (!db_ || !stats) {
+    status_ = Status::kDbOpenFailed;
+    return status_;
+  }
+  if (output_path.empty()) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  struct stat out_st;
+  if (lstat(output_path.c_str(), &out_st) == 0) {
+    // A snapshot never overwrites an existing path (file, symlink or
+    // directory); the caller must move stale staging away first.
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  // Exclusive create: a snapshot never overwrites an existing file, and the
+  // output is created with the owner-only mode so a crash between the
+  // creation and the sqlite open can never leave a readable partial. The
+  // file is created with O_EXCL, then opened by SQLite without CREATE, so
+  // no path check can race a concurrent creator.
+  int out_fd = open(output_path.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, kFileMode);
+  if (out_fd < 0) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  if (fchmod(out_fd, kFileMode) != 0) {
+    close(out_fd);
+    status_ = Status::kDbPermission;
+    return status_;
+  }
+  close(out_fd);
+  sqlite3* dest = nullptr;
+  if (sqlite3_open_v2(output_path.c_str(), &dest, SQLITE_OPEN_READWRITE,
+                      nullptr) != SQLITE_OK) {
+    status_ = Status::kDbWriteFailed;
+    if (dest) {
+      sqlite3_close(dest);
+      dest = nullptr;
+    }
+    return status_;
+  }
+  sqlite3_busy_timeout(dest, kBusyTimeoutMs);
+  sqlite3_backup* backup = sqlite3_backup_init(dest, "main", db_, "main");
+  if (!backup) {
+    status_ = Status::kDbWriteFailed;
+    sqlite3_close(dest);
+    return status_;
+  }
+  // Copy everything; a busy/locked source (a concurrent writer's short
+  // transaction) is retried with a bounded wait so the snapshot converges to
+  // one consistent read point.
+  int rc = SQLITE_OK;
+  int retries = 0;
+  do {
+    rc = sqlite3_backup_step(backup, -1);
+    if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      ++retries;
+      if (retries > 50) {
+        break;
+      }
+      struct timespec pause = {0, 20 * 1000 * 1000};
+      nanosleep(&pause, nullptr);
+      continue;
+    }
+  } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+  int finish_rc = sqlite3_backup_finish(backup);
+  bool copied = rc == SQLITE_DONE && finish_rc == SQLITE_OK;
+  if (!copied) {
+    sqlite3_close(dest);
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  // The destination must be a single self-contained file, not a WAL
+  // database with sidecars. DELETE journaling plus a checkpoint guarantees
+  // the main file alone is complete.
+  if (Exec(dest, "PRAGMA journal_mode=DELETE;") != SQLITE_OK ||
+      Exec(dest, "PRAGMA synchronous=FULL;") != SQLITE_OK) {
+    status_ = Status::kDbWriteFailed;
+    sqlite3_close(dest);
+    return status_;
+  }
+  sqlite3_stmt* checkpoint = nullptr;
+  if (sqlite3_prepare_v2(dest, "PRAGMA wal_checkpoint(TRUNCATE);", -1,
+                         &checkpoint, nullptr) != SQLITE_OK) {
+    status_ = Status::kDbWriteFailed;
+    sqlite3_close(dest);
+    return status_;
+  }
+  bool got_row = sqlite3_step(checkpoint) == SQLITE_ROW;
+  int busy = got_row ? sqlite3_column_int(checkpoint, 0) : 1;
+  sqlite3_finalize(checkpoint);
+  if (!got_row || busy != 0) {
+    status_ = Status::kDbWriteFailed;
+    sqlite3_close(dest);
+    return status_;
+  }
+  if (sqlite3_close(dest) != SQLITE_OK) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  // Re-open read-only and validate the snapshot as a standalone file before
+  // it is ever published; the durable identity, counts and clock reported
+  // here are the manifest's source of truth.
+  sqlite3* check = nullptr;
+  if (sqlite3_open_v2(output_path.c_str(), &check, SQLITE_OPEN_READONLY,
+                      nullptr) != SQLITE_OK) {
+    status_ = Status::kDbCorrupt;
+    if (check) {
+      sqlite3_close(check);
+    }
+    return status_;
+  }
+  bool valid = InspectSnapshotHandle(check, stats);
+  sqlite3_close(check);
+  if (!valid) {
+    status_ = Status::kDbCorrupt;
+    return status_;
+  }
+  struct stat out_check;
+  if (lstat(output_path.c_str(), &out_check) != 0
+      || !S_ISREG(out_check.st_mode) || out_check.st_uid != getuid()
+      || !IsExactMode(out_check, kFileMode)) {
+    status_ = Status::kDbPermission;
+    return status_;
+  }
+  for (const char* suffix : {"-wal", "-shm"}) {
+    path sidecar = output_path;
+    sidecar += suffix;
+    struct stat sidecar_stat;
+    if (lstat(sidecar.c_str(), &sidecar_stat) == 0 &&
+        unlink(sidecar.c_str()) != 0) {
+      status_ = Status::kDbWriteFailed;
+      return status_;
+    }
+  }
+  // fsync the completed snapshot before reporting success.
+  int fd = open(output_path.c_str(), O_RDONLY | O_NOFOLLOW);
+  if (fd < 0) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  bool fsynced = fsync(fd) == 0;
+  close(fd);
+  if (!fsynced) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  return status_;
+}
+
+FactStore::Status FactStore::InspectSnapshotFile(const path& db_path,
+                                                 SnapshotStats* stats) {
+  if (db_path.empty() || !stats) {
+    return Status::kDbOpenFailed;
+  }
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) !=
+      SQLITE_OK) {
+    if (db) {
+      sqlite3_close(db);
+    }
+    return Status::kDbOpenFailed;
+  }
+  bool valid = InspectSnapshotHandle(db, stats);
+  sqlite3_close(db);
+  return valid ? Status::kOk : Status::kDbCorrupt;
 }
 
 bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
