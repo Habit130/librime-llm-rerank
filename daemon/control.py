@@ -177,10 +177,15 @@ def _serve_connection(connection, coordinator):
                 continue
             action = request.get("action")
             if action == "prepare":
-                operation_id = request["operation_id"]
+                # The connection only owns the lease for a prepare the
+                # coordinator actually accepted. Remembering a rejected
+                # operation id here would make EOF recovery pass the wrong id
+                # and strand the live lease of the first, successful prepare.
                 response = coordinator.prepare(
-                    operation_id, lease_id,
+                    request["operation_id"], lease_id,
                     lease_alive=lambda: not lease_lost.is_set())
+                if response.get("ok"):
+                    operation_id = request["operation_id"]
             elif action == "lease":
                 response = coordinator.assert_prepared(request["operation_id"],
                                                        lease_id)
