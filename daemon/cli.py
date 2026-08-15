@@ -564,17 +564,10 @@ def _cmd_operation_run(args, paths):
 # clear
 # ---------------------------------------------------------------------------
 
-def _read_clear_identity(paths, mode):
+def _read_clear_identity(paths):
     """Read-only current identity for the confirmation display."""
     from clear_operation import FactStoreHelper, live_identity
-    try:
-        return live_identity(FactStoreHelper(), paths["semantic_memory_root"])
-    except OperationError as error:
-        raise
-    except Exception as error:  # never crash on an unreadable identity
-        raise OperationError("fact_store_unverifiable", phase="cli",
-                             retryable=False, cause={
-                                 "error": type(error).__name__})
+    return live_identity(FactStoreHelper(), paths["semantic_memory_root"])
 
 
 def _emit_clear_event(entry, args):
@@ -632,7 +625,7 @@ def _cmd_clear(args, paths):
         return 2
 
     try:
-        identity_empty = _read_clear_identity(paths, mode)
+        identity_empty = _read_clear_identity(paths)
     except OperationError as error:
         return _store_operation_error(error, mode)
 
@@ -809,6 +802,13 @@ def main(argv=None, registry=None):
     quarantine arrive with their own tickets). Returns the process exit
     code.
     """
+    if os.geteuid() == 0:
+        error = make_error(
+            "unsupported_privilege", phase="cli",
+            remediation="run this command as the semantic memory owner, "
+                        "not as root")
+        _render_error(error, "human")
+        return 2
     args = build_parser().parse_args(argv)
     paths = default_paths()
     if getattr(args, "registry", None) is None:

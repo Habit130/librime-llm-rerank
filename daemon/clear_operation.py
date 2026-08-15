@@ -55,7 +55,6 @@ from operations import (
 CLEAR_DIRNAME = ".clear"
 FACTS_DB = "facts.sqlite3"
 IDENTITY_FILE = "identity.json"
-OLD_IDENTITY_FILE = "old-identity.json"
 PUBLISHED_MARKER = "published.marker"
 STAGING_STORE_DIR = "store"
 
@@ -275,7 +274,6 @@ def _remove_entry(root_fd, name, euid):
         for entry in os.scandir(dfd):
             entry_stat = entry.stat(follow_symlinks=False)
             if entry_stat.st_uid != euid:
-                os.close(dfd)
                 raise OperationFailed(
                     "cleanup_owner_refused", phase="cleanup", retryable=False,
                     cause={"path": os.path.join(name, entry.name)})
@@ -286,7 +284,6 @@ def _remove_entry(root_fd, name, euid):
             elif entry.is_dir(follow_symlinks=False):
                 removed_bytes += _remove_entry(dfd, entry.name, euid)
             else:
-                os.close(dfd)
                 raise OperationFailed(
                     "cleanup_not_regular", phase="cleanup", retryable=False,
                     cause={"path": os.path.join(name, entry.name)})
@@ -358,13 +355,18 @@ def _gap_belongs_to_old_history(gap, old_epoch):
 
 def _clean_operations(root_fd, operations_dir_fd, keep_id, euid):
     """Delete old operation details (JSON, locks, temp files), keeping the
-    current operation's idempotency record and its locks."""
+    current operation's idempotency record and its locks.
+
+    Run-lock files are deleted only for terminal operations: unlink-while-
+    locked races a live executor of a non-terminal operation, and a blocked
+    operation still awaits an explicit operator retry.
+    """
     removed = 0
+    terminal_ids = set()
     for entry in list(os.scandir(operations_dir_fd)):
         name = entry.name
         entry_stat = entry.stat(follow_symlinks=False)
         if entry_stat.st_uid != euid:
-            os.close(operations_dir_fd)
             raise OperationFailed(
                 "cleanup_owner_refused", phase="cleanup", retryable=False,
                 cause={"path": "operations/" + name})
@@ -373,28 +375,28 @@ def _clean_operations(root_fd, operations_dir_fd, keep_id, euid):
         if name == "%s.lock" % keep_id:
             continue
         if entry.is_symlink() or entry.is_file(follow_symlinks=False):
-            if (name.endswith(".json") and not _record_is_terminal(
-                    operations_dir_fd, name, euid)):
-                # A blocked operation still awaits an explicit operator
-                # retry; its record is not "useless" yet.
-                continue
+            if name.endswith(".json"):
+                if not _record_is_terminal(operations_dir_fd, name, euid):
+                    # A blocked operation still awaits an explicit operator
+                    # retry; its record is not "useless" yet.
+                    continue
+                terminal_ids.add(name[: -len(".json")])
             if entry.is_file(follow_symlinks=False):
                 removed += entry_stat.st_size
             os.unlink(entry.name, dir_fd=operations_dir_fd)
         elif entry.is_dir(follow_symlinks=False):
             removed += _remove_entry(operations_dir_fd, entry.name, euid)
         else:
-            os.close(operations_dir_fd)
             raise OperationFailed(
                 "cleanup_not_regular", phase="cleanup", retryable=False,
                 cause={"path": "operations/" + name})
-    # Root-anchored executor run locks of other operations.
+    # Root-anchored executor run locks of terminal operations.
     for entry in list(os.scandir(root_fd)):
         if not entry.name.startswith(".operation-") or not entry.name.endswith(
                 ".run"):
             continue
         other_id = entry.name[len(".operation-"):-len(".run")]
-        if other_id == keep_id:
+        if other_id == keep_id or other_id not in terminal_ids:
             continue
         try:
             st = os.lstat(entry.name, dir_fd=root_fd)
@@ -668,50 +670,49 @@ class ClearSpec:
 
     # -- steps --------------------------------------------------------------
 
-    def _step_preflight(self, record):
-        expected = record["parameters"]["expect_store_epoch"]
-        identity_empty = live_identity(self.helper, self.root)
-        if identity_empty is None:
-            if expected != _PRISTINE_EPOCH:
-                raise OperationBlocked(
-                    "store_epoch_mismatch", phase="preflight",
-                    remediation="re-run clear with the current store epoch "
-                                "(or with no expectation for a pristine "
-                                "system)",
-                    cause={"expected": expected, "actual": None})
-            return {"advance": True}
-        identity, empty = identity_empty
-        if identity["store_epoch"] != expected:
-            raise OperationBlocked(
-                "store_epoch_mismatch", phase="preflight",
-                remediation="re-run clear with the current store epoch",
-                cause={"expected": expected,
-                       "actual": identity["store_epoch"]})
-        return {"advance": True}
+    def _current_disposition(self, record, phase):
+        """Read the live store through the C++ seam and classify the clear.
 
-    def _step_waiting_for_quiesce(self, record):
+        Returns ("already_clear", identity) when the system is provably
+        empty with nothing pending cleanup, otherwise ("proceed", identity).
+        Raises OperationBlocked on a stale expectation, a missing expected
+        store or an unverifiable store. Every phase prelude uses this one
+        gate so the CAS and already_clear semantics stay identical across
+        the machine.
+        """
         expected = record["parameters"]["expect_store_epoch"]
         identity_empty = live_identity(self.helper, self.root)
         if identity_empty is not None:
             identity, empty = identity_empty
             if _already_clear(self.root, record["operation_id"], identity,
                               empty, self.euid):
-                return {"advance": True}
+                return "already_clear", identity
             if identity["store_epoch"] != expected:
                 raise OperationBlocked(
-                    "store_epoch_mismatch", phase="waiting-for-quiesce",
+                    "store_epoch_mismatch", phase=phase,
                     remediation="re-run clear with the current store epoch",
                     cause={"expected": expected,
                            "actual": identity["store_epoch"]})
-        else:
-            if expected != _PRISTINE_EPOCH:
-                raise OperationBlocked(
-                    "store_epoch_mismatch", phase="waiting-for-quiesce",
-                    remediation="re-run clear with the current store epoch",
-                    cause={"expected": expected, "actual": None})
-            if _already_clear(self.root, record["operation_id"], None, True,
-                              self.euid):
-                return {"advance": True}
+            return "proceed", identity
+        if expected != _PRISTINE_EPOCH:
+            raise OperationBlocked(
+                "store_epoch_mismatch", phase=phase,
+                remediation="re-run clear with the current store epoch",
+                cause={"expected": expected, "actual": None})
+        if _already_clear(self.root, record["operation_id"], None, True,
+                          self.euid):
+            return "already_clear", None
+        return "proceed", None
+
+    def _step_preflight(self, record):
+        self._current_disposition(record, "preflight")
+        return {"advance": True}
+
+    def _step_waiting_for_quiesce(self, record):
+        disposition, _identity = self._current_disposition(
+            record, "waiting-for-quiesce")
+        if disposition == "already_clear":
+            return {"advance": True}
         if self.control_socket is None:
             raise OperationFailed(
                 "daemon_unavailable", phase="waiting-for-quiesce",
@@ -726,21 +727,10 @@ class ClearSpec:
 
     def _step_staging(self, record):
         operation_id = record["operation_id"]
-        expected = record["parameters"]["expect_store_epoch"]
-        identity_empty = live_identity(self.helper, self.root)
-        if identity_empty is not None:
-            identity, empty = identity_empty
-            if _already_clear(self.root, operation_id, identity, empty,
-                              self.euid):
-                return {"advance": True}
-        else:
-            if expected != _PRISTINE_EPOCH:
-                raise OperationBlocked(
-                    "store_epoch_mismatch", phase="staging",
-                    remediation="re-run clear with the current store epoch",
-                    cause={"expected": expected, "actual": None})
-            if _already_clear(self.root, operation_id, None, True, self.euid):
-                return {"advance": True}
+        disposition, old_identity = self._current_disposition(
+            record, "staging")
+        if disposition == "already_clear":
+            return {"advance": True}
         staging_root = _staging_root(self.root, operation_id)
         if os.path.lexists(staging_root):
             staged_identity = _load_staged_identity(staging_root, self.euid)
@@ -753,16 +743,21 @@ class ClearSpec:
         os.makedirs(staging_root, mode=0o700, exist_ok=False)
         staged_identity = self.helper.create_empty(
             _staging_store_dir(self.root, operation_id))
-        if (staged_identity["history_id"] == expected
-                or staged_identity["store_epoch"] == expected):
+        # The staged identity must differ from the old one (epoch and
+        # history) and from the operation's own expectation; anything else
+        # is an impossible random coincidence or a broken helper.
+        expected = record["parameters"]["expect_store_epoch"]
+        if staged_identity["store_epoch"] == expected or (
+                old_identity is not None and (
+                    staged_identity["history_id"]
+                    == old_identity["history_id"]
+                    or staged_identity["store_epoch"]
+                    == old_identity["store_epoch"])):
             raise OperationFailed(
                 "staging_identity_collision", phase="staging",
                 retryable=False)
         _write_json_atomic(os.path.join(staging_root, IDENTITY_FILE),
                            staged_identity, self.euid)
-        old_identity = identity_empty[0] if identity_empty is not None else None
-        _write_json_atomic(os.path.join(staging_root, OLD_IDENTITY_FILE),
-                           old_identity, self.euid)
         try:
             db_size = os.lstat(_staging_db_path(
                 self.root, operation_id)).st_size
@@ -780,14 +775,9 @@ class ClearSpec:
             # A live store may have become already-clear between phases, but
             # a missing staged identity in a non-already-clear system means
             # the staging artifact was lost: fail deterministically.
-            identity_empty = live_identity(self.helper, self.root)
-            if identity_empty is not None:
-                identity, empty = identity_empty
-                if _already_clear(self.root, operation_id, identity, empty,
-                                  self.euid):
-                    return {"advance": True}
-            elif _already_clear(self.root, operation_id, None, True,
-                                self.euid):
+            disposition, _identity = self._current_disposition(
+                record, "publishing")
+            if disposition == "already_clear":
                 return {"advance": True}
             raise OperationBlocked(
                 "staging_identity_missing", phase="publishing",
@@ -797,8 +787,14 @@ class ClearSpec:
         def replacement(lease):
             # Re-verify the expected epoch under the exclusive lease, before
             # any fact mutation (SCN-54-1: the CAS gate closes again here).
-            live = read_identity_under_exclusive(self.root)
-            disk_epoch = live["store_epoch"]
+            # A pristine system has no store at all; that is only valid when
+            # the operation itself expected no store. A present-but-unreadable
+            # store fails closed (the epoch cannot be proven).
+            if os.path.lexists(os.path.join(self.root, FACTS_DB)):
+                live = read_identity_under_exclusive(self.root)
+                disk_epoch = live["store_epoch"]
+            else:
+                disk_epoch = None
             marker_exists = _read_json(os.path.join(
                 _staging_root(self.root, operation_id), PUBLISHED_MARKER),
                 self.euid) is not None
@@ -809,9 +805,23 @@ class ClearSpec:
                 # restore the old epoch.
                 pass
             elif marker_exists:
-                # Marker says published, disk says old epoch: an impossible
-                # sequence without external interference. Fail closed.
+                # Marker says published, disk says something else: an
+                # impossible sequence without external interference. Fail
+                # closed.
                 raise MaintenanceError("publish_state_inconsistent")
+            elif disk_epoch is None:
+                # Pristine clear: the replacement creates the first store.
+                if old_epoch != _PRISTINE_EPOCH:
+                    raise MaintenanceError("epoch_mismatch")
+                try:
+                    identity, empty = self.helper.verify(
+                        _staging_store_dir(self.root, operation_id))
+                except _HelperFailed:
+                    raise MaintenanceError("staging_invalid")
+                if not empty or identity != staged_identity:
+                    raise MaintenanceError("staging_invalid")
+                replace_fact_database(self.root, _staging_db_path(
+                    self.root, operation_id), lease)
             elif disk_epoch != old_epoch:
                 raise MaintenanceError("epoch_mismatch")
             else:
@@ -939,16 +949,9 @@ class ClearSpec:
         if staged_identity is None:
             # Nothing was published (already_clear): the system must still
             # be provably empty; nothing needs reopening.
-            identity_empty = live_identity(self.helper, self.root)
-            if identity_empty is not None:
-                identity, empty = identity_empty
-                if empty and _already_clear(self.root, operation_id,
-                                            identity, empty, self.euid):
-                    return {"advance": True}
-                raise OperationFailed(
-                    "reopen_unverifiable", phase="reopening", retryable=True,
-                    cause=None)
-            if _already_clear(self.root, operation_id, None, True, self.euid):
+            disposition, _identity = self._current_disposition(
+                record, "reopening")
+            if disposition == "already_clear":
                 return {"advance": True}
             raise OperationFailed(
                 "reopen_unverifiable", phase="reopening", retryable=True,
@@ -972,15 +975,6 @@ class ClearSpec:
     def _step_cleanup(self, record):
         operation_id = record["operation_id"]
         old_epoch = record["parameters"]["expect_store_epoch"]
-        # Durable publication evidence and the pre-clear identity must be
-        # captured before the deletion sweep removes the staging directory.
-        staging_root = _staging_root(self.root, operation_id)
-        published = _read_json(os.path.join(staging_root, PUBLISHED_MARKER),
-                               self.euid) is not None
-        old_identity = _read_json(os.path.join(staging_root,
-                                               OLD_IDENTITY_FILE), self.euid)
-        if old_identity is None and old_epoch:
-            old_identity = {"store_epoch": old_epoch, "history_id": None}
         root_fd = _open_root_fd(self.root)
         removed_bytes = 0
         try:
@@ -1019,10 +1013,20 @@ class ClearSpec:
         finally:
             os.close(root_fd)
 
+        # The outcome is derived from durable disk state AFTER the sweep, so
+        # a crash at any point of cleanup retries into the identical result
+        # (the staging directory and its markers are gone by now): a store
+        # whose epoch differs from the expected one — or any store created
+        # by a pristine clear — proves the replacement happened; otherwise
+        # the system was already clear.
         identity_empty = live_identity(self.helper, self.root)
-        if published:
+        if identity_empty is not None and (
+                old_epoch == _PRISTINE_EPOCH
+                or identity_empty[0]["store_epoch"] != old_epoch):
             outcome = "cleared"
-            new_identity = identity_empty[0] if identity_empty else None
+            old_identity = {"store_epoch": old_epoch,
+                            "history_id": None} if old_epoch else None
+            new_identity = identity_empty[0]
         else:
             outcome = "already_clear"
             old_identity = identity_empty[0] if identity_empty else None

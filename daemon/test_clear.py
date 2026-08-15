@@ -42,7 +42,6 @@ from clear_operation import (  # noqa: E402
     FactStoreHelper,
     PUBLISHED_MARKER,
     IDENTITY_FILE,
-    OLD_IDENTITY_FILE,
     _staging_root,
     _staging_store_dir,
 )
@@ -533,6 +532,15 @@ class ClearStepTests(ClearEnv):
         record = self.run_to_terminal(spec, operation_id)
         self.assertEqual("succeeded", record["state"])
         self.assertTrue(record["result"]["cleanup_complete"])
+        # The retry only continues cleanup and reports the identical outcome
+        # (the staging directory holding the publication marker is already
+        # gone; the result is derived from durable disk state).
+        self.assertEqual("cleared", record["result"]["outcome"])
+        live, _empty = self.live_identity()
+        self.assertEqual(live["store_epoch"],
+                         record["result"]["new"]["store_epoch"])
+        self.assertEqual(identity["store_epoch"],
+                         record["result"]["old"]["store_epoch"])
 
     def test_terminal_retry_returns_the_same_result(self):
         identity, _empty = self.make_live_store()
@@ -563,6 +571,31 @@ class ClearStepTests(ClearEnv):
         self.assertEqual(first["rev"], again["rev"])
 
     # -- SCN-54-9 -----------------------------------------------------------
+
+    def test_pristine_with_leftovers_publishes_a_fresh_store(self):
+        # A pristine system with app-controlled leftovers (here: a stale
+        # quarantine directory) is not already-clear: the clear must create
+        # the first store through the replacement seam and clean the
+        # leftovers.
+        os.makedirs(self.root, mode=0o700)
+        os.chmod(self.root, 0o700)
+        os.makedirs(os.path.join(self.root, "quarantine"), mode=0o700)
+        os.chmod(os.path.join(self.root, "quarantine"), 0o700)
+        with open(os.path.join(self.root, "quarantine", "evidence.bin"),
+                  "wb") as stream:
+            stream.write(b"quarantined")
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, "")
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("succeeded", record["state"])
+        self.assertEqual("cleared", record["result"]["outcome"])
+        self.assertIsNone(record["result"]["old"])
+        live, empty = self.live_identity()
+        self.assertTrue(empty)
+        self.assertEqual(live["store_epoch"],
+                         record["result"]["new"]["store_epoch"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, "quarantine")))
 
     def test_already_clear_pristine(self):
         spec = self.build_spec(control_client_factory=self.control_factory())
