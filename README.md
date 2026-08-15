@@ -48,19 +48,29 @@ their immediate retractions remain in one process-local FIFO, bounded at 256
 commit batches or 16 MiB of documented logical payload. Overflow and shutdown
 leftovers are recorded in the owner-only, versioned `recording_gap.json`
 without private text or embeddings; a failed gap update first marks the
-pre-existing `recording_gap.lock` unknown, so a loss can never read as "no
-gap" after a restart.
+pre-existing `recording_gap.lock` unknown so the loss stays visible after a
+restart. One residual combination remains: if the process marker cannot be
+created, an exclusive maintenance lease keeps a commit only in the process
+memory queue, and the process crashes before any durable evidence exists,
+that selection can be lost without a gap record. Committed user text,
+existing canonical facts, candidate fallback and stale-epoch safety are
+unaffected; the impact is limited to semantic-learning and diagnostic
+continuity. This residual will be revisited before the #75 shadow-recording
+baseline freezes.
 
 The daemon serves scoring and maintenance over separate Unix sockets. Both
 sockets require an owner-only directory and `0600` socket file; the control
 socket authenticates the peer UID, keeps a prepared lease until real EOF, and
 fails closed when the fact-store epoch cannot be proven after reopen.
 
-A fact-database replacement is staged for crash consistency: the old database
-is checkpointed (its WAL merged into the main file) and its sidecars removed
-before the new main database is published with one atomic rename. A failure or
-crash therefore exposes only the complete old store or the complete new store,
-never a new main database paired with old WAL/SHM files.
+A fact-database replacement is staged for crash consistency: the existing
+main database is first validated as a regular, owner-owned `0600` file
+through the root directory fd (a symlink is rejected without ever following
+its target), then checkpointed (its WAL merged into the main file) and its
+sidecars removed before the new main database is published with one atomic
+rename. A busy or incomplete checkpoint aborts before any sidecar removal.
+A failure or crash therefore exposes only the complete old store or the
+complete new store, never a new main database paired with old WAL/SHM files.
 
 This is a reusable maintenance seam only. Public clear, restore and schema
 migration operations remain separate tickets.
