@@ -145,6 +145,46 @@ class FactStore {
   // Fails closed (facts untouched) when the checkpoint is busy or fails.
   Status CheckpointTruncate();
 
+  // Deterministic, non-private summary of one fact store snapshot for the
+  // backup manifest (spec #43 "完整备份"): durable identity, clock and event
+  // HLC high-water marks, fact-table counts and the observed event-format
+  // range (-1 for an empty store). Python never derives these from its own
+  // copy of the fact schema.
+  struct SnapshotStats {
+    string history_id;
+    string store_epoch;
+    int64_t hlc_physical_ms = 0;
+    int64_t hlc_logical = 0;
+    int64_t event_hlc_physical_ms = -1;  // -1: no events in the snapshot
+    int64_t event_hlc_logical = -1;
+    int64_t commit_count = 0;
+    int64_t event_count = 0;
+    int64_t candidate_count = 0;
+    int64_t retraction_count = 0;
+    int event_format_min = -1;  // -1: empty store
+    int event_format_max = -1;
+  };
+
+  // Creates a consistent snapshot of the open store with the SQLite Online
+  // Backup API and writes it to `output_path` as a single regular owner-owned
+  // 0600 file with no WAL/SHM dependency. `output_path` must not exist
+  // (exclusive create). The snapshot corresponds to one consistent SQLite
+  // read point: concurrent writers are not blocked and their commits appear
+  // wholly or not at all. The snapshot is then re-opened and fully validated
+  // (integrity_check, foreign-key check, schema/meta/identity invariants)
+  // and its stats are reported in `stats`; the file is fsynced before the
+  // function returns success. Fails closed: the store's own files are never
+  // modified and no partial snapshot is reported as success.
+  Status SnapshotTo(const path& output_path, SnapshotStats* stats);
+
+  // Read-only validation and stats for one standalone fact store database
+  // file (a backup container member or an extracted snapshot). Requires a
+  // single complete non-WAL database file; rejects WAL-dependent files,
+  // unsupported schema/event versions, missing or malformed meta, integrity
+  // or foreign-key failures and impossible count/clock states. Does not
+  // require a root directory structure or a maintenance lease.
+  static Status InspectSnapshotFile(const path& db_path, SnapshotStats* stats);
+
   // Stable code strings for diagnostics; never contains raw text.
   static const char* StatusCode(Status status);
   static const char* StatusMessage(Status status);

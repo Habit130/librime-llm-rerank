@@ -468,10 +468,9 @@ class CliTest(unittest.TestCase):
     # -- reserved maintenance commands --------------------------------------
 
     def test_reserved_commands_return_not_implemented(self):
-        output_path = os.path.join(self._tmp, "backup.squirrel-memory-backup")
+        # backup create/verify are implemented since #55; restore, rebuild
+        # and quarantine remain reserved.
         cases = [
-            ("backup", "create", "--output", output_path),
-            ("backup", "verify", output_path),
             ("restore",),
             ("rebuild",),
             ("quarantine", "list"),
@@ -482,7 +481,15 @@ class CliTest(unittest.TestCase):
                 rc, out, err = self.run_cli(*args)
                 self.assertEqual(2, rc, args)
                 self.assertIn("not_implemented", out + err)
-        # No fake success: the target file was never created.
+
+    def test_backup_create_without_store_fails_closed(self):
+        output_path = os.path.join(self._tmp, "backup.squirrel-memory-backup")
+        rc, out, err = self.run_cli("backup", "create", "--output",
+                                    output_path)
+        # No live store exists in this sandbox: the operation fails closed
+        # with the stable fact-store fault; no fake success, no target.
+        self.assertIn("fact_store_unverifiable", out + err)
+        self.assertNotEqual(0, rc)
         self.assertFalse(os.path.exists(output_path))
 
     def test_unknown_command_is_exit_two(self):

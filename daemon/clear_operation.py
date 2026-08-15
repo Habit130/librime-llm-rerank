@@ -133,7 +133,7 @@ class FactStoreHelper:
         self.helper_path = helper_path or default_fact_store_helper()
         self._run = run
 
-    def _execute(self, command, root):
+    def _execute(self, command, root, phase="staging"):
         import subprocess
         runner = self._run or subprocess.run
         try:
@@ -142,25 +142,25 @@ class FactStoreHelper:
                 capture_output=True, text=True, timeout=120)
         except OSError as error:
             raise OperationFailed(
-                "fact_store_helper_unavailable", phase="staging",
+                "fact_store_helper_unavailable", phase=phase,
                 retryable=False, cause={"error": error.strerror})
         except Exception as error:
             raise OperationFailed(
-                "fact_store_helper_failed", phase="staging", retryable=True,
+                "fact_store_helper_failed", phase=phase, retryable=True,
                 cause={"error": type(error).__name__})
         if completed.returncode != 0 and completed.returncode != 1:
             raise OperationFailed(
-                "fact_store_helper_failed", phase="staging", retryable=True,
+                "fact_store_helper_failed", phase=phase, retryable=True,
                 cause={"exit": completed.returncode})
         try:
             payload = json.loads((completed.stdout or "").strip() or "null")
         except ValueError:
             raise OperationFailed(
-                "fact_store_helper_invalid", phase="staging", retryable=False,
+                "fact_store_helper_invalid", phase=phase, retryable=False,
                 cause=None)
         if not isinstance(payload, dict):
             raise OperationFailed(
-                "fact_store_helper_invalid", phase="staging", retryable=False,
+                "fact_store_helper_invalid", phase=phase, retryable=False,
                 cause=None)
         if payload.get("ok"):
             return payload
@@ -202,6 +202,118 @@ class FactStoreHelper:
             raise OperationFailed(
                 "fact_store_helper_invalid", phase="staging", retryable=False)
         return identity
+
+    def snapshot(self, root, output, phase="staging"):
+        """Create a consistent Online Backup snapshot of the live store at
+        `root` into the not-yet-existing `output` file; returns the C++
+        snapshot stats (identity, versions, counts, HLC high-water marks).
+        """
+        import subprocess
+        runner = self._run or subprocess.run
+        try:
+            completed = runner(
+                [self.helper_path, "snapshot", "--root", root, "--output",
+                 output], capture_output=True, text=True, timeout=120)
+        except OSError as error:
+            raise OperationFailed(
+                "fact_store_helper_unavailable", phase=phase,
+                retryable=False, cause={"error": error.strerror})
+        except Exception as error:
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"error": type(error).__name__})
+        if completed.returncode not in (0, 1):
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"exit": completed.returncode})
+        try:
+            payload = json.loads((completed.stdout or "").strip() or "null")
+        except ValueError:
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if isinstance(payload, dict) and payload.get("ok"):
+            return self._parse_snapshot_stats(payload)
+        status = (payload or {}).get("status") if isinstance(
+            payload, dict) else None
+        raise _HelperFailed(status or "helper_failed")
+
+    def inspect(self, db_path, phase="staging"):
+        """Read-only validation and stats of one standalone fact store
+        database file (a snapshot or an extracted backup member)."""
+        import subprocess
+        runner = self._run or subprocess.run
+        try:
+            completed = runner(
+                [self.helper_path, "inspect", "--db", db_path],
+                capture_output=True, text=True, timeout=120)
+        except OSError as error:
+            raise OperationFailed(
+                "fact_store_helper_unavailable", phase=phase,
+                retryable=False, cause={"error": error.strerror})
+        except Exception as error:
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"error": type(error).__name__})
+        if completed.returncode not in (0, 1):
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"exit": completed.returncode})
+        try:
+            payload = json.loads((completed.stdout or "").strip() or "null")
+        except ValueError:
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if isinstance(payload, dict) and payload.get("ok"):
+            return self._parse_snapshot_stats(payload)
+        status = (payload or {}).get("status") if isinstance(
+            payload, dict) else None
+        raise _HelperFailed(status or "helper_failed")
+
+    def _parse_snapshot_stats(self, payload):
+        """Validate and normalize the C++ snapshot stats envelope."""
+        stats = {
+            "history_id": payload.get("history_id"),
+            "store_epoch": payload.get("store_epoch"),
+            "fact_schema_version": payload.get("fact_schema_version"),
+            "event_format_version_min": payload.get(
+                "event_format_version_min"),
+            "event_format_version_max": payload.get(
+                "event_format_version_max"),
+            "commit_count": payload.get("commit_count"),
+            "event_count": payload.get("event_count"),
+            "candidate_count": payload.get("candidate_count"),
+            "retraction_count": payload.get("retraction_count"),
+            "hlc_physical_ms": payload.get("hlc_physical_ms"),
+            "hlc_logical": payload.get("hlc_logical"),
+            "event_hlc_physical_ms": payload.get("event_hlc_physical_ms"),
+            "event_hlc_logical": payload.get("event_hlc_logical"),
+        }
+        if (not _valid_identity_token(stats["history_id"])
+                or not _valid_identity_token(stats["store_epoch"])
+                or stats["fact_schema_version"] != 1
+                or any(type(stats[key]) is not int
+                       for key in ("commit_count", "event_count",
+                                   "candidate_count", "retraction_count",
+                                   "hlc_physical_ms", "hlc_logical"))):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase="staging", retryable=False)
+        for key in ("event_format_version_min", "event_format_version_max",
+                    "event_hlc_physical_ms", "event_hlc_logical"):
+            value = stats[key]
+            if value is not None and type(value) is not int:
+                raise OperationFailed(
+                    "fact_store_helper_invalid", phase="staging",
+                    retryable=False)
+        if (stats["event_count"] == 0
+                and (stats["event_hlc_physical_ms"] != -1
+                     or stats["event_hlc_logical"] != -1
+                     or stats["event_format_version_min"] != -1
+                     or stats["event_format_version_max"] != -1)):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase="staging", retryable=False)
+        return stats
 
 
 def live_identity(helper, root):

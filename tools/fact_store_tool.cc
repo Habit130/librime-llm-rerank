@@ -21,6 +21,21 @@
 //       validated: quick_check, meta, empty fact tables, exact owner/mode
 //       and no residual WAL/SHM sidecars. Prints the new identity.
 //
+//   fact_store_tool snapshot --root <dir> --output <path>
+//       Create a consistent snapshot of the live store with the SQLite
+//       Online Backup API into a brand-new single-file database at <path>
+//       (exclusive create, never overwrites), then fully validate the
+//       snapshot (integrity, foreign keys, schema/meta/identity invariants,
+//       no WAL dependency, owner-only 0600, fsync) and print its stats.
+//       Concurrent fact writers are never blocked; the snapshot corresponds
+//       to one consistent SQLite read point.
+//
+//   fact_store_tool inspect --db <path>
+//       Read-only validation and stats of one standalone fact store
+//       database file (a snapshot or an extracted backup member). Rejects
+//       WAL-dependent, corrupt or version-incompatible files. Never touches
+//       the live facts root.
+//
 // Success output is a single JSON line. Failures print
 // {"ok":false,"status":"<stable code>"} and exit 1. Output never contains
 // private fact text.
@@ -104,6 +119,48 @@ void EmitIdentity(const string& history_id, const string& store_epoch,
   std::printf("%s\n", payload.c_str());
 }
 
+void AppendJsonInt(std::string* payload, const char* key, int64_t value) {
+  payload->append(",");
+  payload->append(key);
+  payload->append(":");
+  payload->append(std::to_string(value));
+}
+
+void AppendJsonString(std::string* payload, const char* key,
+                      const string& value) {
+  payload->append(",");
+  payload->append(key);
+  payload->append(":");
+  WriteJsonString(payload, value.c_str());
+}
+
+// One JSON line with the full snapshot stats (identity, versions, counts,
+// clock and event high-water marks); empty-store markers stay -1 so the
+// Python manifest can distinguish "no events" from an impossible value.
+void EmitSnapshotStats(const rime::FactStore::SnapshotStats& stats) {
+  std::string payload = "{\"ok\":true,\"history_id\":";
+  WriteJsonString(&payload, stats.history_id.c_str());
+  payload += ",\"store_epoch\":";
+  WriteJsonString(&payload, stats.store_epoch.c_str());
+  AppendJsonInt(&payload, "\"fact_schema_version\"",
+                rime::kFactSchemaVersion);
+  AppendJsonInt(&payload, "\"event_format_version_min\"",
+                stats.event_format_min);
+  AppendJsonInt(&payload, "\"event_format_version_max\"",
+                stats.event_format_max);
+  AppendJsonInt(&payload, "\"commit_count\"", stats.commit_count);
+  AppendJsonInt(&payload, "\"event_count\"", stats.event_count);
+  AppendJsonInt(&payload, "\"candidate_count\"", stats.candidate_count);
+  AppendJsonInt(&payload, "\"retraction_count\"", stats.retraction_count);
+  AppendJsonInt(&payload, "\"hlc_physical_ms\"", stats.hlc_physical_ms);
+  AppendJsonInt(&payload, "\"hlc_logical\"", stats.hlc_logical);
+  AppendJsonInt(&payload, "\"event_hlc_physical_ms\"",
+                stats.event_hlc_physical_ms);
+  AppendJsonInt(&payload, "\"event_hlc_logical\"", stats.event_hlc_logical);
+  payload += "}";
+  std::printf("%s\n", payload.c_str());
+}
+
 bool PathExists(const path& target) {
   struct stat st;
   return lstat(target.c_str(), &st) == 0;
@@ -121,7 +178,8 @@ bool IsExactOwnerMode(const path& target, mode_t mode) {
 // is enough for an operator to recover a broken invocation.
 int Usage() {
   std::fprintf(stderr,
-               "usage: fact_store_tool <verify|create-empty> --root <dir>\n");
+               "usage: fact_store_tool <verify|create-empty|snapshot|inspect>"
+               " --root <dir>|--db <path> [--output <path>]\n");
   return 2;
 }
 
@@ -215,6 +273,62 @@ int RunCreateEmpty(const path& root) {
   return 0;
 }
 
+int RunSnapshot(const path& root, const path& output) {
+  if (output.empty()) {
+    EmitFailure("no_output");
+    return 1;
+  }
+  if (PathExists(output)) {
+    // Exclusive destination: the Python executor owns the staging
+    // directory lifecycle and must move stale staging away first.
+    EmitFailure("output_exists");
+    return 1;
+  }
+  FactStore store(root);
+  FactStore::Status status = store.Open();
+  if (status != FactStore::Status::kOk) {
+    EmitFailure(FactStore::StatusCode(status));
+    return 1;
+  }
+  rime::FactStore::SnapshotStats stats;
+  status = store.SnapshotTo(output, &stats);
+  if (status != FactStore::Status::kOk) {
+    EmitFailure(FactStore::StatusCode(status));
+    return 1;
+  }
+  EmitSnapshotStats(stats);
+  return 0;
+}
+
+int RunInspect(const path& db_path) {
+  if (db_path.empty()) {
+    EmitFailure("no_db");
+    return 1;
+  }
+  struct stat st;
+  if (lstat(db_path.c_str(), &st) != 0) {
+    EmitFailure("no_store");
+    return 1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    EmitFailure("db_symlink");
+    return 1;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    EmitFailure("db_not_regular");
+    return 1;
+  }
+  rime::FactStore::SnapshotStats stats;
+  FactStore::Status status =
+      rime::FactStore::InspectSnapshotFile(db_path, &stats);
+  if (status != FactStore::Status::kOk) {
+    EmitFailure(FactStore::StatusCode(status));
+    return 1;
+  }
+  EmitSnapshotStats(stats);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -222,18 +336,27 @@ int main(int argc, char* argv[]) {
     return Usage();
   const char* command = argv[1];
   path root;
+  path output;
+  path db_path;
   for (int index = 2; index + 1 < argc; index += 2) {
     if (std::strcmp(argv[index], "--root") == 0) {
       root = path(argv[index + 1]);
+    } else if (std::strcmp(argv[index], "--output") == 0) {
+      output = path(argv[index + 1]);
+    } else if (std::strcmp(argv[index], "--db") == 0) {
+      db_path = path(argv[index + 1]);
     } else {
       return Usage();
     }
   }
-  if (root.empty())
-    return Usage();
   if (std::strcmp(command, "verify") == 0)
-    return RunVerify(root);
+    return root.empty() ? Usage() : RunVerify(root);
   if (std::strcmp(command, "create-empty") == 0)
-    return RunCreateEmpty(root);
+    return root.empty() ? Usage() : RunCreateEmpty(root);
+  if (std::strcmp(command, "snapshot") == 0)
+    return (root.empty() || output.empty()) ? Usage() : RunSnapshot(root,
+                                                                    output);
+  if (std::strcmp(command, "inspect") == 0)
+    return db_path.empty() ? Usage() : RunInspect(db_path);
   return Usage();
 }
