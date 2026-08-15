@@ -310,15 +310,18 @@ def replace_fact_database(root, replacement_path, _lease=None,
     Publication is staged so a failure or crash can only ever expose the
     complete old store or the complete new store:
 
-    1. The old database is checkpointed (committed WAL pages merged into the
-       main file) while the exclusive lease still blocks every other
-       connection, the main file is fsynced, and leftover WAL/SHM sidecars
-       are removed.
+    1. The existing main database is validated as a regular, owner-owned
+       `0600` file through the root directory fd (O_NOFOLLOW, so a symlink
+       is rejected without ever following its target). Then the old database
+       is checkpointed (committed WAL pages merged into the main file) while
+       the exclusive lease still blocks every other connection, the main
+       file is fsynced, and leftover WAL/SHM sidecars are removed.
     2. Only then is the new main database published with one atomic rename.
 
-    A failed checkpoint or sidecar removal aborts before the main file is
-    touched, so the old store stays complete; after the rename the new store
-    is complete and no old sidecar can be paired with it.
+    A failed validation, a busy or incomplete checkpoint, or a failed
+    sidecar removal aborts before the main file is touched, so the old store
+    stays complete; after the rename the new store is complete and no old
+    sidecar can be paired with it.
 
     Destructive command policy, backup validation and operation persistence
     remain caller-owned by later maintenance operations. Underscore
@@ -340,7 +343,28 @@ def replace_fact_database(root, replacement_path, _lease=None,
                 or stat.S_IMODE(source_stat.st_mode) != 0o600):
             raise MaintenanceError("replacement_unsafe")
         main_path = os.path.join(root, "facts.sqlite3")
-        if os.path.lexists(main_path):
+        # Validate the existing main database through the directory fd before
+        # any SQLite connection, checkpoint or file modification. A symlink is
+        # rejected by O_NOFOLLOW without ever following the target; owner,
+        # mode and file type are proven on the very fd that was opened, which
+        # matches the safety seam of every other fact-store opener in this
+        # module.
+        try:
+            main_fd = os.open("facts.sqlite3", os.O_RDONLY | os.O_NOFOLLOW,
+                              dir_fd=root_fd)
+        except FileNotFoundError:
+            main_fd = None
+        except OSError as error:
+            raise MaintenanceError("replacement_failed") from error
+        if main_fd is not None:
+            try:
+                main_stat = os.fstat(main_fd)
+                if (not stat.S_ISREG(main_stat.st_mode)
+                        or main_stat.st_uid != os.getuid()
+                        or stat.S_IMODE(main_stat.st_mode) != 0o600):
+                    raise MaintenanceError("replacement_failed")
+            finally:
+                os.close(main_fd)
             try:
                 connection = _connect(main_path, timeout=0)
             except sqlite3.Error as error:
@@ -348,7 +372,12 @@ def replace_fact_database(root, replacement_path, _lease=None,
             try:
                 row = connection.execute(
                     "PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
-                if row is None or row[0] < 0:
+                # SQLite reports busy as 1 in the first result column; any
+                # non-zero value means the checkpoint did not complete. An
+                # incomplete checkpoint must abort before sidecar removal or
+                # publication, because the old main file alone would not be a
+                # complete old store.
+                if row is None or row[0] != 0:
                     raise MaintenanceError("replacement_failed")
             except sqlite3.Error as error:
                 raise MaintenanceError("replacement_failed") from error
@@ -357,7 +386,8 @@ def replace_fact_database(root, replacement_path, _lease=None,
             # The close-time checkpoint has already removed any real WAL/SHM.
             # Make the merged main file durable before anything can rename it.
             try:
-                main_fd = os.open(main_path, os.O_RDONLY | os.O_NOFOLLOW)
+                main_fd = os.open("facts.sqlite3", os.O_RDONLY | os.O_NOFOLLOW,
+                                  dir_fd=root_fd)
             except OSError as error:
                 raise MaintenanceError("replacement_failed") from error
             try:
