@@ -14,11 +14,23 @@ The single supported public entry point for semantic-memory maintenance
                     pending steps for an operation; future tickets spawn it
                     detached so the foreground CLI can exit and only
                     detach, never cancel.
-  backup create|verify, restore, clear, rebuild, quarantine list|purge
+  backup create     consistent online fact snapshot published as a versioned
+                    two-member .squirrel-memory-backup ZIP with a no-
+                    overwrite atomic publication; refuses destination media
+                    that cannot guarantee owner-only permissions unless the
+                    operator explicitly confirms (--allow-insecure-
+                    destination + exact string) and permanently marks the
+                    container.
+  backup verify     fully offline validation of a backup container: strict
+                    member/name/attribute/compression/size checks, CRC,
+                    extracted-database integrity and re-computed manifest
+                    cross-checks; never reads live state, never connects to
+                    or starts the daemon, never loads the model.
+  restore, rebuild, quarantine list|purge
                     RESERVED command surface (approved by spec #43): fully
                     parsed but dispatch to a stable `not_implemented` error;
                     they never fake success and never execute destructive
-                    behavior (#54/#55/#57/#68 implement them).
+                    behavior (#56/#57/#68 implement them).
 
 Output contracts (deterministic):
   - human text and --json carry stable version fields inside the document
@@ -99,14 +111,18 @@ def default_paths():
 
 
 def default_registry(paths=None):
-    """The production operation registry (`clear`; later tickets add the
-    remaining maintenance types)."""
-    from clear_operation import production_registry
+    """The production operation registry (`clear`, `backup.create`; later
+    tickets add the remaining maintenance types)."""
+    from clear_operation import production_registry as clear_registry
+    from backup_operation import production_registry as backup_registry
     paths = paths or default_paths()
-    return production_registry(
+    registry = clear_registry(
         paths["semantic_memory_root"],
         control_socket=paths["control_socket"],
         scoring_socket=paths["daemon_socket"])
+    for spec in backup_registry(paths["semantic_memory_root"])._specs.values():
+        registry.register(spec)
+    return registry
 
 
 def build_parser():
@@ -166,20 +182,26 @@ def build_parser():
 
     # -- reserved maintenance commands (spec #43 contract surface) --------
 
-    backup = sub.add_parser("backup", help="reserved: backup commands")
+    backup = sub.add_parser("backup", help="create or verify an online fact "
+                                           "snapshot")
     backup_sub = backup.add_subparsers(dest="backup_command")
 
     backup_create = backup_sub.add_parser(
-        "create", help="reserved: create an online fact snapshot")
+        "create", help="create a consistent online fact snapshot backup")
     backup_create.add_argument("--output", metavar="PATH", required=True)
+    backup_create.add_argument(
+        "--allow-insecure-destination", action="store_true",
+        help="accept a destination medium that cannot guarantee owner-only "
+             "file permissions; requires typing the exact confirmation "
+             "string")
     backup_create.add_argument("--json", action="store_true")
-    backup_create.set_defaults(handler=_cmd_reserved)
+    backup_create.set_defaults(handler=_cmd_backup_create)
 
     backup_verify = backup_sub.add_parser(
-        "verify", help="reserved: verify a backup offline")
+        "verify", help="verify a backup fully offline")
     backup_verify.add_argument("backup")
     backup_verify.add_argument("--json", action="store_true")
-    backup_verify.set_defaults(handler=_cmd_reserved)
+    backup_verify.set_defaults(handler=_cmd_backup_verify)
 
     restore = sub.add_parser("restore", help="reserved: restore a backup")
     restore.add_argument("--from", dest="from_path", metavar="BACKUP")
@@ -779,6 +801,246 @@ def _cmd_clear(args, paths):
 
 
 # ---------------------------------------------------------------------------
+# backup create / verify
+# ---------------------------------------------------------------------------
+
+def _watch_detached_operation(store, operation_id, emit, mode, noun):
+    """Spawn the detached executor and observe the persistent record until
+    it reaches a terminal state or `blocked`. Ctrl-C only detaches (exit
+    130); the executor keeps running. Returns (record, None) on a terminal
+    observation or (None, exit_code) on early failure or detach."""
+    import time as time_module
+    entry = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "squirrel-semantic-memory")
+    last_seq = 0
+    alive_grace = None
+    executor = None
+    try:
+        executor = subprocess.Popen(
+            [sys.executable, entry, "operation", "run", operation_id],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        while True:
+            current = store.load(operation_id)
+            for entry in current["log"][last_seq:]:
+                emit(entry)
+                last_seq = len(current["log"])
+            if current["state"] in ("succeeded", "failed", "blocked",
+                                    "cancelled"):
+                return current, None
+            if executor.poll() is not None:
+                if alive_grace is None:
+                    alive_grace = time_module.monotonic()
+                elif time_module.monotonic() - alive_grace > 3.0:
+                    error = make_error(
+                        "executor_exited", phase="runner", retryable=True,
+                        remediation="the executor process exited without a "
+                                    "terminal record; run `operation run %s` "
+                                    "to resume" % operation_id,
+                        cause={"state": current["state"],
+                               "phase": current["phase"]})
+                    _render_error(error, mode)
+                    return None, 1
+            else:
+                alive_grace = None
+            time_module.sleep(0.25)
+    except KeyboardInterrupt:
+        current = store.load(operation_id)
+        print("interrupted: detached from operation %s (state %s, phase %s); "
+              "the %s continues in the background, this is not a cancel"
+              % (operation_id, current["state"], current["phase"], noun),
+              file=sys.stderr)
+        return None, 130
+    except OperationError as error:
+        _store_operation_error(error, mode)
+        return None, 2
+    except OSError as error:
+        _store_operation_error(
+            OperationError("executor_start_failed", phase="cli",
+                           retryable=True, cause={"error": error.strerror}),
+            mode)
+        return None, 1
+
+
+def _confirm_insecure_destination(output, mode):
+    """Exact-string second confirmation for --allow-insecure-destination
+    (spec #55 SCN-55-6): any deviation, EOF or extra character cancels.
+    Returns True only after the exact phrase was typed. Everything is
+    rendered on stderr so `--json` stdout stays exactly one document."""
+    from backup_operation import CONFIRMATION_PREFIX
+    confirmation = CONFIRMATION_PREFIX + output
+    print("warning: the destination medium could not prove owner-only file "
+          "permissions for this backup", file=sys.stderr)
+    print("the backup contains plaintext private input history; on an "
+          "insecure destination other accounts or processes of this device "
+          "may be able to read it", file=sys.stderr)
+    print("type the exact string below to confirm:", file=sys.stderr)
+    print(confirmation, file=sys.stderr, flush=True)
+    try:
+        entered = sys.stdin.readline()
+    except (EOFError, OSError):
+        entered = ""
+    return entered.rstrip("\r\n") == confirmation
+
+
+def _print_backup_result(record, args):
+    if args.json:
+        print(_json_dump(public_record(record)), flush=True)
+        return
+    result = record.get("result") or {}
+    print("backup %s" % result.get("backup_id", "created"))
+    print("  destination: %s" % result.get("destination", "unknown"))
+    print("  history: %s (epoch %s)"
+          % (result.get("history_id") or "unknown",
+             result.get("store_epoch") or "unknown"))
+    print("  fact schema: %s; event format: %s..%s"
+          % (result.get("fact_schema_version"),
+             result.get("event_format_version_min"),
+             result.get("event_format_version_max")))
+    print("  facts: %s events, %s commits, %s candidates, %s retractions"
+          % (result.get("event_count"), result.get("commit_count"),
+             result.get("candidate_count"), result.get("retraction_count")))
+    print("  created: %s" % result.get("created_at"))
+    print("  sha256: %s (%s bytes)"
+          % (result.get("database_sha256"), result.get("database_size")))
+    if result.get("insecure_destination"):
+        print("  warning: insecure destination confirmed; this backup is "
+              "not owner-only protected")
+    print("  %s" % result.get(
+        "sensitive_declaration",
+        "this backup contains plaintext private input history"))
+
+
+def _cmd_backup_create(args, paths):
+    store = _operation_store(paths)
+    mode = "json" if args.json else "human"
+    try:
+        store.open(create=False)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    output = os.path.abspath(args.output)
+    if args.allow_insecure_destination:
+        if not _confirm_insecure_destination(output, mode):
+            error = make_error(
+                "confirmation_failed", phase="cli", retryable=True,
+                remediation="re-run backup create and type the exact "
+                            "confirmation string",
+                cause=None)
+            _render_error(error, mode)
+            return 1
+    elif not args.json:
+        print("creating online fact snapshot at %s" % output)
+
+    try:
+        record = create_operation(
+            store, args.registry, "backup.create",
+            {"output": output,
+             "allow_insecure": args.allow_insecure_destination})
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    except ValueError as error:
+        return _store_operation_error(
+            OperationError("invalid_parameters", phase="cli",
+                           retryable=False, cause={
+                               "error": str(error)}), mode)
+
+    operation_id = record["operation_id"]
+    if args.json:
+        # The operation id must be observable before any snapshot work, but
+        # stdout must stay exactly one versioned terminal document so a
+        # single json.loads(stdout) parses the whole run. The compact
+        # started envelope therefore goes to stderr, a separate channel
+        # that never pollutes the JSON stdout contract.
+        print(_json_line({
+            "operation_version": OPERATION_VERSION,
+            "operation_id": operation_id,
+            "type": "backup.create",
+            "state": "running",
+            "output": output,
+        }), flush=True, file=sys.stderr)
+    else:
+        print("backup create started: operation %s" % operation_id)
+
+    def emit(entry):
+        if not args.json:
+            print(_human_event_line(entry), flush=True)
+
+    current, failure_code = _watch_detached_operation(
+        store, operation_id, emit, mode, "backup create")
+    if failure_code is not None:
+        return failure_code
+
+    if current["state"] in ("succeeded", "cancelled"):
+        _print_backup_result(current, args)
+        return 0
+    if args.json:
+        print(_json_dump(public_record(current)), flush=True)
+    else:
+        print("backup create did not complete: state %s (phase %s)"
+              % (current["state"], current["phase"]))
+        if current.get("error") is not None:
+            print("  error: %s" % current["error"]["code"])
+            print("  remediation: %s"
+                  % current["error"].get("remediation", ""))
+    return 1
+
+
+def _print_verify_result(result, args):
+    if args.json:
+        print(_json_dump(result), flush=True)
+        return
+    if result["valid"]:
+        print("backup: valid")
+    else:
+        print("backup: invalid")
+    print("  backup id: %s" % result.get("backup_id"))
+    print("  history: %s (epoch %s)"
+          % (result.get("history_id") or "unknown",
+             result.get("store_epoch") or "unknown"))
+    print("  fact schema: %s; event format: %s..%s"
+          % (result.get("fact_schema_version"),
+             result.get("event_format_version_min"),
+             result.get("event_format_version_max")))
+    print("  facts: %s events, %s commits, %s candidates, %s retractions"
+          % (result.get("event_count"), result.get("commit_count"),
+             result.get("candidate_count"), result.get("retraction_count")))
+    print("  created: %s" % result.get("created_at"))
+    print("  sha256: %s (%s bytes)"
+          % (result.get("database_sha256"), result.get("database_size")))
+    if result.get("insecure_destination"):
+        print("  warning: this backup was created on an explicitly "
+              "confirmed insecure destination; it is not owner-only "
+              "protected")
+
+
+def _cmd_backup_verify(args, paths):
+    from backup_operation import VERIFY_VERSION, BackupError, verify_backup
+    mode = "json" if args.json else "human"
+    try:
+        result = verify_backup(args.backup)
+    except BackupError as error:
+        payload = {
+            "verify_version": VERIFY_VERSION,
+            "valid": False,
+            "error": make_error(
+                error.code, phase="cli",
+                remediation="verify the container's integrity, or re-create "
+                            "the backup with a current build",
+                cause=error.cause),
+        }
+        if mode == "json":
+            print(_json_dump(payload), flush=True)
+        else:
+            print("backup: invalid (%s)" % error.code, file=sys.stderr)
+            print("remediation: %s" % payload["error"]["remediation"],
+                  file=sys.stderr)
+        return 1
+    _print_verify_result(result, args)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # reserved maintenance commands
 # ---------------------------------------------------------------------------
 
@@ -790,8 +1052,6 @@ def _cmd_reserved(args, paths):
 
 
 def _reserved_command_name(args):
-    if args.command == "backup":
-        return "backup %s" % args.backup_command
     if args.command == "quarantine":
         return "quarantine %s" % args.quarantine_command
     return args.command
@@ -804,7 +1064,7 @@ def _reserved_command_name(args):
 def main(argv=None, registry=None):
     """Run the CLI. `registry` is the operation-type registry used by the
     internal `operation run` executor; production code passes None, which
-    loads the production registry (`clear`; backup/restore/rebuild/
+    loads the production registry (`clear`, `backup.create`; restore/rebuild/
     quarantine arrive with their own tickets). Returns the process exit
     code.
     """
