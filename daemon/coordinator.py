@@ -402,6 +402,22 @@ class MaintenanceCoordinator:
             except Exception:
                 identity = None
             if identity is None:
+                if self._prepared_epoch is None:
+                    # A pristine no-database prepare has no old epoch to
+                    # protect: nothing was ever on disk, so no stale derived
+                    # state can exist. Explicit reopen and real EOF recovery
+                    # both return to serving with zero fact handles and no
+                    # derived epoch.
+                    with self._condition:
+                        if self._closed:
+                            return self._block("coordinator_closed")
+                        self._active_derived_epoch = None
+                        self._target_epoch = None
+                        self._state = "serving"
+                        self._clear_lease_locked()
+                        return {"ok": True, "state": "serving",
+                                "explicit": explicit, "store_epoch": None,
+                                "serving_ready": True}
                 return self._block("epoch_unverifiable")
             if not self._valid_identity(identity):
                 return self._block("epoch_unverifiable")
