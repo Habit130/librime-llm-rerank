@@ -13,6 +13,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     switch_config_test.cc
     fact_store_test.cc
     recorder_e2e_test.cc
+    recorder_coordinator_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
   target_link_libraries(llm_rerank_test
     ${rime_library}
@@ -21,9 +22,15 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
   if(BUILD_SHARED_LIBS)
     target_compile_definitions(llm_rerank_test PRIVATE RIME_IMPORTS)
   endif()
+  if(BUILD_MERGED_PLUGINS)
+    set(llm_rerank_runtime_target ${rime_library})
+  else()
+    set(llm_rerank_runtime_target rime-llm-rerank)
+  endif()
   target_compile_definitions(llm_rerank_test PRIVATE
     LLM_RERANK_DAEMON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../daemon"
     LLM_RERANK_PYTHON="${Python3_EXECUTABLE}"
+    LLM_RERANK_PLUGIN_DYLIB="$<TARGET_FILE:${llm_rerank_runtime_target}>"
     LLM_RERANK_BUILD_PREDICT="${EXECUTABLE_OUTPUT_PATH}/../../predict/bin/build_predict")
 
   add_test(NAME llm_rerank_test

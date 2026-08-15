@@ -18,6 +18,7 @@
 
 #include "llm_rerank_config.h"
 #include "llm_rerank_recorder.h"
+#include "recorder_coordinator.h"
 #include "rerank_plan.h"
 
 namespace rime {
@@ -44,6 +45,16 @@ bool IsPlainBackspace(const KeyEvent& key) {
          (key.modifier() & ~kShiftMask) == 0;
 }
 
+bool IsFatalRecordingFault(const string& fault) {
+  return fault == "no_home" || fault == "root_create_failed" ||
+         fault == "root_not_directory" || fault == "root_symlink" ||
+         fault == "root_owner" || fault == "root_permission" ||
+         fault == "db_symlink" || fault == "db_not_regular" ||
+         fault == "db_owner" || fault == "db_permission" ||
+         fault == "db_corrupt" || fault == "db_unsupported_version" ||
+         fault == "db_clock_invalid";
+}
+
 }  // namespace
 
 LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
@@ -58,6 +69,7 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
           : nullptr,
       "llm_rerank");
   const bool recording_enabled = switches.recording_enabled;
+  recording_enabled_ = recording_enabled;
   if (switches.deprecation_warning) {
     LOG(WARNING) << "llm_rerank recorder: legacy 'enable' key is deprecated "
                     "and ignored; v2 switch keys take precedence";
@@ -76,14 +88,19 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
               << " schema=" << schema_id;
     session_->fault_code = "";
   } else {
-    session_->store = std::make_unique<FactStore>(FactStore::DefaultRootDir());
-    FactStore::Status status = session_->store->Open();
+    // Initialize eagerly so a recording-enabled schema has a provable zero
+    // event store, but do not retain the handle: its destructor closes SQLite
+    // before releasing the shared maintenance lease.
+    FactStore store(FactStore::DefaultRootDir());
+    FactStore::Status status = store.Open();
     if (status != FactStore::Status::kOk) {
+      recording_enabled_ = false;
       session_->fault_code = FactStore::StatusCode(status);
       LOG(WARNING) << "llm_rerank recorder: code=recording_disabled"
                    << " reason=" << session_->fault_code
-                   << " message=\"" << FactStore::StatusMessage(status) << "\""
                    << " schema=" << schema_id;
+    } else {
+      session_->fault_code = "";
     }
   }
   if (Context* ctx = engine_ ? engine_->context() : nullptr) {
@@ -145,7 +162,7 @@ ProcessResult LlmRerankRecorder::ProcessKeyEvent(const KeyEvent& key_event) {
 }
 
 void LlmRerankRecorder::OnSelect(Context* ctx) {
-  if (!session_ || !session_->store)
+  if (!recording_enabled_ || !session_)
     return;
   if (!ctx)
     return;
@@ -235,7 +252,7 @@ void LlmRerankRecorder::OnSelect(Context* ctx) {
 }
 
 void LlmRerankRecorder::OnCommit(Context* ctx) {
-  if (!session_ || !session_->store)
+  if (!recording_enabled_ || !session_)
     return;
   if (!ctx || session_->pending.empty()) {
     // A commit with no tentative events (plain text, auto-selection) still
@@ -273,13 +290,6 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
             [](const PendingEvent& a, const PendingEvent& b) {
               return a.confirm_seq < b.confirm_seq;
             });
-  if (!session_->store->is_open()) {
-    ReportGap(session_->fault_code.empty() ? "store_unavailable"
-                                           : session_->fault_code.c_str());
-    session_->pending.clear();
-    retraction_armed_ = false;
-    return;
-  }
   vector<FactStore::Event> events;
   events.reserve(valid.size());
   for (const auto& pending : valid) {
@@ -307,18 +317,23 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
     }
     events.push_back(std::move(event));
   }
-  string commit_id;
-  if (!session_->store->PersistBatch(NowMs(), &events, &commit_id)) {
-    ReportGap(FactStore::StatusCode(session_->store->status()));
+  auto result = RecorderCoordinator::ForRoot(FactStore::DefaultRootDir())
+                     ->SubmitBatch(NowMs(), &events);
+  if (result.outcome == RecorderCoordinator::Outcome::kGap) {
+    ReportGap(result.fault_code.c_str());
+    if (IsFatalRecordingFault(result.fault_code))
+      recording_enabled_ = false;
     session_->pending.clear();
     retraction_armed_ = false;
     return;
   }
+  if (session_->gap_count == 0)
+    session_->fault_code = "";
   for (const auto& pending : valid) {
     session_->pending.erase(pending.segment_start);
   }
   // Arm the immediate-undo window for the whole batch just persisted.
-  retraction_commit_id_ = commit_id;
+  retraction_commit_id_ = result.commit_id;
   retraction_armed_ = true;
   UpdateStatusProperties();
 }
@@ -346,19 +361,20 @@ void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
     return;  // press-only: the confirming key's release must not trigger
   if (!retraction_pending_ || !retraction_armed_)
     return;
-  if (!session_ || !session_->store)
+  if (!recording_enabled_ || !session_)
     return;
   retraction_pending_ = false;
   retraction_armed_ = false;
-  if (!session_->store->is_open()) {
-    ReportGap(session_->fault_code.empty() ? "store_unavailable"
-                                           : session_->fault_code.c_str());
+  auto result = RecorderCoordinator::ForRoot(FactStore::DefaultRootDir())
+                     ->SubmitRetraction(retraction_commit_id_, NowMs());
+  if (result.outcome == RecorderCoordinator::Outcome::kGap) {
+    ReportGap(result.fault_code.c_str());
+    if (IsFatalRecordingFault(result.fault_code))
+      recording_enabled_ = false;
     return;
   }
-  if (!session_->store->AppendRetraction(retraction_commit_id_, NowMs())) {
-    ReportGap(FactStore::StatusCode(session_->store->status()));
-    return;
-  }
+  if (session_->gap_count == 0)
+    session_->fault_code = "";
   LOG(INFO) << "llm_rerank recorder: code=retracted_commit"
             << " commit_id=" << retraction_commit_id_
             << " schema=" << session_->schema_id;
@@ -368,6 +384,8 @@ void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
 void LlmRerankRecorder::ReportGap(const char* reason) {
   if (!session_)
     return;
+  if (reason && *reason)
+    session_->fault_code = reason;
   session_->gap_count += 1;
   LOG(WARNING) << "llm_rerank recorder: code=recording_gap"
                << " reason=" << reason

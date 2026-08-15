@@ -22,6 +22,7 @@ extern char** environ;
 #include <sqlite3.h>
 
 #include "fact_store.h"
+#include "maintenance_lock.h"
 
 using namespace rime;
 
@@ -600,7 +601,24 @@ TEST_F(FactStoreTest, ConcurrentWritersBothPersistAtomically) {
   EXPECT_EQ(0LL, QueryCount(db,
       "SELECT COUNT(*) FROM commits c LEFT JOIN selection_events e"
       " ON c.commit_id = e.commit_id WHERE e.event_id IS NULL;"));
+  // The clock is read only after BEGIN IMMEDIATE. Even writers that opened
+  // their handles before another writer committed therefore cannot allocate a
+  // stale duplicate timestamp.
+  EXPECT_EQ(0LL, QueryCount(db,
+      "SELECT COUNT(*) FROM (SELECT hlc_physical_ms, hlc_logical, COUNT(*) c"
+      " FROM selection_events GROUP BY hlc_physical_ms, hlc_logical"
+      " HAVING c > 1);"));
   sqlite3_close(db);
+}
+
+TEST_F(FactStoreTest, SharedLeaseClosesBeforeExclusiveMaintenance) {
+  MaintenanceLock exclusive;
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    EXPECT_FALSE(exclusive.Acquire(root_, MaintenanceLock::Mode::kExclusive));
+  }
+  EXPECT_TRUE(exclusive.Acquire(root_, MaintenanceLock::Mode::kExclusive));
 }
 
 TEST_F(FactStoreTest, AppendRetractionKeepsOriginalFactsUntouched) {

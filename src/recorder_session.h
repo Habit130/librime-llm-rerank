@@ -108,7 +108,6 @@ class RecorderSession {
   std::map<size_t, PendingEvent> pending;
   uint64_t next_confirm_seq = 0;
   int session_seq = 0;
-  std::unique_ptr<FactStore> store;
   string fault_code;  // stable code; empty means healthy
   int gap_count = 0;
 };

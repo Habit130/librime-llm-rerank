@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 
 #include "fact_store.h"
 #include "recorder_session.h"
@@ -73,6 +74,7 @@ FactStore::~FactStore() {
     sqlite3_close(db_);
     db_ = nullptr;
   }
+  maintenance_lock_.Release();
 }
 
 FactStore::Status FactStore::VerifyRoot() {
@@ -265,9 +267,10 @@ bool ReadMetaText(sqlite3* db, const char* key, string* value) {
 bool ParseInt64(const string& text, int64_t* value) {
   if (text.empty())
     return false;
+  errno = 0;
   char* end = nullptr;
   long long parsed = strtoll(text.c_str(), &end, 10);
-  if (end != text.c_str() + text.size())
+  if (errno == ERANGE || end != text.c_str() + text.size())
     return false;
   *value = static_cast<int64_t>(parsed);
   return true;
@@ -306,12 +309,21 @@ FactStore::Status FactStore::Open() {
     sqlite3_close(db_);
     db_ = nullptr;
   }
+  maintenance_lock_.Release();
   if (Status root_status = VerifyRoot(); root_status != Status::kOk) {
     status_ = root_status;
     return status_;
   }
+  // This is deliberately before VerifyDbFile and sqlite3_open_v2: those
+  // operations can create or mutate facts.sqlite3, WAL and SHM files.
+  if (!maintenance_lock_.Acquire(root_, MaintenanceLock::Mode::kShared, true)) {
+    status_ = maintenance_lock_.busy() ? Status::kMaintenanceLocked
+                                       : Status::kDbOpenFailed;
+    return status_;
+  }
   if (Status file_status = VerifyDbFile(); file_status != Status::kOk) {
     status_ = file_status;
+    maintenance_lock_.Release();
     return status_;
   }
   path db_path = root_ / kDbFileName;
@@ -323,6 +335,7 @@ FactStore::Status FactStore::Open() {
       sqlite3_close(db_);
       db_ = nullptr;
     }
+    maintenance_lock_.Release();
     return status_;
   }
   sqlite3_busy_timeout(db_, kBusyTimeoutMs);
@@ -332,6 +345,7 @@ FactStore::Status FactStore::Open() {
     status_ = Status::kDbCorrupt;
     sqlite3_close(db_);
     db_ = nullptr;
+    maintenance_lock_.Release();
     return status_;
   }
   if (Exec(db_, "PRAGMA journal_mode=WAL;") != SQLITE_OK ||
@@ -340,6 +354,19 @@ FactStore::Status FactStore::Open() {
     status_ = Status::kDbOpenFailed;
     sqlite3_close(db_);
     db_ = nullptr;
+    maintenance_lock_.Release();
+    return status_;
+  }
+
+  // Schema creation and first-clock initialization must be one SQLite write
+  // transaction. The maintenance flock is shared by normal writers, so two
+  // fresh processes can both reach this point; BEGIN IMMEDIATE makes one
+  // initializer win and the other re-read the completed metadata.
+  if (Exec(db_, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+    status_ = Status::kDbOpenFailed;
+    sqlite3_close(db_);
+    db_ = nullptr;
+    maintenance_lock_.Release();
     return status_;
   }
 
@@ -403,31 +430,46 @@ FactStore::Status FactStore::Open() {
       " WHERE NOT EXISTS (SELECT 1 FROM retractions r"
       "                   WHERE r.commit_id = e.commit_id);";
   if (Exec(db_, kSchemaV1) != SQLITE_OK) {
+    Exec(db_, "ROLLBACK;");
     status_ = Status::kDbOpenFailed;
     sqlite3_close(db_);
     db_ = nullptr;
+    maintenance_lock_.Release();
     return status_;
   }
 
   bool has_meta = false;
   if (!QueryBoolValue(db_, "SELECT EXISTS(SELECT 1 FROM meta);", &has_meta)) {
+    Exec(db_, "ROLLBACK;");
     status_ = Status::kDbClockInvalid;
     sqlite3_close(db_);
     db_ = nullptr;
+    maintenance_lock_.Release();
     return status_;
   }
   Status meta_status =
       has_meta ? ValidateMeta() : InitializeMeta();
   if (meta_status != Status::kOk) {
+    Exec(db_, "ROLLBACK;");
     status_ = meta_status;
     sqlite3_close(db_);
     db_ = nullptr;
+    maintenance_lock_.Release();
+    return status_;
+  }
+  if (Exec(db_, "COMMIT;") != SQLITE_OK) {
+    Exec(db_, "ROLLBACK;");
+    status_ = Status::kDbOpenFailed;
+    sqlite3_close(db_);
+    db_ = nullptr;
+    maintenance_lock_.Release();
     return status_;
   }
   if (!EnsureFileModes()) {
     status_ = Status::kDbPermission;
     sqlite3_close(db_);
     db_ = nullptr;
+    maintenance_lock_.Release();
     return status_;
   }
   return status_;
@@ -435,7 +477,8 @@ FactStore::Status FactStore::Open() {
 
 bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
                              vector<Event>* events,
-                             string* commit_id_out) {
+                             string* commit_id_out,
+                             const string* assigned_commit_id) {
   if (!db_ || !events || events->empty()) {
     status_ = Status::kDbWriteFailed;
     return false;
@@ -445,6 +488,17 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
     return false;
   }
   bool ok = true;
+  // SQLite has now serialized all writers. Never tick from the connection's
+  // open-time cache: another process may have advanced meta while we waited.
+  string clock_text;
+  int64_t physical = 0;
+  int64_t logical = 0;
+  if (!ReadMetaText(db_, kMetaClockPhysicalMs, &clock_text) ||
+      !ParseInt64(clock_text, &physical) || physical < 0 ||
+      !ReadMetaText(db_, kMetaClockLogical, &clock_text) ||
+      !ParseInt64(clock_text, &logical) || logical < 0) {
+    ok = false;
+  }
   const char* insert_commit =
       "INSERT INTO commits(commit_id, utc_committed_at_ms) VALUES(?, ?);";
   const char* insert_event =
@@ -469,15 +523,13 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
           SQLITE_OK) {
     ok = false;
   }
-  string commit_id = RandomUuid();
+  string commit_id = assigned_commit_id ? *assigned_commit_id : RandomUuid();
   if (ok) {
     sqlite3_bind_text(commit_stmt, 1, commit_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(commit_stmt, 2, utc_committed_at_ms);
     ok = sqlite3_step(commit_stmt) == SQLITE_DONE;
   }
   if (ok) {
-    int64_t physical = clock_physical_ms_;
-    int64_t logical = clock_logical_;
     for (Event& event : *events) {
       GiveTick(physical, logical);
       event.hlc_physical_ms = physical;
@@ -538,8 +590,6 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
         break;
     }
     if (ok) {
-      clock_physical_ms_ = physical;
-      clock_logical_ = logical;
       ok = RecordMetaClock(db_, physical, logical);
     }
   }
@@ -560,7 +610,16 @@ bool FactStore::PersistBatch(int64_t utc_committed_at_ms,
   }
   if (commit_id_out)
     *commit_id_out = commit_id;
-  EnsureFileModes();
+  // WAL/SHM chmod is a fact mutation and therefore remains inside the shared
+  // lease. The connection stays open until its owning FactStore is destroyed.
+  if (!EnsureFileModes()) {
+    // COMMIT has succeeded. Reporting this as a lost batch would create a
+    // false recording gap and break causal undo; future opens fail closed on
+    // the unsafe mode instead.
+    status_ = Status::kDbPermission;
+  }
+  clock_physical_ms_ = physical;
+  clock_logical_ = logical;
   return true;
 }
 
@@ -579,6 +638,15 @@ bool FactStore::AppendRetraction(const string& commit_id,
     return false;
   }
   bool ok = true;
+  string clock_text;
+  int64_t physical = 0;
+  int64_t logical = 0;
+  if (!ReadMetaText(db_, kMetaClockPhysicalMs, &clock_text) ||
+      !ParseInt64(clock_text, &physical) || physical < 0 ||
+      !ReadMetaText(db_, kMetaClockLogical, &clock_text) ||
+      !ParseInt64(clock_text, &logical) || logical < 0) {
+    ok = false;
+  }
   sqlite3_stmt* check = nullptr;
   const char* kCheckRetractable = "SELECT EXISTS("
       "SELECT 1 FROM commits c"
@@ -608,8 +676,6 @@ bool FactStore::AppendRetraction(const string& commit_id,
     Exec(db_, "COMMIT;");
     return true;
   }
-  int64_t physical = clock_physical_ms_;
-  int64_t logical = clock_logical_;
   GiveTick(physical, logical);
   string retraction_id = RandomUuid();
   sqlite3_stmt* insert = nullptr;
@@ -629,8 +695,6 @@ bool FactStore::AppendRetraction(const string& commit_id,
     ok = false;
   }
   if (ok) {
-    clock_physical_ms_ = physical;
-    clock_logical_ = logical;
     ok = RecordMetaClock(db_, physical, logical);
   }
   if (ok) {
@@ -644,8 +708,28 @@ bool FactStore::AppendRetraction(const string& commit_id,
   }
   if (retraction_id_out)
     *retraction_id_out = retraction_id;
-  EnsureFileModes();
+  if (!EnsureFileModes()) {
+    status_ = Status::kDbPermission;
+  }
+  clock_physical_ms_ = physical;
+  clock_logical_ = logical;
   return true;
+}
+
+FactStore::Status FactStore::ReadStoreIdentity(int64_t* hlc_physical_ms,
+                                                int64_t* hlc_logical,
+                                                string* store_epoch) {
+  if (!db_ || !hlc_physical_ms || !hlc_logical || !store_epoch)
+    return Status::kDbOpenFailed;
+  string value;
+  if (!ReadMetaText(db_, kMetaClockPhysicalMs, &value) ||
+      !ParseInt64(value, hlc_physical_ms) || *hlc_physical_ms < 0 ||
+      !ReadMetaText(db_, kMetaClockLogical, &value) ||
+      !ParseInt64(value, hlc_logical) || *hlc_logical < 0 ||
+      !ReadMetaText(db_, kMetaStoreEpoch, store_epoch) || store_epoch->empty()) {
+    status_ = Status::kDbClockInvalid;
+  }
+  return status_;
 }
 
 bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
@@ -744,6 +828,8 @@ const char* FactStore::StatusCode(Status status) {
       return "db_open_failed";
     case Status::kDbWriteFailed:
       return "db_write_failed";
+    case Status::kMaintenanceLocked:
+      return "maintenance_locked";
   }
   return "unknown";
 }
@@ -782,6 +868,8 @@ const char* FactStore::StatusMessage(Status status) {
       return "facts.sqlite3 could not be opened";
     case Status::kDbWriteFailed:
       return "facts.sqlite3 commit transaction failed";
+    case Status::kMaintenanceLocked:
+      return "facts.sqlite3 is temporarily held for maintenance";
   }
   return "unknown fault";
 }

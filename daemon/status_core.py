@@ -56,7 +56,9 @@ from datetime import datetime, timezone
 
 import yaml
 
-STATUS_VERSION = 1
+from maintenance import MaintenanceError, MaintenanceLock, read_recording_gap
+
+STATUS_VERSION = 2
 NAMESPACE = "llm_rerank"
 SWITCH_KEYS = ("reranking_enabled", "recording_enabled", "evidence_enabled")
 LEGACY_KEY = "enable"
@@ -196,7 +198,14 @@ def _read_facts(facts_root):
 
     db_path = os.path.join(facts_root, FACT_DB_FILENAME)
     if not os.path.lexists(db_path):
-        return _facts_section(observed_at, "not_created", None)
+        facts = _facts_section(observed_at, "not_created", None)
+        gap = read_recording_gap(facts_root)
+        # A pristine root has neither facts nor a gap record. Any durable or
+        # unsafe gap artifact must remain observable even after a replacement
+        # has removed the facts database.
+        if not (gap["state"] == "unknown" and gap["reason"] == "gap_missing"):
+            facts["recording_gaps"] = gap
+        return facts
     try:
         st = os.lstat(db_path)
     except OSError:
@@ -211,12 +220,23 @@ def _read_facts(facts_root):
         return _facts_section(observed_at, "blocked", "db_permission")
 
     try:
-        conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, timeout=2.0
-        )
-    except sqlite3.Error:
-        return _facts_section(observed_at, "degraded", "db_open_failed")
+        # A daemon/status fact handle has the same shared lease for its full
+        # SQLite lifetime as a C++ reader. An exclusive maintainer therefore
+        # sees no hidden WAL reader when prepare has completed.
+        lease = MaintenanceLock(facts_root, exclusive=False, nonblocking=True,
+                                create=False)
+        lease.acquire()
+    except MaintenanceError as error:
+        if error.code == "maintenance_locked":
+            return _facts_section(observed_at, "degraded", "maintenance_in_progress")
+        return _facts_section(observed_at, "unknown", error.code)
     try:
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=0
+            )
+        except sqlite3.Error:
+            return _facts_section(observed_at, "degraded", "db_open_failed")
         try:
             row = conn.execute("PRAGMA quick_check;").fetchone()
         except sqlite3.Error:
@@ -240,12 +260,11 @@ def _read_facts(facts_root):
         if meta.get("fact_schema_version") != str(FACT_SCHEMA_VERSION):
             return _facts_section(observed_at, "blocked",
                                   "db_unsupported_version")
-        if (
-            not meta.get("history_id")
-            or not meta.get("store_epoch")
-            or meta_int("hlc_physical_ms") is None
-            or meta_int("hlc_logical") is None
-        ):
+        physical = meta_int("hlc_physical_ms")
+        logical = meta_int("hlc_logical")
+        if (not meta.get("history_id") or not meta.get("store_epoch")
+                or physical is None or physical < 0
+                or logical is None or logical < 0):
             return _facts_section(observed_at, "blocked", "db_clock_invalid")
 
         def count(sql):
@@ -281,17 +300,17 @@ def _read_facts(facts_root):
             "retracted_commits": retracted_commits,
             "total_events": total_events,
             "fact_high_water": {
-                "hlc_physical_ms": meta_int("hlc_physical_ms"),
-                "hlc_logical": meta_int("hlc_logical"),
+                "hlc_physical_ms": physical,
+                "hlc_logical": logical,
             },
             "last_write_at_ms": last_write,
             "last_write_at": _iso(last_write),
-            # Recording gaps are session-local and not yet persisted; the
-            # status cannot prove them from disk.
-            "recording_gaps": "unknown",
+            "recording_gaps": read_recording_gap(facts_root),
         }
     finally:
-        conn.close()
+        if "conn" in locals():
+            conn.close()
+        lease.release()
 
 
 def _facts_section(observed_at, health, fault_code):
@@ -309,7 +328,11 @@ def _facts_section(observed_at, health, fault_code):
         "fact_high_water": {"hlc_physical_ms": None, "hlc_logical": None},
         "last_write_at_ms": None,
         "last_write_at": None,
-        "recording_gaps": "unknown",
+        "recording_gaps": {
+            "state": "none" if health == "not_created" else "unknown",
+            "reason": "none" if health == "not_created"
+            else "facts_unprovable",
+        },
     }
 
 
@@ -362,9 +385,12 @@ def probe_daemon(socket_path, deadline_s=HEALTH_DEADLINE_SECONDS):
             or not isinstance(health, dict)
         ):
             return _serving_section(observed_at, "unknown")
+        state = "up"
+        if health.get("maintenance_state") not in (None, "serving"):
+            state = "unknown"
         return {
             "observed_at": observed_at,
-            "state": "up",
+            "state": state,
             "model_loaded": bool(health.get("model_loaded")),
             "policy_id": health.get("policy_id"),
             "scoring_strategy": health.get("scoring_strategy"),
@@ -425,9 +451,16 @@ def _duty_state(source, configured, alpha, gamma, facts, serving, duty):
                 "not_configured": "not_configured",
             }[source]
             return "off", reason
-        if facts["health"] == "healthy":
-            return "on", None
-        if facts["health"] == "not_created":
+        if facts["health"] in ("healthy", "not_created"):
+            gap = facts.get("recording_gaps")
+            gap_state = gap.get("state") if isinstance(gap, dict) else "unknown"
+            if gap_state == "present":
+                return "degraded", "recording_gap_present"
+            if gap_state != "none":
+                reason = gap.get("reason") if isinstance(gap, dict) else None
+                return "unknown", reason or "recording_gap_unverifiable"
+            if facts["health"] == "healthy":
+                return "on", None
             return "on", "zero_evidence"
         if facts["health"] == "unknown":
             return "unknown", facts["fault_code"] or "facts_unprovable"
@@ -590,6 +623,9 @@ def compute_exit_code(report):
     1 some enabled duty degraded/blocked/unknown; 2 snapshot not formed."""
     if not report.get("snapshot_ok", False):
         return 2
+    gap = (report.get("facts") or {}).get("recording_gaps")
+    if isinstance(gap, dict) and gap.get("state") in ("present", "unknown"):
+        return 1
     for entry in report.get("schemas", []):
         duties = entry["config"]["runtime_effective"]
         for duty in ("reranking", "recording", "evidence"):
@@ -642,6 +678,22 @@ def render_human(report):
             else ""
         )
     )
+    gap = facts.get("recording_gaps")
+    if not isinstance(gap, dict):
+        lines.append("recording gap: unknown (gap_unverifiable)")
+    elif gap.get("state") == "present":
+        lines.append(
+            "recording gap: present (%s; %s batches, %s events, %s retractions, "
+            "%s bytes)" % (
+                gap.get("reason", "unknown"), gap.get("dropped_batches", 0),
+                gap.get("dropped_events", 0), gap.get("dropped_retractions", 0),
+                gap.get("dropped_bytes", 0),
+            )
+        )
+    elif gap.get("state") == "unknown":
+        lines.append("recording gap: unknown (%s)" % gap.get("reason", "unknown"))
+    else:
+        lines.append("recording gap: none")
     serving = report.get("serving", {})
     serving_line = f"serving: {serving.get('state', 'unknown')}"
     if serving.get("state") == "up":
