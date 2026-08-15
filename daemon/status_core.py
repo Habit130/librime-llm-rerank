@@ -394,6 +394,7 @@ def probe_daemon(socket_path, deadline_s=HEALTH_DEADLINE_SECONDS):
             "model_loaded": bool(health.get("model_loaded")),
             "policy_id": health.get("policy_id"),
             "scoring_strategy": health.get("scoring_strategy"),
+            "model_identity": health.get("model_identity"),
             "daemon_pid": health.get("pid"),
             "context_window": health.get("context_window"),
         }
@@ -411,6 +412,7 @@ def _serving_section(observed_at, state):
         "model_loaded": None,
         "policy_id": None,
         "scoring_strategy": None,
+        "model_identity": None,
         "daemon_pid": None,
         "context_window": None,
     }
@@ -493,6 +495,9 @@ def _schema_config_entry(schema_id, section, alpha, gamma, facts, serving):
         state, reason = _duty_state(resolved["source"], configured, alpha,
                                     gamma, facts, serving, duty)
         duties[duty] = {"state": state, "reason": reason}
+    baseline_policy_id = section.get("baseline_policy_id")
+    if not isinstance(baseline_policy_id, str) or not baseline_policy_id:
+        baseline_policy_id = None
     return {
         "schema_id": schema_id,
         "config": {
@@ -504,6 +509,7 @@ def _schema_config_entry(schema_id, section, alpha, gamma, facts, serving):
             "explicit_keys": resolved["explicit_keys"],
             "gamma": gamma,
             "alpha": alpha,
+            "baseline_policy_id": baseline_policy_id,
             "runtime_effective": {"observed_at": observed_at, **duties},
         },
     }
@@ -662,9 +668,11 @@ def render_human(report):
         ]
         warning = " [legacy enable ignored: v2 keys win]" if config[
             "deprecation_warning"] else ""
+        policy = f"; policy {config['baseline_policy_id']}" if config.get(
+            "baseline_policy_id") else ""
         lines.append(
             f"  {entry['schema_id']}: source={config['source']}{warning}; "
-            + "; ".join(parts)
+            + "; ".join(parts) + policy
         )
     facts = report.get("facts", {})
     lines.append(
@@ -699,6 +707,8 @@ def render_human(report):
     if serving.get("state") == "up":
         loaded = "loaded" if serving.get("model_loaded") else "not loaded"
         serving_line += f" (model {loaded}"
+        if serving.get("model_identity"):
+            serving_line += f", {serving['model_identity']}"
         if serving.get("policy_id"):
             serving_line += f"; policy {serving['policy_id']}"
         serving_line += ")"

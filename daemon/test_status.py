@@ -232,6 +232,7 @@ class StatusCoreTest(unittest.TestCase):
                         "model_loaded": loaded,
                         "scoring_strategy": "mean_token",
                         "policy_id": policy,
+                        "model_identity": "Qwen3-0.6B-Base",
                         "context_window": 64,
                         "cache_limit_mb": 512,
                         "telemetry": False,
@@ -690,8 +691,37 @@ class StatusCoreTest(unittest.TestCase):
         self.assertEqual("up", report["serving"]["state"])
         self.assertTrue(report["serving"]["model_loaded"])
         self.assertEqual("mean-token-lm-v1", report["serving"]["policy_id"])
+        self.assertEqual("Qwen3-0.6B-Base", report["serving"]["model_identity"])
         self.assertEqual(4242, report["serving"]["daemon_pid"])
         self.assertEqual(0, report["exit_code"])
+
+    def test_configured_baseline_policy_id_is_reported(self):
+        self.write_default(["alpha"])
+        self.write_schema(
+            "alpha",
+            llm_rerank={"reranking_enabled": True, "recording_enabled": True,
+                        "evidence_enabled": False,
+                        "baseline_policy_id": (
+                            "frozen-baseline-v1:rule=mean-token-lm-v1"
+                            ":model=Qwen3-0.6B-Base:tokenizer=Qwen3-0.6B-Base"
+                            ":norm=nfc-simplified:fail=fail-closed"
+                            ":squirrel=0123456789ab:plugin=cdef01234567"
+                            ":alpha=0.0:beta_sys=1.0:beta_usr=1.0")},
+            engine={"filters": ["uniquifier", "llm_rerank"],
+                    "processors": ["llm_rerank_recorder"]})
+        self.write_facts(active_events=0)
+        report = self.report()
+        config = report["schemas"][0]["config"]
+        self.assertTrue(config["baseline_policy_id"].startswith(
+            "frozen-baseline-v1:"))
+        self.assertIn("frozen-baseline-v1:", render_human(report))
+
+    def test_missing_baseline_policy_id_is_none(self):
+        self.canonical_schema()
+        self.write_facts(active_events=0)
+        report = self.report()
+        self.assertIsNone(report["schemas"][0]["config"]["baseline_policy_id"])
+        self.assertNotIn("; policy ", render_human(report))
 
     def test_daemon_offline_with_daemon_dependency_is_exit_one(self):
         self.write_default(["m"])

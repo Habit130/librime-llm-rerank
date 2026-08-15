@@ -78,6 +78,74 @@ POLICY_ID_BY_STRATEGY = {
     SCORING_STRATEGY_LEGACY_SUM: LEGACY_SUM_POLICY_ID,
 }
 
+# Frozen shadow baseline (Habit130/squirrel#75, AC-75-v1): the deployed
+# baseline_policy_id is a composed identity carrying code SHAs, model and
+# tokenizer identity, token averaging rule, alpha/beta values, candidate
+# normalization and failure semantics (freeze record in Habit130/squirrel).
+# The daemon cannot verify the deployment-scoped components (SHAs, alpha,
+# beta), but it verifies the ones it owns: the token rule must equal the
+# scoring mode's canonical id and the model/tokenizer identity must equal
+# its own model directory basename. The canonical id stays accepted so
+# unconfigured or calibration schemas keep the exact-match binding.
+FROZEN_BASELINE_PREFIX = "frozen-baseline-v1:"
+FROZEN_REQUIRED_KEYS = ("rule", "model", "tokenizer")
+FROZEN_KNOWN_KEYS = ("rule", "model", "tokenizer", "norm", "fail",
+                     "squirrel", "plugin", "alpha", "beta_sys", "beta_usr")
+
+
+def daemon_model_identity(state):
+    path = getattr(state, "model_path", None) or MODEL_PATH
+    return os.path.basename(os.path.normpath(path))
+
+
+def parse_frozen_baseline_id(declared_id):
+    """Parse a frozen-baseline policy id into its components.
+
+    Returns None for anything malformed: wrong prefix, empty payload,
+    unknown key, empty value, duplicate key or a missing required key.
+    """
+    if not declared_id.startswith(FROZEN_BASELINE_PREFIX):
+        return None
+    payload = declared_id[len(FROZEN_BASELINE_PREFIX):]
+    if not payload:
+        return None
+    components = {}
+    for part in payload.split(":"):
+        if "=" not in part:
+            return None
+        key, _, value = part.partition("=")
+        if key not in FROZEN_KNOWN_KEYS or not value or key in components:
+            return None
+        components[key] = value
+    for key in FROZEN_REQUIRED_KEYS:
+        if key not in components:
+            return None
+    return components
+
+
+def accepted_by_strategy(declared_id, strategy, state):
+    """Whether the daemon may serve a plan declaring `declared_id`.
+
+    Exact canonical match always passes; in the mean_token mode a well-formed
+    frozen-baseline id passes only when its rule and model/tokenizer
+    components match the daemon's own strategy and model identity. legacy_sum
+    keeps the exact-match binding (calibration-only, never a deployment).
+    """
+    accepted_policy = POLICY_ID_BY_STRATEGY.get(strategy)
+    if accepted_policy is None:
+        return False
+    if declared_id == accepted_policy:
+        return True
+    if strategy != SCORING_STRATEGY_MEAN_TOKEN:
+        return False
+    frozen = parse_frozen_baseline_id(declared_id)
+    if frozen is None:
+        return False
+    model_identity = daemon_model_identity(state)
+    return (frozen["rule"] == MEAN_TOKEN_POLICY_ID
+            and frozen["model"] == model_identity
+            and frozen["tokenizer"] == model_identity)
+
 
 class TokenAttributionError(Exception):
     """The candidate token boundary cannot be proven safe to score."""
@@ -515,6 +583,7 @@ def handle_health(state, request, coordinator=None):
             "model_loaded": bool(getattr(state, "loaded", False)),
             "scoring_strategy": strategy,
             "policy_id": POLICY_ID_BY_STRATEGY.get(strategy),
+            "model_identity": daemon_model_identity(state),
             "context_window": getattr(state, "context_window", CONTEXT_WINDOW),
             "cache_limit_mb": getattr(state, "cache_limit_mb", CACHE_LIMIT_MB),
             "telemetry": bool(os.environ.get("LLM_RERANK_TELEMETRY")),
@@ -569,11 +638,11 @@ def handle_request(state, data, coordinator=None, completion_sink=None):
         return protocol_error("invalid_request")
 
     # Policy binding: the declared baseline_policy_id must be the exact id
-    # of the daemon's scoring mode, otherwise the plan's declared
+    # of the daemon's scoring mode (or a frozen-baseline composition whose
+    # rule and model identity match it), otherwise the plan's declared
     # normalization could be silently served by a different algorithm.
-    accepted_policy = POLICY_ID_BY_STRATEGY.get(
-        getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN))
-    if accepted_policy is None or req["baseline_policy_id"] != accepted_policy:
+    strategy = getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN)
+    if not accepted_by_strategy(req["baseline_policy_id"], strategy, state):
         return protocol_error(
             "policy_mismatch",
             phase="validate",
