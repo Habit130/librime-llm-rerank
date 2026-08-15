@@ -1364,8 +1364,11 @@ def _apply_step_result_transform(record, claim, phase, result):
             # before the irreversible point (the progress made by the step
             # is still real and stays persisted).
             return True
-        if phase == record.get("cancel_phase"):
+        if phase == record.get("cancel_phase") and record["cancel_requested"]:
             # Advancing from the compensation phase finishes the cancel.
+            # The guard matters: an operation whose cancel phase is also a
+            # regular phase (restore/clear's reopening) must advance
+            # normally when no cancel was ever requested.
             record["error"] = None
             _append_event(record, "terminal", state="cancelled",
                           phase=phase, outcome="cancelled")

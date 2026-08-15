@@ -129,9 +129,21 @@ class FactStore {
 
   // Reads the current durable identity and clock while holding a shared lock.
   // Used by maintenance reopen checks and never exposes private event text.
+  // `history_id` is optional; pass nullptr when only the epoch is needed.
   Status ReadStoreIdentity(int64_t* hlc_physical_ms,
                            int64_t* hlc_logical,
-                           string* store_epoch);
+                           string* store_epoch,
+                           string* history_id = nullptr);
+
+  // Proves that every fact table is empty. Used by the clear operation to
+  // verify a freshly staged store and to detect an already-empty store;
+  // Python never re-derives this from its own copy of the schema.
+  Status VerifyEmpty(bool* empty);
+
+  // Merges all WAL pages into the main database and truncates the WAL,
+  // preparing a staged store for single-file publication (clear staging).
+  // Fails closed (facts untouched) when the checkpoint is busy or fails.
+  Status CheckpointTruncate();
 
   // Stable code strings for diagnostics; never contains raw text.
   static const char* StatusCode(Status status);

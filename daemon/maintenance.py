@@ -221,9 +221,14 @@ class FactHandle:
                 logical = int(rows.get("hlc_logical", "-1"))
                 if not epoch or physical < 0 or logical < 0:
                     raise MaintenanceError("epoch_unverifiable")
-                return {"store_epoch": epoch,
-                        "hlc_physical_ms": physical,
-                        "hlc_logical": logical}
+                identity = {"store_epoch": epoch,
+                            "hlc_physical_ms": physical,
+                            "hlc_logical": logical}
+                # history_id is additive: older test stores may not carry it
+                # and the epoch gate never depends on it.
+                if rows.get("history_id"):
+                    identity["history_id"] = rows["history_id"]
+                return identity
             except MaintenanceError:
                 raise
             except (sqlite3.Error, TypeError, ValueError) as error:
@@ -432,6 +437,72 @@ def read_fact_identity(root):
     """Read durable identity through a full-lifetime shared fact handle."""
     with FactHandle.open(root) as handle:
         return handle.read_identity()
+
+
+def read_identity_under_exclusive(root, connection_factory=sqlite3.connect):
+    """Read identity meta while the caller already holds the exclusive
+    maintenance lease.
+
+    This deliberately skips the shared maintenance lock (the caller owns the
+    exclusive lease, so acquiring a shared lock would deadlock). It is the
+    epoch re-verification seam used by the clear operation between taking the
+    lease and replacing the database; it opens the same read-only identity
+    projection as FactHandle and never interprets fact rows.
+
+    The connection is opened read-write on purpose: on this host a WAL
+    database without -wal/-shm sidecars cannot be opened read-only at all,
+    and a freshly published clear store has none. Under the exclusive lease
+    there is no other legitimate writer, and the same open materializes the
+    sidecars the daemon's read-only reopen needs.
+    """
+    root_fd = None
+    try:
+        try:
+            root_fd = os.open(root, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as error:
+            raise MaintenanceError("root_unavailable") from error
+        try:
+            root_stat = os.fstat(root_fd)
+            if (not stat.S_ISDIR(root_stat.st_mode)
+                    or root_stat.st_uid != os.getuid()
+                    or stat.S_IMODE(root_stat.st_mode) != ROOT_MODE):
+                raise MaintenanceError("root_unsafe")
+            try:
+                db_fd = os.open("facts.sqlite3", os.O_RDONLY | os.O_NOFOLLOW,
+                                dir_fd=root_fd)
+            except OSError as error:
+                raise MaintenanceError("db_unavailable") from error
+            try:
+                db_stat = os.fstat(db_fd)
+                if (not stat.S_ISREG(db_stat.st_mode)
+                        or db_stat.st_uid != os.getuid()
+                        or stat.S_IMODE(db_stat.st_mode) != 0o600):
+                    raise MaintenanceError("db_unsafe")
+            finally:
+                os.close(db_fd)
+            path = os.path.join(root, "facts.sqlite3")
+            connection = connection_factory(path, timeout=0)
+            try:
+                rows = dict(connection.execute("SELECT key, value FROM meta"))
+            finally:
+                connection.close()
+            epoch = rows.get("store_epoch")
+            history_id = rows.get("history_id")
+            physical = int(rows.get("hlc_physical_ms", "-1"))
+            logical = int(rows.get("hlc_logical", "-1"))
+            if not epoch or not history_id or physical < 0 or logical < 0:
+                raise MaintenanceError("epoch_unverifiable")
+            return {"store_epoch": epoch,
+                    "history_id": history_id,
+                    "hlc_physical_ms": physical,
+                    "hlc_logical": logical}
+        except MaintenanceError:
+            raise
+        except (sqlite3.Error, TypeError, ValueError) as error:
+            raise MaintenanceError("epoch_unverifiable") from error
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def _gap_unknown(reason):

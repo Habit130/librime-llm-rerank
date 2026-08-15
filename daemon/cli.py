@@ -25,6 +25,10 @@ Output contracts (deterministic):
     (status_version / operation_version / event_version / error_version).
   - `operation wait --json-lines` streams the operation log events in seq
     order; seq is strictly increasing.
+  - `clear --json` writes exactly one versioned terminal record to stdout
+    (a single json.loads(stdout) parses the whole run); the compact started
+    envelope that exposes the operation id before destructive work goes to
+    stderr.
   - error objects follow the spec error protocol: code, message,
     occurred_at, retryable, phase, remediation, cause.
   - Exit codes: 0 success; 1 non-success outcome (failed/blocked, or a
@@ -47,8 +51,8 @@ Paths are overridable for tests and headless use:
 import argparse
 import json
 import os
+import subprocess
 import sys
-from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -58,9 +62,9 @@ from operations import (  # noqa: E402
     EVENT_VERSION,
     OPERATION_VERSION,
     OperationError,
-    OperationRegistry,
     OperationStore,
     cancel_operation,
+    create_operation,
     make_error,
     make_runner_claim,
     operation_outcome_exit_code,
@@ -77,6 +81,9 @@ DEFAULT_ROOT = os.path.expanduser(
 DEFAULT_RIME_DIR = os.path.expanduser("~/Library/Rime")
 DEFAULT_DAEMON_SOCKET = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock")
+DEFAULT_CONTROL_SOCKET = os.path.expanduser(
+    "~/Library/Application Support/Squirrel/SemanticMemory/"
+    "llm-rerank-control.sock")
 
 
 def default_paths():
@@ -86,7 +93,20 @@ def default_paths():
         "rime_dir": os.environ.get("SQUIRREL_RIME_DIR") or DEFAULT_RIME_DIR,
         "daemon_socket": os.environ.get("SQUIRREL_DAEMON_SOCKET")
         or DEFAULT_DAEMON_SOCKET,
+        "control_socket": os.environ.get("SQUIRREL_DAEMON_CONTROL_SOCKET")
+        or DEFAULT_CONTROL_SOCKET,
     }
+
+
+def default_registry(paths=None):
+    """The production operation registry (`clear`; later tickets add the
+    remaining maintenance types)."""
+    from clear_operation import production_registry
+    paths = paths or default_paths()
+    return production_registry(
+        paths["semantic_memory_root"],
+        control_socket=paths["control_socket"],
+        scoring_socket=paths["daemon_socket"])
 
 
 def build_parser():
@@ -173,12 +193,15 @@ def build_parser():
     restore.add_argument("--json", action="store_true")
     restore.set_defaults(handler=_cmd_reserved)
 
-    clear = sub.add_parser("clear", help="reserved: physically clear the "
-                                         "semantic memory")
-    clear.add_argument("--yes", action="store_true")
-    clear.add_argument("--expect-store-epoch", metavar="UUID")
+    clear = sub.add_parser("clear", help="physically clear the semantic "
+                                         "memory and start a new history")
+    clear.add_argument("--yes", action="store_true",
+                       help="non-interactive confirmation; requires "
+                            "--expect-store-epoch")
+    clear.add_argument("--expect-store-epoch", metavar="UUID",
+                       help="expected current store epoch (epoch CAS)")
     clear.add_argument("--json", action="store_true")
-    clear.set_defaults(handler=_cmd_reserved)
+    clear.set_defaults(handler=_cmd_clear)
 
     rebuild = sub.add_parser("rebuild", help="reserved: rebuild derived "
                                              "state")
@@ -542,6 +565,220 @@ def _cmd_operation_run(args, paths):
 
 
 # ---------------------------------------------------------------------------
+# clear
+# ---------------------------------------------------------------------------
+
+def _read_clear_identity(paths):
+    """Read-only current identity for the confirmation display."""
+    from clear_operation import FactStoreHelper, live_identity
+    return live_identity(FactStoreHelper(), paths["semantic_memory_root"])
+
+
+def _emit_clear_event(entry, args):
+    if not args.json:
+        print(_human_event_line(entry), flush=True)
+
+
+def _print_clear_result(record, args):
+    if args.json:
+        print(_json_dump(public_record(record)), flush=True)
+        return
+    result = record.get("result") or {}
+    print("clear %s" % result.get("outcome", "completed"))
+    print("  cleanup_complete: %s" % bool(result.get("cleanup_complete")))
+    old = result.get("old") or {}
+    new = result.get("new") or {}
+    if result.get("outcome") == "cleared":
+        print("  old history: %s (epoch %s)"
+              % (old.get("history_id") or "unknown",
+                 old.get("store_epoch") or "unknown"))
+        print("  new history: %s (epoch %s)"
+              % (new.get("history_id") or "unknown",
+                 new.get("store_epoch") or "unknown"))
+    else:
+        identity = new or old
+        if identity:
+            print("  existing empty history: %s (epoch %s)"
+                  % (identity.get("history_id"), identity.get("store_epoch")))
+        else:
+            print("  no semantic memory data existed")
+    serving = result.get("serving_ready")
+    print("  serving_ready: %s"
+          % ("yes" if serving is True else ("no" if serving is False
+                                            else "unknown")))
+    print("  %s" % result.get("media_residue_disclaimer", ""))
+
+
+def _cmd_clear(args, paths):
+    store = _operation_store(paths)
+    mode = "json" if args.json else "human"
+    try:
+        store.open(create=False)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    if args.yes != (args.expect_store_epoch is not None):
+        # Non-interactive clear requires both confirmation and epoch CAS;
+        # there is deliberately no --force (spec #43).
+        error = make_error(
+            "confirmation_required", phase="cli",
+            remediation="provide both --yes and --expect-store-epoch, or run "
+                        "interactively and type the exact confirmation string",
+            cause=None)
+        _render_error(error, mode)
+        return 2
+
+    try:
+        identity_empty = _read_clear_identity(paths)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    if identity_empty is None:
+        confirmation = "CLEAR PRISTINE"
+        expected_epoch = ""
+        description = ("no facts database exists; this clears any remaining "
+                       "application-controlled semantic memory data")
+    else:
+        identity, _empty = identity_empty
+        confirmation = "CLEAR %s AT %s" % (identity["history_id"],
+                                           identity["store_epoch"])
+        expected_epoch = identity["store_epoch"]
+        description = ("this deletes the local semantic memory and starts a "
+                       "new history")
+
+    if args.yes:
+        if args.expect_store_epoch != expected_epoch:
+            # The interactive path above already re-derived the current
+            # epoch; this gate makes a stale non-interactive expectation a
+            # zero-side-effect usage outcome before any operation exists.
+            error = make_error(
+                "store_epoch_mismatch", phase="cli",
+                remediation="re-run with --expect-store-epoch %s"
+                            % (expected_epoch or "<no store>"),
+                cause={"expected": args.expect_store_epoch,
+                       "actual": expected_epoch or None})
+            _render_error(error, mode)
+            return 2
+    else:
+        print(description)
+        print("type the exact string below to confirm:")
+        print(confirmation, flush=True)
+        try:
+            entered = sys.stdin.readline()
+        except (EOFError, OSError):
+            entered = ""
+        if entered.rstrip("\r\n") != confirmation:
+            error = make_error(
+                "confirmation_failed", phase="cli", retryable=True,
+                remediation="re-run clear and type the exact confirmation "
+                            "string",
+                cause=None)
+            _render_error(error, mode)
+            return 1
+
+    try:
+        record = create_operation(
+            store, args.registry, "clear",
+            {"expect_store_epoch": expected_epoch})
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    except ValueError as error:
+        return _store_operation_error(
+            OperationError("invalid_parameters", phase="cli",
+                           retryable=False, cause={
+                               "error": str(error)}), mode)
+
+    operation_id = record["operation_id"]
+    if args.json:
+        # The operation id must be observable before any destructive work,
+        # but stdout must stay exactly one versioned terminal document so a
+        # single json.loads(stdout) parses the whole run. The compact
+        # started envelope therefore goes to stderr, a separate channel
+        # that never pollutes the JSON stdout contract.
+        print(_json_line({
+            "operation_version": OPERATION_VERSION,
+            "operation_id": operation_id,
+            "type": "clear",
+            "state": "running",
+            "expect_store_epoch_present": expected_epoch != "",
+        }), flush=True, file=sys.stderr)
+    else:
+        print("clear started: operation %s" % operation_id)
+
+    entry = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "squirrel-semantic-memory")
+    # Observe the persistent record; Ctrl-C only detaches (exit 130) while
+    # the detached executor keeps running. If the executor died without
+    # reaching a terminal state, report it instead of waiting forever. The
+    # try encloses the executor spawn itself so a SIGINT can never kill
+    # this process before the observation loop takes over.
+    import time as time_module
+    last_seq = 0
+    alive_grace = None
+    executor = None
+    try:
+        executor = subprocess.Popen(
+            [sys.executable, entry, "operation", "run", operation_id],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        while True:
+            current = store.load(operation_id)
+            for entry in current["log"][last_seq:]:
+                _emit_clear_event(entry, args)
+                last_seq = len(current["log"])
+            if current["state"] in ("succeeded", "failed", "blocked",
+                                    "cancelled"):
+                break
+            if executor.poll() is not None:
+                if alive_grace is None:
+                    alive_grace = time_module.monotonic()
+                elif time_module.monotonic() - alive_grace > 3.0:
+                    error = make_error(
+                        "executor_exited", phase="runner", retryable=True,
+                        remediation="the executor process exited without a "
+                                    "terminal record; run `operation run %s` "
+                                    "to resume" % operation_id,
+                        cause={"state": current["state"],
+                               "phase": current["phase"]})
+                    _render_error(error, mode)
+                    return 1
+            else:
+                alive_grace = None
+            time_module.sleep(0.25)
+    except KeyboardInterrupt:
+        current = store.load(operation_id)
+        print("interrupted: detached from operation %s (state %s, phase %s); "
+              "the clear continues in the background, this is not a cancel"
+              % (operation_id, current["state"], current["phase"]),
+              file=sys.stderr)
+        return 130
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    except OSError as error:
+        return _store_operation_error(
+            OperationError("executor_start_failed", phase="cli",
+                           retryable=True, cause={"error": error.strerror}),
+            mode)
+
+    if current["state"] == "succeeded":
+        _print_clear_result(current, args)
+        return 0
+    if current["state"] == "cancelled":
+        _print_clear_result(current, args)
+        return 0
+    if args.json:
+        print(_json_dump(public_record(current)), flush=True)
+    else:
+        print("clear did not complete: state %s (phase %s)"
+              % (current["state"], current["phase"]))
+        if current.get("error") is not None:
+            print("  error: %s" % current["error"]["code"])
+            print("  remediation: %s"
+                  % current["error"].get("remediation", ""))
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # reserved maintenance commands
 # ---------------------------------------------------------------------------
 
@@ -566,13 +803,23 @@ def _reserved_command_name(args):
 
 def main(argv=None, registry=None):
     """Run the CLI. `registry` is the operation-type registry used by the
-    internal `operation run` executor; production code passes None (no
-    maintenance type is registered in #52). Returns the process exit code.
+    internal `operation run` executor; production code passes None, which
+    loads the production registry (`clear`; backup/restore/rebuild/
+    quarantine arrive with their own tickets). Returns the process exit
+    code.
     """
+    if os.geteuid() == 0:
+        error = make_error(
+            "unsupported_privilege", phase="cli",
+            remediation="run this command as the semantic memory owner, "
+                        "not as root")
+        _render_error(error, "human")
+        return 2
     args = build_parser().parse_args(argv)
     paths = default_paths()
     if getattr(args, "registry", None) is None:
-        args.registry = registry if registry is not None else OperationRegistry()
+        args.registry = registry if registry is not None else \
+            default_registry(paths)
     if not hasattr(args, "handler"):
         print("error: missing command (try --help)", file=sys.stderr)
         return 2

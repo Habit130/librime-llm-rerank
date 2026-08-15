@@ -718,7 +718,8 @@ bool FactStore::AppendRetraction(const string& commit_id,
 
 FactStore::Status FactStore::ReadStoreIdentity(int64_t* hlc_physical_ms,
                                                 int64_t* hlc_logical,
-                                                string* store_epoch) {
+                                                string* store_epoch,
+                                                string* history_id) {
   if (!db_ || !hlc_physical_ms || !hlc_logical || !store_epoch)
     return Status::kDbOpenFailed;
   string value;
@@ -728,6 +729,73 @@ FactStore::Status FactStore::ReadStoreIdentity(int64_t* hlc_physical_ms,
       !ParseInt64(value, hlc_logical) || *hlc_logical < 0 ||
       !ReadMetaText(db_, kMetaStoreEpoch, store_epoch) || store_epoch->empty()) {
     status_ = Status::kDbClockInvalid;
+    return status_;
+  }
+  if (history_id &&
+      (!ReadMetaText(db_, kMetaHistoryId, history_id) || history_id->empty())) {
+    status_ = Status::kDbClockInvalid;
+    return status_;
+  }
+  return status_;
+}
+
+namespace {
+
+// Runs one COUNT(*) style query and returns the single integer result.
+bool QueryCount(sqlite3* db, const char* table, int64_t* count) {
+  sqlite3_stmt* stmt = nullptr;
+  string sql = "SELECT COUNT(*) FROM " + string(table) + ";";
+  if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
+  if (ok) {
+    *count = sqlite3_column_int64(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+}  // namespace
+
+FactStore::Status FactStore::VerifyEmpty(bool* empty) {
+  if (!db_ || !empty)
+    return Status::kDbOpenFailed;
+  static const char* kFactTables[] = {
+      "commits", "selection_events", "selection_candidates", "retractions",
+  };
+  *empty = true;
+  for (const char* table : kFactTables) {
+    int64_t count = -1;
+    if (!QueryCount(db_, table, &count)) {
+      status_ = Status::kDbClockInvalid;
+      return status_;
+    }
+    if (count != 0)
+      *empty = false;
+  }
+  return status_;
+}
+
+FactStore::Status FactStore::CheckpointTruncate() {
+  if (!db_) {
+    status_ = Status::kDbOpenFailed;
+    return status_;
+  }
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, "PRAGMA wal_checkpoint(TRUNCATE);", -1, &stmt,
+                         nullptr) != SQLITE_OK) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
+  }
+  bool got_row = sqlite3_step(stmt) == SQLITE_ROW;
+  // The first column is the busy flag; any non-zero value means the
+  // checkpoint did not complete and the main file alone is not a complete
+  // store.
+  int busy = got_row ? sqlite3_column_int(stmt, 0) : 1;
+  sqlite3_finalize(stmt);
+  if (!got_row || busy != 0) {
+    status_ = Status::kDbWriteFailed;
+    return status_;
   }
   return status_;
 }

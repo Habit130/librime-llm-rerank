@@ -72,8 +72,51 @@ rename. A busy or incomplete checkpoint aborts before any sidecar removal.
 A failure or crash therefore exposes only the complete old store or the
 complete new store, never a new main database paired with old WAL/SHM files.
 
-This is a reusable maintenance seam only. Public clear, restore and schema
+This is a reusable maintenance seam only. Public restore and schema
 migration operations remain separate tickets.
+
+## Physical clear
+
+`squirrel-semantic-memory clear` is the supported way to physically reset
+the semantic memory. It publishes a brand-new empty fact store with a fresh
+`history_id`, a fresh `store_epoch` and a reset HLC, then deletes every
+application-controlled copy of the old facts and derived state
+(generations, delta, staging, derived manifests, quarantine, internal
+snapshots and old operation records), while the three schema switches and
+any backup you copied outside the fact root stay untouched.
+
+Interactive use prints the exact confirmation string
+`CLEAR <history_id> AT <store_epoch>` (or `CLEAR PRISTINE` when no store
+exists) and proceeds only when you type it verbatim. Non-interactive use
+requires both confirmation and a store-epoch CAS:
+
+```text
+squirrel-semantic-memory clear --yes --expect-store-epoch <epoch>
+```
+
+There is deliberately no `--force` flag. The expected epoch is verified
+before any destructive work and again under the exclusive maintenance
+lease; a mismatch is a zero-side-effect failure. Text commits never wait
+for the clear: commits buffered during the bounded (5 s) maintenance window
+are written into the new history after the linearization point.
+
+Crash recovery is phase-persistent. A crash before the atomic replacement
+leaves the complete old store observable; after the replacement the durable
+`published` marker and the staged identity let a retry recognize the
+already-published store without regenerating history or epoch, and a retry
+after cleanup only continues cleanup. Once published, the old epoch is
+never served again. A cancel honored before publishing reopens the old
+state; after publishing the operation is uncancellable and finishes its
+cleanup. A Ctrl-C in the foreground CLI only detaches (exit 130) while the
+detached executor continues. Re-running clear on an already-empty system
+returns `already_clear` without generating new identities.
+
+**Clear is application-level deletion.** It removes every copy the
+application can currently address. It does not erase APFS snapshots, SSD
+wear-leveling remnants, system backups, or backups you copied to a path the
+application does not manage; clear never creates an implicit backup of the
+old facts, so back up explicitly first if you may want the old history
+later.
 
 ## License
 
