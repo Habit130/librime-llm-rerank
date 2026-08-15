@@ -11,9 +11,11 @@
 
 #include <cerrno>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -708,6 +710,198 @@ TEST_F(RecorderCoordinatorTest, FlushesBufferedBatchIntoReplacementEpoch) {
   EXPECT_EQ(1, QueryCount(db_path,
                           "SELECT COUNT(*) FROM selection_events"
                           " WHERE event_id = 'replacement-queued';"));
+}
+
+// Runs the C++ fact-store helper (the clear staging seam) and captures its
+// single-line JSON output via posix_spawn (fork + sqlite3 is unsafe in this
+// process image; see Habit130/squirrel#92).
+std::pair<int, std::string> RunFactStoreTool(const std::string& command,
+                                             const std::string& root) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0)
+    return {-1, ""};
+  char* argv[] = {const_cast<char*>(LLM_RERANK_FACT_STORE_TOOL),
+                  const_cast<char*>(command.c_str()),
+                  const_cast<char*>("--root"),
+                  const_cast<char*>(root.c_str()), nullptr};
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&actions, pipe_fds[0]);
+  pid_t pid = -1;
+  int spawn_rc = posix_spawn(&pid, argv[0], &actions, nullptr, argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  close(pipe_fds[1]);
+  if (spawn_rc != 0) {
+    close(pipe_fds[0]);
+    return {-1, ""};
+  }
+  std::string output;
+  char buffer[512];
+  ssize_t count;
+  while ((count = read(pipe_fds[0], buffer, sizeof(buffer))) > 0)
+    output.append(buffer, static_cast<size_t>(count));
+  close(pipe_fds[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  return {exit_code, output};
+}
+
+std::string ToolJsonField(const std::string& payload, const char* key) {
+  std::string needle = std::string("\"") + key + "\":";
+  size_t pos = payload.find(needle);
+  if (pos == std::string::npos)
+    return "";
+  pos += needle.size();
+  while (pos < payload.size() && payload[pos] == ' ')
+    ++pos;
+  if (pos >= payload.size())
+    return "";
+  if (payload[pos] == '"') {
+    ++pos;
+    size_t end = payload.find('"', pos);
+    return end == std::string::npos ? "" : payload.substr(pos, end - pos);
+  }
+  size_t end = payload.find_first_of(",}", pos);
+  return payload.substr(pos, end == std::string::npos
+                               ? std::string::npos : end - pos);
+}
+
+// SCN-54-5: text commits never wait for a clear; facts formed before the
+// maintenance linearization point are removed; a complete commit batch
+// buffered during the exclusive window (plus the retraction pair submitted
+// after it) lands in the new history with HLC strictly after the staged
+// store's creation clock; a retraction of a pre-clear commit is a no-op.
+TEST_F(RecorderCoordinatorTest, ClearMovesBufferedBatchIntoNewHistory) {
+  int64_t old_physical = 0;
+  int64_t old_logical = 0;
+  std::string old_epoch;
+  {
+    FactStore initial(root_);
+    ASSERT_EQ(FactStore::Status::kOk, initial.Open());
+    std::vector<FactStore::Event> old_events{MakeEvent("pre-clear-event")};
+    ASSERT_TRUE(initial.PersistBatch(1700000000000LL, &old_events));
+    ASSERT_EQ(FactStore::Status::kOk,
+              initial.ReadStoreIdentity(&old_physical, &old_logical,
+                                        &old_epoch));
+  }
+  auto coordinator = RecorderCoordinator::ForRoot(root_);
+  // A commit that is durable before the clear linearization point.
+  std::vector<FactStore::Event> committed{MakeEvent("pre-clear-committed")};
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitBatch(1700000001000LL, &committed).outcome);
+  coordinator->FlushForTesting();
+  std::string committed_id;
+  {
+    FactStore reader(root_);
+    ASSERT_EQ(FactStore::Status::kOk, reader.Open());
+    std::vector<FactStore::Event> active;
+    ASSERT_TRUE(reader.QueryActiveEventsAsOf(
+        std::numeric_limits<int64_t>::max(), 0, &active));
+    for (const auto& event : active) {
+      if (event.event_id == "pre-clear-committed")
+        committed_id = event.commit_id;
+    }
+  }
+  ASSERT_FALSE(committed_id.empty());
+
+  // The exclusive maintenance window: input returns immediately (buffered,
+  // never blocked) while the old history is still on disk.
+  MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(root_, MaintenanceLock::Mode::kExclusive));
+  std::vector<FactStore::Event> buffered{MakeEvent("clear-buffered-commit")};
+  auto buffered_result =
+      coordinator->SubmitBatch(1700000002000LL, &buffered);
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            buffered_result.outcome);
+  // FIFO pair: the retraction of the buffered commit follows the batch; a
+  // retraction of the pre-clear commit is a cross-history no-op.
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitRetraction(buffered_result.commit_id,
+                                          1700000003000LL).outcome);
+  ASSERT_EQ(RecorderCoordinator::Outcome::kBuffered,
+            coordinator->SubmitRetraction(committed_id,
+                                          1700000003000LL).outcome);
+
+  // Stage the replacement through the same C++ fact-store seam the clear
+  // CLI uses.
+  const fs::path staging_root = fs::path(temp_) / "clear-staging";
+  auto staged = RunFactStoreTool("create-empty", staging_root.string());
+  ASSERT_EQ(0, staged.first) << staged.second;
+  const std::string staged_epoch = ToolJsonField(staged.second, "store_epoch");
+  const std::string staged_history = ToolJsonField(staged.second, "history_id");
+  ASSERT_EQ(32u, staged_epoch.size());
+  ASSERT_EQ(32u, staged_history.size());
+
+  // Checkpoint the old store, drop its sidecars and atomically rename the
+  // staged single-file database into place (the production replacement
+  // order, SCN-54-4).
+  {
+    sqlite3* db = nullptr;
+    ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(
+        (root_ / "facts.sqlite3").c_str(), &db,
+        SQLITE_OPEN_READWRITE, nullptr));
+    sqlite3_stmt* statement = nullptr;
+    ASSERT_EQ(SQLITE_OK, sqlite3_prepare_v2(
+        db, "PRAGMA wal_checkpoint(TRUNCATE);", -1, &statement, nullptr));
+    ASSERT_EQ(SQLITE_ROW, sqlite3_step(statement));
+    ASSERT_EQ(0, sqlite3_column_int(statement, 0));
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+  }
+  for (const char* suffix : {"-wal", "-shm"})
+    fs::remove(root_ / (std::string("facts.sqlite3") + suffix));
+  fs::rename(staging_root / "facts.sqlite3", root_ / "facts.sqlite3");
+  exclusive.Release();
+
+  coordinator->FlushForTesting();
+  const fs::path db_path = root_ / "facts.sqlite3";
+  // New history identity on disk.
+  EXPECT_EQ(staged_epoch,
+            QueryText(db_path, "SELECT value FROM meta WHERE key='store_epoch';"));
+  EXPECT_EQ(staged_history,
+            QueryText(db_path, "SELECT value FROM meta WHERE key='history_id';"));
+  // Pre-clear facts are gone.
+  EXPECT_EQ(0, QueryCount(db_path,
+                          "SELECT COUNT(*) FROM selection_events"
+                          " WHERE event_id IN ('pre-clear-event',"
+                          " 'pre-clear-committed');"));
+  const std::string committed_row_sql =
+      "SELECT COUNT(*) FROM commits"
+      " WHERE commit_id = '" + committed_id + "';";
+  EXPECT_EQ(0, QueryCount(db_path, committed_row_sql.c_str()));
+  // The buffered batch lands in the new history after the linearization
+  // point (its HLC is strictly past the staged store's creation clock).
+  EXPECT_EQ(1, QueryCount(db_path,
+                          "SELECT COUNT(*) FROM selection_events"
+                          " WHERE event_id = 'clear-buffered-commit';"));
+  const auto buffered_hlc = QueryEventHlc(db_path, "clear-buffered-commit");
+  const auto staged_clock = std::make_pair(
+      std::atoll(ToolJsonField(staged.second, "hlc_physical_ms").c_str()),
+      std::atoll(ToolJsonField(staged.second, "hlc_logical").c_str()));
+  EXPECT_LT(staged_clock, buffered_hlc);
+  // FIFO preserved: the retraction of the buffered commit exists in the new
+  // history and its commit is out of the active projection; the retraction
+  // of the pre-clear commit was a no-op (its commit was cleared).
+  const std::string buffered_retraction_sql =
+      "SELECT COUNT(*) FROM retractions"
+      " WHERE commit_id = '" + buffered_result.commit_id + "';";
+  EXPECT_EQ(1, QueryCount(db_path, buffered_retraction_sql.c_str()));
+  const std::string committed_retraction_sql =
+      "SELECT COUNT(*) FROM retractions"
+      " WHERE commit_id = '" + committed_id + "';";
+  EXPECT_EQ(0, QueryCount(db_path, committed_retraction_sql.c_str()));
+  const std::string active_commit_sql =
+      "SELECT COUNT(*) FROM active_events"
+      " WHERE commit_id = '" + buffered_result.commit_id + "';";
+  EXPECT_EQ(0, QueryCount(db_path, active_commit_sql.c_str()));
+  // No recording gap was fabricated by the maintenance window: the gap
+  // evidence record the worker established before flushing still says none.
+  std::ifstream gap_file(root_ / "recording_gap.json");
+  std::string gap_payload((std::istreambuf_iterator<char>(gap_file)),
+                          std::istreambuf_iterator<char>());
+  EXPECT_NE(std::string::npos, gap_payload.find("\"state\":\"none\""));
 }
 
 TEST_F(RecorderCoordinatorTest, ShutdownLeftoversPublishAPersistentGap) {
