@@ -301,12 +301,28 @@ def run_maintenance(preflight, root, replacement, control_socket, operation_id,
         return recovery
 
 
-def replace_fact_database(root, replacement_path, _lease=None):
+def replace_fact_database(root, replacement_path, _lease=None,
+                          _connect=sqlite3.connect, _unlink=os.unlink,
+                          _replace=os.replace, _fsync=os.fsync,
+                          _after_checkpoint=None):
     """Replace only the fact database under an already-held exclusive lease.
 
-    This is the reusable production replacement callback. Destructive command
-    policy, backup validation and operation persistence remain caller-owned by
-    later maintenance operations.
+    Publication is staged so a failure or crash can only ever expose the
+    complete old store or the complete new store:
+
+    1. The old database is checkpointed (committed WAL pages merged into the
+       main file) while the exclusive lease still blocks every other
+       connection, the main file is fsynced, and leftover WAL/SHM sidecars
+       are removed.
+    2. Only then is the new main database published with one atomic rename.
+
+    A failed checkpoint or sidecar removal aborts before the main file is
+    touched, so the old store stays complete; after the rename the new store
+    is complete and no old sidecar can be paired with it.
+
+    Destructive command policy, backup validation and operation persistence
+    remain caller-owned by later maintenance operations. Underscore
+    parameters are the deterministic test seams for fault injection.
     """
     try:
         root_fd = os.open(root, os.O_RDONLY | os.O_NOFOLLOW)
@@ -323,14 +339,46 @@ def replace_fact_database(root, replacement_path, _lease=None):
                 or source_stat.st_uid != os.getuid()
                 or stat.S_IMODE(source_stat.st_mode) != 0o600):
             raise MaintenanceError("replacement_unsafe")
-        os.replace(replacement_path, os.path.join(root, "facts.sqlite3"))
-        os.chmod(os.path.join(root, "facts.sqlite3"), 0o600)
+        main_path = os.path.join(root, "facts.sqlite3")
+        if os.path.lexists(main_path):
+            try:
+                connection = _connect(main_path, timeout=0)
+            except sqlite3.Error as error:
+                raise MaintenanceError("replacement_failed") from error
+            try:
+                row = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+                if row is None or row[0] < 0:
+                    raise MaintenanceError("replacement_failed")
+            except sqlite3.Error as error:
+                raise MaintenanceError("replacement_failed") from error
+            finally:
+                connection.close()
+            # The close-time checkpoint has already removed any real WAL/SHM.
+            # Make the merged main file durable before anything can rename it.
+            try:
+                main_fd = os.open(main_path, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError as error:
+                raise MaintenanceError("replacement_failed") from error
+            try:
+                _fsync(main_fd)
+            finally:
+                os.close(main_fd)
         for suffix in ("-wal", "-shm"):
             try:
-                os.unlink(os.path.join(root, "facts.sqlite3" + suffix))
+                _unlink(os.path.join(root, "facts.sqlite3" + suffix))
             except FileNotFoundError:
-                pass
-        os.fsync(root_fd)
+                continue
+            except OSError as error:
+                # Abort before publication: the old main database is still
+                # complete (checkpointed), and a leftover disposable sidecar
+                # is a conservative reason to refuse the replacement.
+                raise MaintenanceError("replacement_failed") from error
+        if _after_checkpoint is not None:
+            _after_checkpoint()
+        _replace(replacement_path, main_path)
+        os.chmod(main_path, 0o600)
+        _fsync(root_fd)
     except MaintenanceError:
         raise
     except OSError as error:
