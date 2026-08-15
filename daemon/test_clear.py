@@ -940,23 +940,43 @@ class ClearCliTests(ClearEnv):
         self.assertTrue(ready.wait(timeout=10))
         self._threads.append(thread)
 
-    def read_stdout_docs(self, output):
-        """--json prints a started envelope then the final record."""
-        lines = [line for line in output.splitlines() if line.strip()]
-        self.assertGreaterEqual(len(lines), 1)
-        docs = []
-        buffer = []
-        for line in lines:
-            buffer.append(line)
-            try:
-                docs.append(json.loads("\n".join(buffer)))
-                buffer = []
-            except ValueError:
-                continue
-        self.assertFalse(buffer)
-        return docs
+    def started_envelope(self, err):
+        """The compact started envelope on stderr (SCN-54-3: the operation
+        id is observable before destructive work, without polluting the
+        single-document JSON stdout)."""
+        lines = [line for line in err.splitlines() if line.strip()]
+        self.assertEqual(1, len(lines), err)
+        return json.loads(lines[0])
 
     # -- SCN-54-1 -----------------------------------------------------------
+
+    def test_json_stdout_is_a_single_parseable_document(self):
+        identity, _ = self.make_live_store()
+        self.start_control_server()
+        rc, out, err = self.run_cli(
+            "clear", "--yes", "--expect-store-epoch",
+            identity["store_epoch"], "--json")
+        self.assertEqual(0, rc, out + err)
+        # The whole stdout parses in one json.loads call: any second
+        # document (or trailing bytes) would raise "Extra data".
+        final = json.loads(out)
+        self.assertEqual("succeeded", final["state"])
+        self.assertEqual("cleared", final["result"]["outcome"])
+        self.assertTrue(final["result"]["cleanup_complete"])
+        operation_id = final["operation_id"]
+        self.assertTrue(operation_id)
+        self.assertEqual(identity["store_epoch"],
+                         final["result"]["old"]["store_epoch"])
+        live, empty = self.live_identity()
+        self.assertEqual(live["store_epoch"],
+                         final["result"]["new"]["store_epoch"])
+        # Started evidence observable via stderr, with the same id, before
+        # any destructive work ran (the envelope is printed right after the
+        # operation record is created and before the executor starts).
+        envelope = self.started_envelope(err)
+        self.assertEqual("running", envelope["state"])
+        self.assertEqual("clear", envelope["type"])
+        self.assertEqual(operation_id, envelope["operation_id"])
 
     def test_noninteractive_clear_end_to_end(self):
         identity, _ = self.make_live_store()
@@ -965,11 +985,11 @@ class ClearCliTests(ClearEnv):
             "clear", "--yes", "--expect-store-epoch",
             identity["store_epoch"], "--json")
         self.assertEqual(0, rc, out + err)
-        docs = self.read_stdout_docs(out)
-        self.assertEqual(2, len(docs))
-        envelope, final = docs
+        final = json.loads(out)
+        operation_id = final["operation_id"]
+        envelope = self.started_envelope(err)
         self.assertEqual("running", envelope["state"])
-        operation_id = envelope["operation_id"]
+        self.assertEqual(operation_id, envelope["operation_id"])
         self.assertEqual("succeeded", final["state"])
         self.assertEqual("cleared", final["result"]["outcome"])
         self.assertTrue(final["result"]["cleanup_complete"])
@@ -1126,7 +1146,7 @@ class ClearCliTests(ClearEnv):
             "clear", "--yes", "--expect-store-epoch",
             identity["store_epoch"], "--json")
         self.assertEqual(0, rc, out)
-        operation_id = self.read_stdout_docs(out)[0]["operation_id"]
+        operation_id = json.loads(out)["operation_id"]
         rc, out, _ = self.run_cli("operation", "show", operation_id,
                                   "--json")
         self.assertEqual(0, rc)
@@ -1145,18 +1165,18 @@ class ClearCliTests(ClearEnv):
             "clear", "--yes", "--expect-store-epoch",
             identity["store_epoch"], "--json")
         self.assertEqual(0, first[0], first[1] + first[2])
-        first_id = self.read_stdout_docs(first[1])[0]["operation_id"]
+        first_record = json.loads(first[1])
+        first_id = first_record["operation_id"]
         # Second clear: the first record is an "old operation detail" and is
         # removed by cleanup; the second remains queryable. The store exists
         # (empty), so the non-interactive epoch CAS applies.
-        first_record = self.read_stdout_docs(first[1])[1]
         self.assertEqual("cleared", first_record["result"]["outcome"])
         live, _empty = self.live_identity()
         second = self.run_cli(
             "clear", "--yes", "--expect-store-epoch", live["store_epoch"],
             "--json")
         self.assertEqual(0, second[0], second[1] + second[2])
-        second_id = self.read_stdout_docs(second[1])[0]["operation_id"]
+        second_id = json.loads(second[1])["operation_id"]
         ops_dir = os.path.join(self.root, "operations")
         names = os.listdir(ops_dir)
         self.assertIn("%s.json" % second_id, names)

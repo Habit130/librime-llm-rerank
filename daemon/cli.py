@@ -25,6 +25,10 @@ Output contracts (deterministic):
     (status_version / operation_version / event_version / error_version).
   - `operation wait --json-lines` streams the operation log events in seq
     order; seq is strictly increasing.
+  - `clear --json` writes exactly one versioned terminal record to stdout
+    (a single json.loads(stdout) parses the whole run); the compact started
+    envelope that exposes the operation id before destructive work goes to
+    stderr.
   - error objects follow the spec error protocol: code, message,
     occurred_at, retryable, phase, remediation, cause.
   - Exit codes: 0 success; 1 non-success outcome (failed/blocked, or a
@@ -686,16 +690,18 @@ def _cmd_clear(args, paths):
 
     operation_id = record["operation_id"]
     if args.json:
-        # Started envelope first (the operation id is published before any
-        # destructive work), then the final public record as the second
-        # document once the operation reaches a terminal state.
+        # The operation id must be observable before any destructive work,
+        # but stdout must stay exactly one versioned terminal document so a
+        # single json.loads(stdout) parses the whole run. The compact
+        # started envelope therefore goes to stderr, a separate channel
+        # that never pollutes the JSON stdout contract.
         print(_json_line({
             "operation_version": OPERATION_VERSION,
             "operation_id": operation_id,
             "type": "clear",
             "state": "running",
             "expect_store_epoch_present": expected_epoch != "",
-        }), flush=True)
+        }), flush=True, file=sys.stderr)
     else:
         print("clear started: operation %s" % operation_id)
 
