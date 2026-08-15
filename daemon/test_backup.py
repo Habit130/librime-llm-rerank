@@ -42,6 +42,7 @@ import unittest
 import uuid
 import zipfile
 import zlib
+from datetime import datetime, timezone
 
 DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(DAEMON_DIR, "squirrel-semantic-memory")
@@ -60,6 +61,7 @@ from backup_operation import (  # noqa: E402
     MANIFEST_MEMBER,
     SENSITIVE_DECLARATION,
     ZIP_MEMBERS,
+    _ensure_backup_dir,
     _staging_manifest_path,
     _staging_root,
     _temp_artifact_path,
@@ -440,6 +442,202 @@ class BackupCreateStepsTest(BackupEnv):
         self.assertFalse(record["result"]["insecure_destination"])
         manifest = read_backup_manifest(self.output)
         self.assertIs(False, manifest["insecure_destination"])
+
+    def test_real_non_0600_temp_succeeds_only_when_confirmed(self):
+        """A medium whose temp file is really not 0600 after chmod (the
+        filesystem ignores owner-only modes) must fail closed without the
+        explicit confirmation and succeed with it, carrying the permanent
+        insecure warning. The temp is genuinely created with a non-0600
+        mode — not just reported by a probe."""
+        self.make_live_store()
+
+        def write_zip_non_0600(temp, snapshot, manifest, parent):
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                raw = os.fdopen(fd, "wb")
+                fd = None
+                try:
+                    with zipfile.ZipFile(raw, "w",
+                                         compression=zipfile.ZIP_DEFLATED
+                                         ) as archive:
+                        for name in ZIP_MEMBERS:
+                            info = zipfile.ZipInfo(name)
+                            info.create_system = 3
+                            info.external_attr = (0o600 | 0x8000) << 16
+                            if name == FACTS_MEMBER:
+                                with open(snapshot, "rb") as source:
+                                    archive.writestr(info, source.read())
+                            else:
+                                archive.writestr(
+                                    info, json.dumps(
+                                        manifest, ensure_ascii=False,
+                                        indent=2).encode("utf-8"))
+                    raw.flush()
+                    os.fsync(raw.fileno())
+                finally:
+                    raw.close()
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            # The medium then fails to honor the 0600 mode: the real on-disk
+            # mode is read back as 0644 despite the fchmod.
+            os.chmod(temp, 0o644)
+
+        insecure_registry = self.make_registry(
+            probe_medium=lambda output, op: False,
+            write_zip=write_zip_non_0600)
+        # Without the confirmed override the real non-0600 temp fails closed
+        # and leaves nothing behind.
+        store = OperationStore(self.root)
+        record = create_operation(
+            store, insecure_registry, "backup.create",
+            {"output": self.output, "allow_insecure": False})
+        record = run_pending_steps(store, insecure_registry,
+                                   record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("insecure_destination", record["error"]["code"])
+        self.assertFalse(os.path.exists(self.output))
+        self.assertEqual([], os.listdir(self.dest_dir))
+        # With the confirmed override the same real non-0600 temp succeeds.
+        store = OperationStore(self.root)
+        record = create_operation(
+            store, insecure_registry, "backup.create",
+            {"output": self.output, "allow_insecure": True})
+        record = run_pending_steps(store, insecure_registry,
+                                   record["operation_id"])
+        self.assertEqual("succeeded", record["state"], record)
+        self.assertIs(True, record["result"]["insecure_destination"])
+        st = os.lstat(self.output)
+        self.assertEqual(0o644, stat.S_IMODE(st.st_mode))
+        self.assertEqual(os.geteuid(), st.st_uid)
+        self.assertTrue(stat.S_ISREG(st.st_mode))
+        manifest = read_backup_manifest(self.output)
+        self.assertIs(True, manifest["insecure_destination"])
+        outcome = verify_backup(self.output, helper=self.helper)
+        self.assertTrue(outcome["valid"])
+        self.assertIs(True, outcome["insecure_destination"])
+
+    def test_wrong_owner_temp_never_accepted_as_insecure(self):
+        """A temp that is a symlink, directory or device (or not regular)
+        can never be accepted as an insecure destination; only a regular
+        non-0600 file may."""
+        self.make_live_store()
+        wrong = []
+
+        def write_zip_symlink(temp, snapshot, manifest, parent):
+            os.symlink(os.path.join(parent, "does-not-exist"), temp)
+            wrong.append(temp)
+
+        registry = self.make_registry(
+            probe_medium=lambda output, op: False,
+            write_zip=write_zip_symlink)
+        store = OperationStore(self.root)
+        record = create_operation(
+            store, registry, "backup.create",
+            {"output": self.output, "allow_insecure": True})
+        record = run_pending_steps(store, registry, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("insecure_destination", record["error"]["code"])
+        self.assertFalse(os.path.exists(self.output))
+        # The symlink temp was removed again.
+        self.assertEqual([], os.listdir(self.dest_dir))
+
+    def test_incomplete_staging_retry_converges(self):
+        """A crash between the staging directory creation and the durable
+        manifest write leaves an incomplete staging root. A retry with the
+        same operation ID must remove it symlink-safely, rebuild, and
+        converge to exactly one backup ID and one final destination with no
+        staging or temp residue — never a leaked FileExistsError."""
+        self.make_live_store()
+        registry = self.make_registry()
+        store = OperationStore(self.root)
+        record = create_operation(store, registry, "backup.create",
+                                  {"output": self.output})
+        operation_id = record["operation_id"]
+        # Simulate the crash residue: staging root exists, manifest was
+        # never durably written.
+        os.makedirs(_staging_root(self.root, operation_id), mode=0o700)
+        self.assertFalse(os.path.exists(_staging_manifest_path(
+            self.root, operation_id)))
+        record = run_pending_steps(store, registry, operation_id)
+        self.assertEqual("succeeded", record["state"], record)
+        manifest = read_backup_manifest(self.output)
+        self.assertTrue(manifest["backup_id"])
+        self.assertEqual(manifest["backup_id"],
+                         record["result"]["backup_id"])
+        self.assertFalse(os.path.exists(_staging_root(
+            self.root, operation_id)))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.root, BACKUP_DIRNAME)))
+        self.assertEqual([f for f in os.listdir(self.dest_dir)
+                          if f.startswith(".")], [])
+
+    def test_incomplete_staging_with_symlink_root_converges(self):
+        """A hostile or stale symlink at the staging root of this operation
+        is unlinked, never followed, and the retry converges."""
+        self.make_live_store()
+        registry = self.make_registry()
+        store = OperationStore(self.root)
+        record = create_operation(store, registry, "backup.create",
+                                  {"output": self.output})
+        operation_id = record["operation_id"]
+        _ensure_backup_dir(self.root, os.geteuid())
+        target = os.path.join(self._tmp, "symlink-target")
+        os.makedirs(target, mode=0o700)
+        os.symlink(target, _staging_root(self.root, operation_id))
+        record = run_pending_steps(store, registry, operation_id)
+        self.assertEqual("succeeded", record["state"], record)
+        self.assertTrue(os.path.exists(self.output))
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual([], os.listdir(target))
+
+    def test_cleanup_crash_recovers_full_result_from_final(self):
+        """A crash after the cleanup step ran but before the operation
+        record was persisted deletes the staging manifest. The retry must
+        rebuild the identical full result from the durable final container
+        — never a generic {'completed': true}."""
+        self.make_live_store()
+        fixed_now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        registry = self.make_registry(now=lambda: fixed_now)
+        store = OperationStore(self.root)
+        record = create_operation(store, registry, "backup.create",
+                                  {"output": self.output})
+        operation_id = record["operation_id"]
+        for _ in range(3):
+            record = run_pending_steps(store, registry, operation_id,
+                                       max_steps=1)
+        self.assertEqual("cleanup", record["phase"])
+        spec = registry.get("backup.create")
+        cleanup_step = spec.steps["cleanup"]
+        # The crash window: the cleanup step runs (building the result and
+        # deleting staging) and its return value is lost before the record
+        # is persisted.
+        first = cleanup_step(store.load(operation_id))
+        self.assertIn("backup_id", first["result"])
+        self.assertNotIn("completed", first["result"])
+        # The durable record still shows cleanup (the step's outcome was
+        # never persisted) and staging is gone.
+        persisted = store.load(operation_id)
+        self.assertEqual("cleanup", persisted["phase"])
+        self.assertFalse(os.path.exists(_staging_manifest_path(
+            self.root, operation_id)))
+        # Retry to terminal: the result is recovered from the final
+        # container and is field-for-field identical.
+        record = run_pending_steps(store, registry, operation_id)
+        self.assertEqual("succeeded", record["state"])
+        self.assertEqual(first["result"], record["result"])
+        self.assertEqual(record["result"]["destination"], self.output)
+        for key in ("backup_id", "history_id", "store_epoch",
+                    "fact_schema_version", "event_format_version_min",
+                    "event_format_version_max", "commit_count", "event_count",
+                    "candidate_count", "retraction_count", "hlc_high_water",
+                    "event_hlc_high_water", "created_at", "producer",
+                    "database_size", "database_sha256",
+                    "insecure_destination", "plaintext_sensitive"):
+            self.assertIn(key, record["result"])
+        self.assertEqual("succeeded", record["state"])
 
     def test_cancel_before_publish_cleans_and_goes_cancelled(self):
         self.make_live_store()
@@ -1096,6 +1294,60 @@ class MaliciousContainerTest(BackupEnv):
             [(FACTS_MEMBER, db, {"file_size": 2000 * 1024 ** 2}),
              (MANIFEST_MEMBER, manifest, {})])
         self._assert_rejected(path, ("zip_ratio_limit",))
+
+    def test_ratio_exact_boundary_1000_allows_into_later_checks(self):
+        """file_size == 1000 * compress_size is exactly at the limit and
+        must pass the ratio gate into the later validation stages (the
+        forged sizes then fail those stages, but not with zip_ratio_limit).
+        """
+        from backup_operation import parse_zip_structure
+        db = self._snapshot_bytes()
+        manifest = self._valid_manifest_bytes()
+        compress = max(1, len(db) // 1000)
+        path = self._raw_zip(
+            [(FACTS_MEMBER, db, {"file_size": 1000 * compress,
+                                 "compress_size": compress}),
+             (MANIFEST_MEMBER, manifest, {})])
+        structure = parse_zip_structure(path)
+        self.assertEqual(2, len(structure))
+        try:
+            outcome = verify_backup(path, helper=self.helper)
+        except BackupError as error:
+            # The boundary itself passed; a later stage rejects the forged
+            # sizes, and that later stage must not be the ratio gate.
+            self.assertNotEqual("zip_ratio_limit", error.code)
+            return
+        self.assertFalse(outcome["valid"])
+
+    def test_ratio_exact_boundary_1001_rejected(self):
+        """file_size == 1000 * compress_size + 1 exceeds the limit and is
+        rejected with zip_ratio_limit."""
+        from backup_operation import parse_zip_structure, MAX_COMPRESSION_RATIO
+        db = self._snapshot_bytes()
+        manifest = self._valid_manifest_bytes()
+        compress = max(1, len(db) // 1000)
+        path = self._raw_zip(
+            [(FACTS_MEMBER, db, {"file_size": MAX_COMPRESSION_RATIO
+                                 * compress + 1,
+                                 "compress_size": compress}),
+             (MANIFEST_MEMBER, manifest, {})])
+        with self.assertRaises(BackupError) as ctx:
+            parse_zip_structure(path)
+        self.assertEqual("zip_ratio_limit", ctx.exception.code)
+
+    def test_ratio_zero_compress_size_rejected(self):
+        """A member with zero compressed size but nonzero data has an
+        infinite ratio and is safely rejected."""
+        from backup_operation import parse_zip_structure
+        db = self._snapshot_bytes()
+        manifest = self._valid_manifest_bytes()
+        path = self._raw_zip(
+            [(FACTS_MEMBER, db, {"file_size": len(db),
+                                 "compress_size": 0}),
+             (MANIFEST_MEMBER, manifest, {})])
+        with self.assertRaises(BackupError) as ctx:
+            parse_zip_structure(path)
+        self.assertEqual("zip_ratio_limit", ctx.exception.code)
 
     def test_malformed_zip_rejected(self):
         path = os.path.join(self._tmp, "truncated.squirrel-memory-backup")

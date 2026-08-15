@@ -149,6 +149,8 @@ _MANIFEST_INT_FIELDS = (
 
 
 def _now_iso(now=None):
+    if callable(now):
+        return now().isoformat()
     if now is not None:
         return now
     return datetime.now(timezone.utc).isoformat()
@@ -412,8 +414,15 @@ def parse_zip_structure(path):
         total += info.file_size
         if total > MAX_TOTAL_UNCOMPRESSED:
             raise BackupError("zip_size_limit")
-        if info.compress_size > 0 and info.file_size // info.compress_size \
-                > MAX_COMPRESSION_RATIO:
+        # Exact ratio comparison without floating point or integer
+        # overflow: file_size > 1000 * compress_size. A zero compressed
+        # size with nonzero data is an infinite ratio and rejected; a zero
+        # compressed size with zero data is a degenerate empty member that
+        # later size/checksum checks handle.
+        if info.compress_size == 0:
+            if info.file_size > 0:
+                raise BackupError("zip_ratio_limit")
+        elif info.file_size > MAX_COMPRESSION_RATIO * info.compress_size:
             raise BackupError("zip_ratio_limit")
         if info.filename == MANIFEST_MEMBER \
                 and info.file_size > MAX_MANIFEST_SIZE:
@@ -1191,8 +1200,13 @@ class BackupSpec:
         if manifest is not None and self._verify_staging(operation_id,
                                                          manifest):
             return {"advance": True}
-        if manifest is not None:
-            _remove_staging(self.root, operation_id, self.euid)
+        # Any staging directory for this operation that is not provably
+        # complete (missing or invalid manifest) is removed symlink-safely
+        # before a fresh staging is built: an incomplete staging (crash
+        # before the manifest was durably written) must never be re-created
+        # with exist_ok=False and must never leak a FileExistsError. Other
+        # operations' staging roots are never touched.
+        _remove_staging(self.root, operation_id, self.euid)
         _ensure_backup_dir(self.root, self.euid)
         os.makedirs(_staging_root(self.root, operation_id), mode=0o700,
                     exist_ok=False)
@@ -1246,6 +1260,34 @@ class BackupSpec:
         return {"progress": {"bytes": database_size, "chunks": 1},
                 "advance": True}
 
+    def _verify_temp_file(self, temp, manifest, phase):
+        """Validate the staged temp before publication: it must always be a
+        regular file owned by the current user; a secure destination must
+        additionally prove the exact 0600 mode. Only a destination whose
+        insecurity was explicitly confirmed and durably recorded in the
+        manifest may carry a real non-0600 mode — never a wrong owner, a
+        symlink, a directory or a device."""
+        try:
+            st = os.lstat(temp)
+        except OSError as error:
+            raise OperationFailed(
+                "staging_write_failed", phase=phase, retryable=True,
+                cause={"error": error.strerror})
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != self.euid:
+            raise OperationBlocked(
+                "insecure_destination", phase=phase,
+                remediation="the destination medium cannot guarantee a "
+                            "regular owner-owned file")
+        if stat.S_IMODE(st.st_mode) != 0o600 \
+                and manifest["insecure_destination"] is not True:
+            raise OperationBlocked(
+                "insecure_destination", phase=phase,
+                remediation="the destination medium cannot guarantee "
+                            "owner-only permissions; run with "
+                            "--allow-insecure-destination and confirm the "
+                            "exact string, or choose a destination that "
+                            "honors owner-only permissions")
+
     def _build_temp_zip(self, output, operation_id, manifest):
         """Write the final container as an exclusive owner-only temp file in
         the destination parent; fsync it; then re-open and strictly
@@ -1274,13 +1316,6 @@ class BackupSpec:
                                 "it")
             try:
                 os.fchmod(fd, 0o600)
-                st = os.fstat(fd)
-                if (not stat.S_ISREG(st.st_mode) or st.st_uid != self.euid
-                        or stat.S_IMODE(st.st_mode) != 0o600):
-                    raise OperationBlocked(
-                        "insecure_destination", phase="publishing",
-                        remediation="the destination medium cannot "
-                                    "guarantee owner-only permissions")
                 raw = os.fdopen(fd, "wb")
                 fd = None
                 try:
@@ -1309,6 +1344,9 @@ class BackupSpec:
                     os.close(fd)
             os.fsync(parent_fd)
             os.close(parent_fd)
+        # The temp's real on-disk state is verified on every path (also for
+        # injected seams), and a secure destination must still prove 0600.
+        self._verify_temp_file(temp, manifest, "publishing")
         # Re-open and self-verify the staged container exactly like verify
         # does, before anything is published.
         try:
@@ -1367,18 +1405,27 @@ class BackupSpec:
 
     def _self_check_final(self, output, manifest):
         """Verify the published final: it must be a regular owner-owned file
-        whose container reads back with this operation's backup_id."""
+        whose container reads back with this operation's backup_id. A
+        secure destination must additionally prove the exact 0600 mode; an
+        explicitly confirmed insecure destination only requires the
+        regular owner-owned file."""
         try:
             st = os.lstat(output)
         except OSError as error:
             raise OperationFailed(
                 "publish_failed", phase="publishing", retryable=True,
                 cause={"error": error.strerror})
-        if not stat.S_ISREG(st.st_mode):
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != self.euid:
             raise OperationBlocked(
                 "staging_invalid", phase="publishing",
                 remediation="the published destination is not a regular "
-                            "file; inspect it")
+                            "owner-owned file; inspect it")
+        if stat.S_IMODE(st.st_mode) != 0o600 \
+                and manifest["insecure_destination"] is not True:
+            raise OperationBlocked(
+                "insecure_destination", phase="publishing",
+                remediation="the published destination does not carry the "
+                            "required owner-only permissions; inspect it")
         try:
             final_manifest = self._read_final_manifest(output)
         except BackupError as error:
@@ -1450,11 +1497,25 @@ class BackupSpec:
             self._remove_own_artifacts(output, operation_id)
             _remove_staging(self.root, operation_id, self.euid)
             return {"advance": True}
+        # The result is built BEFORE the staging directory is removed, and
+        # is recoverable after a crash: if the staged manifest is gone (the
+        # previous attempt already removed staging but crashed before the
+        # operation record was persisted), the full result is rebuilt from
+        # the durable final container's own manifest. No snapshot, packing
+        # or publication is repeated and no new backup ID is generated.
         manifest = self._load_staging_manifest(operation_id)
-        _remove_staging(self.root, operation_id, self.euid)
-        self._remove_own_artifacts(output, operation_id)
+        recovered = False
         if manifest is None:
-            return {"advance": True}
+            try:
+                manifest = self._read_final_manifest(output)
+            except BackupError as error:
+                raise OperationBlocked(
+                    "staging_invalid", phase="cleanup",
+                    remediation="neither the staged manifest nor the final "
+                                "container is readable; inspect before "
+                                "retrying",
+                    cause={"fault_code": error.code})
+            recovered = True
         try:
             st = os.lstat(output)
             regular = stat.S_ISREG(st.st_mode) and st.st_uid == self.euid
@@ -1465,6 +1526,26 @@ class BackupSpec:
                 "staging_invalid", phase="cleanup",
                 remediation="the published destination is missing after a "
                             "successful publication; inspect it")
+        if not recovered:
+            try:
+                final_manifest = self._read_final_manifest(output)
+            except BackupError as error:
+                raise OperationBlocked(
+                    "staging_invalid", phase="cleanup",
+                    remediation="the published container does not verify; "
+                                "inspect it",
+                    cause={"fault_code": error.code})
+            if final_manifest["backup_id"] != manifest["backup_id"]:
+                raise OperationBlocked(
+                    "staging_invalid", phase="cleanup",
+                    remediation="the published container belongs to a "
+                                "different backup; inspect it")
+        if stat.S_IMODE(st.st_mode) != 0o600 \
+                and manifest["insecure_destination"] is not True:
+            raise OperationBlocked(
+                "insecure_destination", phase="cleanup",
+                remediation="the published destination does not carry the "
+                            "required owner-only permissions; inspect it")
         result = {
             "backup_version": BACKUP_FORMAT_VERSION,
             "backup_id": manifest["backup_id"],
@@ -1487,6 +1568,8 @@ class BackupSpec:
             "plaintext_sensitive": manifest["plaintext_sensitive"],
             "destination": output,
         }
+        _remove_staging(self.root, operation_id, self.euid)
+        self._remove_own_artifacts(output, operation_id)
         return {"progress": {"bytes": removed, "chunks": 1},
                 "advance": True, "result": result}
 
