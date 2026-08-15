@@ -41,15 +41,26 @@ The semantic-memory fact root contains an owner-only `maintenance.lock`. Fact
 writes and daemon fact readers take a shared advisory lease before opening
 SQLite; maintenance callers take a bounded exclusive lease only after their
 preflight and daemon prepare steps complete. The recorder never waits for that
-exclusive lease: complete commit batches and their immediate retractions remain
-in one process-local FIFO, bounded at 256 commit batches or 16 MiB of documented
-logical payload. Overflow and shutdown leftovers are recorded in the
-owner-only, versioned `recording_gap.json` without private text or embeddings.
+exclusive lease, and its commit path never performs durable I/O at all: a
+single worker thread owns the store, the per-process crash-evidence marker
+(`.recording_process.*`) and the gap-state files. Complete commit batches and
+their immediate retractions remain in one process-local FIFO, bounded at 256
+commit batches or 16 MiB of documented logical payload. Overflow and shutdown
+leftovers are recorded in the owner-only, versioned `recording_gap.json`
+without private text or embeddings; a failed gap update first marks the
+pre-existing `recording_gap.lock` unknown, so a loss can never read as "no
+gap" after a restart.
 
 The daemon serves scoring and maintenance over separate Unix sockets. Both
 sockets require an owner-only directory and `0600` socket file; the control
 socket authenticates the peer UID, keeps a prepared lease until real EOF, and
 fails closed when the fact-store epoch cannot be proven after reopen.
+
+A fact-database replacement is staged for crash consistency: the old database
+is checkpointed (its WAL merged into the main file) and its sidecars removed
+before the new main database is published with one atomic rename. A failure or
+crash therefore exposes only the complete old store or the complete new store,
+never a new main database paired with old WAL/SHM files.
 
 This is a reusable maintenance seam only. Public clear, restore and schema
 migration operations remain separate tickets.
