@@ -307,6 +307,89 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual("blocked", self.coordinator.health()["maintenance_state"])
         self.assertIsNone(self.coordinator.begin_request())
 
+    def test_pristine_no_database_reopen_returns_to_serving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            os.mkdir(root, 0o700)
+            coordinator = MaintenanceCoordinator(root)
+            prepared = coordinator.prepare("op-empty")
+            self.assertTrue(prepared["ok"])
+            self.assertIsNone(prepared["store_epoch"])
+            self.assertEqual("prepared",
+                             coordinator.health()["maintenance_state"])
+
+            result = coordinator.reopen("op-empty")
+            self.assertTrue(result["ok"])
+            self.assertEqual("serving", result["state"])
+            self.assertIsNone(result["store_epoch"])
+            self.assertTrue(result["serving_ready"])
+            health = coordinator.health()
+            self.assertEqual("serving", health["maintenance_state"])
+            self.assertEqual(0, health["open_handles"])
+            self.assertIsNone(health["active_derived_epoch"])
+            lease = coordinator.begin_request()
+            self.assertIsNotNone(lease)
+            lease.complete()
+
+    def test_pristine_no_database_eof_recovers_to_serving(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            os.mkdir(root, 0o700)
+            coordinator = MaintenanceCoordinator(root)
+            self.assertTrue(coordinator.prepare("op-empty")["ok"])
+            coordinator.lease_lost("op-empty")
+            health = coordinator.health()
+            self.assertEqual("serving", health["maintenance_state"])
+            self.assertEqual(0, health["open_handles"])
+            self.assertIsNone(health["active_derived_epoch"])
+            lease = coordinator.begin_request()
+            self.assertIsNotNone(lease)
+            lease.complete()
+
+    def test_no_database_maintenance_publishing_valid_db_follows_new_epoch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            recovery = ManualRecovery()
+            coordinator = MaintenanceCoordinator(root, recovery=recovery)
+            self.assertTrue(coordinator.prepare("op-empty")["ok"])
+            # Maintenance publishes a valid database during the lease; reopen
+            # must then follow the existing new-epoch path.
+            write_facts(root, epoch="epoch-b")
+            result = coordinator.reopen("op-empty")
+            self.assertTrue(result["ok"])
+            self.assertEqual("catching_up", result["state"])
+            self.assertFalse(result["serving_ready"])
+            self.assertEqual([(None, "epoch-b")], recovery.invalidated)
+            self.assertIsNone(coordinator.begin_request())
+            self.assertTrue(recovery.complete())
+            lease = coordinator.begin_request()
+            self.assertIsNotNone(lease)
+            lease.complete()
+            self.assertEqual("serving", coordinator.health()["maintenance_state"])
+
+    def test_existing_db_with_unprovable_identity_blocks_reopen(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            write_facts(root, epoch="epoch-a")
+            coordinator = MaintenanceCoordinator(root)
+            self.assertTrue(coordinator.prepare("op-a")["ok"])
+            # Maintenance publishes a database whose identity cannot be
+            # proven: reopen must fail closed instead of serving stale state.
+            db_path = os.path.join(root, "facts.sqlite3")
+            connection = sqlite3.connect(db_path)
+            connection.execute("DROP TABLE meta")
+            connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            connection.commit()
+            connection.close()
+            os.chmod(db_path, 0o600)
+            result = coordinator.reopen("op-a")
+            self.assertFalse(result["ok"])
+            self.assertEqual("blocked", result["state"])
+            self.assertEqual("epoch_unverifiable", result["code"])
+            self.assertEqual("blocked",
+                             coordinator.health()["maintenance_state"])
+            self.assertIsNone(coordinator.begin_request())
+
 
 if __name__ == "__main__":
     unittest.main()

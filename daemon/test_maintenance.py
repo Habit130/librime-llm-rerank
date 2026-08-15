@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -187,6 +188,7 @@ class MaintenanceTest(unittest.TestCase):
         self.assertEqual("unknown", gap["state"])
         self.assertEqual("gap_missing_after_initialization", gap["reason"])
 
+
     def test_default_timeout_preserves_every_maintenance_target(self):
         targets = ["facts.sqlite3", "facts.sqlite3-wal", "facts.sqlite3-shm",
                    "replacement.marker", "derived.marker"]
@@ -333,6 +335,208 @@ class MaintenanceTest(unittest.TestCase):
         self.assertEqual("serving", coordinator.health()["maintenance_state"])
         self.assertEqual(1, coordinator.health()["open_handles"])
         coordinator.close()
+
+
+class _FakeCheckpointResult:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _FakeCheckpointConnection:
+    """A connection seam returning an exact wal_checkpoint result shape."""
+
+    def __init__(self, row):
+        self._row = row
+        self.closed = False
+
+    def execute(self, sql):
+        if sql != "PRAGMA wal_checkpoint(TRUNCATE);":
+            raise AssertionError("unexpected sql: %r" % sql)
+        return _FakeCheckpointResult(self._row)
+
+    def close(self):
+        self.closed = True
+
+
+class ReplacementStagingTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.temp.name, "SemanticMemory")
+        os.mkdir(self.root, 0o700)
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        connection = sqlite3.connect(db_path)
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        connection.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            [("store_epoch", "epoch-a"), ("hlc_physical_ms", "9"),
+             ("hlc_logical", "1")],
+        )
+        connection.commit()
+        connection.close()
+        os.chmod(db_path, 0o600)
+        with open(os.path.join(self.root, "facts.sqlite3-shm"), "wb") as stream:
+            stream.write(b"stale")
+        os.chmod(os.path.join(self.root, "facts.sqlite3-shm"), 0o600)
+        self.replacement = os.path.join(self.temp.name, "replacement.sqlite3")
+        connection = sqlite3.connect(self.replacement)
+        connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        connection.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            [("store_epoch", "epoch-b"), ("hlc_physical_ms", "10"),
+             ("hlc_logical", "0")],
+        )
+        connection.commit()
+        connection.close()
+        os.chmod(self.replacement, 0o600)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _read_main_epoch(self):
+        connection = sqlite3.connect(
+            f"file:{os.path.join(self.root, 'facts.sqlite3')}?mode=ro", uri=True)
+        try:
+            return connection.execute(
+                "SELECT value FROM meta WHERE key='store_epoch'").fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_checkpoint_busy_aborts_before_publication(self):
+        events = []
+
+        def recording_unlink(path):
+            events.append(("unlink", path))
+            return os.unlink(path)
+
+        def recording_replace(source, target):
+            events.append(("replace", source, target))
+
+        connection = _FakeCheckpointConnection((1, 7, 0))
+        with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+            replace_fact_database(
+                self.root, self.replacement,
+                _connect=lambda path, **kwargs: connection,
+                _unlink=recording_unlink,
+                _replace=recording_replace)
+        self.assertTrue(connection.closed)
+        # A busy checkpoint must not remove sidecars or publish the new main.
+        self.assertEqual([], events)
+        self.assertEqual("epoch-a", self._read_main_epoch())
+        self.assertTrue(os.path.exists(os.path.join(self.root,
+                                                    "facts.sqlite3-shm")))
+        self.assertTrue(os.path.exists(self.replacement))
+
+    def test_checkpoint_success_still_publishes(self):
+        connection = _FakeCheckpointConnection((0, -1, -1))
+        replace_fact_database(
+            self.root, self.replacement,
+            _connect=lambda path, **kwargs: connection)
+        self.assertTrue(connection.closed)
+        self.assertEqual("epoch-b", self._read_main_epoch())
+        self.assertFalse(os.path.exists(self.replacement))
+        self.assertFalse(os.path.exists(os.path.join(self.root,
+                                                     "facts.sqlite3-shm")))
+
+    def test_symlinked_existing_main_rejected_before_connect(self):
+        # Move the real database outside the root and symlink it in: the
+        # replacement must reject the link without ever connecting to or
+        # modifying the target.
+        os.rename(os.path.join(self.root, "facts.sqlite3"),
+                  os.path.join(self.temp.name, "real-facts.sqlite3"))
+        os.symlink(os.path.join(self.temp.name, "real-facts.sqlite3"),
+                   os.path.join(self.root, "facts.sqlite3"))
+        events = []
+
+        def recording_connect(path, **kwargs):
+            events.append(("connect", path))
+            raise AssertionError("symlink target must not be opened")
+
+        def recording_unlink(path):
+            events.append(("unlink", path))
+            return os.unlink(path)
+
+        def recording_replace(source, target):
+            events.append(("replace", source, target))
+
+        with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+            replace_fact_database(
+                self.root, self.replacement,
+                _connect=recording_connect,
+                _unlink=recording_unlink,
+                _replace=recording_replace)
+        self.assertEqual([], events)
+        # The target is untouched and the sidecar and replacement remain.
+        target = sqlite3.connect(
+            f"file:{os.path.join(self.temp.name, 'real-facts.sqlite3')}"
+            "?mode=ro", uri=True)
+        try:
+            self.assertEqual("epoch-a", target.execute(
+                "SELECT value FROM meta WHERE key='store_epoch'").fetchone()[0])
+        finally:
+            target.close()
+        self.assertTrue(os.path.exists(os.path.join(self.root,
+                                                    "facts.sqlite3-shm")))
+        self.assertTrue(os.path.exists(self.replacement))
+
+    def test_wrong_mode_existing_main_rejected_before_connect(self):
+        os.chmod(os.path.join(self.root, "facts.sqlite3"), 0o644)
+        events = []
+
+        def recording_connect(path, **kwargs):
+            events.append(("connect", path))
+            raise AssertionError("unsafe main must not be opened")
+
+        with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+            replace_fact_database(self.root, self.replacement,
+                                  _connect=recording_connect,
+                                  _unlink=lambda _: events.append(("unlink",)),
+                                  _replace=lambda *_: events.append(("replace",)))
+        self.assertEqual([], events)
+        self.assertTrue(os.path.exists(self.replacement))
+
+    def test_wrong_owner_existing_main_rejected_before_connect(self):
+        import maintenance as maintenance_module
+        real_fstat = maintenance_module.os.fstat
+        events = []
+
+        def flipped_owner_fstat(fd):
+            result = real_fstat(fd)
+            if stat.S_ISREG(result.st_mode):
+                parts = list(result)
+                parts[4] = result.st_uid + 1
+                return os.stat_result(parts)
+            return result
+
+        try:
+            maintenance_module.os.fstat = flipped_owner_fstat
+            with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+                replace_fact_database(
+                    self.root, self.replacement,
+                    _connect=lambda *args, **kwargs: events.append(
+                        ("connect",)),
+                    _unlink=lambda _: events.append(("unlink",)),
+                    _replace=lambda *_: events.append(("replace",)))
+        finally:
+            maintenance_module.os.fstat = real_fstat
+        self.assertEqual([], events)
+        self.assertTrue(os.path.exists(self.replacement))
+
+    def test_non_regular_existing_main_rejected_before_connect(self):
+        os.unlink(os.path.join(self.root, "facts.sqlite3"))
+        os.mkdir(os.path.join(self.root, "facts.sqlite3"))
+        events = []
+
+        with self.assertRaisesRegex(MaintenanceError, "replacement_failed"):
+            replace_fact_database(
+                self.root, self.replacement,
+                _connect=lambda *args, **kwargs: events.append(("connect",)),
+                _unlink=lambda _: events.append(("unlink",)),
+                _replace=lambda *_: events.append(("replace",)))
+        self.assertEqual([], events)
+        self.assertTrue(os.path.exists(self.replacement))
 
 
 if __name__ == "__main__":
