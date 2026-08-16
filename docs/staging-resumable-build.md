@@ -148,6 +148,23 @@ A `ready` staging is re-verified once per machine start; one that fails is
 discarded and rebuilt — never served, never published. Nothing is ever
 published by this machine (publish is #65).
 
+## Publish seams (#65)
+
+When the daemon wires a publisher, both share one **publish lock**: the
+worker acquires it around every state-machine cycle and the publisher
+around its whole transaction, so the verify/rename of a ready container can
+never race a worker cycle (resume/finalize/reverify/discard) over the same
+directory. The machine additionally exposes the seams the publisher calls
+under that lock: `verify_publishable(staging_dir)` (reload the record,
+resume gate, full reopen verification; raises on the first failing check),
+`publish_reject(staging_dir, reason)` (a staging that fails the publish
+preconditions is marked discarded, never published), and
+`publish_block(reason, blocked_events, phase)` (a deterministic
+publish-time delta fault marks the ready staging blocked; `retry()`
+re-arms it). `status()` reports `ready_staging_dir` so the publisher can
+address the ready container. The machine still never writes the active
+manifest, the active checkpoint or the facts.
+
 ## Determinism across build paths
 
 The chunk loop, probes and manifest composition are shared code with
@@ -205,8 +222,10 @@ the desired provider.
 
 ## Deferred by decision
 
-- Publish lock and blue-green switch (#65), compaction/retention/rollback
-  (#66/#67), ANN probes (#78/#79), real-data replay (#70), deployment:
-  out of scope, recorded as deferred in the delivery contract. Physical
-  deletion of discarded staging records belongs to clear and #66, not to
-  this machine.
+- Compaction/retention/rollback (#66/#67), ANN probes (#78/#79),
+  real-data replay (#70), deployment: out of scope, recorded as deferred in
+  the delivery contract. Physical deletion of discarded staging records
+  belongs to clear and #66, not to this machine.
+- The publish itself is delivered (#65): the publish lock, the staging's own
+  delta checkpoint, the active manifest and the pointer swap are documented
+  in `docs/publish-atomic.md`.

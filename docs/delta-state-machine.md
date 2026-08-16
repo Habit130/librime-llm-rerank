@@ -141,17 +141,22 @@ the checkpoint. Restart paths:
 - `EvidenceService(facts_root, params, provider, gamma, machine=None)`: with
   a machine and an existing fact store, every request is served from the
   machine's caught-up snapshot (the request watermark is still checked
-  against the snapshot: epoch + at-or-before). Without a machine, the direct
-  live-facts path is unchanged (offline/calibration). Missing fact store with
-  a machine keeps the #61 missing-store semantics (zero-ok without a
-  declared watermark, `fact_store_fault` with one).
+  against the snapshot: epoch + at-or-before). The query vector comes from
+  the snapshot itself (#65): the snapshot binds its own representation at
+  publish time, so one query never mixes the old and the new identity.
+  Without a machine, the direct live-facts path is unchanged
+  (offline/calibration). Missing fact store with a machine keeps the #61
+  missing-store semantics (zero-ok without a declared watermark,
+  `fact_store_fault` with one).
 - `server.run_server`: when the evidence config declares `derived_root` +
   `generation_id`, the machine is constructed, registered as the
   coordinator's derived-state recovery (`invalidate`/`rebuild` seam, wired
   through `MaintenanceCoordinator(recovery=...)`) and as a quiesceable
   builder (`request_stop`/`wait_idle`), and passed into the service. The
   active generation must be declared explicitly — no directory scanning
-  (spec clause 不扫描目录猜测最新 generation).
+  (spec clause 不扫描目录猜测最新 generation). After a runtime publish
+  (#65) the durable active manifest resolves the active generation id and
+  representation at startup; the config seam receives them as overrides.
 - The config seam stays fixture-driven (like #61 today); the real
   hidden-state provider plugs at the same `RepresentationProvider` seam and
   is exercised by `integration_delta.py`.
@@ -164,9 +169,22 @@ the checkpoint. Restart paths:
   a cache keyed by `representation_id` + `preceding_text` digest (verified
   against the raw UTF-8 text) could later slot in without touching the state
   machine.
-- Staging-side delta + blue-green publish (#64/#65), compaction/rollback
-  (#66/#67), ANN, real-data replay (#70), deployment: out of scope, recorded
-  as deferred in the delivery contract.
+- Compaction/rollback (#66/#67), ANN, real-data replay (#70), deployment:
+  out of scope, recorded as deferred in the delivery contract.
+- The blue-green publish itself is delivered (#65): `publish_switch` is the
+  in-memory pointer swap; the durable manifest, the staging-side delta and
+  the publish lock are documented in `docs/publish-atomic.md`.
+- **Checkpoint layout** (#65): the checkpoint is per-generation
+  (`delta/<generation_id>/delta.sqlite3`), so the active and the staging
+  generation each own one (spec clause); `open_delta_checkpoint` accepts
+  `change_seq == -1` for an empty-window generation.
+- **Fact-store read connections** (#65): the macOS WAL `-shm` handshake can
+  transiently return SQLITE_BUSY when threads open fresh read-only
+  connections at the same instant (the worker + query-gate pattern, which
+  the publish's extra readers widen); fact-store reads use a short busy
+  wait (2 s) instead of fail-fast. The fail-fast `timeout=0` stays only on
+  the delta-checkpoint verification connections, where the #63 rationale
+  still applies.
 
 ## Test-time note
 

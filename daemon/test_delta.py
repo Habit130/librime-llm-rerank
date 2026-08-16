@@ -263,7 +263,10 @@ class DeltaEnv:
 
     @property
     def delta_path(self):
-        return os.path.join(self.derived_root, DELTA_FILENAME)
+        # #65: the checkpoint is per-generation
+        # (delta/<generation_id>/delta.sqlite3).
+        return os.path.join(self.derived_root, "delta", self.generation_id,
+                            DELTA_FILENAME)
 
     def machine(self, provider=None, **kwargs):
         defaults = {"poll_interval": 0.01, "catch_up_deadline": 5.0}
@@ -1030,7 +1033,7 @@ class RecoveryTest(EnvTest):
                            selection="世界", preceding_text="我之前去")
         snapshot = machine.ensure_caught_up()
         self.assertIn("n2", snapshot.event_ids())
-        conn = sqlite3.connect(self.env.delta_path)
+        conn = sqlite3.connect(machine.delta_checkpoint_path())
         try:
             meta = dict(conn.execute(
                 "SELECT key, value FROM meta").fetchall())
@@ -1453,6 +1456,7 @@ class EmptyAndEdgeTest(EnvTest):
     def test_delta_checkpoint_open_rejects_garbage(self):
         self.make_env()
         path = self.env.delta_path
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         with open(path, "wb") as handle:
             handle.write(b"not a sqlite database at all")
         with self.assertRaises(DeltaRejected):
