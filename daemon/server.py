@@ -33,6 +33,7 @@ import time
 from control import run_control_server, validate_control_path
 from coordinator import MaintenanceCoordinator
 from delta import build_delta_machine_from_config
+from staging import build_staging_machine_from_config
 from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
                       build_evidence_service_from_config)
 
@@ -984,18 +985,27 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
     if evidence_config is not None:
-        # #63 wiring: when the config declares a derived root and an active
-        # generation, the delta state machine becomes both the evidence
-        # snapshot source and the coordinator's derived-state recovery.
-        machine = build_delta_machine_from_config(facts_root, evidence_config)
+        # #63/#64 wiring: when the config declares a derived root and an
+        # active generation, the delta state machine becomes both the
+        # evidence snapshot source and the coordinator's derived-state
+        # recovery, and the staging machine (if the config declares a
+        # desired representation different from the active one) resumably
+        # builds the target generation in the background.  Both builders
+        # share the single-builder lease (spec "一次只运行一个 builder").
+        builder_lock = threading.Lock()
+        machine = build_delta_machine_from_config(
+            facts_root, evidence_config, builder_lock=builder_lock)
         coordinator = MaintenanceCoordinator(
             facts_root, recovery=machine, auto_open_fact_handle=True)
         if machine is not None:
             coordinator.register_builder(machine)
+        staging_machine = build_staging_machine_from_config(
+            facts_root, evidence_config, builder_lock=builder_lock)
         state.evidence_service = build_evidence_service_from_config(
             facts_root, evidence_config, machine=machine)
     else:
         machine = None
+        staging_machine = None
         coordinator = (
             MaintenanceCoordinator(facts_root, auto_open_fact_handle=True)
             if facts_root else None
@@ -1083,6 +1093,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             coordinator.close()
         if machine is not None:
             machine.close()
+        if staging_machine is not None:
+            staging_machine.close()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 

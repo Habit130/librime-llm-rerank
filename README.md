@@ -435,6 +435,54 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 daemon/.venv/bin/python daemon/integration_delta.py --events 24
 ```
 
+## Resumable staging generation build
+
+`daemon/staging.py` builds the *desired* generation in the background while
+the current healthy generation keeps serving and absorbing delta
+(Habit130/squirrel#64), resumably and without ever disturbing the active
+path:
+
+- The staging fixes the target epoch, H0, all fingerprints and the builder
+  version in an atomically advanced `progress.json` (`status`:
+  `running | blocked | ready | discarded`), and each build chunk records
+  its real row range (== event count), byte count and sha256.
+- One chunk is embedded per worker cycle, so every intermediate state is a
+  crashable resting state: a daemon restart (or any transient interruption)
+  resumes from the last **verified** chunk — completed chunks are
+  re-verified against the vectors file and never re-embedded. Resumption
+  is gated on epoch, H0, fingerprints and builder version all matching the
+  record; any mismatch (or a changed desired representation / store epoch /
+  builder version) discards the staging in full — no continuation, no
+  partial reuse.
+- Deterministic parse/representation/model faults enter `blocked` naming
+  the offending event(s); the worker parks (no auto-retry, and queries
+  never wake the builder), `retry()` resumes from the last verified chunk.
+- When the chunks are done, finalize writes metadata + the fixed
+  exact-oracle probes + the #62 manifest and runs the full reopen
+  self-verification before marking the staging `ready` — which is then
+  re-verified once per daemon start. Nothing is published here (the
+  publish lock and blue-green switch are #65).
+- The config distinguishes **desired** from **active**
+  (`desired_representation_id`, defaulting to the active one = idle); the
+  desired configuration never reinterprets the active generation. A shared
+  builder lock serializes this machine's chunk embeds against the delta
+  machine's generation rebuilds (spec: 一次只运行一个 builder).
+- The staged container is byte-identical to a one-shot `build_generation`
+  of the same target (both share the same build core), pinned by tests and
+  the real-model integration.
+
+Design decisions are recorded in `docs/staging-resumable-build.md`.
+
+Evidence commands:
+
+```sh
+# model-free gate (no MLX/model)
+python3 -m unittest discover -s daemon -p 'test_*.py'
+# real-model: chunked build + byte-identity, crash/resume, epoch and
+# desired change discard, deterministic block, active serving
+daemon/.venv/bin/python daemon/integration_staging.py --events 24
+```
+
 ## Frozen baseline policy identity
 
 The shadow baseline (Habit130/squirrel#75) pins a composed
