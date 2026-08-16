@@ -239,6 +239,60 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 including the fixed counterexample for the top-K order and the retraction
 timing scenarios.
 
+## Versioned hidden-state 上文 representations
+
+`daemon/representations.py` (pure, model-free) and `daemon/hidden_state.py`
+(MLX-bound, lazy imports) generate the pre-declared first-round 上文
+representations for Habit130/squirrel#60: the seam that turns the raw last-64
+chars of committed text into versioned, recomputable, comparably-scaled
+vectors without a second resident model (ADR-0001).
+
+The first-round candidate set is exactly what the manual prototype
+(`feat/prototype-semantic-neighbors`, Habit130/squirrel#33) kept:
+
+- `exact_l14_last`, `exact_l21_last`, `exact_l28_last` — one deterministic
+  `encode(last 64 chars)` forward, last-token hidden state at layers 14/21/28;
+- `split_l28_last` — the pre-declared split-reuse representation: the scoring
+  seam's tokenized prefix + tail (prefix KV-cached), last token at layer 28.
+
+Every vector applies Qwen's final RMSNorm to the snapshot (so intermediate
+layers live on the same scale as the last), is cast to FP32 and L2-normalized,
+so distance is cosine. EOS last-token, unnormalized dot, prefix-only
+(drop-last-4-chars) and candidate-conditioned pair representations were
+rejected by the manual prototype and are deliberately not first-round
+candidates.
+
+Each generated vector is bound to a deterministic `representation_id` that
+covers the model/tokenizer content digests, the mlx-lm implementation version,
+layer, pooling, truncation, seam, normalization, dimension, dtype and metric.
+Any component change yields a different id, so a vector computed under one id
+is incompatible with vectors under another (spec #43's "任何表示变化都会触发
+正确重建"). Recomputing the same raw UTF-8 上文 under the same identity is
+bit-identical across loads and processes; the `mlx_lm` forward graph is
+version-constrained to Qwen3.
+
+Fail-closed boundary rules: an empty window, a window that tokenizes to no
+tokens, a model-forward fault and a non-finite or zero-norm vector are all
+explicit `RepresentationError` faults — a dirty vector can never leave the
+generation path. An empty 上文 is a fault, not a phantom EOS-anchored vector,
+because a representation of void text could later contribute bogus evidence.
+
+Evidence commands (daemon venv required for the integration/latency run):
+
+```sh
+# model-free gate (no MLX/model)
+python3 -m unittest discover -s daemon -p 'test_*.py'
+# real-model determinism, no-second-model, seam/boundary, segmented latency
+daemon/.venv/bin/python daemon/integration_hidden_state.py --rounds 32:32
+```
+
+The integration script writes a JSON evidence artifact (environment snapshot,
+timestamps, representation ids and vector hashes, segmented latency) to
+`--output` or a fresh temp dir; it reads and writes only temp/synthetic data,
+never the private fact root or `~/Library/Rime`. Winner selection among these
+candidates is intentionally deferred: no representation is declared a winner
+without real selection-event evidence (Habit130/squirrel#77 / #80).
+
 ## Frozen baseline policy identity
 
 The shadow baseline (Habit130/squirrel#75) pins a composed
