@@ -286,6 +286,11 @@ class StoredEvent:
     category: str
     final_selection_text: str
     hlc: Tuple[int, int]
+    # The raw recent-64-char 上文 snapshot the event was recorded with (spec
+    # #43: events save the raw window, never embeddings).  The evidence path
+    # does not consume it; the #62 generation builder reads it to recompute
+    # the event's representation vector from facts.
+    preceding_text: str = ""
 
     @property
     def key(self):
@@ -366,7 +371,8 @@ class FactReader:
             rows = self._conn.execute(
                 "SELECT e.event_id, e.commit_id, e.schema_id,"
                 " e.canonical_segment_input, e.category,"
-                " e.final_selection_text, e.hlc_physical_ms, e.hlc_logical"
+                " e.final_selection_text, e.preceding_text,"
+                " e.hlc_physical_ms, e.hlc_logical"
                 " FROM selection_events e"
                 " WHERE (e.hlc_physical_ms < ?1 OR (e.hlc_physical_ms = ?1"
                 "        AND e.hlc_logical <= ?2))"
@@ -388,7 +394,8 @@ class FactReader:
                 canonical_segment_input=row["canonical_segment_input"],
                 category=row["category"],
                 final_selection_text=row["final_selection_text"],
-                hlc=(row["hlc_physical_ms"], row["hlc_logical"])))
+                hlc=(row["hlc_physical_ms"], row["hlc_logical"]),
+                preceding_text=row["preceding_text"]))
         return events
 
 
