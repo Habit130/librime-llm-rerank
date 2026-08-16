@@ -32,6 +32,7 @@ import time
 
 from control import run_control_server, validate_control_path
 from coordinator import MaintenanceCoordinator
+from delta import build_delta_machine_from_config
 from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
                       build_evidence_service_from_config)
 
@@ -720,9 +721,14 @@ def handle_evidence_request(state, data, coordinator=None,
         result = service.serve(req)
     except EvidenceError as error:
         code = error.code if error.code in _EVIDENCE_FAULT_CODES else "oracle_fault"
+        # A catch-up failure is transient: the worker is still absorbing the
+        # facts, so a retry after a moment is the honest remediation.  All
+        # other evidence faults keep the pass-through semantics of #61.
+        retryable = code == "not_caught_up"
         return finish(protocol_error(
             code,
             phase="evidence",
+            retryable=retryable,
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
         ))
@@ -978,12 +984,22 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
     if evidence_config is not None:
+        # #63 wiring: when the config declares a derived root and an active
+        # generation, the delta state machine becomes both the evidence
+        # snapshot source and the coordinator's derived-state recovery.
+        machine = build_delta_machine_from_config(facts_root, evidence_config)
+        coordinator = MaintenanceCoordinator(
+            facts_root, recovery=machine, auto_open_fact_handle=True)
+        if machine is not None:
+            coordinator.register_builder(machine)
         state.evidence_service = build_evidence_service_from_config(
-            facts_root, evidence_config)
-    coordinator = (
-        MaintenanceCoordinator(facts_root, auto_open_fact_handle=True)
-        if facts_root else None
-    )
+            facts_root, evidence_config, machine=machine)
+    else:
+        machine = None
+        coordinator = (
+            MaintenanceCoordinator(facts_root, auto_open_fact_handle=True)
+            if facts_root else None
+        )
     if control_socket and coordinator is None:
         raise ValueError("--control-socket requires --facts-root")
     if control_socket and os.path.abspath(control_socket) == os.path.abspath(sock_path):
@@ -1065,6 +1081,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             control_thread.join(2.0)
         if coordinator is not None:
             coordinator.close()
+        if machine is not None:
+            machine.close()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
