@@ -334,6 +334,27 @@ class FactReader:
             raise OracleError("fact store meta clock is malformed")
         return (physical, logical)
 
+    def read_fact_identity(self):
+        """Durable identity + max change HLC from the meta table.
+
+        Mirrors FactHandle.read_identity: store_epoch and the store's current
+        clock (the max change HLC).  A missing or malformed identity is a
+        true fault, never a zero-evidence result.
+        """
+        try:
+            rows = dict(self._conn.execute("SELECT key, value FROM meta"))
+        except sqlite3.Error as error:
+            raise OracleError("fact store meta read failed: %s" % error)
+        store_epoch = rows.get("store_epoch")
+        try:
+            physical = int(rows.get("hlc_physical_ms", "-1"))
+            logical = int(rows.get("hlc_logical", "-1"))
+        except (TypeError, ValueError) as error:
+            raise OracleError("fact store meta clock is malformed") from error
+        if not store_epoch or physical < 0 or logical < 0:
+            raise OracleError("fact store identity is incomplete")
+        return (store_epoch, physical, logical)
+
     def read_active_events(self, as_of):
         """All events active at the query point, in HLC order.
 

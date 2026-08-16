@@ -135,6 +135,13 @@ class FakeDaemon {
   }
 
   void ServeOne() {
+    // Poll the listening socket with a bounded idle window: after the client
+    // gives up on a failed exchange it opens no further connection, and a
+    // blocking accept would hang the fixture thread forever.
+    struct pollfd listen_poll{fd_, POLLIN, 0};
+    const int polled = poll(&listen_poll, 1, 100);
+    if (polled <= 0 || (listen_poll.revents & POLLIN) == 0)
+      return;
     const int connection = accept(fd_, nullptr, nullptr);
     if (connection < 0)
       return;
@@ -249,7 +256,7 @@ vector<string> CollectProtocolTexts(an<Translation> translation) {
 
 vector<string> FilterWithDaemon(const string& path, int deadline_ms = 200) {
   auto llm = New<LlmScorer>(path, 1.0, false, deadline_ms);
-  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), nullptr, llm);
+  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), llm);
   Ticket ticket;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
@@ -451,7 +458,7 @@ TEST(LlmScorerProtocolTest, DeferredTranslationsSendTheirOwnContextSnapshot) {
       },
       2);
   auto llm = New<LlmScorer>(daemon.path(), 1.0);
-  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), nullptr, llm);
+  auto scorer = New<CompositeScorer>(New<WeightScorer>(1.0, 1.0), llm);
   Ticket ticket;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
@@ -492,7 +499,6 @@ TEST(LlmScorerProtocolTest, DuplicateCandidateScoresRemainPositional) {
   ASSERT_TRUE(scorer.ScoreBatch({"rerank-plan-v2:duplicate",
                                  "mean-token-lm-v1",
                                  "context",
-                                 "",
                                  {"同", "同"}},
                                 candidates, &scores));
   ASSERT_EQ(2u, scores.size());
@@ -521,14 +527,14 @@ TEST(LlmScorerProtocolTest, ConcurrentBatchesKeepTheirOwnResponses) {
     while (!start.load())
       std::this_thread::yield();
     scored_a = scorer.ScoreBatch(
-        {"rerank-plan-v2:a", "mean-token-lm-v1", "context-a", "", {"同"}},
+        {"rerank-plan-v2:a", "mean-token-lm-v1", "context-a", {"同"}},
         candidates, &scores_a);
   });
   std::thread thread_b([&] {
     while (!start.load())
       std::this_thread::yield();
     scored_b = scorer.ScoreBatch(
-        {"rerank-plan-v2:b", "mean-token-lm-v1", "context-b", "", {"同"}},
+        {"rerank-plan-v2:b", "mean-token-lm-v1", "context-b", {"同"}},
         candidates, &scores_b);
   });
   start = true;
@@ -861,4 +867,291 @@ TEST(LlmScorerProtocolTest, StaleResponseFromPriorRequestPassesThroughWindow) {
   EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
             FilterWithDaemon(daemon.path()));
   EXPECT_EQ(kProtocolOriginalOrder, FilterWithDaemon(daemon.path()));
+}
+
+// --- Squirrel#61: evidence request/response protocol ---
+
+// The evidence scorer hits the same unix socket with a per-group evidence
+// request; the daemon responds with candidate-level s_c. The plugin applies
+// gamma * s_c only on a complete, identity-bound success; any fault passes
+// the whole window through in original order.
+
+string EvidenceResponse(const string& request,
+                        const string& evidence_json,
+                        const std::optional<string>& request_identity =
+                            std::nullopt,
+                        const std::optional<string>& plan_identity =
+                            std::nullopt,
+                        const std::optional<string>& config_identity =
+                            std::nullopt,
+                        const std::optional<string>& high_water =
+                            std::nullopt,
+                        const std::optional<bool>& zero_evidence =
+                            std::nullopt) {
+  const string request_id =
+      request_identity.value_or(ExtractStringField(request, "request_id"));
+  const string plan_id =
+      plan_identity.value_or(ExtractStringField(request, "plan_identity"));
+  const string config_id =
+      config_identity.value_or(ExtractStringField(request, "config_identity"));
+  const string water = high_water.value_or(
+      request.find("\"fact_high_water\":null") != string::npos ? "null" : "{}");
+  const string zero = zero_evidence.has_value()
+                          ? (zero_evidence.value() ? "true" : "false")
+                          : "false";
+  return "{\"version\":2,\"kind\":\"evidence\",\"request_id\":\"" +
+         request_id + "\",\"plan_identity\":\"" + plan_id +
+         "\",\"config_identity\":\"" + config_id +
+         "\",\"fact_high_water\":" + water + ",\"status\":\"ok\"," +
+         "\"zero_evidence\":" + zero + ",\"evidence\":" + evidence_json +
+         ",\"query_point\":{\"hlc_physical_ms\":1,\"hlc_logical\":0}}\n";
+}
+
+string EvidenceErrorResponse(const string& request,
+                             const string& code) {
+  return "{\"version\":2,\"kind\":\"evidence\",\"request_id\":\"" +
+         ExtractStringField(request, "request_id") + "\",\"plan_identity\":\"" +
+         ExtractStringField(request, "plan_identity") + "\",\"error\":{\"code\":\"" +
+         code + "\",\"message\":\"evidence failed\",\"occurred_at\":\"2026-08-03T00:00:00Z\",\"retryable\":false,\"phase\":\"evidence\",\"remediation\":\"fix\",\"cause\":null}}\n";
+}
+
+// Constructs a filter whose evidence scorer talks to `socket_path`; the LLM
+// scorer is absent (alpha=0) so only weight + evidence decide the order.
+LlmRerankFilter FilterWithEvidenceDaemon(const string& socket_path,
+                                         double gamma = 4.0) {
+  auto evidence = New<EvidenceScorer>(
+      socket_path, "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4",
+      200);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(New<WeightScorer>(1.0, 1.0));
+  filter.set_evidence_scorer(evidence);
+  filter.set_evidence_active(true);
+  filter.set_evidence_config_identity(
+      "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4");
+  filter.set_facts_root(path("/tmp/nonexistent-evidence-facts-root"));
+  filter.set_gamma(gamma);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+  return filter;
+}
+
+// The two complete word groups in the protocol fixture request evidence by
+// their canonical input: group (0,2) -> "ab", group (2,4) -> "cd".
+vector<string> EvidenceWindow(ResponseBuilder response_builder) {
+  FakeDaemon daemon(std::move(response_builder), 2);
+  auto filter = FilterWithEvidenceDaemon(daemon.path());
+  return CollectProtocolTexts(filter.Apply(
+      New<ProtocolTranslation>(ProtocolCandidates()), nullptr));
+}
+
+TEST(EvidenceProtocolTest, RequestCarriesFullContractFields) {
+  // AC61-1: schema, choice problem (schema+category+canonical input), recent
+  // context, current candidate group, config identity and fact watermark.
+  FakeDaemon daemon([&](const string& request) -> std::optional<string> {
+    EXPECT_NE(string::npos, request.find("\"kind\":\"evidence\""));
+    EXPECT_NE(string::npos, request.find("\"schema_id\":\"test\""));
+    EXPECT_NE(string::npos, request.find("\"category\":\"word\""));
+    EXPECT_NE(string::npos, request.find("\"canonical_segment_input\":\"ab\""));
+    EXPECT_NE(string::npos, request.find("\"preceding_text\":\"敏感测试上文\""));
+    EXPECT_NE(string::npos,
+              request.find("\"config_identity\":\"evidence-v1:repr=r:tau=0.5:"
+                           "kev=8:H=32:sat=1:gamma=4\""));
+    EXPECT_NE(string::npos, request.find("\"fact_high_water\":null"));
+    // The current candidate group is the request's candidate list.
+    EXPECT_NE(string::npos, request.find("\"candidates\":[\"甲\",\"乙\"]"));
+    return EvidenceResponse(request,
+                          "[{\"index\":0,\"s\":0.0},"
+                          "{\"index\":1,\"s\":0.0}]");
+  }, 1);
+  auto evidence = New<EvidenceScorer>(daemon.path(), "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4", 200);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(New<WeightScorer>(1.0, 1.0));
+  filter.set_evidence_scorer(evidence);
+  filter.set_evidence_active(true);
+  filter.set_evidence_config_identity(
+      "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4");
+  filter.set_facts_root(path("/tmp/nonexistent-evidence-facts-root"));
+  filter.set_gamma(4.0);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+  filter.set_preceding_text("敏感测试上文");
+  vector<an<Candidate>> cands{
+      MakeProtocolPhrase("table", 0, 2, "甲", 1.0),
+      MakeProtocolPhrase("table", 0, 2, "乙", 4.0),
+  };
+  CandidateList candidates;
+  auto filtered = filter.Apply(New<ProtocolTranslation>(cands), &candidates);
+  // Zero evidence -> base order: 乙 (weight 4) before 甲 (weight 1).
+  EXPECT_EQ((vector<string>{"乙", "甲"}), CollectProtocolTexts(filtered));
+}
+
+TEST(EvidenceProtocolTest, HitChangesWithinGroupOrder) {
+  // SCN-61-1: 乙 (weight 4) beats 甲 (weight 1) on base; evidence s=0.5 for
+  // 甲 with gamma=4 gives 甲 = 1 + 2 = 3 < 乙... use gamma 10 so 甲 wins.
+  auto filter = [](const string& socket_path) {
+    auto evidence = New<EvidenceScorer>(
+        socket_path, "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=10",
+        200);
+    Ticket ticket;
+    ticket.name_space = "llm_rerank";
+    LlmRerankFilter f(ticket);
+    f.set_scorer(New<WeightScorer>(1.0, 1.0));
+    f.set_evidence_scorer(evidence);
+    f.set_evidence_active(true);
+    f.set_evidence_config_identity(
+        "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=10");
+    f.set_facts_root(path("/tmp/nonexistent-evidence-facts-root"));
+    f.set_gamma(10.0);
+    f.set_schema_id("test");
+    f.set_input("abcdef");
+    return f;
+  };
+  vector<string> emitted;
+  {
+    FakeDaemon daemon([](const string& request) -> std::optional<string> {
+      if (request.find("\"canonical_segment_input\":\"ab\"") != string::npos)
+        return EvidenceResponse(request,
+                                "[{\"index\":0,\"s\":0.5},"
+                                "{\"index\":1,\"s\":0.0}]");
+      return EvidenceResponse(request,
+                              "[{\"index\":0,\"s\":0.0},"
+                              "{\"index\":1,\"s\":0.0}]");
+    }, 2);
+    auto f = filter(daemon.path());
+    CandidateList candidates;
+    emitted = CollectProtocolTexts(f.Apply(
+        New<ProtocolTranslation>(ProtocolCandidates()), &candidates));
+  }
+  // 甲 = 1 + 10*0.5 = 6 > 乙 = 4 in group (0,2); (2,4) keeps 丁(3) > 丙(1).
+  EXPECT_EQ((vector<string>{"甲", "，", "乙", "丁", "丙", "整句"}), emitted);
+}
+
+TEST(EvidenceProtocolTest, ZeroEvidenceKeepsBaseOrder) {
+  // SCN-61-2: success with zero_evidence=true and all s=0 -> base order.
+  EXPECT_EQ((vector<string>{"乙", "，", "甲", "丁", "丙", "整句"}),
+            EvidenceWindow([](const string& request) -> std::optional<string> {
+              return EvidenceResponse(
+                  request,
+                  "[{\"index\":0,\"s\":0.0},"
+                  "{\"index\":1,\"s\":0.0}]",
+                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                  true);
+            }));
+}
+
+void ExpectEvidenceFailure(ResponseBuilder response_builder) {
+  EXPECT_EQ(kProtocolOriginalOrder, EvidenceWindow(std::move(response_builder)));
+}
+
+TEST(EvidenceProtocolTest, TimeoutPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string&) -> std::optional<string> {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    return std::nullopt;
+  });
+}
+
+TEST(EvidenceProtocolTest, ConnectionFailurePassesThroughWholeWindow) {
+  EXPECT_EQ(kProtocolOriginalOrder,
+            EvidenceWindow([](const string&) -> std::optional<string> {
+              return std::nullopt;
+            }));
+}
+
+TEST(EvidenceProtocolTest, InvalidJsonPassesThroughWholeWindow) {
+  ExpectEvidenceFailure(
+      [](const string&) -> std::optional<string> { return "not-json\n"; });
+}
+
+TEST(EvidenceProtocolTest, MissingFieldPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return "{\"version\":2,\"kind\":\"evidence\",\"request_id\":\"" +
+           ExtractStringField(request, "request_id") + "\"}\n";
+  });
+}
+
+TEST(EvidenceProtocolTest, WrongVersionPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    string response = EvidenceResponse(request, "[0.0,0.0]");
+    response.replace(response.find("\"version\":2"), 11, "\"version\":3");
+    return response;
+  });
+}
+
+TEST(EvidenceProtocolTest, RequestIdentityMismatchPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceResponse(request, "[0.0,0.0]", "wrong-request");
+  });
+}
+
+TEST(EvidenceProtocolTest, PlanIdentityMismatchPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceResponse(request, "[0.0,0.0]", std::nullopt, "wrong-plan");
+  });
+}
+
+TEST(EvidenceProtocolTest, ConfigIdentityMismatchPassesThroughWholeWindow) {
+  // SCN-61-4: identity mismatch is a true fault, never silent evidence.
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceResponse(request, "[0.0,0.0]", std::nullopt, std::nullopt,
+                            "evidence-v1:repr=other:tau=0.5:kev=8:H=32:sat=1:gamma=4");
+  });
+}
+
+TEST(EvidenceProtocolTest, FactHighWaterEchoMismatchPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceResponse(request, "[0.0,0.0]", std::nullopt, std::nullopt,
+                            std::nullopt,
+                            "{\"store_epoch\":\"other\","
+                            "\"hlc_physical_ms\":1,\"hlc_logical\":0}");
+  });
+}
+
+TEST(EvidenceProtocolTest, CountMismatchPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceResponse(request, "[{\"index\":0,\"s\":0.0}]");
+  });
+}
+
+TEST(EvidenceProtocolTest, NonFiniteOrOutOfRangeEvidencePassesThroughWindow) {
+  for (const string& bad :
+       {"[{\"index\":0,\"s\":0.0},{\"index\":1,\"s\":NaN}]",
+        "[{\"index\":0,\"s\":0.0},{\"index\":1,\"s\":1.5}]",
+        "[{\"index\":0,\"s\":-0.5},{\"index\":1,\"s\":0.0}]",
+        "[{\"index\":0,\"s\":\"x\"},{\"index\":1,\"s\":0.0}]",
+        "[{\"index\":1,\"s\":0.0},{\"index\":0,\"s\":0.0}]"}) {
+    SCOPED_TRACE(bad);
+    ExpectEvidenceFailure([bad](const string& request) -> std::optional<string> {
+      return EvidenceResponse(request, bad);
+    });
+  }
+}
+
+TEST(EvidenceProtocolTest, DaemonErrorPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceErrorResponse(request, "oracle_fault");
+  });
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceErrorResponse(request, "not_caught_up");
+  });
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceErrorResponse(request, "config_identity_mismatch");
+  });
+}
+
+TEST(EvidenceProtocolTest, TrailingPayloadPassesThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    return EvidenceResponse(request, "[0.0,0.0]") + "garbage";
+  });
+}
+
+TEST(EvidenceProtocolTest, DuplicateFieldsPassThroughWholeWindow) {
+  ExpectEvidenceFailure([](const string& request) -> std::optional<string> {
+    string response = EvidenceResponse(request, "[0.0,0.0]");
+    response.replace(response.size() - 2, 1, ",\"extra\":true}");
+    return response;
+  });
 }

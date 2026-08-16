@@ -9,7 +9,7 @@
 
 #include <memory>
 
-#include "context_memory.h"
+#include "evidence_scorer.h"
 #include "llm_rerank_config.h"
 #include "recorder_session.h"
 #include "rerank_plan.h"
@@ -28,7 +28,6 @@ struct ScoringRequest {
   string plan_identity;
   string baseline_policy_id;
   string preceding_text;
-  string previous_word;
   vector<string> candidate_texts;
 };
 
@@ -63,40 +62,12 @@ class WeightScorer : public Scorer {
   bool verbose_;
 };
 
-// Produces the bounded context evidence s(prev_word, candidate) separately from
-// the frozen base score. The replay policy applies gamma only when it derives
-// the final comparison score.
-class ContextScorer : public Scorer {
- public:
-  ContextScorer(ContextCounter* counter,
-                double saturate_k,
-                bool verbose = false)
-      : counter_(counter), saturate_k_(saturate_k), verbose_(verbose) {}
-
-  bool ScoreBatch(const ScoringRequest& request,
-                  const vector<an<Candidate>>& candidates,
-                  vector<ScoreComponents>* scores) override;
-
-  // Bounded evidence strength in [0, 1). Zero on a miss (total_count <= 0); a
-  // single observation reaches only 1 / (1 + saturate_k), never the bound.
-  static double EvidenceStrength(int pair_count,
-                                 int total_count,
-                                 double saturate_k);
-
- private:
-  ContextCounter* counter_;
-  double saturate_k_;
-  bool verbose_;
-};
-
-// Sums every enabled term into a complete score while keeping context evidence
+// Sums every enabled term into a complete score while keeping evidence
 // separate. A failure from any enabled term rejects the whole score.
 class CompositeScorer : public Scorer {
  public:
-  CompositeScorer(an<Scorer> weight,
-                  an<Scorer> context,
-                  an<Scorer> llm = nullptr)
-      : weight_(weight), context_(context), llm_(llm) {}
+  CompositeScorer(an<Scorer> weight, an<Scorer> llm = nullptr)
+      : weight_(weight), llm_(llm) {}
 
   bool ScoreBatch(const ScoringRequest& request,
                   const vector<an<Candidate>>& candidates,
@@ -104,7 +75,6 @@ class CompositeScorer : public Scorer {
 
  private:
   an<Scorer> weight_;
-  an<Scorer> context_;
   an<Scorer> llm_;
 };
 
@@ -119,6 +89,17 @@ class LlmRerankFilter : public Filter {
                         CandidateList* candidates) override;
 
   void set_scorer(an<Scorer> scorer) { scorer_ = scorer; }
+  void set_evidence_scorer(an<EvidenceScorer> scorer) {
+    evidence_scorer_ = scorer;
+  }
+  void set_evidence_active(bool active) { evidence_active_ = active; }
+  void set_evidence_config_identity(const string& identity) {
+    evidence_config_identity_ = identity;
+  }
+  // Test seam: where the fact high-water is read from. Production keeps the
+  // spec-fixed HOME-derived root; tests point it at a sandboxed temp root so
+  // a unit fixture never reads real private history.
+  void set_facts_root(const path& root) { facts_root_ = root; }
   void set_window(int window) { window_ = window; }
   void set_gamma(double gamma) { gamma_ = gamma; }
   void set_schema_id(const string& schema_id) { schema_id_ = schema_id; }
@@ -155,13 +136,22 @@ class LlmRerankFilter : public Filter {
   // normalization semantics (mean-token since #46). Overridable per machine
   // via the schema so deployments can pin the strategy explicitly.
   string baseline_policy_id_ = "mean-token-lm-v1";
+  // Retrieval-evidence parameters (#61): the daemon must be configured with
+  // the identical evidence config identity, otherwise evidence requests fail
+  // closed and the whole window passes through.
+  string representation_id_;
+  double tau_ = 0.0;
+  int k_evidence_ = 8;
+  double half_life_ = std::numeric_limits<double>::infinity();
+  string evidence_config_identity_;
+  bool evidence_active_ = false;
   string schema_id_;
   string input_;
   string socket_path_;
+  path facts_root_;
   an<Scorer> scorer_;
-  an<ContextScorer> context_scorer_;
   an<LlmScorer> llm_scorer_;
-  the<ContextMemory> memory_;
+  an<EvidenceScorer> evidence_scorer_;
   connection commit_connection_;
   connection commit_text_connection_;
   std::shared_ptr<RecorderSession> recorder_session_;

@@ -87,7 +87,7 @@ TEST(RerankPlanTest, SameNormalizedContentsHaveStableIdentity) {
   EXPECT_EQ(2, kRerankPlanVersion);
   ASSERT_TRUE(first.identity.has_value());
   EXPECT_EQ(first.identity, second.identity);
-  EXPECT_EQ("rerank-plan-v2:sha1:58c995640c47bf2b0059f9fbfee8c00f40ee2c5f",
+  EXPECT_EQ("rerank-plan-v2:sha1:b46b00dbc7066f0ed0398c68623b55f32adeeff6",
             *first.identity);
   ASSERT_EQ(2u, first.groups->size());
   EXPECT_EQ((*first.groups)[0].identity, (*second.groups)[0].identity);

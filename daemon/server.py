@@ -32,6 +32,8 @@ import time
 
 from control import run_control_server, validate_control_path
 from coordinator import MaintenanceCoordinator
+from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
+                      build_evidence_service_from_config)
 
 SOCKET_PATH = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock"
@@ -54,6 +56,24 @@ REQUEST_FIELDS = {
     "baseline_policy_id",
     "context",
     "candidates",
+}
+
+# Evidence request kind (Squirrel#61, AC61-1): the plugin asks the daemon for
+# the canonical oracle's candidate-level retrieval evidence for one rerank
+# group.  The exact field set is part of the protocol; anything else is
+# invalid_request.
+EVIDENCE_FIELDS = {
+    "version",
+    "kind",
+    "request_id",
+    "plan_identity",
+    "schema_id",
+    "category",
+    "canonical_segment_input",
+    "preceding_text",
+    "candidates",
+    "config_identity",
+    "fact_high_water",
 }
 
 # Scoring strategies (see docs/token-attribution.md). The production strategy
@@ -504,6 +524,13 @@ def protocol_error(
         "policy_mismatch": "plan policy does not match the daemon scoring mode",
         "server_error": "scoring transport failed",
         "maintenance_in_progress": "scoring is temporarily quiesced for maintenance",
+        "evidence_unavailable": "evidence service is not configured",
+        "config_identity_mismatch": "declared evidence config identity does not match the daemon",
+        "fact_identity_mismatch": "fact store epoch does not match the request",
+        "not_caught_up": "daemon fact snapshot is behind the request watermark",
+        "fact_store_fault": "fact store is missing or unreadable",
+        "oracle_fault": "retrieval-evidence oracle failed",
+        "representation_fault": "representation generation failed",
     }
     response = {
         "version": PROTOCOL_VERSION,
@@ -595,6 +622,144 @@ def handle_health(state, request, coordinator=None):
     return response
 
 
+def handle_evidence_request(state, data, coordinator=None,
+                            completion_sink=None):
+    """Serve one retrieval-evidence request (Squirrel#61, AC61-1/AC61-2).
+
+    The evidence path is model-free: it reads the fact store read-only and
+    computes the canonical oracle's candidate-level evidence with the
+    configured injectable representation provider.  Success responses carry
+    ``status: "ok"`` with an explicit ``zero_evidence`` flag; every true
+    fault (store, watermark, identity, representation, oracle) is a bounded
+    error object that must make the plugin pass the whole window through.
+    """
+    try:
+        decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_object_fields)
+        req, parsed_end = decoder.raw_decode(data)
+        if parsed_end != len(data):
+            raise ValueError("trailing request payload")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return protocol_error("invalid_json")
+
+    if (
+        not isinstance(req, dict)
+        or set(req) != EVIDENCE_FIELDS
+        or type(req["version"]) is not int
+        or req["version"] != PROTOCOL_VERSION
+        or req.get("kind") != EVIDENCE_KIND
+        or not isinstance(req["request_id"], str)
+        or not req["request_id"]
+        or not isinstance(req["plan_identity"], str)
+        or not req["plan_identity"]
+        or not isinstance(req["schema_id"], str)
+        or not req["schema_id"]
+        or not isinstance(req["category"], str)
+        or not req["category"]
+        or not isinstance(req["canonical_segment_input"], str)
+        or not isinstance(req["preceding_text"], str)
+        # The request carries the recent-64-char 上文 window (ADR-0002 / the
+        # plugin's plan truncation); a longer context is out of contract and
+        # would silently change the query semantics.
+        or len(req["preceding_text"]) > 64
+        or not isinstance(req["candidates"], list)
+        or not req["candidates"]
+        or any(
+            not isinstance(candidate, str) or not candidate
+            for candidate in req["candidates"]
+        )
+        or not isinstance(req["config_identity"], str)
+        or not req["config_identity"]
+    ):
+        return protocol_error("invalid_request")
+
+    service = getattr(state, "evidence_service", None)
+    if service is None:
+        return protocol_error(
+            "evidence_unavailable",
+            phase="evidence",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+
+    # Config-identity binding: the daemon serves exactly the identity it was
+    # configured with; a request declaring anything else is a true fault
+    # (plugin passes through), never a silently different evidence algorithm.
+    if req["config_identity"] != service.config_identity():
+        return protocol_error(
+            "config_identity_mismatch",
+            phase="evidence",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+
+    lease = coordinator.begin_request() if coordinator is not None else None
+    if coordinator is not None and lease is None:
+        return protocol_error(
+            "maintenance_in_progress", phase="maintenance", retryable=True,
+            request_id=req["request_id"], plan_identity=req["plan_identity"])
+    if lease is not None and completion_sink is None:
+        lease.complete()
+        return protocol_error(
+            "server_error",
+            phase="transport",
+            retryable=True,
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        )
+
+    def finish(response):
+        if lease is not None:
+            try:
+                completion_sink(lease)
+            except Exception:
+                lease.complete()
+                raise
+        return response
+
+    try:
+        result = service.serve(req)
+    except EvidenceError as error:
+        code = error.code if error.code in _EVIDENCE_FAULT_CODES else "oracle_fault"
+        return finish(protocol_error(
+            code,
+            phase="evidence",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        ))
+    except Exception:  # noqa: BLE001 - any fault fails closed
+        return finish(protocol_error(
+            "oracle_fault",
+            phase="evidence",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        ))
+
+    return finish({
+        "version": PROTOCOL_VERSION,
+        "kind": EVIDENCE_KIND,
+        "request_id": req["request_id"],
+        "plan_identity": req["plan_identity"],
+        "config_identity": req["config_identity"],
+        "fact_high_water": req["fact_high_water"],
+        "status": "ok",
+        "zero_evidence": result["zero_evidence"],
+        "evidence": result["evidence"],
+        "query_point": result["query_point"],
+    })
+
+
+_EVIDENCE_FAULT_CODES = frozenset((
+    "evidence_unavailable",
+    "config_identity_mismatch",
+    "fact_identity_mismatch",
+    "not_caught_up",
+    "fact_store_fault",
+    "oracle_fault",
+    "representation_fault",
+    "invalid_request",
+))
+
+
 def handle_request(state, data, coordinator=None, completion_sink=None):
     try:
         decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_object_fields)
@@ -616,6 +781,13 @@ def handle_request(state, data, coordinator=None, completion_sink=None):
         ):
             return protocol_error("invalid_request")
         return handle_health(state, req, coordinator)
+
+    # Retrieval-evidence request (Squirrel#61, AC61-1): the plugin asks for
+    # the candidate-level oracle evidence of one rerank group.  Additive
+    # request kind like health; scoring requests never carry "kind".
+    if isinstance(req, dict) and req.get("kind") == EVIDENCE_KIND:
+        return handle_evidence_request(state, data, coordinator,
+                                       completion_sink)
 
     if (
         not isinstance(req, dict)
@@ -792,7 +964,7 @@ def serve_scoring_connection(state, conn, coordinator=None,
 def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
                cache_limit_mb=CACHE_LIMIT_MB,
                scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False,
-               control_socket=None, facts_root=None):
+               control_socket=None, facts_root=None, evidence_config=None):
     import mlx.core as mx
 
     if cache_limit_mb > 0:
@@ -805,6 +977,9 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
                   or FACTS_ROOT)
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
+    if evidence_config is not None:
+        state.evidence_service = build_evidence_service_from_config(
+            facts_root, evidence_config)
     coordinator = (
         MaintenanceCoordinator(facts_root, auto_open_fact_handle=True)
         if facts_root else None
@@ -985,6 +1160,12 @@ if __name__ == "__main__":
     parser.add_argument("--facts-root")
     parser.add_argument("--control-socket")
     parser.add_argument(
+        "--evidence-config",
+        help="JSON file configuring the retrieval-evidence service "
+        "(representation seam + oracle params + gamma); absent = evidence "
+        "requests fail with evidence_unavailable",
+    )
+    parser.add_argument(
         "--context-window",
         type=int,
         default=CONTEXT_WINDOW,
@@ -1017,8 +1198,13 @@ if __name__ == "__main__":
         ok = self_test(args.socket, args.model)
         sys.exit(0 if ok else 1)
     else:
+        evidence_config = None
+        if args.evidence_config:
+            import json as _json
+            with open(args.evidence_config, encoding="utf-8") as handle:
+                evidence_config = _json.load(handle)
         run_server(
             args.socket, args.model, args.context_window, args.cache_limit_mb,
             args.scoring, test_mode=True, control_socket=args.control_socket,
-            facts_root=args.facts_root
+            facts_root=args.facts_root, evidence_config=evidence_config
         )

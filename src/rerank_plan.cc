@@ -281,7 +281,11 @@ RerankScoringPolicy DefaultRerankScoringPolicy() {
   // The LM term stays disabled by default and can be enabled explicitly via
   // the schema; a future contextual fixture decides a positive default.
   policy.baseline_policy_id = "mean-token-lm-v1";
-  policy.retrieval_policy_id = "context-evidence-v1";
+  // The retrieval-evidence policy (Squirrel#61): the semantic oracle evidence
+  // term replaces the first-stage bigram term. When evidence is active the
+  // filter overrides this id with the full evidence config identity it was
+  // scored under, so the plan identity binds the exact evidence config.
+  policy.retrieval_policy_id = "exact-oracle-evidence-v1";
   policy.alpha = 0.0;
   policy.sys_coeff = 1.0;
   policy.usr_coeff = 1.0;

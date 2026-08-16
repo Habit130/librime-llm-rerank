@@ -23,7 +23,7 @@ class Config;
 //   silently (user story 26). When the legacy `enable` key also exists, v2
 //   wins and the deprecation flag is set.
 // - Only `enable`        -> source = legacy. Reranking follows the legacy
-//   value (first-stage visible behavior, including the bigram evidence),
+//   value (first-stage visible behavior: weight + LM terms),
 //   recording and semantic evidence default off.
 // - No keys at all       -> source = not_configured. Behavior keeps the
 //   phase-1 defaults (visible reranking active, no recording, no semantic

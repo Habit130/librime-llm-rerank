@@ -8,9 +8,11 @@
 // facts.sqlite3 and that text commits never depend on recording.
 //
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <dlfcn.h>
+#include <signal.h>
 
 #include <condition_variable>
 #include <cstdio>
@@ -19,6 +21,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -366,9 +369,13 @@ const char* kV2PrioritySchemaYaml =
     "  recording_enabled: true\n";
 
 // Evidence-application schemas on a dedicated dictionary with a small weight
-// gap (世界 99 / 时界 98) so one bigram observation can flip the order under
-// a strong gamma. Each schema owns its own bigram userdb
-// (<schema>.llm_rerank), so no cross-test contamination is possible.
+// gap (世界 99 / 时界 98) so one qualified history event can flip the order
+// under a strong gamma (Squirrel#61). The evidence path is per-group over the
+// daemon protocol; the daemon is spawned per test with an injected
+// deterministic representation fixture and reads this test's temp facts
+// root read-only.
+const char* kEvSocketPath = "/tmp/llm_rerank_evidence_e2e.sock";
+const char* kEvRepresentationId = "e2e-fixture-repr";
 const char* kEvOnSchemaYaml =
     "schema:\n"
     "  schema_id: e2e_evidence_on\n"
@@ -407,7 +414,12 @@ const char* kEvOnSchemaYaml =
     "  recording_enabled: true\n"
     "  evidence_enabled: true\n"
     "  gamma: 4.0\n"
-    "  saturate_k: 1.0\n";
+    "  saturate_k: 1.0\n"
+    "  representation_id: e2e-fixture-repr\n"
+    "  tau: 0.5\n"
+    "  k_evidence: 8\n"
+    "  half_life: 32.0\n"
+    "  socket_path: /tmp/llm_rerank_evidence_e2e.sock\n";
 
 const char* kEvOffSchemaYaml =
     "schema:\n"
@@ -2211,14 +2223,14 @@ TEST_F(RecorderE2ETest, SwitchConfigIsSnapshottedPerInstance) {
   sqlite3_close(db);
 }
 
-TEST_F(RecorderE2ETest, EvidenceOffIgnoresBigramHistory) {
-  // Evidence application off: the personalized evidence term is zero, so the
-  // bigram history is neither fed nor applied; recording continues (the
-  // explicit selection still lands as a fact).
+TEST_F(RecorderE2ETest, EvidenceOffIgnoresSemanticHistory) {
+  // Evidence application off: the semantic evidence term is zero, so no
+  // evidence request is ever sent and the base strategy decides; recording
+  // continues (the explicit selection still lands as a fact).
   RimeSessionId session = NewSession(kEvOffSchema);
   ASSERT_NE(0, session);
 
-  // 我 -> commit (unique candidate: no event, bigram never fed).
+  // 我 -> commit (unique candidate: no event).
   TypeString(session, "wo");
   ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
   EXPECT_EQ("我", CommitText(session));
@@ -2226,13 +2238,11 @@ TEST_F(RecorderE2ETest, EvidenceOffIgnoresBigramHistory) {
   TypeString(session, "shijie");
   ASSERT_TRUE(g_rime->process_key(session, '2', 0));
   EXPECT_EQ("时界", CommitText(session));
-  // 我 again, so the immediately preceding word before the next shijie is 我
-  // (the bigram key is the last committed word).
+  // 我 again.
   TypeString(session, "wo");
   ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
   EXPECT_EQ("我", CommitText(session));
-  // No bigram was ever fed, so the shijie menu keeps the dictionary order:
-  // 世界 (99) stays first and Space confirms it.
+  // Evidence is off: no promotion; 世界 (99) stays first and Space confirms it.
   TypeString(session, "shijie");
   ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
   EXPECT_EQ("世界", CommitText(session));
@@ -2253,44 +2263,196 @@ TEST_F(RecorderE2ETest, EvidenceOffIgnoresBigramHistory) {
   sqlite3_close(db);
 }
 
-TEST_F(RecorderE2ETest, EvidenceOnAppliesBigramHistory) {
-  // Evidence application on: the observed (我, 时界) bigram promotes 时界
-  // above 世界 on the next identical problem, and Space confirms the promoted
-  // first candidate.
+// --- Squirrel#61: semantic evidence e2e (injected deterministic representation)
+
+// Spawns the real daemon evidence path on a unix socket: reads the request
+// with the production framing, serves it with an EvidenceService built from a
+// fixture config (deterministic injected representation) and this test's
+// temp facts root. Model-free: the evidence handler never loads MLX.
+class SpawnedEvidenceDaemon {
+ public:
+  SpawnedEvidenceDaemon(const char* fixture_json, const char* facts_root)
+      : socket_path_(kEvSocketPath),
+        ready_path_(std::string(kEvSocketPath) + ".ready") {
+    fixture_path_ = std::string(kEvSocketPath) + ".fixture.json";
+    FILE* fixture = fopen(fixture_path_.c_str(), "w");
+    if (!fixture)
+      return;
+    fputs(fixture_json, fixture);
+    if (fclose(fixture) != 0)
+      return;
+
+    const char* script =
+        "import json, socket, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from server import handle_evidence_request, read_request\n"
+        "from evidence import build_evidence_service_from_config\n"
+        "config = json.load(open(sys.argv[5]))\n"
+        "class State:\n"
+        "    pass\n"
+        "state = State()\n"
+        "state.evidence_service = build_evidence_service_from_config(\n"
+        "    sys.argv[4], config)\n"
+        "server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "server.bind(sys.argv[2])\n"
+        "server.listen(8)\n"
+        "open(sys.argv[3], 'w').close()\n"
+        "while True:\n"
+        "    connection, _ = server.accept()\n"
+        "    try:\n"
+        "        connection.settimeout(5)\n"
+        "        data = read_request(connection)\n"
+        "        if data is not None:\n"
+        "            response = handle_evidence_request(state, data)\n"
+        "            connection.sendall(\n"
+        "                (json.dumps(response) + '\\n').encode('utf-8'))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    finally:\n"
+        "        connection.close()\n";
+    child_ = fork();
+    if (child_ < 0)
+      return;
+    if (child_ == 0) {
+      execl(LLM_RERANK_PYTHON, LLM_RERANK_PYTHON, "-c", script,
+            LLM_RERANK_DAEMON_DIR, socket_path_.c_str(), ready_path_.c_str(),
+            facts_root, fixture_path_.c_str(), nullptr);
+      _exit(127);
+    }
+    for (int attempt = 0; attempt < 200 && !fs::exists(ready_path_);
+         ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+
+  // The daemon is ready only when the python child reported its socket.
+  bool ready() const {
+    return child_ > 0 && fs::exists(ready_path_);
+  }
+
+  ~SpawnedEvidenceDaemon() {
+    if (child_ > 0) {
+      kill(child_, SIGKILL);
+      waitpid(child_, nullptr, 0);
+    }
+    unlink(socket_path_.c_str());
+    unlink(ready_path_.c_str());
+    unlink(fixture_path_.c_str());
+  }
+
+ private:
+  std::string socket_path_;
+  std::string ready_path_;
+  std::string fixture_path_;
+  pid_t child_ = -1;
+};
+
+// Seeds one synthetic selection event with the C++ FactStore (independent
+// temp facts root; never real private history).
+static void SeedEvidenceFact(const fs::path& facts_root, const char* schema_id,
+                             const char* canonical_input,
+                             const char* selection) {
+  rime::FactStore store(facts_root);
+  ASSERT_EQ(rime::FactStore::Status::kOk, store.Open());
+  rime::FactStore::Event event;
+  event.event_id = "seed-event-0000000000000000000000000001";
+  event.schema_id = schema_id;
+  event.canonical_segment_input = canonical_input;
+  event.span_start = 0;
+  event.span_end = 6;
+  event.category = "word";
+  event.preceding_text = "我";
+  event.competition_complete = true;
+  event.final_selection_text = selection;
+  event.confirmation_source = "explicit_indexed";
+  event.trigger_keycode = -1;
+  event.display_rank = 1;
+  event.display_page = 1;
+  event.session_id = "seed-session";
+  event.session_seq = 1;
+  event.utc_confirmed_at_ms = 1;
+  event.candidates = {{0, "世界"}, {1, "时界"}, {2, "石阶"}};
+  std::vector<rime::FactStore::Event> events{std::move(event)};
+  ASSERT_TRUE(store.PersistBatch(1, &events));
+}
+
+const char* kHitFixture =
+    "{"
+    "\"representation_id\":\"e2e-fixture-repr\","
+    "\"tau\":0.5,\"k_evidence\":8,\"half_life\":32.0,"
+    "\"saturation_k\":1.0,\"gamma\":4.0,"
+    "\"query_vectors\":{\"我\":[1.0,0.0,0.0,0.0]},"
+    "\"event_vectors\":{"
+    "\"e2e_evidence_on|shijie|时界\":[0.95,0.3122498999,0.0,0.0]},"
+    "\"default_event\":[0.0,1.0,0.0,0.0]}";
+
+const char* kSupporterMissingFixture =
+    "{"
+    "\"representation_id\":\"e2e-fixture-repr\","
+    "\"tau\":0.5,\"k_evidence\":8,\"half_life\":32.0,"
+    "\"saturation_k\":1.0,\"gamma\":4.0,"
+    "\"query_vectors\":{\"我\":[1.0,0.0,0.0,0.0]},"
+    "\"event_vectors\":{"
+    "\"e2e_evidence_on|shijie|攻击\":[0.95,0.3122498999,0.0,0.0]},"
+    "\"default_event\":[0.0,1.0,0.0,0.0]}";
+
+TEST_F(RecorderE2ETest, EvidenceSemanticHitPromotesCandidate) {
+  // SCN-61-1: a qualified history event (same choice problem, 时界 under
+  // shijie) whose injected vector is near the query vector gives s > 0, and
+  // gamma * s flips the within-group order: Space now confirms 时界.
+  SeedEvidenceFact(FactsRoot(), kEvOnSchema, "shijie", "时界");
+  SpawnedEvidenceDaemon daemon(kHitFixture, FactsRoot().c_str());
+  ASSERT_TRUE(daemon.ready()) << "evidence daemon did not start";
   RimeSessionId session = NewSession(kEvOnSchema);
   ASSERT_NE(0, session);
 
-  // 我 -> commit (unique candidate: no event; last word becomes 我).
   TypeString(session, "wo");
   ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
   EXPECT_EQ("我", CommitText(session));
-  // shijie -> 时界 (index 1): event 1, and the (我, 时界) bigram is fed.
-  TypeString(session, "shijie");
-  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
-  EXPECT_EQ("时界", CommitText(session));
-  // 我 again so the immediately preceding word before the next shijie is 我.
-  TypeString(session, "wo");
-  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
-  EXPECT_EQ("我", CommitText(session));
-  // The bigram (我, 时界) now promotes 时界 above 世界 (98 + 4*0.5 > 99).
   TypeString(session, "shijie");
   ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
   EXPECT_EQ("时界", CommitText(session));
   g_rime->destroy_session(session);
   session_ = 0;
+}
 
-  sqlite3* db = OpenFactsDb();
-  ASSERT_TRUE(db != nullptr);
-  long long count = 0;
-  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
-  EXPECT_EQ(2LL, count);
-  std::vector<EventRow> events;
-  ASSERT_TRUE(ReadAllEvents(db, &events));
-  ASSERT_EQ(2u, events.size());
-  EXPECT_EQ("时界", events[0].final_selection_text);
-  EXPECT_EQ("时界", events[1].final_selection_text);
-  EXPECT_EQ("explicit_current", events[1].confirmation_source);
-  sqlite3_close(db);
+TEST_F(RecorderE2ETest, EvidenceNoHitKeepsBaseScoreOrder) {
+  // SCN-61-2: no qualified history (empty store) is a successful zero
+  // evidence result; the emission order equals the base-score order.
+  SpawnedEvidenceDaemon daemon(kHitFixture, FactsRoot().c_str());
+  ASSERT_TRUE(daemon.ready()) << "evidence daemon did not start";
+  RimeSessionId session = NewSession(kEvOnSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("世界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+}
+
+TEST_F(RecorderE2ETest, EvidenceSupporterCandidateMissingGivesZero) {
+  // SCN-61-3: qualified history exists (same choice problem, vector near the
+  // query) but its final selection (攻击) is not among the current group's
+  // candidates -> zero contribution, base order unchanged.
+  SeedEvidenceFact(FactsRoot(), kEvOnSchema, "shijie", "攻击");
+  SpawnedEvidenceDaemon daemon(kSupporterMissingFixture,
+                               FactsRoot().c_str());
+  ASSERT_TRUE(daemon.ready()) << "evidence daemon did not start";
+  RimeSessionId session = NewSession(kEvOnSchema);
+  ASSERT_NE(0, session);
+
+  TypeString(session, "wo");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("我", CommitText(session));
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, XK_space, 0));
+  EXPECT_EQ("世界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
 }
 
 // --- #90: per-category non-word behavior and user-dictionary word class ---
