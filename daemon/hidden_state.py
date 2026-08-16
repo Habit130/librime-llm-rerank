@@ -19,9 +19,6 @@ All MLX/numpy imports are lazy so the model-free daemon gate can import this
 module without MLX installed.
 """
 
-import os
-import sys
-
 from representations import (
     EXACT_LAYERS,
     SPLIT_REUSE_LAYER,
@@ -231,8 +228,11 @@ class HiddenStateExtractor:
         prefix KV cache reused. ``prefix_cache`` may be supplied by the caller
         (the batched-reuse path builds it once in the scoring batch, then the
         representation only pays the tail forward); when omitted a fresh
-        prefix cache is built here. Returns ``(vector, cache)`` where ``cache``
-        is the prompt-cache list used, so callers can reuse it across queries.
+        prefix cache is built here. Returns ``(vector, cache)`` where
+        ``cache`` is the prompt-cache list used. The tail forward advances the
+        supplied cache past the tail tokens, so a caller that wants to reuse a
+        prefix cache across rounds must provide a fresh clone at the prefix
+        offset per round (see ``integration_hidden_state.py``).
         """
         self._require_model()
         tokenizer = self._tokenizer()
@@ -244,12 +244,3 @@ class HiddenStateExtractor:
         snapshots, cache = self._guarded(
             lambda: self._run(tail_ids, prefix_cache, {SPLIT_REUSE_LAYER}))
         return self._final_validate(snapshots[SPLIT_REUSE_LAYER]), cache
-
-
-def extractor_ready_error(state):
-    """A short human-readable readiness check (integration/status use)."""
-    if state.model is None:
-        return "model not loaded"
-    if state.tokenizer is None:
-        return "tokenizer not loaded"
-    return None
