@@ -189,12 +189,21 @@ class FactHandle:
             finally:
                 os.close(root_fd)
             path = os.path.join(self.root, "facts.sqlite3")
+            # Read-only open semantics (AC-65-v1 repair): sqlite 3.54.0
+            # returns SQLITE_CANTOPEN for a ``file:...?mode=ro`` URI open
+            # of a WAL store with an active in-process writer (3.53.3
+            # succeeds; docs/publish-atomic.md).  Open the plain path and
+            # enforce read-only in the engine with ``PRAGMA query_only=ON``
+            # -- every write statement fails with SQLITE_READONLY, the
+            # same fail-closed guarantee, independent of the versioned URI
+            # behavior.  The db safety check above proves the file exists
+            # and is safe, so the plain open can never create it.
             self.connection = self._connection_factory(
-                "file:%s?mode=ro" % path,
-                uri=True,
+                path,
                 timeout=0,
                 check_same_thread=False,
             )
+            self.connection.execute("PRAGMA query_only=ON;")
         except MaintenanceError:
             self.close()
             raise

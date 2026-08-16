@@ -232,10 +232,20 @@ def _read_facts(facts_root):
             return _facts_section(observed_at, "degraded", "maintenance_in_progress")
         return _facts_section(observed_at, "unknown", error.code)
     try:
+        if not os.path.isfile(db_path):
+            return _facts_section(observed_at, "degraded", "db_missing")
         try:
-            conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True, timeout=0
-            )
+            # Read-only open semantics (AC-65-v1 repair): sqlite 3.54.0
+            # returns SQLITE_CANTOPEN for a ``file:...?mode=ro`` URI open
+            # of a WAL store with an active in-process writer (3.53.3
+            # succeeds; docs/publish-atomic.md).  Open the plain path and
+            # enforce read-only in the engine with ``PRAGMA query_only=ON``
+            # -- every write statement fails with SQLITE_READONLY, the
+            # same fail-closed guarantee, independent of the versioned URI
+            # behavior.  The isfile check above keeps the plain open from
+            # creating a missing store.
+            conn = sqlite3.connect(db_path, timeout=0)
+            conn.execute("PRAGMA query_only=ON;")
         except sqlite3.Error:
             return _facts_section(observed_at, "degraded", "db_open_failed")
         try:

@@ -153,3 +153,49 @@ scope here.)
 - The delta machine's own checkpoint path at *startup* is resolved from
   the manifest by the config seam, mirroring the fixture provider seam;
   the real hidden-state provider plugs at the same seam.
+
+## WAL read-only open semantics across sqlite versions (AC-65-v1 repair)
+
+Sqlite **3.54.0** returns `SQLITE_CANTOPEN` ("unable to open database
+file") for a `file:<path>?mode=ro` URI open of a WAL database whose data
+was written *before* the `journal_mode=WAL` switch, while an in-process
+writer connection on that store is still open — the failure surfaces at
+the first query, not at `connect()`. Sqlite **3.53.3** succeeds in the same
+situation. The minimal reproduction is exactly the daemon's pattern: the
+fact-store writer (C++ recorder) holds the WAL store open while the daemon
+opens it read-only for the evidence path.
+
+This is a *versioned* behavior of the URI form, not a versioned guarantee
+of the read semantics, so the fact-store read-open path no longer uses
+`mode=ro` at all. Every fact-store read connection opens the plain path
+and enforces read-only in the engine instead:
+
+```python
+conn = sqlite3.connect(db_path, timeout=<busy>)
+conn.execute("PRAGMA query_only=ON;")
+```
+
+- `PRAGMA query_only=ON` rejects every data-modifying statement
+  (DML/DDL) with `SQLITE_READONLY` — the same fail-closed guarantee as
+  `mode=ro`; read results are identical, and transaction control (`BEGIN`
+  of a read transaction) is unaffected. The engine, not the open flag,
+  now carries the read-only guarantee, so an accidental write fails
+  identically on every sqlite version.
+- The plain open would create a missing database file, so every open site
+  keeps an explicit existence check and a named fault
+  (`fact store not found` / `db_missing`); a store that cannot be opened
+  still fails loudly and is never interpreted as empty memory.
+- The change keeps the busy-wait behavior of the previous repair: read
+  connections that run beside the query gate / worker / publisher use a
+  short busy timeout for the macOS WAL `-shm` concurrent-open SQLITE_BUSY
+  transient; the maintenance and status paths keep their fail-fast
+  `timeout=0` (they degrade explicitly on any lock).
+- Affected sites (one shared mechanism, fixed together): `FactReader`
+  (oracle.py), `_open_fact_store` (generation.py), `_open_facts_ro`
+  (delta.py and publish.py), the maintenance prepare connection
+  (maintenance.py), and the status facts probe (status_core.py).
+
+Verified on both gate interpreters: full suite (663 tests) green on
+Python 3.9 / sqlite 3.54.0 and on the venv Python 3.11 / sqlite 3.53.3,
+10 consecutive runs each; the real-model integration passes under the
+deployed venv (3.53.3).

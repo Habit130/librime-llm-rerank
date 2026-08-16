@@ -188,14 +188,31 @@ class DeltaBlocked(DeltaError):
 # (worker catch-up + query gate + the #65 publisher/switch), so fact reads
 # get a short busy wait instead of a spurious fail-fast fault; a genuinely
 # held exclusive lock (maintenance) still faults after the wait.
+#
+# Read-only open semantics (AC-65-v1 repair): sqlite 3.54.0 returns
+# SQLITE_CANTOPEN ("unable to open database file") for a
+# ``file:<path>?mode=ro`` URI open of a WAL database whose data was written
+# before the WAL switch, while an in-process writer connection is open
+# (sqlite 3.53.3 succeeds; docs/publish-atomic.md "WAL read-only open
+# semantics across sqlite versions").  Fact reads therefore open the plain
+# path and enforce read-only in the engine instead: ``PRAGMA query_only=ON``
+# rejects every data-modifying statement with SQLITE_READONLY -- the same
+# fail-closed guarantee as ``mode=ro``, without depending on the versioned
+# URI behavior.  The file must already exist (a plain open would otherwise
+# create it), so callers that can reach a missing store must check first.
 FACT_READ_BUSY_TIMEOUT_S = 2.0
 
 
 def _open_facts_ro(facts_root):
     db_path = os.path.join(facts_root, "facts.sqlite3")
-    conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True,
-                           timeout=FACT_READ_BUSY_TIMEOUT_S)
-    conn.row_factory = sqlite3.Row
+    if not os.path.isfile(db_path):
+        raise DeltaError("fact store not found: %s" % db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=FACT_READ_BUSY_TIMEOUT_S)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON;")
+    except sqlite3.Error as error:
+        raise DeltaError("cannot open fact store: %s" % error)
     return conn
 
 

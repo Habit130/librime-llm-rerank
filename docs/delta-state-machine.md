@@ -185,10 +185,18 @@ the checkpoint. Restart paths:
   wait (2 s) instead of fail-fast. The fail-fast `timeout=0` stays only on
   the delta-checkpoint verification connections, where the #63 rationale
   still applies.
+- **Fact-store read-open semantics** (AC-65-v1 repair): sqlite 3.54.0
+  returns SQLITE_CANTOPEN for the `file:...?mode=ro` URI form on a WAL
+  store with an active in-process writer (3.53.3 succeeds), so fact reads
+  open the plain path and enforce read-only with `PRAGMA query_only=ON`
+  instead (engine-level read-only, identical results, no dependence on
+  the versioned URI behavior) — see `docs/publish-atomic.md` "WAL
+  read-only open semantics across sqlite versions".
 
 ## Test-time note
 
 `test_delta.py` runs the fact fixture in WAL mode (mirroring the production
 C++ store, which also runs WAL). The fixture's `-wal`/`-shm` sidecars are
-materialized before the machine reads, because a read-only connection cannot
-create them itself.
+materialized before the machine reads (the original `mode=ro` connections
+could not create them; the AC-65-v1 repair's plain `query_only=ON` opens
+can, and the materialization is kept as harmless belt-and-braces).
