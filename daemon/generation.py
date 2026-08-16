@@ -315,8 +315,13 @@ def _open_fact_store(facts_root):
     if not os.path.isfile(db_path):
         raise BuildError("fact store not found: %s" % db_path)
     try:
+        # The macOS WAL -shm read-marker handshake can transiently return
+        # SQLITE_BUSY when concurrent threads open fresh read-only
+        # connections (the builder / staging resume gate / #65 publish run
+        # beside the delta worker and the query gate); a short busy wait
+        # turns that into a retry instead of a spurious build fault.
         conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True,
-                               timeout=0)
+                               timeout=2.0)
         conn.row_factory = sqlite3.Row
         return conn
     except sqlite3.Error as error:
