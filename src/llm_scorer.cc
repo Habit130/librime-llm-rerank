@@ -310,38 +310,38 @@ NonBlockingConnectStatus ConnectNonBlockingWithDeadline(
   return NonBlockingConnectStatus::kTimeout;
 }
 
-bool LlmScorer::SendRequest(const string& context,
-                            const vector<string>& candidates,
-                            const string& request_id,
-                            const string& plan_identity,
-                            const string& baseline_policy_id,
-                            string* response) {
-  if (deadline_ms_ <= 0) {
-    LogFailure("deadline_invalid", "score", candidates.size());
+bool ExchangeJson(const string& socket_path,
+                  const string& request_json,
+                  int deadline_ms,
+                  string* response) {
+  if (!response)
+    return false;
+  if (deadline_ms <= 0) {
+    LogFailure("deadline_invalid", "score", 0);
     return false;
   }
   const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(deadline_ms_);
+                        std::chrono::milliseconds(deadline_ms);
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
-    LogFailure("socket_failed", "connect", candidates.size());
+    LogFailure("socket_failed", "connect", 0);
     return false;
   }
 
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  if (socket_path_.size() >= sizeof(addr.sun_path)) {
+  if (socket_path.size() >= sizeof(addr.sun_path)) {
     close(fd);
-    LogFailure("socket_path_invalid", "connect", candidates.size());
+    LogFailure("socket_path_invalid", "connect", 0);
     return false;
   }
-  strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+  strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
   const int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
     close(fd);
-    LogFailure("socket_setup_failed", "connect", candidates.size());
+    LogFailure("socket_setup_failed", "connect", 0);
     return false;
   }
 #ifdef SO_NOSIGPIPE
@@ -358,23 +358,22 @@ bool LlmScorer::SendRequest(const string& context,
     LogFailure(connect_status == NonBlockingConnectStatus::kTimeout
                    ? "deadline_exceeded"
                    : "connection_failed",
-               "connect", candidates.size());
+               "connect", 0);
     return false;
   }
 
-  string request = BuildRequest(context, candidates, request_id, plan_identity,
-                                baseline_policy_id);
   size_t sent = 0;
-  while (sent < request.size()) {
+  while (sent < request_json.size()) {
     WaitStatus wait = WaitFor(fd, POLLOUT, deadline, &DefaultConnectSyscalls());
     if (wait != WaitStatus::kReady) {
       close(fd);
       LogFailure(
           wait == WaitStatus::kTimeout ? "deadline_exceeded" : "write_failed",
-          "write", candidates.size());
+          "write", 0);
       return false;
     }
-    ssize_t size = send(fd, request.data() + sent, request.size() - sent, 0);
+    ssize_t size =
+        send(fd, request_json.data() + sent, request_json.size() - sent, 0);
     if (size > 0) {
       sent += size;
       continue;
@@ -382,7 +381,7 @@ bool LlmScorer::SendRequest(const string& context,
     if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
       continue;
     close(fd);
-    LogFailure("write_failed", "write", candidates.size());
+    LogFailure("write_failed", "write", 0);
     return false;
   }
   shutdown(fd, SHUT_WR);
@@ -395,7 +394,7 @@ bool LlmScorer::SendRequest(const string& context,
       close(fd);
       LogFailure(
           wait == WaitStatus::kTimeout ? "deadline_exceeded" : "read_failed",
-          "read", candidates.size());
+          "read", 0);
       return false;
     }
     ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
@@ -403,7 +402,7 @@ bool LlmScorer::SendRequest(const string& context,
       continue;
     if (n < 0) {
       close(fd);
-      LogFailure("read_failed", "read", candidates.size());
+      LogFailure("read_failed", "read", 0);
       return false;
     }
     if (n == 0)
@@ -411,18 +410,29 @@ bool LlmScorer::SendRequest(const string& context,
     buf.append(chunk, n);
     if (buf.size() > kMaximumResponseBytes) {
       close(fd);
-      LogFailure("response_too_large", "read", candidates.size());
+      LogFailure("response_too_large", "read", 0);
       return false;
     }
   }
   close(fd);
 
   if (buf.empty()) {
-    LogFailure("empty_response", "read", candidates.size());
+    LogFailure("empty_response", "read", 0);
     return false;
   }
   *response = buf;
   return true;
+}
+
+bool LlmScorer::SendRequest(const string& context,
+                            const vector<string>& candidates,
+                            const string& request_id,
+                            const string& plan_identity,
+                            const string& baseline_policy_id,
+                            string* response) {
+  string request = BuildRequest(context, candidates, request_id, plan_identity,
+                                baseline_policy_id);
+  return ExchangeJson(socket_path_, request, deadline_ms_, response);
 }
 
 bool LlmScorer::ScoreBatch(const ScoringRequest& request,

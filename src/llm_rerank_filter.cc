@@ -17,9 +17,10 @@
 #include <rime/ticket.h>
 #include <rime/translation.h>
 #include <rime/commit_history.h>
-#include <rime/dict/user_db.h>
 #include <rime/gear/translator_commons.h>
 
+#include "evidence_scorer.h"
+#include "fact_store.h"
 #include "llm_rerank_filter.h"
 #include "llm_scorer.h"
 
@@ -88,51 +89,6 @@ bool WeightScorer::ScoreBatch(const ScoringRequest& request,
   return true;
 }
 
-double ContextScorer::EvidenceStrength(int pair_count,
-                                       int total_count,
-                                       double saturate_k) {
-  if (total_count <= 0 || pair_count <= 0)
-    return 0.0;
-  double relative_preference = (double)pair_count / (double)total_count;
-  double evidence = (double)pair_count / ((double)pair_count + saturate_k);
-  return relative_preference * evidence;
-}
-
-bool ContextScorer::ScoreBatch(const ScoringRequest& request,
-                               const vector<an<Candidate>>& candidates,
-                               vector<ScoreComponents>* scores) {
-  if (!scores || request.candidate_texts.size() != candidates.size())
-    return false;
-  vector<ScoreComponents> result;
-  result.reserve(candidates.size());
-  for (size_t i = 0; i < candidates.size(); ++i) {
-    if (!candidates[i] || candidates[i]->text() != request.candidate_texts[i])
-      return false;
-    ScoreComponents score;
-    if (counter_ && !request.previous_word.empty()) {
-      int pair_count;
-      int total_count;
-      if (!counter_->PairCount(request.previous_word, candidates[i]->text(),
-                               &pair_count) ||
-          !counter_->TotalCount(request.previous_word, &total_count) ||
-          pair_count < 0 || total_count < 0 || pair_count > total_count) {
-        return false;
-      }
-      double evidence = EvidenceStrength(pair_count, total_count, saturate_k_);
-      if (!std::isfinite(evidence) || evidence < 0.0 || evidence >= 1.0)
-        return false;
-      score.retrieval_evidence = evidence;
-      if (verbose_) {
-        LOG(INFO) << "llm_rerank context: pair=" << pair_count
-                  << " total=" << total_count << " evidence=" << evidence;
-      }
-    }
-    result.push_back(score);
-  }
-  *scores = std::move(result);
-  return true;
-}
-
 bool CompositeScorer::ScoreBatch(const ScoringRequest& request,
                                  const vector<an<Candidate>>& candidates,
                                  vector<ScoreComponents>* scores) {
@@ -141,12 +97,6 @@ bool CompositeScorer::ScoreBatch(const ScoringRequest& request,
   vector<ScoreComponents> weight_scores;
   if (!weight_->ScoreBatch(request, candidates, &weight_scores) ||
       weight_scores.size() != candidates.size()) {
-    return false;
-  }
-  vector<ScoreComponents> context_scores(candidates.size());
-  if (context_ &&
-      (!context_->ScoreBatch(request, candidates, &context_scores) ||
-       context_scores.size() != candidates.size())) {
     return false;
   }
   vector<ScoreComponents> llm_scores(candidates.size());
@@ -158,7 +108,7 @@ bool CompositeScorer::ScoreBatch(const ScoringRequest& request,
   result.reserve(candidates.size());
   for (size_t i = 0; i < candidates.size(); ++i) {
     result.push_back({weight_scores[i].base_score + llm_scores[i].base_score,
-                      context_scores[i].retrieval_evidence});
+                      0.0});
   }
   *scores = std::move(result);
   return true;
@@ -174,6 +124,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
  public:
   LlmRerankTranslation(an<Translation> translation,
                        an<Scorer> scorer,
+                       an<EvidenceScorer> evidence_scorer,
+                       bool evidence_active,
+                       path facts_root,
                        int window,
                        string schema_id,
                        string input,
@@ -186,6 +139,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
                        bool snapshot_only)
       : PrefetchTranslation(translation),
         scorer_(scorer),
+        evidence_scorer_(std::move(evidence_scorer)),
+        evidence_active_(evidence_active),
+        facts_root_(std::move(facts_root)),
         window_(window),
         schema_id_(std::move(schema_id)),
         input_(std::move(input)),
@@ -206,6 +162,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
                     CandidateQueue* out);
 
   an<Scorer> scorer_;
+  an<EvidenceScorer> evidence_scorer_;
+  bool evidence_active_ = false;
+  path facts_root_;
   int window_;
   string schema_id_;
   string input_;
@@ -330,8 +289,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     }
   }
   ScoringRequest request{*plan.identity, *scoring_policy_.baseline_policy_id,
-                         *plan.preceding_text, *plan.previous_word,
-                         std::move(texts)};
+                         *plan.preceding_text, std::move(texts)};
   vector<ScoreComponents> batch_scores;
   if (!scorer_->ScoreBatch(request, scored_candidates, &batch_scores) ||
       batch_scores.size() != scored_candidates.size()) {
@@ -341,6 +299,45 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   vector<ScoreComponents> scores(buffer.size());
   for (size_t i = 0; i < scored_indexes.size(); ++i)
     scores[scored_indexes[i]] = batch_scores[i];
+
+  // Retrieval evidence (#61): one evidence request per complete rerank group
+  // (each group is one choice problem). The plugin applies gamma * s_c only
+  // on a complete, identity-bound success; any fault passes the whole window
+  // through in original order.
+  if (evidence_active_) {
+    if (!evidence_scorer_) {
+      LogWindowFailure("evidence_unavailable", "evidence", buffer.size());
+      return false;
+    }
+    EvidenceScorer::FactHighWater high_water;
+    EvidenceScorer::ReadFactHighWater(
+        facts_root_.empty() ? FactStore::DefaultRootDir() : facts_root_,
+        &high_water);
+    for (const auto& group : *plan.groups) {
+      if (!*group.complete)
+        continue;
+      EvidenceScorer::GroupRequest evidence_request;
+      evidence_request.plan_identity = *plan.identity;
+      evidence_request.schema_id = schema_id_;
+      evidence_request.category = *group.category;
+      evidence_request.canonical_segment_input = *group.canonical_input;
+      evidence_request.preceding_text = *plan.preceding_text;
+      evidence_request.config_identity = *scoring_policy_.retrieval_policy_id;
+      evidence_request.fact_high_water = high_water;
+      for (size_t index : *group.candidate_indexes)
+        evidence_request.candidate_texts.push_back(buffer[index]->text());
+      vector<double> group_evidence;
+      if (!evidence_scorer_->ScoreGroup(evidence_request, &group_evidence) ||
+          group_evidence.size() != group.candidate_indexes->size()) {
+        LogWindowFailure("evidence_scoring_failed", "evidence",
+                         buffer.size());
+        return false;
+      }
+      for (size_t i = 0; i < group.candidate_indexes->size(); ++i)
+        scores[(*group.candidate_indexes)[i]].retrieval_evidence =
+            group_evidence[i];
+    }
+  }
 
   RerankScoreResult result;
   result.version = kRerankScoreResultVersion;
@@ -405,6 +402,11 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     config->GetInt(name_space_ + "/deadline_ms", &deadline_ms_);
     config->GetBool(name_space_ + "/verbose", &verbose_);
     config->GetString(name_space_ + "/socket_path", &socket_path_);
+    config->GetString(name_space_ + "/representation_id",
+                      &representation_id_);
+    config->GetDouble(name_space_ + "/tau", &tau_);
+    config->GetInt(name_space_ + "/k_evidence", &k_evidence_);
+    config->GetDouble(name_space_ + "/half_life", &half_life_);
   }
   if (socket_path_.empty()) {
     const char* home = getenv("HOME");
@@ -422,38 +424,32 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     llm_scorer_ = New<LlmScorer>(socket_path_, alpha_, verbose_, deadline_ms_);
   }
   // Evidence application (v2): only the explicit `evidence_enabled` switch
-  // admits the personalized evidence term (currently the first-stage bigram,
-  // standing in for the phase-2 retrieval evidence). Legacy and not
-  // configured keep the first-stage behavior: the bigram term applies when
-  // gamma > 0.
-  const bool evidence_active =
-      (config_source_ == SwitchConfigSource::kV2)
-          ? (evidence_enabled_ && gamma_ > 0.0)
-          : (gamma_ > 0.0);
-  if (engine_) {
-    if (auto component = UserDb::Require("userdb")) {
-      string db_name = ticket.schema->schema_id() + ".llm_rerank";
-      if (component->extension() == ".userdb") {
-        memory_ = ContextMemory::OpenUserLevelDb(
-            Service::instance().deployer().user_data_dir, db_name,
-            {db_name, "userdb", Service::instance().deployer().user_id});
-      }
-    }
-    if (memory_) {
-      context_scorer_ =
-          New<ContextScorer>(memory_.get(), saturate_k_, verbose_);
-      scorer_ = New<CompositeScorer>(
-          weight_scorer, evidence_active ? context_scorer_ : nullptr,
-          llm_scorer_);
-    } else {
+  // admits the semantic retrieval evidence term. Legacy and not_configured
+  // keep the first-stage base behavior (weight + LLM, no evidence term).
+  evidence_active_ =
+      (config_source_ == SwitchConfigSource::kV2 && evidence_enabled_ &&
+       gamma_ > 0.0);
+  if (evidence_active_) {
+    evidence_config_identity_ = EvidenceScorer::ComposeConfigIdentity(
+        representation_id_, tau_, k_evidence_, half_life_, saturate_k_,
+        gamma_);
+    if (representation_id_.empty() || socket_path_.empty()) {
       LOG(WARNING) << name_space_
-                   << ": failed to open user db; context scoring unavailable";
-      if (evidence_active) {
-        scorer_.reset();
-      } else if (llm_scorer_) {
-        scorer_ = New<CompositeScorer>(weight_scorer, nullptr, llm_scorer_);
-      }
+                   << ": evidence enabled but representation seam is not "
+                      "configured; evidence requests will fail closed";
+    } else {
+      evidence_scorer_ = New<EvidenceScorer>(socket_path_,
+                                             evidence_config_identity_,
+                                             deadline_ms_, verbose_);
     }
+  }
+  if (llm_scorer_)
+    scorer_ = New<CompositeScorer>(weight_scorer, llm_scorer_);
+  if (alpha_ > 0.0 && !llm_scorer_) {
+    LOG(WARNING) << name_space_ << ": LLM scoring unavailable";
+    scorer_.reset();
+  }
+  if (engine_) {
     Context* ctx = engine_->context();
     if (ctx) {
       for (const auto& record : ctx->commit_history())
@@ -471,15 +467,12 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
         [this](const string& text) { OnCommitText(text); });
     recorder_session_ = RecorderSessionRegistry::GetForEngine(engine_);
   }
-  if (alpha_ > 0.0 && !llm_scorer_) {
-    LOG(WARNING) << name_space_ << ": LLM scoring unavailable";
-    scorer_.reset();
-  }
   LOG(INFO) << name_space_ << ": source = "
             << SwitchConfigSourceName(config_source_)
             << ", reranking = " << (reranking_enabled_ ? "true" : "false")
             << ", recording = " << (recording_enabled_ ? "true" : "false")
             << ", evidence = " << (evidence_enabled_ ? "true" : "false")
+            << ", evidence_active = " << (evidence_active_ ? "true" : "false")
             << ", window = " << window_ << ", alpha = " << alpha_
             << ", sys_coeff = " << sys_coeff_ << ", usr_coeff = " << usr_coeff_
             << ", gamma = " << gamma_ << ", saturate_k = " << saturate_k_
@@ -498,15 +491,8 @@ void LlmRerankFilter::OnCommit(Context* ctx) {
   string selected = ctx->GetCommitText();
   if (selected.empty())
     return;
-  if (!memory_ || !HasNonAscii(selected))
+  if (!HasNonAscii(selected))
     return;
-  // v2 with evidence application off: the personalized evidence pipeline is
-  // disabled as a whole — its private store is not fed either, so no
-  // phase-1 bigram data accumulates silently. Legacy and not_configured keep
-  // the first-stage behavior.
-  if (config_source_ == SwitchConfigSource::kV2 && !evidence_enabled_)
-    return;
-  memory_->Record(last_word_, selected);
   last_word_ = selected;
 }
 
@@ -563,12 +549,17 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   scoring_policy.usr_coeff = usr_coeff_;
   // v2 with evidence application off: the plan declares gamma = 0 so the
   // evidence term is exactly zero. Legacy and not_configured keep the
-  // configured gamma.
+  // configured gamma (no evidence term exists on those paths).
   scoring_policy.gamma =
       (config_source_ == SwitchConfigSource::kV2 && !evidence_enabled_)
           ? 0.0
           : gamma_;
   scoring_policy.saturate_k = saturate_k_;
+  // The plan binds the exact evidence config identity it was scored under;
+  // the evidence request carries the same identity so the daemon serves only
+  // a matching evidence configuration (AC61-1 "配置身份").
+  if (evidence_active_)
+    scoring_policy.retrieval_policy_id = evidence_config_identity_;
   string input = input_;
   if (engine_ && engine_->context())
     input = engine_->context()->input();
@@ -578,9 +569,11 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
     segment_start = engine_->context()->composition().back().start;
   }
   return New<LlmRerankTranslation>(
-      translation, reranking_enabled_ ? scorer_ : nullptr, window_, schema_id_,
-      input, preceding_text, last_word_, scoring_policy, recorder_session_,
-      segment_start, want_snapshots, !reranking_enabled_);
+      translation, reranking_enabled_ ? scorer_ : nullptr,
+      evidence_active_ ? evidence_scorer_ : nullptr, evidence_active_,
+      facts_root_, window_, schema_id_, input, preceding_text, last_word_,
+      scoring_policy, recorder_session_, segment_start, want_snapshots,
+      !reranking_enabled_);
 }
 
 }  // namespace rime

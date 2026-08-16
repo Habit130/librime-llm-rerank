@@ -20,7 +20,7 @@ Observable-condition mapping (design decision, #51):
   * only `enable`        -> legacy. Reranking follows it, recording and
     semantic evidence are off (no silent collection, user story 26).
   * no keys at all       -> not_configured. Behavior keeps phase-1 defaults
-    (visible reranking active, bigram evidence applies when gamma > 0, no
+    (visible reranking active, no evidence term, no
     recording); status reports not_configured so it is never confused with an
     intentional off.
 - Duty states per schema (config.runtime_effective):
@@ -30,8 +30,9 @@ Observable-condition mapping (design decision, #51):
     (degraded/blocked/unknown fault states propagate).
   * evidence: off unless v2 evidence_enabled; suppressed by
     reranking disabled (`suppressed_by_reranking_disabled`) or gamma <= 0
-    (`suppressed_by_gamma_zero`). The currently implemented evidence term is
-    the first-stage bigram; phase-2 generation health joins later.
+    (`suppressed_by_gamma_zero`). The evidence term is the daemon-served
+    semantic retrieval evidence (#61); the daemon's ability to serve it
+    (representation seam health) joins status reporting later.
 - Facts (global, read-only from disk): healthy / not_created (pristine zero
   evidence, not a fault) / degraded (transient: open/write failures) /
   blocked (deterministic: permission, owner, symlink, corrupt, unsupported

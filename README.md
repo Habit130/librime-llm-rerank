@@ -192,9 +192,6 @@ evaluation compares against. It is model-free and stdlib-only, consumes
 read-only fact stores plus caller-supplied deterministic per-event vectors,
 and never produces or touches embeddings.
 
-For one current rerank group it returns the bounded retrieval evidence
-`s_c` per candidate, exactly per spec:
-
 ```text
 choice_problem_key = schema_id + category + canonical_segment_input
 r_i = clamp((cos_i - tau) / (1 - tau), 0, 1)
@@ -238,6 +235,41 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 `daemon/test_oracle.py` covers every acceptance criterion of #59,
 including the fixed counterexample for the top-K order and the retraction
 timing scenarios.
+
+## Retrieval-evidence protocol (Squirrel#61)
+
+The plugin asks the daemon for the oracle's candidate-level evidence of one
+rerank group over the same unix socket, as an additive `kind: "evidence"`
+request. The request carries the full AC61-1 contract: schema, choice
+problem (schema + category + canonical segment input), the recent 64-char
+上文, the current candidate group, the evidence config identity and the
+plugin's declared fact high-water (`store_epoch` + max change HLC).
+
+- `daemon/evidence.py` — `EvidenceService`: read-only facts + the canonical
+  oracle behind an injectable `RepresentationProvider` seam (the #62
+  generation hook). `FixtureRepresentationProvider` is the injected,
+  deterministic, model-free implementation used by the daemon tests and the
+  end-to-end gate; #62 plugs a real hidden-state provider behind the same
+  interface.
+- Success responses carry `status: "ok"` plus a per-candidate `s` array and
+  an explicit `zero_evidence` flag. Zero evidence (empty store, no same-key
+  events, nothing above the threshold, nothing matching the current group)
+  is a success, never an error.
+- True faults — missing/corrupt stores, config-identity mismatch, fact
+  epoch mismatch, not caught up, representation/oracle faults — are explicit
+  error objects. The plugin adds `gamma * s_c` to the base score only on a
+  complete, identity-bound success; every fault passes the whole window
+  through in original order.
+- The old first-stage bigram term is gone: `ContextScorer`/`ContextMemory`
+  were removed, and the plan's retrieval policy id is the exact-oracle
+  evidence policy. There is no second term to double-count.
+
+Run the evidence tests with the rest of the daemon and C++ suites:
+
+```sh
+python3 -m unittest discover -s daemon -p 'test_*.py'
+ctest # llm_rerank_test (filter/protocol/recorder e2e)
+```
 
 ## Versioned hidden-state 上文 representations
 

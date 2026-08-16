@@ -42,6 +42,15 @@ NonBlockingConnectStatus ConnectNonBlockingWithDeadline(
     std::chrono::steady_clock::time_point deadline,
     ConnectSyscalls* syscalls);
 
+// Shared unix-socket exchange for the scoring and evidence clients: sends
+// one newline-terminated JSON document and reads the framed response under
+// one absolute deadline. Returns false on any transport failure (connect,
+// write, read, size cap); the caller parses and validates the response.
+bool ExchangeJson(const string& socket_path,
+                  const string& request_json,
+                  int deadline_ms,
+                  string* response);
+
 class LlmScorer : public Scorer {
  public:
   LlmScorer(const string& socket_path,
