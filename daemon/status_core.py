@@ -394,6 +394,7 @@ def probe_daemon(socket_path, deadline_s=HEALTH_DEADLINE_SECONDS):
             "model_loaded": bool(health.get("model_loaded")),
             "policy_id": health.get("policy_id"),
             "scoring_strategy": health.get("scoring_strategy"),
+            "model_identity": health.get("model_identity"),
             "daemon_pid": health.get("pid"),
             "context_window": health.get("context_window"),
         }
@@ -411,6 +412,7 @@ def _serving_section(observed_at, state):
         "model_loaded": None,
         "policy_id": None,
         "scoring_strategy": None,
+        "model_identity": None,
         "daemon_pid": None,
         "context_window": None,
     }
@@ -493,6 +495,9 @@ def _schema_config_entry(schema_id, section, alpha, gamma, facts, serving):
         state, reason = _duty_state(resolved["source"], configured, alpha,
                                     gamma, facts, serving, duty)
         duties[duty] = {"state": state, "reason": reason}
+    baseline_policy_id = section.get("baseline_policy_id")
+    if not isinstance(baseline_policy_id, str) or not baseline_policy_id:
+        baseline_policy_id = None
     return {
         "schema_id": schema_id,
         "config": {
@@ -504,6 +509,7 @@ def _schema_config_entry(schema_id, section, alpha, gamma, facts, serving):
             "explicit_keys": resolved["explicit_keys"],
             "gamma": gamma,
             "alpha": alpha,
+            "baseline_policy_id": baseline_policy_id,
             "runtime_effective": {"observed_at": observed_at, **duties},
         },
     }
@@ -519,10 +525,20 @@ def _component_schemas(rime_dir):
     A schema counts as configured-component when its resolved build config
     has an `llm_rerank` section or lists llm_rerank / llm_rerank_recorder in
     its engine processors or filters.
+
+    The schema list comes from the resolved default config: a deployed
+    Squirrel user data dir keeps the merged result under `build/default.yaml`
+    and does not carry a root-level `default.yaml` (that file is a shared
+    data artifact). Prefer the root file when present (test fixtures), then
+    the deployment-resolved build file.
     """
     build_dir = os.path.join(rime_dir, "build")
-    default_path = os.path.join(rime_dir, "default.yaml")
-    if not os.path.isfile(default_path):
+    for candidate in (os.path.join(rime_dir, "default.yaml"),
+                      os.path.join(build_dir, "default.yaml")):
+        if os.path.isfile(candidate):
+            default_path = candidate
+            break
+    else:
         return None
     try:
         with open(default_path, encoding="utf-8") as f:
@@ -662,9 +678,11 @@ def render_human(report):
         ]
         warning = " [legacy enable ignored: v2 keys win]" if config[
             "deprecation_warning"] else ""
+        policy = f"; policy {config['baseline_policy_id']}" if config.get(
+            "baseline_policy_id") else ""
         lines.append(
             f"  {entry['schema_id']}: source={config['source']}{warning}; "
-            + "; ".join(parts)
+            + "; ".join(parts) + policy
         )
     facts = report.get("facts", {})
     lines.append(
@@ -699,6 +717,8 @@ def render_human(report):
     if serving.get("state") == "up":
         loaded = "loaded" if serving.get("model_loaded") else "not loaded"
         serving_line += f" (model {loaded}"
+        if serving.get("model_identity"):
+            serving_line += f", {serving['model_identity']}"
         if serving.get("policy_id"):
             serving_line += f"; policy {serving['policy_id']}"
         serving_line += ")"

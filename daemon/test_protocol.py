@@ -36,6 +36,7 @@ class FakeState:
         self.loaded = False
         self.context_window = 64
         self.cache_limit_mb = 512
+        self.model_path = "/fixture/models/Qwen3-0.6B-Base"
 
     def score(self, context, candidates):
         if self.error:
@@ -339,6 +340,100 @@ class ProtocolTest(unittest.TestCase):
         )
         self.assertIn("scores", response)
 
+    # -- frozen shadow baseline policy id (Habit130/squirrel#75) ----------
+
+    def frozen_baseline_id(self, **overrides):
+        value = ("frozen-baseline-v1:rule=mean-token-lm-v1:model=Qwen3-0.6B-Base"
+                 ":tokenizer=Qwen3-0.6B-Base:norm=nfc-simplified:fail=fail-closed"
+                 ":squirrel=0123456789ab:plugin=cdef01234567:alpha=0.0"
+                 ":beta_sys=1.0:beta_usr=1.0")
+        for key, replacement in overrides.items():
+            marker = f"{key}="
+            start = value.index(marker)
+            end = value.find(":", start)
+            value = value[:start] + marker + replacement + value[end:]
+        return value
+
+    def test_frozen_baseline_id_is_accepted_by_mean_token(self):
+        response = handle_request(
+            FakeState(),
+            encode(request(baseline_policy_id=self.frozen_baseline_id())),
+        )
+        self.assertIn("scores", response)
+
+    def test_frozen_baseline_id_is_rejected_by_legacy_sum(self):
+        legacy_state = FakeState()
+        legacy_state.scoring_strategy = SCORING_STRATEGY_LEGACY_SUM
+        response = handle_request(
+            legacy_state,
+            encode(request(baseline_policy_id=self.frozen_baseline_id())),
+        )
+        self.assert_protocol_error(response, "policy_mismatch")
+        self.assert_bound_error(response)
+
+    def test_frozen_baseline_id_with_wrong_rule_is_rejected(self):
+        response = handle_request(
+            FakeState(),
+            encode(request(
+                baseline_policy_id=self.frozen_baseline_id(
+                    rule=LEGACY_SUM_POLICY_ID))),
+        )
+        self.assert_protocol_error(response, "policy_mismatch")
+
+    def test_frozen_baseline_id_with_wrong_model_is_rejected(self):
+        response = handle_request(
+            FakeState(),
+            encode(request(
+                baseline_policy_id=self.frozen_baseline_id(
+                    model="SomeOtherModel"))),
+        )
+        self.assert_protocol_error(response, "policy_mismatch")
+        # The mismatch error never echoes the declared identity.
+        self.assertNotIn("SomeOtherModel", str(response))
+
+    def test_frozen_baseline_id_with_wrong_tokenizer_is_rejected(self):
+        response = handle_request(
+            FakeState(),
+            encode(request(
+                baseline_policy_id=self.frozen_baseline_id(
+                    tokenizer="SomeOtherTokenizer"))),
+        )
+        self.assert_protocol_error(response, "policy_mismatch")
+
+    def test_malformed_frozen_baseline_ids_are_rejected(self):
+        state = FakeState()
+        for damaged in (
+            "frozen-baseline-v1:",
+            "frozen-baseline-v1:rule=mean-token-lm-v1",
+            "frozen-baseline-v1:model=Qwen3-0.6B-Base:tokenizer=Qwen3-0.6B-Base",
+            "frozen-baseline-v1:rule=mean-token-lm-v1:model=Qwen3-0.6B-Base"
+            ":tokenizer=Qwen3-0.6B-Base:unknown=1",
+            "frozen-baseline-v1:rule=mean-token-lm-v1:model=:tokenizer=qwen",
+            "frozen-baseline-v1:rule=mean-token-lm-v1:rule=legacy-sum"
+            ":model=Qwen3-0.6B-Base:tokenizer=Qwen3-0.6B-Base",
+            "frozen-baseline-v1:rule=mean-token-lm-v1:model=Qwen3-0.6B-Base"
+            ":tokenizer=Qwen3-0.6B-Base:bogus",
+            "not-a-frozen-id",
+            "frozen-baseline-v1:rule=mean-token-lm-v1:model=Qwen3-0.6B-Base"
+            ":tokenizer=Qwen3-0.6B-Base:alpha=",
+        ):
+            with self.subTest(damaged=damaged):
+                response = handle_request(
+                    state, encode(request(baseline_policy_id=damaged)))
+                self.assert_protocol_error(response, "policy_mismatch")
+
+    def test_frozen_baseline_id_mismatch_does_not_echo_input(self):
+        response = handle_request(
+            FakeState(),
+            encode(request(
+                baseline_policy_id=self.frozen_baseline_id(
+                    model="WrongModel"))),
+        )
+        self.assertEqual("policy_mismatch", response["error"]["code"])
+        self.assertNotIn("private context fixture", str(response))
+        self.assertNotIn("candidate-a", str(response))
+        self.assertNotIn("WrongModel", str(response["error"]))
+
     def test_policy_mismatch_does_not_echo_input(self):
         response = handle_request(
             FakeState(),
@@ -437,6 +532,7 @@ class HealthHandshakeTest(unittest.TestCase):
         self.assertFalse(health["model_loaded"])
         self.assertEqual(MEAN_TOKEN_POLICY_ID, health["policy_id"])
         self.assertEqual(SCORING_STRATEGY_MEAN_TOKEN, health["scoring_strategy"])
+        self.assertEqual("Qwen3-0.6B-Base", health["model_identity"])
         self.assertEqual(64, health["context_window"])
         self.assertIsInstance(health["pid"], int)
         # The daemon state is never touched by the handshake: loading stays

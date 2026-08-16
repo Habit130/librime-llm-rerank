@@ -55,8 +55,11 @@ memory queue, and the process crashes before any durable evidence exists,
 that selection can be lost without a gap record. Committed user text,
 existing canonical facts, candidate fallback and stale-epoch safety are
 unaffected; the impact is limited to semantic-learning and diagnostic
-continuity. This residual will be revisited before the #75 shadow-recording
-baseline freezes.
+continuity. Revisited at the #75 shadow-baseline freeze (AC-75-v1): the
+owner-approved decision carries this residual as RISK-75-1 — loss mechanism
+is candidate-independent and cannot bias scheme comparison; containment is
+this README statement plus the freeze record; revisit milestone is the #80
+config lock or earlier evidence of in-window loss.
 
 The daemon serves scoring and maintenance over separate Unix sockets. Both
 sockets require an owner-only directory and `0600` socket file; the control
@@ -235,6 +238,34 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 `daemon/test_oracle.py` covers every acceptance criterion of #59,
 including the fixed counterexample for the top-K order and the retraction
 timing scenarios.
+
+## Frozen baseline policy identity
+
+The shadow baseline (Habit130/squirrel#75) pins a composed
+`baseline_policy_id` in the deployed schema:
+
+```text
+frozen-baseline-v1:rule=<token-rule-id>:model=<model-dir-basename>
+  :tokenizer=<model-dir-basename>:norm=<normalization-id>
+  :fail=<failure-semantics-id>:squirrel=<squirrel-sha12>
+  :plugin=<plugin-sha12>:alpha=<alpha>:beta_sys=<beta_sys>
+  :beta_usr=<beta_usr>
+```
+
+The composition is deterministic and ordered; changing any component (code
+SHA, model, token rule, alpha/beta, normalization or failure semantics)
+produces a different id, which is how a baseline change is detected
+(AC-75-v1 criterion AC75-6). The exact component values at freeze time are
+recorded in the freeze record in `Habit130/squirrel` (docs/freeze/).
+
+The daemon accepts the frozen-baseline form only when the components it can
+verify match its own identity: `rule` must equal the scoring strategy's
+canonical id (`mean-token-lm-v1` for the `mean_token` strategy) and
+`model`/`tokenizer` must equal the daemon's own model directory basename.
+The canonical id (`mean-token-lm-v1`) remains accepted for schemas that
+declare no frozen id. Any other declared id fails closed with
+`policy_mismatch`, and `legacy_sum` mode keeps the exact-match binding
+(calibration only).
 
 ## License
 
