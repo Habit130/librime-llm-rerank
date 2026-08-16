@@ -47,6 +47,7 @@ cannot finish within a request's deadline fails that request with
 ``not_caught_up`` (AC63-6); the worker keeps working for the next request.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -734,7 +735,8 @@ class DeltaStateMachine:
     def __init__(self, facts_root, derived_root, provider, generation_id,
                  catch_up_deadline=DEFAULT_CATCH_UP_DEADLINE_S,
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
-                 now=time.monotonic, sleep=time.sleep, start_worker=True):
+                 now=time.monotonic, sleep=time.sleep, start_worker=True,
+                 builder_lock=None):
         if not facts_root:
             raise DeltaError("facts root missing")
         if not derived_root:
@@ -757,6 +759,7 @@ class DeltaStateMachine:
         self._poll_interval = float(poll_interval)
         self._now = now
         self._sleep = sleep
+        self._builder_lock = builder_lock
         self._condition = threading.Condition()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
@@ -928,15 +931,21 @@ class DeltaStateMachine:
         return self._build_generation_now()
 
     def _build_generation_now(self):
-        try:
-            return build_generation(self._facts_root, self._provider,
-                                    self._derived_root)
-        except BuildBlockedError as error:
-            raise DeltaBlocked(
-                "cannot rebuild the generation: %s" % error.message,
-                error.blocked_events, phase=error.phase)
-        except BuildError as error:
-            raise DeltaError("generation build failed: %s" % error)
+        # The single-builder constraint (spec "一次只运行一个 builder"):
+        # when the daemon wires a shared builder lock, this rebuild path and
+        # the staging machine's embed steps serialize on it, so two builders
+        # never run the model concurrently.
+        lease = self._builder_lock or contextlib.nullcontext()
+        with lease:
+            try:
+                return build_generation(self._facts_root, self._provider,
+                                        self._derived_root)
+            except BuildBlockedError as error:
+                raise DeltaBlocked(
+                    "cannot rebuild the generation: %s" % error.message,
+                    error.blocked_events, phase=error.phase)
+            except BuildError as error:
+                raise DeltaError("generation build failed: %s" % error)
 
     # ------------------------------------------------------------------
     # Snapshot publication (only the worker writes; lock held)
@@ -1566,7 +1575,7 @@ def _validate_vector(vector, dimension):
 # Config wiring (server.py builds the machine when the config declares it)
 # ---------------------------------------------------------------------------
 
-def build_delta_machine_from_config(facts_root, config):
+def build_delta_machine_from_config(facts_root, config, builder_lock=None):
     """Construct the delta machine from the evidence config dict.
 
     The config must declare the active generation explicitly (no directory
@@ -1580,6 +1589,9 @@ def build_delta_machine_from_config(facts_root, config):
     Both ``derived_root`` and ``generation_id`` must be present together;
     declaring only one is a configuration fault, not a silent fallback to
     the direct-facts evidence path.  Returns None when neither is declared.
+    ``builder_lock`` (#64) is the shared single-builder lease: the machine's
+    rebuild path acquires it around every generation build so it never
+    embeds concurrently with the staging machine.
     """
     if "derived_root" not in config and "generation_id" not in config:
         return None
@@ -1604,7 +1616,7 @@ def build_delta_machine_from_config(facts_root, config):
     provider = _build_provider_from_config(config)
     return DeltaStateMachine(facts_root, derived_root, provider,
                              generation_id, catch_up_deadline=deadline,
-                             poll_interval=poll)
+                             poll_interval=poll, builder_lock=builder_lock)
 
 
 def _build_provider_from_config(config):

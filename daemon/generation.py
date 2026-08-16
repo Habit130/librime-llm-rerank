@@ -60,6 +60,12 @@ Determinism and failure semantics:
   active set at ``H0``, and serves vectors from the mmap'd FP32 file, so the
   evidence is bit-identical to the canonical oracle on the same vectors
   (SCN-62-4).
+
+The #64 resumable staging machine (``staging.py``) reuses the shared build
+core below (``_read_snapshot`` / ``_prepare_target`` / ``_build_chunks`` /
+``_compute_probes`` / ``_compose_manifest``), so a staged build and a
+one-shot ``build_generation`` of the same target produce the same
+generation id and byte-identical files.
 """
 
 import hashlib
@@ -147,6 +153,20 @@ class BuildBlockedError(BuildError):
         self.message = message
         self.blocked_events = tuple(blocked_events)
         self.phase = phase
+
+
+class BuildProgressError(BuildError):
+    """A recorded progress manifest cannot be trusted.
+
+    The staging machine discards the whole staging on this fault: a build
+    whose recorded chunk checksums no longer match the vectors file (or
+    whose records are structurally invalid) is never resumed in part
+    (SCN-64-3 "四要素一致才续跑"; verified chunks only).
+    """
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +582,314 @@ def _check_identity_unchanged(facts_root, store_epoch, source_hlc):
             "(%s/%s -> %s/%s)" % (store_epoch, source_hlc, now_epoch, now_hlc))
 
 
+# ---------------------------------------------------------------------------
+# Shared build core (used by build_generation and the #64 staging machine)
+# ---------------------------------------------------------------------------
+#
+# The resumable staging machine (#64) and the one-shot builder share every
+# step that determines container bytes, so a staged build and a direct build
+# of the same target produce the same generation id and byte-identical
+# files (spec "并发重建与蓝绿发布"; determinism across both paths).
+
+def _read_snapshot(facts_root, as_of=None):
+    """(store_epoch, source_hlc, events) on one consistent read-only snapshot.
+
+    ``as_of=None`` pins the source watermark to the store's current clock
+    and requires that clock unchanged across the read (the #62 guarantee:
+    the builder fixes ``H0`` on a consistent snapshot).  A caller-provided
+    ``as_of`` reads the active projection at that fixed watermark instead;
+    only the epoch must stay unchanged during the read -- facts are
+    immutable within one epoch, so the pinned projection is stable even
+    while new facts commit (the staging machine's resume path).
+    """
+    conn = _open_fact_store(facts_root)
+    pinned = as_of is not None
+    try:
+        conn.execute("BEGIN")
+        store_epoch, current_hlc = _read_fact_identity(conn)
+        if as_of is None:
+            as_of = current_hlc
+        events = _read_active_event_rows(conn, as_of)
+        after_epoch, after_hlc = _read_fact_identity(conn)
+        conn.execute("COMMIT")
+    except sqlite3.Error as error:
+        raise BuildError("fact store read failed: %s" % error)
+    finally:
+        conn.close()
+    if after_epoch != store_epoch:
+        raise BuildEpochChangedError(
+            "fact store epoch changed during the snapshot read (%s -> %s)"
+            % (store_epoch, after_epoch))
+    if not pinned and after_hlc != current_hlc:
+        raise BuildEpochChangedError(
+            "fact store identity changed during the snapshot read "
+            "(%s/%s -> %s/%s)" % (store_epoch, current_hlc, after_epoch,
+                                  after_hlc))
+    return store_epoch, as_of, events
+
+
+def _prepare_target(events, provider, store_epoch, source_hlc):
+    """The deterministic build target over one frozen snapshot.
+
+    Validates every event (a violation blocks with the event named), derives
+    the ordered row projection and the rows fingerprint, and composes the
+    container identity and generation id (spec: staging 固定目标 epoch、H0、
+    全部 fingerprints、builder 版本与确定事件清单).  Returns a dict with
+    ``rows``, ``rows_fingerprint``, ``identity`` and ``generation_id``.
+    """
+    rows = []
+    for stored in events:
+        problem = _validate_event(stored)
+        if problem is not None:
+            raise BuildBlockedError(
+                "cannot build generation: %s (event %s)"
+                % (problem, stored.event_id), [stored.event_id],
+                phase="parse")
+        key = choice_problem_key(stored.schema_id, stored.category,
+                                 stored.canonical_segment_input)
+        rows.append(_metadata_row(stored.event_id, key,
+                                  stored.final_selection_text, stored.hlc))
+    fingerprint = _rows_fingerprint(rows)
+    identity = {
+        "store_epoch": store_epoch,
+        "source_hlc": [source_hlc[0], source_hlc[1]],
+        "representation_id": provider.representation_id(),
+        "vector_dimension": provider.vector_dimension(),
+        "vector_format": VECTOR_FORMAT,
+        "builder_version": BUILD_VERSION,
+        "retrieval_backend": RETRIEVAL_BACKEND,
+        "retrieval_params": RETRIEVAL_PARAMS,
+    }
+    generation_id = _compose_generation_id(identity, fingerprint)
+    return {
+        "rows": rows,
+        "rows_fingerprint": fingerprint,
+        "identity": identity,
+        "generation_id": generation_id,
+    }
+
+
+def _build_chunks(staging_dir, vectors_path, events, provider, dimension,
+                  chunk_rows, generation_id, progress, start_row=0,
+                  prefix_digest=None, chunk_limit=None):
+    """Embed vector chunks [start_row, ...) and advance progress.
+
+    ``start_row`` is the first row NOT yet covered by a verified chunk
+    record; when it is > 0 the file is truncated to ``start_row`` rows
+    first (a crash mid-chunk leaves garbage after the last committed
+    chunk) and embedding continues from there.  ``prefix_digest`` must be
+    the sha256 hash object over the verified prefix when resuming (None
+    from scratch); it is copied so the returned whole-file digest covers
+    the prefix plus the newly written bytes.  ``chunk_limit`` bounds the
+    number of chunks embedded in one call (the staging machine embeds one
+    chunk per state-machine cycle, so every intermediate state is a
+    crashable resting state).  Every chunk is fsynced before the progress
+    manifest is atomically advanced, so a crash at any point resumes from
+    the last verified chunk.  Returns ``(chunks, full_sha256)`` where
+    ``chunks`` are the newly written records; ``full_sha256`` covers the
+    whole file.
+    """
+    chunks = []
+    full_sha = prefix_digest.copy() if prefix_digest else hashlib.sha256()
+    flags = os.O_WRONLY | os.O_NOFOLLOW
+    if start_row == 0:
+        flags |= os.O_CREAT | os.O_EXCL
+    vector_fd = os.open(vectors_path, flags, 0o600)
+    try:
+        if start_row > 0:
+            os.ftruncate(vector_fd, start_row * dimension * 4)
+            os.lseek(vector_fd, 0, os.SEEK_END)
+        start = start_row
+        embedded = 0
+        while start < len(events):
+            if chunk_limit is not None and embedded >= chunk_limit:
+                break
+            end = min(start + chunk_rows, len(events))
+            buffers = []
+            for stored in events[start:end]:
+                event_id = stored.event_id
+                try:
+                    vector = provider.event_vector(stored)
+                except EvidenceError as error:
+                    raise BuildBlockedError(
+                        "cannot build generation: %s (event %s)"
+                        % (error.message, event_id), [event_id],
+                        phase="vector")
+                except Exception as error:  # noqa: BLE001 - fail closed
+                    raise BuildBlockedError(
+                        "cannot build generation: representation error for "
+                        "event %s: %s" % (event_id, error), [event_id],
+                        phase="vector")
+                problem = _validate_vector(vector, dimension)
+                if problem is not None:
+                    raise BuildBlockedError(
+                        "cannot build generation: dirty vector for event %s: "
+                        "%s" % (event_id, problem), [event_id],
+                        phase="vector")
+                buffers.append(struct.pack("<%df" % dimension,
+                                           *[float(v) for v in vector]))
+            chunk_bytes = b"".join(buffers)
+            view = memoryview(chunk_bytes)
+            written = 0
+            while written < len(view):
+                written += os.write(vector_fd, view[written:])
+            full_sha.update(chunk_bytes)
+            record = {"start_row": start, "end_row": end,
+                      "bytes": len(chunk_bytes),
+                      "sha256": _sha256_hex(chunk_bytes)}
+            chunks.append(record)
+            progress["chunks"].append(record)
+            _mark_progress(staging_dir, progress)
+            os.fsync(vector_fd)
+            embedded += 1
+            start = end
+    finally:
+        os.close(vector_fd)
+    return chunks, full_sha.hexdigest()
+
+
+def _verify_progress_chunks(progress, vectors_path, dimension):
+    """Re-verify the recorded chunk records against the vectors file.
+
+    Returns ``(next_row, prefix_digest)``: ``next_row`` is the first row
+    after the last fully verified chunk (the resume point) and
+    ``prefix_digest`` the sha256 hash object over the verified prefix (the
+    builder copies it to extend the final whole-file checksum).  Raises
+    ``BuildProgressError`` on the first structural or checksum mismatch --
+    a staging whose progress cannot be re-verified is discarded in full,
+    never resumed in part.
+    """
+    chunks = progress.get("chunks")
+    if not isinstance(chunks, list):
+        raise BuildProgressError("progress chunks are not a list")
+    row_bytes = dimension * 4
+    digest = hashlib.sha256()
+    if not chunks:
+        # No chunks recorded yet (fresh build): nothing to verify, and the
+        # vectors file may not even exist -- the first embed creates it.
+        return 0, digest
+    next_row = 0
+    try:
+        handle = open(vectors_path, "rb")
+    except OSError as error:
+        raise BuildProgressError("cannot open the staging vectors file: %s"
+                                 % error)
+    try:
+        for index, chunk in enumerate(chunks):
+            if not isinstance(chunk, dict):
+                raise BuildProgressError("chunk %d is not an object" % index)
+            start = chunk.get("start_row")
+            end = chunk.get("end_row")
+            if not (isinstance(start, int) and isinstance(end, int)
+                    and 0 <= start < end and start == next_row):
+                raise BuildProgressError("chunk %d row range invalid" % index)
+            if chunk.get("bytes") != (end - start) * row_bytes:
+                raise BuildProgressError(
+                    "chunk %d byte count mismatch" % index)
+            expected = chunk.get("sha256")
+            if not isinstance(expected, str) or not expected:
+                raise BuildProgressError("chunk %d checksum missing" % index)
+            handle.seek(start * row_bytes)
+            data = handle.read((end - start) * row_bytes)
+            if len(data) != (end - start) * row_bytes:
+                raise BuildProgressError("chunk %d is truncated" % index)
+            if _sha256_hex(data) != expected:
+                raise BuildProgressError("chunk %d checksum mismatch" % index)
+            digest.update(data)
+            next_row = end
+    finally:
+        handle.close()
+    return next_row, digest
+
+
+def _write_metadata(metadata_path, rows):
+    _write_file(metadata_path, _canonical_json([
+        dict(row, row=index) for index, row in enumerate(rows)
+    ]).encode("utf-8"))
+
+
+def _compute_probes(facts_root, provider, events, rows, vectors_path,
+                    dimension, probe_params, source_hlc):
+    """The fixed exact-oracle probes over the finished vectors file.
+
+    Recomputes the probe query vectors from the raw 上文 in the facts and
+    runs the canonical oracle against the container's own projection, so
+    the recorded result fingerprints are reproducible at reopen without the
+    facts store.  A deterministic probe fault raises ``BuildBlockedError``
+    (phase "probe") naming the event; the caller marks the staging blocked.
+    """
+    probes = {"params": _probe_params_dict(probe_params), "items": []}
+    probe_events = events[:PROBE_COUNT] if PROBE_COUNT > 0 else []
+    row_index = {row["event_id"]: index for index, row in enumerate(rows)}
+    vfile = None
+    try:
+        vfile = _VectorFile(vectors_path, len(rows), dimension)
+        probe_reader = _open_fact_store(facts_root)
+        try:
+            for stored in probe_events:
+                event_id = stored.event_id
+                candidates = _competition_candidates(probe_reader, event_id)
+                if not candidates:
+                    candidates = [stored.final_selection_text]
+                try:
+                    query_vector = list(provider.query_vector(
+                        stored.preceding_text))
+                except EvidenceError as error:
+                    raise BuildBlockedError(
+                        "cannot build generation: probe query vector for "
+                        "event %s: %s" % (event_id, error.message),
+                        [event_id], phase="probe")
+                except Exception as error:  # noqa: BLE001 - fail closed
+                    raise BuildBlockedError(
+                        "cannot build generation: probe query vector for "
+                        "event %s: %s" % (event_id, error), [event_id],
+                        phase="probe")
+                probe = {
+                    "schema_id": stored.schema_id,
+                    "category": stored.category,
+                    "canonical_segment_input": stored.canonical_segment_input,
+                    "candidates": list(candidates),
+                    "query_vector": query_vector,
+                }
+                result = _compute_probe(probe, events, vfile, row_index,
+                                        probe_params, source_hlc)
+                probes["items"].append(dict(probe, results_fingerprint=(
+                    _probe_results_fingerprint(result))))
+        finally:
+            probe_reader.close()
+    finally:
+        if vfile is not None:
+            vfile.close()
+    return probes
+
+
+def _compose_manifest(identity, generation_id, rows_fingerprint, row_count,
+                      chunks, probes, metadata_path, vectors_path,
+                      vectors_sha256):
+    """The final manifest bytes (checksums + self-checksum, exactly the #62
+    format so a staged build and a direct build are byte-identical)."""
+    files = {
+        "metadata.json": {"size": os.path.getsize(metadata_path),
+                          "sha256": _file_sha256(metadata_path)},
+        "vectors.fp32": {"size": os.path.getsize(vectors_path),
+                         "sha256": vectors_sha256},
+    }
+    manifest = {
+        "manifest_version": MANIFEST_VERSION,
+        "generation_id": generation_id,
+        "identity": identity,
+        "rows": {"count": row_count, "fingerprint": rows_fingerprint},
+        "chunks": chunks,
+        "probes": probes,
+        "files": files,
+    }
+    self_check = dict(manifest)
+    self_check["files"] = dict(self_check["files"])
+    self_sha = _sha256_hex(_canonical_json(self_check).encode("utf-8"))
+    manifest["files"]["manifest.json"] = {"sha256": self_sha}
+    return _canonical_json(manifest).encode("utf-8")
+
+
 def build_generation(facts_root, provider, output_root,
                      chunk_rows=CHUNK_ROWS, probe_params=PROBE_PARAMS):
     """Build and publish one immutable generation over a facts snapshot.
@@ -593,48 +921,12 @@ def build_generation(facts_root, provider, output_root,
         raise BuildError("provider vector_dimension must be a positive "
                          "integer")
 
-    conn = _open_fact_store(facts_root)
-    events = []
-    try:
-        conn.execute("BEGIN")
-        store_epoch, source_hlc = _read_fact_identity(conn)
-        events = _read_active_event_rows(conn, source_hlc)
-        after_epoch, after_hlc = _read_fact_identity(conn)
-        conn.execute("COMMIT")
-    except sqlite3.Error as error:
-        raise BuildError("fact store read failed: %s" % error)
-    finally:
-        conn.close()
-    if after_epoch != store_epoch or after_hlc != source_hlc:
-        raise BuildEpochChangedError(
-            "fact store identity changed during the snapshot read "
-            "(%s/%s -> %s/%s)" % (store_epoch, source_hlc, after_epoch,
-                                  after_hlc))
-
-    rows = []
-    for stored in events:
-        problem = _validate_event(stored)
-        if problem is not None:
-            raise BuildBlockedError(
-                "cannot build generation: %s (event %s)"
-                % (problem, stored.event_id), [stored.event_id],
-                phase="parse")
-        key = choice_problem_key(stored.schema_id, stored.category,
-                                 stored.canonical_segment_input)
-        rows.append(_metadata_row(stored.event_id, key,
-                                  stored.final_selection_text, stored.hlc))
-    fingerprint = _rows_fingerprint(rows)
-    identity = {
-        "store_epoch": store_epoch,
-        "source_hlc": [source_hlc[0], source_hlc[1]],
-        "representation_id": representation_id_value,
-        "vector_dimension": dimension,
-        "vector_format": VECTOR_FORMAT,
-        "builder_version": BUILD_VERSION,
-        "retrieval_backend": RETRIEVAL_BACKEND,
-        "retrieval_params": RETRIEVAL_PARAMS,
-    }
-    generation_id = _compose_generation_id(identity, fingerprint)
+    store_epoch, source_hlc, events = _read_snapshot(facts_root)
+    target = _prepare_target(events, provider, store_epoch, source_hlc)
+    rows = target["rows"]
+    fingerprint = target["rows_fingerprint"]
+    identity = target["identity"]
+    generation_id = target["generation_id"]
 
     staging_dir = os.path.join(output_root, "staging", generation_id)
     published_dir = os.path.join(output_root, "generations", generation_id)
@@ -661,136 +953,33 @@ def build_generation(facts_root, provider, output_root,
     _mark_progress(staging_dir, progress)
 
     # -- chunked vector build (spec: 每块记录 row 范围和 checksum) ----------
-    chunks = []
-    full_sha = hashlib.sha256()
-    vector_fd = os.open(vectors_path,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600)
     try:
-        start = 0
-        while start < len(events):
-            end = min(start + chunk_rows, len(events))
-            buffers = []
-            for stored in events[start:end]:
-                event_id = stored.event_id
-                try:
-                    vector = provider.event_vector(stored)
-                except EvidenceError as error:
-                    _mark_blocked(staging_dir, generation_id, [event_id],
-                                  error.message, "vector")
-                    raise BuildBlockedError(
-                        "cannot build generation: %s (event %s)"
-                        % (error.message, event_id), [event_id],
-                        phase="vector")
-                except Exception as error:  # noqa: BLE001 - fail closed
-                    _mark_blocked(staging_dir, generation_id, [event_id],
-                                  "representation error: %s" % error,
-                                  "vector")
-                    raise BuildBlockedError(
-                        "cannot build generation: representation error for "
-                        "event %s: %s" % (event_id, error), [event_id],
-                        phase="vector")
-                problem = _validate_vector(vector, dimension)
-                if problem is not None:
-                    _mark_blocked(staging_dir, generation_id, [event_id],
-                                  "dirty vector: %s" % problem, "vector")
-                    raise BuildBlockedError(
-                        "cannot build generation: dirty vector for event %s: "
-                        "%s" % (event_id, problem), [event_id],
-                        phase="vector")
-                buffers.append(struct.pack("<%df" % dimension,
-                                           *[float(v) for v in vector]))
-            chunk_bytes = b"".join(buffers)
-            view = memoryview(chunk_bytes)
-            written = 0
-            while written < len(view):
-                written += os.write(vector_fd, view[written:])
-            full_sha.update(chunk_bytes)
-            chunks.append({"start_row": start, "end_row": end,
-                           "bytes": len(chunk_bytes),
-                           "sha256": _sha256_hex(chunk_bytes)})
-            progress["chunks"] = list(chunks)
-            _mark_progress(staging_dir, progress)
-            start = end
-        os.fsync(vector_fd)
-    finally:
-        os.close(vector_fd)
+        chunks, vectors_sha256 = _build_chunks(
+            staging_dir, vectors_path, events, provider, dimension,
+            chunk_rows, generation_id, progress)
+    except BuildBlockedError as error:
+        _mark_blocked(staging_dir, generation_id, error.blocked_events,
+                      error.message, error.phase)
+        raise
 
     # -- read-only row metadata ---------------------------------------------
-    _write_file(metadata_path, _canonical_json([
-        dict(row, row=index) for index, row in enumerate(rows)
-    ]).encode("utf-8"))
-    row_index = {row["event_id"]: index for index, row in enumerate(rows)}
+    _write_metadata(metadata_path, rows)
 
     # -- fixed exact-oracle probes ------------------------------------------
-    probes = {"params": _probe_params_dict(probe_params), "items": []}
-    probe_events = events[:PROBE_COUNT] if PROBE_COUNT > 0 else []
-    vfile = None
     try:
-        vfile = _VectorFile(vectors_path, len(rows), dimension)
-        probe_reader = _open_fact_store(facts_root)
-        try:
-            for stored in probe_events:
-                event_id = stored.event_id
-                candidates = _competition_candidates(probe_reader, event_id)
-                if not candidates:
-                    candidates = [stored.final_selection_text]
-                try:
-                    query_vector = list(provider.query_vector(
-                        stored.preceding_text))
-                except EvidenceError as error:
-                    _mark_blocked(staging_dir, generation_id, [event_id],
-                                  "probe query vector: %s" % error.message,
-                                  "probe")
-                    raise BuildBlockedError(
-                        "cannot build generation: probe query vector for "
-                        "event %s: %s" % (event_id, error.message),
-                        [event_id], phase="probe")
-                except Exception as error:  # noqa: BLE001 - fail closed
-                    _mark_blocked(staging_dir, generation_id, [event_id],
-                                  "probe query vector: %s" % error, "probe")
-                    raise BuildBlockedError(
-                        "cannot build generation: probe query vector for "
-                        "event %s: %s" % (event_id, error), [event_id],
-                        phase="probe")
-                probe = {
-                    "schema_id": stored.schema_id,
-                    "category": stored.category,
-                    "canonical_segment_input": stored.canonical_segment_input,
-                    "candidates": list(candidates),
-                    "query_vector": query_vector,
-                }
-                result = _compute_probe(probe, events, vfile, row_index,
-                                        probe_params, source_hlc)
-                probes["items"].append(dict(probe, results_fingerprint=(
-                    _probe_results_fingerprint(result))))
-        finally:
-            probe_reader.close()
-    finally:
-        if vfile is not None:
-            vfile.close()
+        probes = _compute_probes(facts_root, provider, events, rows,
+                                 vectors_path, dimension, probe_params,
+                                 source_hlc)
+    except BuildBlockedError as error:
+        _mark_blocked(staging_dir, generation_id, error.blocked_events,
+                      error.message, error.phase)
+        raise
 
     # -- final manifest -------------------------------------------------------
-    files = {
-        "metadata.json": {"size": os.path.getsize(metadata_path),
-                          "sha256": _file_sha256(metadata_path)},
-        "vectors.fp32": {"size": os.path.getsize(vectors_path),
-                         "sha256": full_sha.hexdigest()},
-    }
-    manifest = {
-        "manifest_version": MANIFEST_VERSION,
-        "generation_id": generation_id,
-        "identity": identity,
-        "rows": {"count": len(rows), "fingerprint": fingerprint},
-        "chunks": chunks,
-        "probes": probes,
-        "files": files,
-    }
-    self_check = dict(manifest)
-    self_check["files"] = dict(self_check["files"])
-    self_sha = _sha256_hex(_canonical_json(self_check).encode("utf-8"))
-    manifest["files"]["manifest.json"] = {"sha256": self_sha}
-    manifest_bytes = _canonical_json(manifest).encode("utf-8")
+    manifest_bytes = _compose_manifest(identity, generation_id, fingerprint,
+                                       len(rows), chunks, probes,
+                                       metadata_path, vectors_path,
+                                       vectors_sha256)
     _write_file(manifest_path, manifest_bytes)
     _fsync_directory(staging_dir)
 
