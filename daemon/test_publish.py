@@ -1071,14 +1071,31 @@ class IdentityAtomicityTest(PublishBase):
         builder = env.staging()
         progress = env.run_to_ready(builder)
         machine = self.machine()
+        machine.ensure_caught_up()
         old_snapshot = machine.snapshot()
+        # Park the worker so the epoch change cannot trigger a rebuild
+        # before the switch is queued.
+        machine.request_stop()
+        self.assertTrue(machine.wait_idle(5.0))
         env.facts.conn.execute(
             "UPDATE meta SET value = 'e2' WHERE key = 'store_epoch';")
         env.facts.conn.commit()
-        ok, error = machine.publish_switch(
-            progress["generation_id"],
-            env.checkpoint_path(progress["generation_id"]),
-            env.desired_provider, "e1")
+        result_holder = {}
+
+        def run_switch():
+            result_holder["result"] = machine.publish_switch(
+                progress["generation_id"],
+                env.checkpoint_path(progress["generation_id"]),
+                env.desired_provider, "e1",
+                deadline=time.monotonic() + 10.0)
+
+        thread = threading.Thread(target=run_switch)
+        thread.start()
+        time.sleep(0.1)  # the switch is queued (the worker is parked)
+        machine.start()  # the worker processes it and aborts on the epoch
+        thread.join(10.0)
+        self.assertFalse(thread.is_alive(), "switch handshake did not end")
+        ok, error = result_holder["result"]
         self.assertFalse(ok)
         self.assertIn("epoch changed", error)
         self.assertIs(machine.snapshot(), old_snapshot)
