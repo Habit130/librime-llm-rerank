@@ -253,9 +253,17 @@ class EvidenceService:
     ``params`` the oracle aggregation parameters, ``provider`` the injected
     deterministic representation seam and ``gamma`` the plugin-side evidence
     weight that participates in the config identity.
+
+    ``machine`` (optional, #63) is the delta state machine whose published
+    query snapshot gates every request: the request is served only from a
+    snapshot that has caught up to the facts' current ``store_epoch`` +
+    max change HLC, so a request never succeeds on a stale watermark.  When
+    no machine is configured the service reads the facts directly (the
+    offline/calibration path); when a machine is configured but the fact
+    store is missing, the missing-store semantics below apply unchanged.
     """
 
-    def __init__(self, facts_root, params, provider, gamma):
+    def __init__(self, facts_root, params, provider, gamma, machine=None):
         if not facts_root:
             raise EvidenceError("evidence_unavailable", "facts root missing")
         if not isinstance(params, OracleParams):
@@ -270,6 +278,7 @@ class EvidenceService:
         self._params = params
         self._provider = provider
         self._gamma = gamma
+        self._machine = machine
         self._config_identity = compose_config_identity(
             provider.representation_id(), params, gamma)
 
@@ -278,6 +287,68 @@ class EvidenceService:
 
     def _db_path(self):
         return os.path.join(self._facts_root, "facts.sqlite3")
+
+    def _serve_via_snapshot(self, request):
+        """Serve one request from the machine's caught-up query snapshot.
+
+        The catch-up gate (AC63-1) re-reads the facts identity inside
+        ``ensure_caught_up``; only a snapshot covering the facts' current
+        watermark is returned, otherwise a true ``not_caught_up`` fault is
+        raised -- never a stale-watermark success (AC63-6).
+        """
+        schema_id = request["schema_id"]
+        category = request["category"]
+        canonical_input = request["canonical_segment_input"]
+        preceding_text = request["preceding_text"]
+        candidates = request["candidates"]
+        request_watermark = request["fact_high_water"]
+
+        snapshot = self._machine.ensure_caught_up()
+        self._check_watermark(request_watermark, snapshot.store_epoch,
+                              snapshot.consumed[0], snapshot.consumed[1])
+
+        try:
+            query_vector = self._provider.query_vector(preceding_text)
+        except EvidenceError:
+            raise
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise EvidenceError(
+                "representation_fault", "query vector failed: %s" % error
+            ) from error
+
+        query = OracleQuery(
+            schema_id=schema_id,
+            canonical_segment_input=canonical_input,
+            candidates=list(candidates),
+            query_vector=list(query_vector),
+            category=category,
+        )
+        reader = snapshot.reader()
+        try:
+            result = compute_evidence(reader, self._params, query,
+                                      snapshot.vector_for)
+        except OracleError as error:
+            raise EvidenceError("oracle_fault", str(error)) from error
+        finally:
+            reader.close()
+
+        s_by_index = {
+            candidate.index: candidate.s for candidate in result.candidates
+        }
+        evidence = [
+            {"index": index, "s": s_by_index.get(index, 0.0)}
+            for index in range(len(candidates))
+        ]
+        zero_evidence = all(abs(entry["s"]) == 0.0 for entry in evidence)
+        return {
+            "status": "ok",
+            "zero_evidence": zero_evidence,
+            "evidence": evidence,
+            "query_point": {
+                "hlc_physical_ms": result.query_point[0],
+                "hlc_logical": result.query_point[1],
+            },
+        }
 
     def _read_identity(self, reader):
         """store_epoch + max change HLC from the meta table (read-only).
@@ -329,6 +400,8 @@ class EvidenceService:
         Returns the success response dict (including ``zero_evidence``);
         raises EvidenceError for every true fault.
         """
+        if self._machine is not None and os.path.isfile(self._db_path()):
+            return self._serve_via_snapshot(request)
         schema_id = request["schema_id"]
         category = request["category"]
         canonical_input = request["canonical_segment_input"]
@@ -452,7 +525,7 @@ def make_evidence_request(schema_id, category, canonical_segment_input,
     }
 
 
-def build_evidence_service_from_config(facts_root, config):
+def build_evidence_service_from_config(facts_root, config, machine=None):
     """Construct an EvidenceService from a JSON config dict.
 
     The config binds the oracle params, the plugin-side gamma and the
@@ -463,9 +536,12 @@ def build_evidence_service_from_config(facts_root, config):
         event_vectors (schema_id|canonical_segment_input|final_selection -> vector),
         default_query, default_event
 
-    This is the #61 seam: e2e and daemon tests inject a deterministic
-    fixture; #62 plugs the real hidden-state provider behind the same
-    config shape (query/event vectors produced by the generation instead).
+    ``machine`` (#63) is an optional prebuilt delta state machine; when
+    present, every served request is gated through its published query
+    snapshot instead of the live facts.  This is the #61 seam: e2e and
+    daemon tests inject a deterministic fixture; #62 plugs the real
+    hidden-state provider behind the same config shape (query/event vectors
+    produced by the generation instead).
     """
     try:
         representation_id = config["representation_id"]
@@ -493,4 +569,5 @@ def build_evidence_service_from_config(facts_root, config):
         default_event=(default_event if default_event is not None
                        else (0.0, 1.0, 0.0, 0.0)),
     )
-    return EvidenceService(facts_root, params, provider, gamma)
+    return EvidenceService(facts_root, params, provider, gamma,
+                           machine=machine)

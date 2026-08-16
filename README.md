@@ -393,6 +393,48 @@ identity and file hashes, determinism rerun hashes, replay equality) to
 `--output` or a fresh temp dir; it never touches the private fact root,
 `~/Library/Rime` or the live daemon.
 
+## Persistent delta state machine
+
+`daemon/delta.py` makes newly committed events and whole-commit retractions
+immediately visible to the next successful semantic query (Habit130/squirrel#63),
+on top of one verified immutable base generation (#62):
+
+- A single catch-up worker absorbs fact changes in fact-transaction order
+  and advances one `delta.sqlite3` checkpoint (WAL, `synchronous=FULL`)
+  holding FP32 vector BLOBs, event metadata, retraction tombstones, the
+  compatible identity (base generation, store epoch, representation,
+  dimension) and the consumed change HLC.
+- One catch-up batch embeds vectors, then advances rows + tombstones +
+  watermark + change sequence in ONE SQLite transaction; only after that
+  commit is a new read-only query snapshot published atomically. A
+  retraction exits both evidence and the age clock in the same snapshot.
+- Every query first re-reads `store_epoch` + max change HLC from the facts
+  and succeeds only when the published snapshot has caught up; a snapshot
+  behind the watermark (or a catch-up that misses the request deadline)
+  fails explicitly with `not_caught_up`, never a stale-watermark success.
+  Notifications are only a wake optimization.
+- The checkpoint is a fast-recovery cache, never a second fact source:
+  restart, lost notifications, checkpoint corruption (identity, checks,
+  event-set equality) and `store_epoch` changes all replay deterministically
+  from facts to evidence-identical results (文件级等价不作承诺).
+- `EvidenceService` serves from the machine's snapshot when the evidence
+  config declares `derived_root` + `generation_id`; the machine doubles as
+  the maintenance coordinator's derived-state recovery (invalidate/rebuild)
+  and quiesceable builder. Without the delta keys the direct live-facts path
+  is unchanged.
+
+Design decisions are recorded in `docs/delta-state-machine.md`.
+
+Evidence commands:
+
+```sh
+# model-free gate (no MLX/model)
+python3 -m unittest discover -s daemon -p 'test_*.py'
+# real-model: immediate visibility + retraction, restart fast path,
+# corrupt-checkpoint replay and epoch-change rebuild on synthetic facts
+daemon/.venv/bin/python daemon/integration_delta.py --events 24
+```
+
 ## Frozen baseline policy identity
 
 The shadow baseline (Habit130/squirrel#75) pins a composed
