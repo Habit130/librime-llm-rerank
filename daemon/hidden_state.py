@@ -19,6 +19,7 @@ All MLX/numpy imports are lazy so the model-free daemon gate can import this
 module without MLX installed.
 """
 
+from evidence import EvidenceError, RepresentationProvider
 from representations import (
     EXACT_LAYERS,
     SPLIT_REUSE_LAYER,
@@ -244,3 +245,48 @@ class HiddenStateExtractor:
         snapshots, cache = self._guarded(
             lambda: self._run(tail_ids, prefix_cache, {SPLIT_REUSE_LAYER}))
         return self._final_validate(snapshots[SPLIT_REUSE_LAYER]), cache
+
+
+class HiddenStateRepresentationProvider(RepresentationProvider):
+    """One pre-declared representation behind the #61 provider seam (#62).
+
+    The generation path's real provider: ``event_vector`` recomputes the
+    event representation from the event's raw ``preceding_text`` (facts are
+    the only source of raw text; the generation stores vectors only),
+    ``query_vector`` computes the same representation for request text, and
+    ``representation_id`` is the extractor's deterministic id for the bound
+    spec.  Any representation fault (empty window, model forward failure,
+    non-finite vector) surfaces as ``EvidenceError(representation_fault)``
+    so the #62 builder blocks the build naming the event (SCN-62-7).
+    """
+
+    def __init__(self, extractor, spec):
+        if not isinstance(spec, RepresentationSpec):
+            raise InvalidRepresentationSpec(
+                "spec must be a RepresentationSpec")
+        self._extractor = extractor
+        self._spec = spec
+
+    def representation_id(self):
+        return self._extractor.representation_id(self._spec)
+
+    def query_vector(self, preceding_text):
+        return self._forward(preceding_text)
+
+    def event_vector(self, event):
+        return self._forward(event.preceding_text)
+
+    def vector_dimension(self):
+        return self._extractor.identity.hidden_dim
+
+    def _forward(self, context):
+        try:
+            if self._spec.kind == "exact":
+                return self._extractor.exact(self._spec, context)
+            return self._extractor.split_reuse(context)[0]
+        except EvidenceError:
+            raise
+        except RepresentationError as error:
+            raise EvidenceError(
+                "representation_fault", "representation failed: %s" % error
+            ) from error

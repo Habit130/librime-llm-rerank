@@ -325,6 +325,74 @@ never the private fact root or `~/Library/Rime`. Winner selection among these
 candidates is intentionally deferred: no representation is declared a winner
 without real selection-event evidence (Habit130/squirrel#77 / #80).
 
+## Immutable shadow generations
+
+`daemon/generation.py` builds immutable, byte-deterministic FP32 shadow
+generations from the selection facts (Habit130/squirrel#62): each generation
+is the pre-declared representation of every active event at a fixed fact
+snapshot, stored so it can be re-verified, replayed and deterministically
+rebuilt without ever becoming a second fact source.
+
+Container layout (spec #43):
+
+```text
+<derived_root>/staging/<generation_id>/   in-progress / blocked builds
+    progress.json   transient progress manifest (atomically advanced)
+    manifest.json   identity + per-file checksums + chunk records + probes
+    metadata.json   read-only row -> event projection
+    vectors.fp32    row-major little-endian FP32, mmap-able, no header
+<derived_root>/generations/<generation_id>/   immutable published generation
+```
+
+Identity composition — `generation_id = shadow-gen-v1:<sha256(identity +
+rows_fingerprint)>` — binds `store_epoch`, the source HLC watermark `H0`, the
+complete `representation_id`, vector dimension and format, the builder
+version, and the retrieval backend and parameters. Two builds over the same
+facts and identity produce the same id and byte-identical files; deleting a
+generation and rebuilding from facts is bit-identical (spec's explicit
+rebuild path, never an in-place update). The builder reads the facts
+read-only inside one SQLite transaction (active events as of `H0`, ordered by
+`(hlc, event_id)`), re-checks the store identity before publishing, writes
+chunks with per-chunk row-range checksums in `progress.json`, and publishes by
+atomic rename only after the full reopen verification (checksums, chunk
+records, row/event bijection, finiteness and unit norm of every vector, and
+the fixed exact-oracle probes) passes.
+
+Deterministic parse, representation or model errors enter `blocked` with the
+blocking event(s) named in `progress.json`; nothing is silently skipped, and a
+blocked build is never published. `open_generation` re-verifies everything
+and raises `GenerationRejected` for corrupt, truncated or identity-unknown
+containers — never loading them as an empty memory. `replay_exact` replays one
+query against the generation: the oracle's as-of point is pinned to `H0`, the
+facts must carry the same `store_epoch` and the same active event set, and
+event vectors come from the mmap'd file, so the evidence is bit-identical to
+the canonical oracle on the same facts and vectors. `GenerationRepresentationProvider`
+exposes the generation behind the #61 `RepresentationProvider` seam (the
+online/delta integration and staging blue-green publish are deferred to
+#63/#64/#65).
+
+The real-model provider (`HiddenStateRepresentationProvider` in
+`daemon/hidden_state.py`) recomputes each event's vector from the raw
+`preceding_text` stored in the facts — the facts stay the only raw-text
+source; the container holds vectors, keys and candidate text only. No
+winner is declared: the shadow build covers the whole pre-declared first-round
+set (`exact_l14/21/28_last` and `split_l28_last`), one generation each.
+
+Evidence commands (daemon venv required for the integration run):
+
+```sh
+# model-free gate (no MLX/model)
+python3 -m unittest discover -s daemon -p 'test_*.py'
+# real-model: build all first-round generations, determinism rerun,
+# delete-rebuild and replay-vs-oracle equality on 24 synthetic events
+daemon/.venv/bin/python daemon/integration_generation.py --events 24
+```
+
+The integration script writes a JSON evidence artifact (per-generation
+identity and file hashes, determinism rerun hashes, replay equality) to
+`--output` or a fresh temp dir; it never touches the private fact root,
+`~/Library/Rime` or the live daemon.
+
 ## Frozen baseline policy identity
 
 The shadow baseline (Habit130/squirrel#75) pins a composed

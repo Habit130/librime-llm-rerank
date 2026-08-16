@@ -146,10 +146,14 @@ class FactsFixture:
                   commit_id=None, schema_id="luna_pinyin",
                   segment_input="nihao", category="word",
                   selection="你好", hlc=None, utc_committed=None,
-                  utc_confirmed=None):
+                  utc_confirmed=None, preceding_text="前文",
+                  competition=()):
         """One immutable selection event; HLC auto-advances when not given.
 
         The meta clock advances with every write, mirroring the C++ store.
+        ``preceding_text`` is the raw recent-64-char 上文 the event was
+        recorded with; ``competition`` extends the materialized competition
+        set (merge order 1+; the selection itself is always merge order 0).
         """
         commit_id = commit_id or "commit-" + event_id
         if hlc is None:
@@ -169,11 +173,15 @@ class FactsFixture:
             " hlc_logical, utc_confirmed_at_ms, utc_committed_at_ms)"
             " VALUES(?,?,?,?,?,0,4,?,?,1,?,?,NULL,1,1,'s1',0,?,?,?,?);",
             (event_id, commit_id, 1, schema_id, segment_input, category,
-             "前文", selection, "explicit_current", physical, logical,
+             preceding_text, selection, "explicit_current", physical, logical,
              utc_confirmed or physical, utc_committed or physical))
         self.conn.execute(
             "INSERT INTO selection_candidates(event_id, merge_order, text)"
             " VALUES(?, 0, ?);", (event_id, selection))
+        for order, text in enumerate(competition, start=1):
+            self.conn.execute(
+                "INSERT INTO selection_candidates(event_id, merge_order, text)"
+                " VALUES(?, ?, ?);", (event_id, order, text))
         self._advance_clock(physical, logical)
         self.conn.commit()
         return event_id

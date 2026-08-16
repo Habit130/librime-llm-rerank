@@ -130,8 +130,10 @@ class RepresentationProvider:
     representation; ``event_vector`` turns one stored selection event into
     the representation that was (or will be) generated for it.  A missing or
     unusable event vector is a true fault (the oracle's ``vector_for`` raises
-    OracleError), never silent zero evidence.  #62 plugs a real
-    generation-backed provider behind this interface.
+    OracleError), never silent zero evidence.  ``vector_dimension`` declares
+    the fixed output dimension (the generation builder binds it into the
+    container identity).  #62 plugs a real generation-backed provider behind
+    this interface.
     """
 
     def representation_id(self):
@@ -141,6 +143,9 @@ class RepresentationProvider:
         raise NotImplementedError
 
     def event_vector(self, event):
+        raise NotImplementedError
+
+    def vector_dimension(self):
         raise NotImplementedError
 
 
@@ -228,6 +233,9 @@ class FixtureRepresentationProvider(RepresentationProvider):
                                  event.canonical_segment_input,
                                  event.final_selection_text)
         return self._event_vectors.get(key, self._default_event)
+
+    def vector_dimension(self):
+        return len(self._default_query)
 
 
 # ---------------------------------------------------------------------------
