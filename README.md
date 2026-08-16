@@ -184,6 +184,61 @@ Ctrl-C in the foreground CLI only detaches (exit 130) while the detached
 executor continues. The same operation ID with the same parameters reuses
 the same backup; the same ID with different parameters is rejected.
 
+## Exact retrieval-evidence oracle
+
+`daemon/oracle.py` implements the spec-fixed exact oracle (Habit130/squirrel
+#43 "精确 oracle" / #59): the single ground truth every semantic-memory
+evaluation compares against. It is model-free and stdlib-only, consumes
+read-only fact stores plus caller-supplied deterministic per-event vectors,
+and never produces or touches embeddings.
+
+For one current rerank group it returns the bounded retrieval evidence
+`s_c` per candidate, exactly per spec:
+
+```text
+choice_problem_key = schema_id + category + canonical_segment_input
+r_i = clamp((cos_i - tau) / (1 - tau), 0, 1)
+u_i = count of same-key active events with order > order(i)
+d_i = 2 ** (-u_i / H)
+a_i = r_i * d_i
+kept = at most K_evidence events above the threshold, largest a_i
+m_c = sum(a_i for kept events whose simplified-NFC selection == candidate c)
+s_c = (m_c / M) * m_c / (m_c + k)   # M > 0; s_c = 0 otherwise
+```
+
+Semantics that must never drift:
+
+- All same-key active events are fully evaluated (cosine, threshold
+  relevance, usage age, final weight) **before** the top-K cut; taking a
+  cosine top-K first and aging afterwards is a different, non-equivalent
+  order (a fixed counterexample test proves this).
+- Usage age advances only by same-key **active** events later in HLC order;
+  calendar time, unrelated input and idle time never decay an event.
+- Retraction follows HLC, mirroring `FactStore::QueryActiveEventsAsOf`:
+  an event exits both the evidence set and the age clock at its retraction
+  HLC, and a future retraction never backfills an earlier replay point.
+- Zero evidence (empty store, no same-key events, nothing above `tau`,
+  nothing matching the current group) is a successful result; missing or
+  malformed stores, missing vectors and non-finite values are true faults
+  (`OracleError`).
+- Matching uses simplified-converted NFC text: NFC normalization plus the
+  OpenCC `t2s` conversion (longest phrase match, character fallback, first
+  alternative). The dictionary files under `daemon/opencc_data/` are copied
+  verbatim from the OpenCC revision librime pins
+  (`deps/opencc` @ `556ed224`, ver.1.1.2-148, Apache-2.0) — the same data
+  librime's `zh_hans` simplifier uses — so oracle matching agrees with the
+  candidate text librime actually shows.
+
+Run the oracle tests with the rest of the daemon suite:
+
+```sh
+python3 -m unittest discover -s daemon -p 'test_*.py'
+```
+
+`daemon/test_oracle.py` covers every acceptance criterion of #59,
+including the fixed counterexample for the top-K order and the retraction
+timing scenarios.
+
 ## Frozen baseline policy identity
 
 The shadow baseline (Habit130/squirrel#75) pins a composed
