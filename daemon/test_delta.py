@@ -1171,6 +1171,140 @@ class BlockedTest(EnvTest):
         machine.retry()
         snapshot = machine.ensure_caught_up()
         self.assertIn("n1", snapshot.event_ids())
+        # The diagnosis record is cleared by a successful retry.
+        conn = sqlite3.connect(self.env.delta_path)
+        try:
+            meta = dict(conn.execute(
+                "SELECT key, value FROM meta").fetchall())
+        finally:
+            conn.close()
+        self.assertNotIn("blocked", meta)
+
+    def test_retry_waits_for_the_delta_write_lock(self):
+        """Maintenance retry() never fails fast on a concurrent write lock.
+
+        Pins the AC-63-v1 repair: a checkpoint connection must not re-set
+        the persistent journal_mode pragma (which would take the write
+        lock), and the maintenance path must wait for a briefly held lock
+        instead of surfacing a spurious failure.
+        """
+        self.make_env()
+        inner = self.env.provider
+        failures = {"on": True}
+
+        class Flaky(RepresentationProvider):
+            def representation_id(self):
+                return inner.representation_id()
+
+            def query_vector(self, preceding_text):
+                return inner.query_vector(preceding_text)
+
+            def event_vector(self, event):
+                if failures["on"] and event.event_id == "n1":
+                    raise EvidenceError(
+                        "representation_fault",
+                        "cannot represent %s" % event.event_id)
+                return inner.event_vector(event)
+
+            def vector_dimension(self):
+                return inner.vector_dimension()
+
+        machine = self.machine(provider=Flaky(), poll_interval=0.01,
+                               catch_up_deadline=0.3)
+        machine.ensure_caught_up()
+        self.env.add_event("n1", segment_input="shijie", selection="世界",
+                           preceding_text="我之前去")
+        with self.assertRaises(EvidenceError):
+            machine.ensure_caught_up()
+        failures["on"] = False
+        # A second connection holds the delta write lock for 0.3 s (created
+        # in its own thread: sqlite connections are thread-bound).
+        locked = threading.Event()
+
+        def holder():
+            conn = sqlite3.connect(self.env.delta_path, timeout=0)
+            conn.execute("BEGIN IMMEDIATE;")
+            locked.set()
+            time.sleep(0.3)
+            conn.rollback()
+            conn.close()
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(locked.wait(5.0))
+        start = time.monotonic()
+        try:
+            machine.retry()
+            waited = time.monotonic() - start
+        finally:
+            thread.join(10.0)
+        # retry() waited for the lock and completed -- it did not fail
+        # fast with a spurious lock error (the repaired defect).
+        self.assertGreaterEqual(waited, 0.25)
+        self.assertLess(waited, 4.0)
+        snapshot = machine.ensure_caught_up()
+        self.assertIn("n1", snapshot.event_ids())
+
+    def test_retry_under_worker_write_concurrency(self):
+        """Many block -> retry -> catch-up cycles stay deterministic.
+
+        Each round commits a batch of events, blocks on the first, then
+        retries while the worker absorbs the whole batch.  The retry path
+        must never surface a spurious lock failure and every round must
+        end fully caught up (regression pin for the AC-63-v1 repair).
+        """
+        self.make_env()
+        inner = self.env.provider
+        failures = {"on": True}
+        rounds = 8
+
+        class Flaky(RepresentationProvider):
+            def representation_id(self):
+                return inner.representation_id()
+
+            def query_vector(self, preceding_text):
+                return inner.query_vector(preceding_text)
+
+            def event_vector(self, event):
+                if failures["on"] and event.event_id.endswith("blocking"):
+                    raise EvidenceError(
+                        "representation_fault",
+                        "cannot represent %s" % event.event_id)
+                return inner.event_vector(event)
+
+            def vector_dimension(self):
+                return inner.vector_dimension()
+
+        machine = self.machine(provider=Flaky(), poll_interval=0.005,
+                               catch_up_deadline=5.0)
+        machine.ensure_caught_up()
+        for round_index in range(rounds):
+            prefix = "r%d-" % round_index
+            self.env.add_event(
+                prefix + "blocking", segment_input="shijie",
+                selection="世界", preceding_text="我之前去")
+            for index in range(30):
+                self.env.add_event(
+                    prefix + "e%02d" % index, segment_input="shijie",
+                    selection="时界" if index % 2 else "世界",
+                    preceding_text="我之前去")
+            with self.assertRaises(EvidenceError) as raised:
+                machine.ensure_caught_up()
+            self.assertEqual(raised.exception.code, "representation_fault")
+            failures["on"] = False
+            machine.retry()
+            snapshot = machine.ensure_caught_up()
+            self.assertIn(prefix + "blocking", snapshot.event_ids())
+            self.assertIn(prefix + "e29", snapshot.event_ids())
+            failures["on"] = True
+        machine.close()
+        self.machines.clear()
+        # A restart after all rounds loads a clean checkpoint (no leftover
+        # blocked record from any round).
+        machine2 = self.machine(provider=Flaky(), poll_interval=0.005,
+                                catch_up_deadline=5.0)
+        snapshot = machine2.ensure_caught_up()
+        self.assertIn("r7-e29", snapshot.event_ids())
 
 
 class ServiceWiringTest(EnvTest):

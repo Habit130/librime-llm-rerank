@@ -421,23 +421,41 @@ class DeltaSnapshotReader:
 # Checkpoint I/O (single writer: the worker thread)
 # ---------------------------------------------------------------------------
 
-def _connect_delta(path):
-    """Open one checkpoint connection with the spec's WAL/FULL pragmas.
+# Locking behavior of checkpoint connections (docs/delta-state-machine.md
+# "Connection classes"): writer and maintenance connections wait up to
+# WRITE_BUSY_TIMEOUT_S for a concurrent lock holder -- the worker's own
+# transactions are milliseconds, so a maintenance path that fails instead
+# of waiting (e.g. retry() racing the worker's write) is a spurious fault.
+# Read/verify connections keep sqlite's fail-fast timeout=0: verification
+# runs before the worker starts, and a verification that would block is a
+# genuine problem -- the checkpoint is dropped and replayed anyway.
+WRITE_BUSY_TIMEOUT_S = 5.0
+READ_BUSY_TIMEOUT_S = 0.0
 
-    ``journal_mode`` is persistent in the database header; ``synchronous``
-    is connection-local, so FULL is (re-)applied on every connection -- a
-    checkpoint connection can never silently run with weaker durability.
+
+def _connect_delta(path, busy_timeout=READ_BUSY_TIMEOUT_S):
+    """Open one checkpoint connection.
+
+    ``synchronous=FULL`` is connection-local (spec durability) and is
+    applied on every connection -- a checkpoint connection can never
+    silently run with weaker durability.  ``journal_mode=WAL`` is durable
+    in the database header and is set exactly once, at checkpoint creation
+    (``_create_delta_schema``); later connections only verify it (via
+    ``_verify_delta_pragmas``).  Re-setting journal_mode on every
+    connection would acquire the write lock each time and make maintenance
+    connections collide with the worker's write lock (the repaired AC-63-v1
+    defect).
     """
     try:
-        conn = sqlite3.connect(path, timeout=0)
+        conn = sqlite3.connect(path, timeout=busy_timeout)
     except sqlite3.Error as error:
         raise DeltaRejected("cannot open delta checkpoint: %s" % error)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=%s;" % DELTA_JOURNAL_MODE)
         conn.execute("PRAGMA synchronous=%s;" % DELTA_SYNC_MODE)
     except sqlite3.Error as error:
-        raise DeltaRejected("cannot set delta pragmas: %s" % error)
+        raise DeltaRejected("cannot set delta synchronous pragma: %s"
+                            % error)
     return conn
 
 
@@ -450,19 +468,26 @@ def _verify_delta_pragmas(conn):
     if mode != DELTA_JOURNAL_MODE:
         raise DeltaRejected("delta journal mode is %r, need %r"
                             % (mode, DELTA_JOURNAL_MODE))
-    if int(sync) != 2:  # SQLITE_SYNCHRONOUS_FULL, re-applied per connection
+    if int(sync) != 2:  # SQLITE_SYNCHRONOUS_FULL, applied per connection
         raise DeltaRejected("delta synchronous is %r, need full" % sync)
 
 
 def _create_delta_schema(path):
-    """Create the checkpoint file + schema (idempotent, owner-only)."""
+    """Create the checkpoint file + schema (idempotent, owner-only).
+
+    This is the only place ``journal_mode=WAL`` is set: the mode is durable
+    in the database header, and re-setting it on later connections would
+    require the write lock for no benefit.  ``synchronous=FULL`` is applied
+    here as well (``_connect_delta`` also applies it to every connection).
+    """
     conn = None
     try:
-        conn = _connect_delta(path)
+        conn = _connect_delta(path, busy_timeout=WRITE_BUSY_TIMEOUT_S)
         has_meta = conn.execute(
             "SELECT COUNT(*) FROM sqlite_master"
             " WHERE type = 'table' AND name = 'meta';").fetchone()[0]
         if not has_meta:
+            conn.execute("PRAGMA journal_mode=%s;" % DELTA_JOURNAL_MODE)
             conn.executescript(_DELTA_DDL)
         conn.commit()
         os.chmod(path, 0o600)
@@ -1021,13 +1046,23 @@ class DeltaStateMachine:
             self._wake_event.clear()
 
     def _cycle(self):
-        """One worker iteration: pending rebuild, then catch-up attempt."""
+        """One worker iteration: pending rebuild, then catch-up attempt.
+
+        While a deterministic block is recorded the worker parks: catch-up
+        stays halted (no repeated embedding of the failing batch, no
+        repeated diagnosis writes) until ``retry()`` or a rebuild clears
+        it.  This also keeps the delta free of concurrent writers during
+        the maintenance ``retry()`` path.
+        """
         with self._condition:
             pending = self._pending_rebuild
             snapshot = self._snapshot
+            blocked = self._blocked
         if pending is not None:
             self._perform_rebuild(pending)
             return
+        if blocked is not None:
+            return  # parked: blocked until retry()/rebuild
         facts_identity = read_facts_identity(self._facts_root)
         if facts_identity is None:
             return  # store not created yet; retry on the next wake
@@ -1100,10 +1135,14 @@ class DeltaStateMachine:
             pending[1](pending[0])
 
     def _enter_blocked(self, blocked):
+        # Persist the diagnosis BEFORE publishing the block: when a waiting
+        # request observes the blocked flag, the checkpoint record already
+        # exists, so a subsequent retry() (which deletes the record) can
+        # never race an in-flight diagnosis write.
+        self._record_blocked(blocked)
         with self._condition:
             self._blocked = blocked
             self._condition.notify_all()
-        self._record_blocked(blocked)
 
     def _record_blocked(self, blocked):
         """Persist the block as a diagnosis record in the checkpoint."""
@@ -1112,7 +1151,8 @@ class DeltaStateMachine:
         conn = None
         try:
             _create_delta_schema(self._delta_path)
-            conn = _connect_delta(self._delta_path)
+            conn = _connect_delta(self._delta_path,
+                                  busy_timeout=WRITE_BUSY_TIMEOUT_S)
             conn.execute("BEGIN IMMEDIATE;")
             _write_delta_meta(conn, {
                 "delta_schema_version": DELTA_SCHEMA_VERSION,
@@ -1130,8 +1170,11 @@ class DeltaStateMachine:
                 "blocked_reason": blocked.message,
             })
             conn.execute("COMMIT;")
-        except sqlite3.Error:
-            pass  # diagnosis record is best effort; the block still applies
+        except (sqlite3.Error, DeltaError):
+            # Diagnosis record is best effort; the block still applies (and
+            # re-derives deterministically on restart either way).  A
+            # checkpoint fault must never kill the worker thread.
+            pass
         finally:
             if conn is not None:
                 conn.close()
@@ -1140,27 +1183,37 @@ class DeltaStateMachine:
         """Clear a deterministic block and let the worker re-attempt.
 
         Spec: 确定性失败保持 blocked,直到输入、配置或实现改变,或维护者显式重试.
+        The checkpoint cleanup runs FIRST, while the worker is still parked
+        on the block -- so this maintenance path never contends with the
+        worker's write lock -- and the block is cleared (and the worker
+        woken) only afterwards.  The cleanup waits up to
+        ``WRITE_BUSY_TIMEOUT_S`` for any concurrent lock holder instead of
+        failing fast (the repaired AC-63-v1 defect).
         """
+        conn = None
+        try:
+            if os.path.isfile(self._delta_path):
+                conn = _connect_delta(self._delta_path,
+                                      busy_timeout=WRITE_BUSY_TIMEOUT_S)
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute(
+                    "DELETE FROM meta WHERE key IN"
+                    " ('blocked', 'blocked_events', 'blocked_reason');")
+                conn.execute("COMMIT;")
+        except (sqlite3.Error, DeltaError):
+            # Best effort, consistent with _record_blocked: the in-memory
+            # unblock below is authoritative for this run, and a leftover
+            # diagnosis record merely re-derives the block on restart.
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
         with self._condition:
             if self._closed:
                 return
             self._blocked = None
             self._condition.notify_all()
             self._wake_event.set()
-        conn = None
-        try:
-            if os.path.isfile(self._delta_path):
-                conn = _connect_delta(self._delta_path)
-                conn.execute("BEGIN IMMEDIATE;")
-                conn.execute(
-                    "DELETE FROM meta WHERE key IN"
-                    " ('blocked', 'blocked_events', 'blocked_reason');")
-                conn.execute("COMMIT;")
-        except sqlite3.Error:
-            pass
-        finally:
-            if conn is not None:
-                conn.close()
 
     # ------------------------------------------------------------------
     # The catch-up batch (the only delta writer)
@@ -1255,7 +1308,7 @@ class DeltaStateMachine:
         conn = None
         try:
             _create_delta_schema(path)
-            conn = _connect_delta(path)
+            conn = _connect_delta(path, busy_timeout=WRITE_BUSY_TIMEOUT_S)
             conn.execute("BEGIN IMMEDIATE;")
             for _hlc, _key, kind, payload in merged:
                 seq += 1

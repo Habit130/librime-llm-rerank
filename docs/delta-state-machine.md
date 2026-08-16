@@ -29,8 +29,12 @@ retractions     commit_id PK, retraction HLC, change_seq UNIQUE
 ```
 
 - WAL journal + `synchronous=FULL`. `journal_mode` is durable in the file
-  header; `synchronous` is connection-local, so FULL is re-applied on every
-  checkpoint connection (verified by test).
+  header and is set exactly once, at checkpoint creation; later connections
+  only verify it. `synchronous` is connection-local, so FULL is re-applied
+  on every checkpoint connection (verified by test). Re-setting
+  `journal_mode` per connection would acquire the write lock every time and
+  make maintenance connections collide with the worker's write lock
+  (AC-63-v1 repair; see "Connection classes" below).
 - `change_seq` is one global counter advanced inside the batch transaction;
   it preserves the fact store's total order across both tables.
 - The raw `preceding_text` is never stored — facts stay the only raw-text
@@ -77,8 +81,43 @@ and waits; on deadline expiry it raises `not_caught_up` (transient,
 `retryable: true` in the server response) — never a stale-watermark success.
 A deterministic block (representation/parse fault naming the event) raises
 `representation_fault` and is recorded in the checkpoint until `retry()`
-(spec: 确定性失败保持 blocked). The worker keeps working after a request
-deadline; a later request can succeed on the same snapshot.
+(spec: 确定性失败保持 blocked). While blocked the worker parks: catch-up
+stays halted (no repeated embedding of the failing batch, no repeated
+diagnosis writes) until `retry()` or a rebuild clears the block — which
+also keeps the checkpoint free of concurrent writers during the maintenance
+`retry()` path. The block is persisted BEFORE it is published to waiting
+requests, and `retry()` deletes the diagnosis record BEFORE clearing the
+block and waking the worker, so the two can never race on the checkpoint
+write lock. The worker keeps working after a request deadline; a later
+request can succeed on the same snapshot.
+
+## Connection classes
+
+`_connect_delta(path, busy_timeout)` distinguishes two locking behaviors
+(AC-63-v1 repair):
+
+- **Writer and maintenance connections** (schema creation, the batch
+  transaction, the blocked-record write, `retry()`): `busy_timeout = 5 s`.
+  They wait for a concurrent lock holder — the worker's own transactions
+  are milliseconds, so a maintenance path that fails instead of waiting
+  (e.g. `retry()` racing the worker's write) is a spurious fault.
+- **Read/verify connections** (load-time checkpoint verification in
+  `open_delta_checkpoint`): fail-fast `timeout = 0`, preserved by design.
+  Verification runs before the worker starts, and a verification that would
+  block indicates a real problem — the checkpoint is dropped and replayed
+  from `H0` anyway.
+- `journal_mode=WAL` is never re-set by any connection except creation
+  (`_create_delta_schema`): it is durable in the header, and re-setting it
+  requires the write lock. Every other connection verifies the header mode
+  and re-applies the connection-local `synchronous=FULL`.
+
+The AC-63-v1 gate-determinism defect was exactly this: `_connect_delta`
+re-set `journal_mode=WAL` with `timeout=0`, so `retry()` failed
+immediately with a spurious `DeltaRejected` whenever the worker held the
+write lock. The regression is pinned by `test_retry_waits_for_the_delta_write_lock`
+(lock held 0.3 s while `retry()` runs: it waits and completes) and
+`test_retry_under_worker_write_concurrency` (8 rounds of block → retry →
+catch-up with a 30-event batch per round, ending fully caught up).
 
 ## Replay equivalence (AC63-7)
 
