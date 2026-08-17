@@ -25,14 +25,16 @@ from semantic_benchmark import (  # noqa: E402
 )
 from oracle import FactReader  # noqa: E402
 
+EXPECTED_BENCHMARK_DIGEST = (
+    "69205442228a14b6942e2a4de999587e893125f24f3d91e3e218a0140e2df1ec"
+)
+
 
 class SemanticBenchmarkShapeTest(unittest.TestCase):
     def test_counts_and_stable_ids(self):
         cases = benchmark_cases()
-        self.assertGreaterEqual(sum(c.relation == "positive" for c in cases),
-                                100)
-        self.assertGreaterEqual(sum(c.relation == "hard_negative" for c in cases),
-                                100)
+        self.assertEqual(100, sum(c.relation == "positive" for c in cases))
+        self.assertEqual(100, sum(c.relation == "hard_negative" for c in cases))
         self.assertEqual(len(cases), len({case.case_id for case in cases}))
         self.assertEqual(
             [case.case_id for case in cases],
@@ -73,6 +75,15 @@ class SemanticBenchmarkShapeTest(unittest.TestCase):
         second = benchmark_manifest()
         self.assertEqual(first, second)
         self.assertEqual(first["counts"]["total"], len(benchmark_cases()))
+        self.assertEqual({"total": 200, "positive": 100,
+                          "hard_negative": 100}, first["counts"])
+        self.assertEqual({"negation": 40, "entity": 32,
+                          "number_flip": 32, "bpe_seam": 32,
+                          "window_64": 32, "preference_change": 32},
+                         first["axis_counts"])
+        self.assertEqual(EXPECTED_BENCHMARK_DIGEST,
+                         first["benchmark_digest"])
+        self.assertEqual(200, len(first["case_summaries"]))
         self.assertEqual(first["decision_scope"],
                          "eliminate_obvious_regressions_only")
         self.assertEqual(first["selection"], "not_run")
@@ -95,6 +106,8 @@ class SemanticBenchmarkOracleFixtureTest(unittest.TestCase):
         for result in report["representations"].values():
             self.assertEqual(1.0, result["positive"]["rate"])
             self.assertEqual(1.0, result["hard_negative"]["rate"])
+            self.assertTrue(result["fixture_mechanism_pass"])
+            self.assertEqual(200, result["exact_top_k"]["kept_at_k"])
             self.assertTrue(result["gate_pass"])
         serialized = json.dumps(report, ensure_ascii=False)
         for case in benchmark_cases():
@@ -110,7 +123,11 @@ class SemanticBenchmarkOracleFixtureTest(unittest.TestCase):
             }
             for index in range(len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)):
                 event_id = "distractor-%s-%02d" % (case.case_id, index + 1)
-                vectors[event_id] = _unit_vector(0.95 - index * 0.005)
+                vectors[event_id] = _unit_vector(
+                    BENCHMARK_TAU if index ==
+                    len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS) - 1
+                    else 0.95 - index * 0.005
+                )
             reader = FactReader(fixture.db_path)
             try:
                 result = _run_oracle_case(
@@ -123,6 +140,8 @@ class SemanticBenchmarkOracleFixtureTest(unittest.TestCase):
             self.assertTrue(_case_passed(case, result, fixture.target_event_id))
             self.assertTrue(all(entry.cosine > BENCHMARK_TAU
                                 for entry in result.kept))
+            self.assertNotIn(fixture.threshold_probe_event_id,
+                             [entry.event_id for entry in result.kept])
         finally:
             fixture.close()
 

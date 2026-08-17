@@ -22,7 +22,8 @@ The model-free gate uses controlled vectors and a temporary SQLite facts root
 to exercise the #59 exact oracle, thresholding, exact top-K, stable IDs and
 summary calculation.  The opt-in real-model gate is implemented by
 ``daemon/integration_semantic_benchmark.py`` and writes only hashes, IDs and
-numeric results to its report; it never writes raw benchmark text to a report.
+ numeric results and non-sensitive environment metadata to its report; it
+ never writes raw benchmark text to a report.
 """
 
 import argparse
@@ -81,6 +82,7 @@ FIXTURE_DISTRACTOR_PRECEDING_TEXTS = (
     "实验室把仪器校准结果整理成了内部测试记录。",
     "社区工作人员提醒居民分类投放生活垃圾。",
     "厨房采购清单列出了米面蔬菜和日常调味品。",
+    "合成阈值探针只用于确认等于阈值的事件严格不进证据。",
 )
 
 
@@ -334,10 +336,10 @@ FAMILY_SPECS = (
              _window_preceding_text("工作结束时记得报告完成情况，让大家掌握节奏", 65)),
             (_window_preceding_text("请每天下班前更新近况，方便团队互相问候", 64),
              _window_preceding_text("工作结束时记得报告个人状态，让大家了解生活情况", 65))),
-    _family("window-08", ("window_64",), "jihua", ("计划", "计画"), "计划",
+    _family("window-08", ("window_64",), "jihua", ("计划", "记划"), "计划",
             (_window_preceding_text("下个月的计划已经确定，团队开始准备资源", 64),
              _window_preceding_text("新的工作安排已经敲定，现在着手准备所需材料", 65)),
-            (_window_preceding_text("下个月的计画已经确定，团队开始绘制图表", 64),
+            (_window_preceding_text("下个月的计划已经确定，团队开始绘制图表", 64),
              _window_preceding_text("新的图表安排已经敲定，现在着手准备绘图材料", 65))),
 
     # Preference change: same topic, but the historical personal preference
@@ -600,6 +602,7 @@ class SyntheticFacts:
              ("created_at_ms", "1000000")),
         )
         self.target_event_id = "target-" + case.case_id
+        self.threshold_probe_event_id = None
         self._insert_event(
             self.target_event_id, case.choice_problem,
             case.recorded_preceding_text,
@@ -608,6 +611,8 @@ class SyntheticFacts:
         for index, preceding_text in enumerate(distractor_preceding_texts,
                                                 start=1):
             event_id = "distractor-%s-%02d" % (case.case_id, index)
+            if index == len(distractor_preceding_texts):
+                self.threshold_probe_event_id = event_id
             self._insert_event(
                 event_id, case.choice_problem, preceding_text,
                 case.candidates[-1],
@@ -723,7 +728,10 @@ def _fixture_vector_factory(spec, case, fixture):
     }
     for index in range(len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)):
         event_id = "distractor-%s-%02d" % (case.case_id, index + 1)
-        vector_by_event[event_id] = _unit_vector(0.95 - index * 0.005)
+        cosine = (BENCHMARK_TAU if index ==
+                  len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS) - 1
+                  else 0.95 - index * 0.005)
+        vector_by_event[event_id] = _unit_vector(cosine)
     return (1.0, 0.0, 0.0, 0.0), vector_by_event, target_cosine
 
 
@@ -737,7 +745,8 @@ def _coverage_pass(coverage):
 
 def _run_representation_gate(cases, params, vector_factory,
                              representation_ids, vector_fixture,
-                             coverage=None, include_failure_details=False):
+                             coverage=None, include_failure_details=False,
+                             require_fixture_mechanism=False):
     """Run one shared exact-oracle gate for fixture and real vectors."""
     positive_total = sum(case.relation == "positive" for case in cases)
     negative_total = sum(case.relation == "hard_negative" for case in cases)
@@ -751,6 +760,7 @@ def _run_representation_gate(cases, params, vector_factory,
         negative_above_tau = 0
         negative_in_top_k = 0
         kept_counts = []
+        threshold_boundary_pass = True
         failed = []
         failure_details = []
         for case in cases:
@@ -772,6 +782,12 @@ def _run_representation_gate(cases, params, vector_factory,
                 target_in_top_k = target is not None
                 target_above_tau = target_cosine > params.tau
                 kept_counts.append(len(result.kept))
+                if require_fixture_mechanism:
+                    threshold_probe = fixture.threshold_probe_event_id
+                    threshold_boundary_pass = threshold_boundary_pass and not any(
+                        entry.event_id == threshold_probe
+                        for entry in result.kept
+                    )
                 if case.relation == "positive":
                     positive_above_tau += int(target_above_tau)
                     positive_in_top_k += int(target_in_top_k)
@@ -826,8 +842,16 @@ def _run_representation_gate(cases, params, vector_factory,
                 "kept_at_k": sum(count == params.k_evidence
                                   for count in kept_counts),
             },
+            "fixture_mechanism_pass": (
+                not require_fixture_mechanism
+                or (max(kept_counts) == params.k_evidence
+                    and threshold_boundary_pass)
+            ),
             "failed_case_ids": failed,
-            "gate_pass": quality_pass and _coverage_pass(coverage),
+            "gate_pass": (quality_pass and _coverage_pass(coverage)
+                          and (not require_fixture_mechanism
+                               or (max(kept_counts) == params.k_evidence
+                                   and threshold_boundary_pass))),
         }
         if include_failure_details:
             representation_result["failure_details"] = failure_details
@@ -845,6 +869,7 @@ def run_fixture_gate():
     results = _run_representation_gate(
         cases, _benchmark_params(), _fixture_vector_factory,
         representation_ids, "shared_controlled_unit_vectors",
+        require_fixture_mechanism=True,
     )
     return {
         "contract": CONTRACT_ID,

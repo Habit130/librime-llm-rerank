@@ -588,8 +588,10 @@ case payloads. This makes content changes visible without placing private
 history in a report.
 
 The model-free gate uses a disposable temporary facts root and controlled unit
-vectors to exercise the #59 exact oracle, strict threshold semantics and exact
-top-K. It is not a quality result for a real representation:
+vectors to exercise the #59 exact oracle, including the strict `cosine == tau`
+boundary and exact top-K truncation. It is not a quality result for a real
+representation; all four fixture entries intentionally share controlled
+vectors:
 
 ```sh
 python3 -m unittest eval.test_semantic_benchmark
