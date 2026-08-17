@@ -577,7 +577,37 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
                             "malformed evidence config: %s" % error)
     params = OracleParams(tau=tau, k_evidence=k_evidence,
                           half_life=half_life, saturation_k=saturation_k)
-    provider = FixtureRepresentationProvider(
+    provider = _provider_from_config(config, representation_id)
+    return EvidenceService(facts_root, params, provider, gamma,
+                           machine=machine)
+
+
+def _provider_from_config(config, representation_id):
+    """Construct the representation provider behind the config seam.
+
+    Two provider kinds are supported:
+
+    - ``provider_kind: "fixture"`` (default): the existing
+      FixtureRepresentationProvider with explicit query/event vector maps
+      (tests and small e2e fixtures).
+    - ``provider_kind: "seed_vectors"``: the #71 capacity-fixture provider,
+      deterministic fixed-seed vectors for the 100k-event fixtures (see
+      seed_vectors.py).  The seed and dimension come from the config.
+    """
+    kind = config.get("provider_kind", "fixture")
+    if kind == "seed_vectors":
+        from seed_vectors import build_seed_provider_from_config
+        return build_seed_provider_from_config(config)
+    if kind != "fixture":
+        raise EvidenceError(
+            "evidence_unavailable",
+            "unknown provider_kind %r (expected fixture or seed_vectors)"
+            % kind)
+    query_vectors = config.get("query_vectors") or {}
+    event_vectors = config.get("event_vectors") or {}
+    default_query = config.get("default_query")
+    default_event = config.get("default_event")
+    return FixtureRepresentationProvider(
         representation_id,
         query_vectors,
         event_vectors,
@@ -586,5 +616,3 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
         default_event=(default_event if default_event is not None
                        else (0.0, 1.0, 0.0, 0.0)),
     )
-    return EvidenceService(facts_root, params, provider, gamma,
-                           machine=machine)

@@ -34,6 +34,24 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     target_compile_definitions(rime-llm-rerank-fact-store-tool PRIVATE
       RIME_IMPORTS)
   endif()
+
+  # #71 fact-write eligibility benchmark (SCN-71-5): measures the real
+  # C++ write path (single-writer 10k batches and 4-writer competition)
+  # with the production durability level (WAL + synchronous=FULL).
+  add_executable(rime-llm-rerank-fact-write-bench
+    tools/fact_write_bench.cc
+    $<TARGET_OBJECTS:rime-llm-rerank-objs>)
+  target_include_directories(rime-llm-rerank-fact-write-bench PRIVATE src)
+  target_link_libraries(rime-llm-rerank-fact-write-bench
+    ${rime_library}
+    sqlite3)
+  set_target_properties(rime-llm-rerank-fact-write-bench PROPERTIES
+    OUTPUT_NAME fact_write_bench
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+  if(BUILD_SHARED_LIBS)
+    target_compile_definitions(rime-llm-rerank-fact-write-bench PRIVATE
+      RIME_IMPORTS)
+  endif()
 endif()
 
 if(BUILD_TEST)
