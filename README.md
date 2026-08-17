@@ -559,6 +559,62 @@ declare no frozen id. Any other declared id fails closed with
 `policy_mismatch`, and `legacy_sum` mode keeps the exact-match binding
 (calibration only).
 
+## Fixed semantic regression benchmark
+
+`eval/semantic_benchmark.py` carries the fixed synthetic Simplified-Chinese
+benchmark for Habit130/squirrel#69 (`AC-69-v1`). It is intentionally separate
+from the daemon serving path and from the private fact root. The source records
+derive 200 stable cases:
+
+- 100 positive cases: two directions of 50 hand-authored same-choice-problem
+  paraphrase pairs, with the same expected candidate;
+- 100 hard negatives: related topics with a different intent, including
+  polarity, named entity, number, tokenization seam, 64-character window and
+  explicit preference changes;
+- every case carries a stable ID, choice problem, candidate relation, axis
+  labels and a deterministic version summary.
+
+The distribution is 40 negation labels, 32 entity labels, 32 number-flip
+labels, 32 BPE-seam labels, 32 64-character-window labels and 32
+preference-change labels. Window cases are authored as a 64-character versus
+over-64-character pair. BPE cases end in the known synthetic `今天天气?`
+probe so the real tokenizer seam is checked rather than merely named.
+
+The version summary is
+`sha256(canonical_json(case_without_version_summary))[:24]`, where canonical
+JSON uses UTF-8, sorted keys and compact separators. The benchmark digest binds
+the contract, benchmark version, schema/category, fixture threshold, K and all
+case payloads. This makes content changes visible without placing private
+history in a report.
+
+The model-free gate uses a disposable temporary facts root and controlled unit
+vectors to exercise the #59 exact oracle, strict threshold semantics and exact
+top-K. It is not a quality result for a real representation:
+
+```sh
+python3 -m unittest eval.test_semantic_benchmark
+python3 eval/semantic_benchmark.py --fixture
+```
+
+The opt-in real-model gate recomputes every synthetic 上文 with the #60
+`Qwen3-0.6B-Base` extractor, then uses the same #59 oracle and temporary facts
+root. The benchmark-only `tau=0.90`, `K_evidence=8`, `H=inf` values are fixed
+regression inputs, not production calibration or a declared winner. A report
+only says whether a representation should be eliminated as an obvious
+regression; selection and production enablement remain outside this ticket.
+
+```sh
+daemon/.venv/bin/python daemon/integration_semantic_benchmark.py \
+  --model /Users/habit/Models/Qwen/Qwen3-0.6B-Base
+```
+
+The integration artifact contains the benchmark digest, representation IDs,
+case IDs for failures, coverage counts and numeric pass rates. It never writes
+the synthetic raw 上文 or candidate text to the artifact, never reads
+`~/Library/Rime`, never connects to the live daemon and never changes `gamma`.
+Threshold/grid calibration (#70), walk-forward selection and announcement
+(#77/#80), ANN and deployment remain deferred.
+
 ## License
 
 BSD-3-Clause, matching librime.
