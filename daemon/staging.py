@@ -1072,19 +1072,34 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
     except (KeyError, TypeError, ValueError) as error:
         raise EvidenceError("evidence_unavailable",
                             "malformed staging config: %s" % error)
-    provider = _build_desired_provider(config, desired_representation_id)
+    provider = _build_desired_provider(
+        config, desired_representation_id,
+        seed=config.get("desired_seed"))
     return StagingBuildMachine(
         facts_root, derived_root, provider, active_representation_id_value,
         generation_id, poll_interval=poll, builder_lock=builder_lock,
         publish_lock=publish_lock)
 
 
-def _build_desired_provider(config, desired_representation_id):
-    """The fixture representation seam behind the desired target (mirrors
+def _build_desired_provider(config, desired_representation_id, seed=None):
+    """The injectable representation seam behind the desired target (mirrors
     delta.py's provider construction; the real hidden-state provider plugs
-    at the same seam in the integration harness)."""
+    at the same seam in the integration harness).  ``seed`` optionally
+    overrides the config seed so the desired target can differ from the
+    active one (the #71 background-rebuild concurrency fixture)."""
     from evidence import FixtureRepresentationProvider
     try:
+        kind = config.get("provider_kind", "fixture")
+        if kind == "seed_vectors":
+            from seed_vectors import build_seed_provider_from_config
+            return build_seed_provider_from_config(
+                config, representation_id=desired_representation_id,
+                seed=seed)
+        if kind != "fixture":
+            raise EvidenceError(
+                "evidence_unavailable",
+                "unknown provider_kind %r (expected fixture or seed_vectors)"
+                % kind)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}
         default_query = config.get("default_query")

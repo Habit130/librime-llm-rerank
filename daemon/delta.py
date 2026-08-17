@@ -1938,7 +1938,7 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
 
 
 def _build_provider_from_config(config, representation_id=None):
-    """The fixture representation seam behind the config (mirrors evidence.py).
+    """The injectable representation seam behind the config (mirrors evidence.py).
 
     Kept here (not imported from evidence.py) to avoid a module-level import
     cycle: delta.py already imports evidence.py for the seam and the faults.
@@ -1948,6 +1948,15 @@ def _build_provider_from_config(config, representation_id=None):
     from evidence import FixtureRepresentationProvider
     try:
         representation_id = representation_id or config["representation_id"]
+        kind = config.get("provider_kind", "fixture")
+        if kind == "seed_vectors":
+            from seed_vectors import build_seed_provider_from_config
+            return build_seed_provider_from_config(config)
+        if kind != "fixture":
+            raise EvidenceError(
+                "evidence_unavailable",
+                "unknown provider_kind %r (expected fixture or seed_vectors)"
+                % kind)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}
         default_query = config.get("default_query")
