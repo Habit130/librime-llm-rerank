@@ -100,6 +100,64 @@ byte-for-byte summary regeneration. Must pass on the committed artifacts.
   `daemon/integration_cache_limit.py`, and an isolated daemon plus
   `daemon/integration_memory.py --socket <sock> --pid <pid>`.
 
+## Strict-HLC walk-forward evaluation (Habit130/squirrel#70)
+
+`walkforward.py` + `metrics.py` / `bootstrap.py` / `calibration.py` /
+`grid.py` / `snapshot.py` / `report.py` implement the frozen-fact
+walk-forward quality and safety evaluation on top of the #59 exact oracle
+and the #60 hidden-state representations. The driver is
+`run_walkforward.py`:
+
+```sh
+# model-free fixture smoke (fast, no model):
+python3 eval/run_walkforward.py --fixture --work-dir <dir>
+
+# real-model diagnostic over a frozen snapshot (daemon venv; the live
+# recorder is not disturbed, SCN-70-7):
+daemon/.venv/bin/python eval/run_walkforward.py \
+  --live-db <live facts.sqlite3> \
+  --status-cli <daemon>/squirrel-semantic-memory \
+  --work-dir <dir> \
+  --model /Users/habit/Models/Qwen/Qwen3-0.6B-Base
+```
+
+Engine contract (AC-70-v1; the decision record is embedded in every
+report):
+
+- **Strict HLC walk-forward**: every target event replays with `as_of` =
+  its commit HLC and the whole commit excluded — score first, then add to
+  memory; only facts committed at-or-before and active at the point are
+  visible; retractions apply as-of and never backfill (SCN-70-1).
+- **Incomplete competition** (`competition_complete=false`) provides
+  positive historical evidence only; it never enters top-1 / MRR /
+  mispromotion / event-count gates (SCN-70-2).
+- **Actionable / actionable union / coverage / strata** are computed per
+  spec (SCN-70-3). The milestone counts are scheme-independent (reference
+  replay).
+- **Bootstrap** is key-clustered with a fixed seed and >=10000 replicates,
+  95% percentile CI, paired differences on the common actionable union
+  (SCN-70-4).
+- **Pre-declared grid** (representations x H x K x gamma x k), τ per
+  representation only from the dev-prefix hard-negative protocol
+  (>=200 queries, Q95/Q97.5/Q99/Q99.5); below 200 the state is
+  `not_calibratable` and no τ is invented; Δ₁ single-event boundary
+  eliminates cells; finite-H gates compare each finite-H cell against its
+  H=inf twin (SCN-70-5). No continuous optimizer anywhere.
+- **Report** is desensitized: code/model summaries, fingerprints, snapshot
+  SHA-256, HLC range, inclusion/exclusion counts, coverage, strata,
+  milestone state and the #69 fixed-benchmark gate state (quoted, not
+  re-adjudicated); never raw preceding/candidate text (SCN-70-6).
+
+Base-score reconstruction: the facts persist only the recorded competition
+order and the confirmation position of the final selection, so the scheme
+base proxy pins the selection at its recorded position and keeps the
+remaining candidates in recorded order around it — γ=0 then reproduces the
+shadow baseline exactly (fixture-tested); page>1 confirmations are
+non-reconstructable and reported in the fidelity diagnostic. Real snapshots
+report `margin_base unavailable` and enforce the Δ₁ <= 0.5 hard cap;
+synthetic fixtures inject base scores and pin the full Δ₁ boundary in the
+test suite.
+
 ## Policy reference
 
 The scoring policies under calibration are defined in
