@@ -66,7 +66,7 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
     def test_milestone_diagnostic_below_selection(self):
         state, reason = milestone_state(999, 100, 200, 200)
         self.assertEqual(state, "diagnostic")
-        self.assertIn("诊断报告" if False else "actionable complete", reason)
+        self.assertIn("诊断报告,不选方案", reason)
 
     def test_milestone_requires_all_four(self):
         self.assertEqual(milestone_state(

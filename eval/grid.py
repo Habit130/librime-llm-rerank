@@ -143,8 +143,9 @@ def milestone_state(actionable_complete, key_count, explicit_indexed,
             rank_gt1 >= MILESTONE_RANK_GT1:
         return ("selectable", "all selection milestones met")
     return ("diagnostic",
-            "actionable complete=%d (need >=%d), keys=%d (need >=%d), "
-            "explicit_indexed=%d (need >=%d), rank>1=%d (need >=%d)"
+            "诊断报告,不选方案: actionable complete=%d (need >=%d), "
+            "keys=%d (need >=%d), explicit_indexed=%d (need >=%d), "
+            "rank>1=%d (need >=%d)"
             % (actionable_complete, MILESTONE_SELECT, key_count,
                MILESTONE_KEYS, explicit_indexed, MILESTONE_EXPLICIT_INDEXED,
                rank_gt1, MILESTONE_RANK_GT1))
