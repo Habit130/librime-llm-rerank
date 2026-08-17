@@ -173,6 +173,72 @@ def _rate_fn(metric):
     return fn
 
 
+def _stratum_gates(outcomes, seed, replicates=10000):
+    """Per-stratum quality gates (spec #43).
+
+    Any stratum (confirmation source x confirmation rank) reaching >=200
+    actionable complete-competition events must satisfy, on that stratum's
+    own events:
+
+    - top-1 non-inferiority vs the shadow baseline: the key-clustered
+      paired-difference 95% CI lower bound >= -1pp;
+    - mispromotion: point estimate <= 2% and 95% CI upper bound <= 3%
+      (denominator = actionable complete events where the baseline ranked
+      the selection first).
+
+    Strata below 200 events are reported with ``applicable: false`` and
+    no gate result.  Returns a list of per-stratum gate dicts.
+    """
+    from metrics import strata_of
+
+    results = []
+    strata = strata_of(outcomes, complete_only=True)
+    for (source, rank), stratum_outcomes in sorted(strata.items()):
+        actionable_complete = [o for o in stratum_outcomes if o.actionable]
+        if len(actionable_complete) < 200:
+            results.append({
+                "stratum": "%s/%s" % (source, rank),
+                "applicable": False,
+                "count": len(actionable_complete),
+            })
+            continue
+
+        def top1_fn(o):
+            return 1.0 if o.scheme_rank == 1 else 0.0
+
+        def baseline_fn(o):
+            return 1.0 if o.baseline_rank == 1 else 0.0
+
+        top1_diff = paired_difference(actionable_complete, top1_fn,
+                                      baseline_fn, replicates=replicates,
+                                      seed=seed)
+        mp_den, mp_num = mispromotion_events(actionable_complete,
+                                             complete_only=True)
+        mp_point = (len(mp_num) / len(mp_den)) if mp_den else None
+
+        # Mispromotion CI: bootstrap the rate on the denominator events.
+        mp_ci = (None, None)
+        if mp_den:
+            from bootstrap import bootstrap_rate
+            _, mp_ci = bootstrap_rate(
+                mp_den, lambda o: 0.0 if o.scheme_rank == 1 else 1.0,
+                replicates=replicates, seed=seed)
+
+        top1_ok = top1_diff[1][0] is None or top1_diff[1][0] >= -0.01
+        mp_point_ok = mp_point is None or mp_point <= 0.02
+        mp_ci_ok = mp_ci[1] is None or mp_ci[1] <= 0.03
+        results.append({
+            "stratum": "%s/%s" % (source, rank),
+            "applicable": True,
+            "count": len(actionable_complete),
+            "top1_diff": top1_diff,
+            "mispromotion_point": mp_point,
+            "mispromotion_ci": mp_ci,
+            "pass": top1_ok and mp_point_ok and mp_ci_ok,
+        })
+    return results
+
+
 def run_cell(replay, cell, seed, replicates=10000):
     """Run one grid cell and its per-cell metrics + bootstrap CIs.
 
@@ -215,6 +281,7 @@ def run_cell(replay, cell, seed, replicates=10000):
         "ci": {
             "top1_vs_baseline": top1_diff,
         },
+        "stratum_gates": _stratum_gates(outcomes, seed, replicates),
         "delta_one": delta_one(cell["gamma"], cell["saturation_k"]),
         "delta_one_ok": delta_one_ok(cell["gamma"], cell["saturation_k"],
                                      margin_base=None),

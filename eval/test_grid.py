@@ -245,6 +245,46 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
             frozen.close()
             facts.close()
 
+    def test_stratum_gate_applies_at_200_events(self):
+        """A stratum with >=200 actionable complete-competition events is
+        gated (top-1 non-inferiority + mispromotion <=2%/<=3% CI); below
+        200 it is reported as not applicable."""
+        from grid import _stratum_gates
+        from walkforward import EventOutcome
+
+        def make(count, scheme_rank, source="explicit_current", rank=1):
+            return [EventOutcome(
+                event_id="e%d" % i, hlc=(1000 + i, 0),
+                key=("s", "word", "k%d" % (i % 10)),
+                confirmation_source=source,
+                competition_complete=True,
+                baseline_rank=rank,
+                scheme_rank=scheme_rank,
+                actionable=True, total_mass=1.0, candidate_count=2,
+                selection_index=0, kept_ids=("h1",), kept_weights=(1.0,),
+                kept_matches=(0,)) for i in range(count)]
+
+        # 250 events all ranked first by the scheme, baseline also first:
+        # top-1 diff 0 (non-inferior), mispromotion 0 -> pass.
+        outcomes = make(250, 1)
+        gates = _stratum_gates(outcomes, seed=42)
+        self.assertEqual(len(gates), 1)
+        self.assertTrue(gates[0]["applicable"])
+        self.assertEqual(gates[0]["count"], 250)
+        self.assertTrue(gates[0]["pass"])
+
+        # 250 events where the scheme never ranks first but baseline does:
+        # top-1 diff -1.0 (fail non-inferiority), mispromotion 1.0 (fail).
+        outcomes = make(250, 2)
+        gates = _stratum_gates(outcomes, seed=42)
+        self.assertFalse(gates[0]["pass"])
+        self.assertLess(gates[0]["top1_diff"][1][0], -0.01)
+        self.assertGreater(gates[0]["mispromotion_point"], 0.02)
+
+        # A small stratum is not applicable.
+        gates = _stratum_gates(make(150, 1), seed=42)
+        self.assertFalse(gates[0]["applicable"])
+
 
 if __name__ == "__main__":
     unittest.main()
