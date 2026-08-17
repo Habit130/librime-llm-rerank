@@ -8,8 +8,8 @@
 - store_epoch: 8407bd6b456ba5c5a526b4b95951bac3
 - HLC range: [1786806466751, 0] .. [1786936305188, 0]
 - Seed: 20260817
-- Report package SHA-256: `10e9c9f13b5e652e5bffde301964c22c7ddd26c86718f81a67fba77525a3efd8`
-- Milestone: **diagnostic** (τ not calibratable)
+- Report package SHA-256: `f0ca0b06de3365befc459bbc94da06660d2dc45915d2d85fb9e75ee511cf27bb`
+- Milestone: **diagnostic** (诊断报告,不选方案: actionable complete=31 (need >=1000), keys=4 (need >=100), explicit_indexed=0 (need >=200), rank>1=0 (need >=200) (τ not calibratable: 29 hard-negative queries < 200))
 - Selection: not_run
 
 ## Replay counts
