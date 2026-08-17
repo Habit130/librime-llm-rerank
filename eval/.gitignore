@@ -1,2 +1,3 @@
 .venv/
 telemetry.jsonl
+__pycache__/
