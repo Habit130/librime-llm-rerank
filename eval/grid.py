@@ -41,7 +41,7 @@ values, numbers and event counts.
 import math
 
 from bootstrap import paired_difference
-from calibration import calibrate_tau
+from calibration import MIN_HARD_NEGATIVE_QUERIES, calibrate_tau
 from metrics import (majority_pollution_rate, mispromotion_events,
                      mispromotion_rate, pollution_distribution,
                      pollution_mass, top1, mrr)
@@ -323,12 +323,16 @@ def run_representation(replay, name, seed, replicates=10000,
             "saturation_k": SATURATION_KS[0],
         }, gamma=0.0)
         counts = milestone_counts(reference_outcomes)
+        milestone_state_name, milestone_reason = milestone_state(*counts)
         return {
             "representation": name,
             "tau": status,
             "cells": cells,
-            "milestone": {"state": "diagnostic",
-                          "reason": "τ not calibratable",
+            "milestone": {"state": milestone_state_name,
+                          "reason": "%s (τ not calibratable: %d hard-negative "
+                                    "queries < %d)"
+                                    % (milestone_reason, status["queries"],
+                                       MIN_HARD_NEGATIVE_QUERIES),
                           "counts": {
                               "actionable_complete": counts[0],
                               "keys": counts[1],
