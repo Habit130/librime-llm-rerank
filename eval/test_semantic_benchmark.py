@@ -12,7 +12,7 @@ from semantic_benchmark import (  # noqa: E402
     AXES,
     BENCHMARK_K_EVIDENCE,
     BENCHMARK_TAU,
-    FIXTURE_DISTRACTOR_CONTEXTS,
+    FIXTURE_DISTRACTOR_PRECEDING_TEXTS,
     SyntheticFacts,
     _benchmark_params,
     _case_passed,
@@ -46,7 +46,8 @@ class SemanticBenchmarkShapeTest(unittest.TestCase):
             self.assertTrue(case.candidates)
             self.assertIn(case.expected_candidate, case.candidates)
             self.assertIn(case.history_selection, case.candidates)
-            self.assertNotEqual(case.query_text, case.history_text)
+            self.assertNotEqual(case.query_preceding_text,
+                                case.recorded_preceding_text)
             self.assertTrue(set(case.axes).issubset(set(AXES)))
             self.assertTrue(case.version_summary.startswith(
                 "semantic-regression-benchmark-v1:"))
@@ -60,11 +61,12 @@ class SemanticBenchmarkShapeTest(unittest.TestCase):
             self.assertTrue(all(axis in case.axes for case in selected))
 
         bpe = [case for case in cases if "bpe_seam" in case.axes]
-        self.assertTrue(all(case.query_text.endswith("今天天气?")
+        self.assertTrue(all(case.query_preceding_text.endswith("今天天气?")
                             for case in bpe))
         window = [case for case in cases if "window_64" in case.axes]
-        self.assertTrue(all({len(case.query_text), len(case.history_text)}
-                            == {64, 65} for case in window))
+        self.assertTrue(all({len(case.query_preceding_text),
+                             len(case.recorded_preceding_text)} == {64, 65}
+                            for case in window))
 
     def test_manifest_is_deterministic_and_scope_is_elimination_only(self):
         first = benchmark_manifest()
@@ -96,17 +98,17 @@ class SemanticBenchmarkOracleFixtureTest(unittest.TestCase):
             self.assertTrue(result["gate_pass"])
         serialized = json.dumps(report, ensure_ascii=False)
         for case in benchmark_cases():
-            self.assertNotIn(case.query_text, serialized)
-            self.assertNotIn(case.history_text, serialized)
+            self.assertNotIn(case.query_preceding_text, serialized)
+            self.assertNotIn(case.recorded_preceding_text, serialized)
 
     def test_fixture_exercises_threshold_and_exact_top_k(self):
         case = benchmark_cases()[0]
-        fixture = SyntheticFacts(case, FIXTURE_DISTRACTOR_CONTEXTS)
+        fixture = SyntheticFacts(case, FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
         try:
             vectors = {
                 fixture.target_event_id: _unit_vector(0.97),
             }
-            for index in range(len(FIXTURE_DISTRACTOR_CONTEXTS)):
+            for index in range(len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)):
                 event_id = "distractor-%s-%02d" % (case.case_id, index + 1)
                 vectors[event_id] = _unit_vector(0.95 - index * 0.005)
             reader = FactReader(fixture.db_path)

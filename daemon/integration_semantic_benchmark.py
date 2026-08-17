@@ -3,7 +3,7 @@
 
 This is explicit opt-in integration, not part of the model-free unittest
 gate.  It loads the #60 Qwen3 extractor once, computes vectors for the fixed
-synthetic benchmark contexts, and sends every case through the #59 exact
+synthetic benchmark 上文, and sends every case through the #59 exact
 oracle over disposable temporary facts roots.  The report contains no raw
 上文, candidate text, or private path: only benchmark/case digests, IDs and
 numeric gate results are retained.

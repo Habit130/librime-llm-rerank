@@ -72,7 +72,7 @@ AXES = (
     "preference_change",
 )
 
-FIXTURE_DISTRACTOR_CONTEXTS = (
+FIXTURE_DISTRACTOR_PRECEDING_TEXTS = (
     "合成天气记录显示周末可能有小雨，出门前准备雨具。",
     "图书馆下午开放借阅服务，读者可以按规则办理登记。",
     "园艺课程介绍了春季修剪和浇水的基本方法。",
@@ -84,12 +84,12 @@ FIXTURE_DISTRACTOR_CONTEXTS = (
 )
 
 
-def _seam_context(core):
+def _seam_preceding_text(core):
     """Keep a known ``今/天`` BPE boundary at the split seam."""
     return core + "，今天天气?"
 
 
-def _window_context(core, length):
+def _window_preceding_text(core, length):
     """Place meaningful text at the end of a deterministic window fixture."""
     filler = "合成边界记录"
     value = core
@@ -257,88 +257,88 @@ FAMILY_SPECS = (
 
     # BPE seam: the final ``今天天气?`` keeps the known 今/天 seam probe.
     _family("bpe-01", ("bpe_seam",), "shangxian", ("上线", "上限"), "上线",
-            (_seam_context("代码评审已经完成，版本准备在本周发布"),
-             _seam_context("评审通过以后，这个版本就可以部署到线上")),
-            (_seam_context("代码评审已经完成，版本的容量上限需要重新测量"),
-             _seam_context("评审通过以后，先检查系统能够承受的最大负载"))),
+            (_seam_preceding_text("代码评审已经完成，版本准备在本周发布"),
+             _seam_preceding_text("评审通过以后，这个版本就可以部署到线上")),
+            (_seam_preceding_text("代码评审已经完成，版本的容量上限需要重新测量"),
+             _seam_preceding_text("评审通过以后，先检查系统能够承受的最大负载"))),
     _family("bpe-02", ("bpe_seam",), "shuju", ("数据", "属具"), "数据",
-            (_seam_context("实验结果已经收集完毕，接下来整理数据"),
-             _seam_context("测量记录全部归档，现在开始汇总样本信息")),
-            (_seam_context("实验设备已经收集完毕，接下来整理仪器"),
-             _seam_context("测量工具全部归档，现在开始清点实验器材"))),
+            (_seam_preceding_text("实验结果已经收集完毕，接下来整理数据"),
+             _seam_preceding_text("测量记录全部归档，现在开始汇总样本信息")),
+            (_seam_preceding_text("实验设备已经收集完毕，接下来整理仪器"),
+             _seam_preceding_text("测量工具全部归档，现在开始清点实验器材"))),
     _family("bpe-03", ("bpe_seam",), "jishu", ("技术", "急速"), "技术",
-            (_seam_context("研发团队正在讨论新的技术路线"),
-             _seam_context("工程师准备评估下一代实现方案")),
-            (_seam_context("研发团队正在讨论如何加快处理速度"),
-             _seam_context("工程师准备评估一次快速执行的方案"))),
+            (_seam_preceding_text("研发团队正在讨论新的技术路线"),
+             _seam_preceding_text("工程师准备评估下一代实现方案")),
+            (_seam_preceding_text("研发团队正在讨论如何加快处理速度"),
+             _seam_preceding_text("工程师准备评估一次快速执行的方案"))),
     _family("bpe-04", ("bpe_seam",), "chengxu", ("程序", "成序"), "程序",
-            (_seam_context("安装包下载完成后请运行程序进行检查"),
-             _seam_context("文件装好以后打开应用，确认软件能够启动")),
-            (_seam_context("安装包下载完成后请排列程序步骤"),
-             _seam_context("文件装好以后先安排流程，确认顺序能够执行"))),
+            (_seam_preceding_text("安装包下载完成后请运行程序进行检查"),
+             _seam_preceding_text("文件装好以后打开应用，确认软件能够启动")),
+            (_seam_preceding_text("安装包下载完成后请排列程序步骤"),
+             _seam_preceding_text("文件装好以后先安排流程，确认顺序能够执行"))),
     _family("bpe-05", ("bpe_seam",), "gongcheng", ("工程", "公称"), "工程",
-            (_seam_context("桥梁施工进入最后阶段，工程进度需要复核"),
-             _seam_context("建筑项目接近完工，现在核对施工进展")),
-            (_seam_context("产品铭牌上的公称尺寸需要复核"),
-             _seam_context("设备标注的标准尺寸需要重新确认"))),
+            (_seam_preceding_text("桥梁施工进入最后阶段，工程进度需要复核"),
+             _seam_preceding_text("建筑项目接近完工，现在核对施工进展")),
+            (_seam_preceding_text("产品铭牌上的公称尺寸需要复核"),
+             _seam_preceding_text("设备标注的标准尺寸需要重新确认"))),
     _family("bpe-06", ("bpe_seam",), "xiangmu", ("项目", "相目"), "项目",
-            (_seam_context("项目计划已经批准，团队下周开始实施"),
-             _seam_context("方案获得确认后，工作组准备进入执行阶段")),
-            (_seam_context("目录里的相貌条目已经整理，团队下周开始校对"),
-             _seam_context("人物的外貌资料获得确认，工作组准备进入核对阶段"))),
+            (_seam_preceding_text("项目计划已经批准，团队下周开始实施"),
+             _seam_preceding_text("方案获得确认后，工作组准备进入执行阶段")),
+            (_seam_preceding_text("目录里的相貌条目已经整理，团队下周开始校对"),
+             _seam_preceding_text("人物的外貌资料获得确认，工作组准备进入核对阶段"))),
     _family("bpe-07", ("bpe_seam",), "huodong", ("活动", "活东"), "活动",
-            (_seam_context("周末社区要举办亲子活动，报名名单正在确认"),
-             _seam_context("社区将在周末安排家庭互动，参加人员需要登记")),
-            (_seam_context("设备运行时出现活动部件，维修人员正在确认"),
-             _seam_context("机器内部有一个运动零件，技术人员需要登记"))),
+            (_seam_preceding_text("周末社区要举办亲子活动，报名名单正在确认"),
+             _seam_preceding_text("社区将在周末安排家庭互动，参加人员需要登记")),
+            (_seam_preceding_text("设备运行时出现活动部件，维修人员正在确认"),
+             _seam_preceding_text("机器内部有一个运动零件，技术人员需要登记"))),
     _family("bpe-08", ("bpe_seam",), "jianyi", ("建议", "见义"), "建议",
-            (_seam_context("评审结束后请提出建议，帮助我们改进方案"),
-             _seam_context("看完材料以后欢迎给出意见，方便下一轮修订")),
-            (_seam_context("遇到危险时应当见义勇为，及时帮助他人"),
-             _seam_context("公共场所发生意外时可以挺身而出，协助受困者"))),
+            (_seam_preceding_text("评审结束后请提出建议，帮助我们改进方案"),
+             _seam_preceding_text("看完材料以后欢迎给出意见，方便下一轮修订")),
+            (_seam_preceding_text("遇到危险时应当见义勇为，及时帮助他人"),
+             _seam_preceding_text("公共场所发生意外时可以挺身而出，协助受困者"))),
 
     # Window boundary: query is exactly 64 characters; history is longer than
     # 64 so the representation must use the defined tail window.
     _family("window-01", ("window_64",), "tihui", ("体会", "替回"), "体会",
-            (_window_context("读完这本书以后，我对耐心和长期积累有了新的体会", 64),
-             _window_context("阅读完整本书后，我更能理解坚持积累带来的收获", 65)),
-            (_window_context("读完这本书以后，我打算把书退回图书馆", 64),
-             _window_context("阅读完整本书后，我先去办理归还手续再离开", 65))),
+            (_window_preceding_text("读完这本书以后，我对耐心和长期积累有了新的体会", 64),
+             _window_preceding_text("阅读完整本书后，我更能理解坚持积累带来的收获", 65)),
+            (_window_preceding_text("读完这本书以后，我打算把书退回图书馆", 64),
+             _window_preceding_text("阅读完整本书后，我先去办理归还手续再离开", 65))),
     _family("window-02", ("window_64",), "zongjie", ("总结", "总界"), "总结",
-            (_window_context("项目收尾时需要整理总结，记录经验和问题", 64),
-             _window_context("工作结束以后要汇总过程，留下经验教训", 65)),
-            (_window_context("项目收尾时需要安排总结会的时间", 64),
-             _window_context("工作结束以后要预订会议室并通知参会人员", 65))),
+            (_window_preceding_text("项目收尾时需要整理总结，记录经验和问题", 64),
+             _window_preceding_text("工作结束以后要汇总过程，留下经验教训", 65)),
+            (_window_preceding_text("项目收尾时需要安排总结会的时间", 64),
+             _window_preceding_text("工作结束以后要预订会议室并通知参会人员", 65))),
     _family("window-03", ("window_64",), "fenxi", ("分析", "反习"), "分析",
-            (_window_context("拿到实验结果后先分析原因，再决定下一步", 64),
-             _window_context("数据收集完成后要查找规律，然后制定后续方案", 65)),
-            (_window_context("拿到实验结果后先保存文件，再等待负责人签字", 64),
-             _window_context("数据收集完成后要归档材料，然后等待审批流程", 65))),
+            (_window_preceding_text("拿到实验结果后先分析原因，再决定下一步", 64),
+             _window_preceding_text("数据收集完成后要查找规律，然后制定后续方案", 65)),
+            (_window_preceding_text("拿到实验结果后先保存文件，再等待负责人签字", 64),
+             _window_preceding_text("数据收集完成后要归档材料，然后等待审批流程", 65))),
     _family("window-04", ("window_64",), "jieguo", ("结果", "借过"), "结果",
-            (_window_context("测试结束后请查看结果，确认功能是否正常", 64),
-             _window_context("运行完检查用例后核对输出，判断系统状态", 65)),
-            (_window_context("测试结束后请从通道借过，避免堵住入口", 64),
-             _window_context("运行完检查用例后先让工作人员通过，保持通道畅通", 65))),
+            (_window_preceding_text("测试结束后请查看结果，确认功能是否正常", 64),
+             _window_preceding_text("运行完检查用例后核对输出，判断系统状态", 65)),
+            (_window_preceding_text("测试结束后请从通道借过，避免堵住入口", 64),
+             _window_preceding_text("运行完检查用例后先让工作人员通过，保持通道畅通", 65))),
     _family("window-05", ("window_64",), "renwu", ("任务", "人五"), "任务",
-            (_window_context("今天的任务已经分配完毕，大家按计划开始工作", 64),
-             _window_context("工作内容已经安排到人，现在按照排期执行", 65)),
-            (_window_context("今天的人员名单已经分配完毕，大家按计划签到", 64),
-             _window_context("参与者已经安排到组，现在按照名单完成报到", 65))),
+            (_window_preceding_text("今天的任务已经分配完毕，大家按计划开始工作", 64),
+             _window_preceding_text("工作内容已经安排到人，现在按照排期执行", 65)),
+            (_window_preceding_text("今天的人员名单已经分配完毕，大家按计划签到", 64),
+             _window_preceding_text("参与者已经安排到组，现在按照名单完成报到", 65))),
     _family("window-06", ("window_64",), "huibao", ("汇报", "会报"), "汇报",
-            (_window_context("周五需要汇报项目进展，让负责人了解风险", 64),
-             _window_context("本周结束前要说明工作状态，特别是尚未解决的问题", 65)),
-            (_window_context("周五需要召开项目例会，让负责人安排资源", 64),
-             _window_context("本周结束前要组织工作会议，特别讨论资源分配", 65))),
+            (_window_preceding_text("周五需要汇报项目进展，让负责人了解风险", 64),
+             _window_preceding_text("本周结束前要说明工作状态，特别是尚未解决的问题", 65)),
+            (_window_preceding_text("周五需要召开项目例会，让负责人安排资源", 64),
+             _window_preceding_text("本周结束前要组织工作会议，特别讨论资源分配", 65))),
     _family("window-07", ("window_64",), "jindu", ("进度", "近度"), "进度",
-            (_window_context("请每天下班前更新进度，方便团队同步计划", 64),
-             _window_context("工作结束时记得报告完成情况，让大家掌握节奏", 65)),
-            (_window_context("请每天下班前更新近况，方便团队互相问候", 64),
-             _window_context("工作结束时记得报告个人状态，让大家了解生活情况", 65))),
+            (_window_preceding_text("请每天下班前更新进度，方便团队同步计划", 64),
+             _window_preceding_text("工作结束时记得报告完成情况，让大家掌握节奏", 65)),
+            (_window_preceding_text("请每天下班前更新近况，方便团队互相问候", 64),
+             _window_preceding_text("工作结束时记得报告个人状态，让大家了解生活情况", 65))),
     _family("window-08", ("window_64",), "jihua", ("计划", "计画"), "计划",
-            (_window_context("下个月的计划已经确定，团队开始准备资源", 64),
-             _window_context("新的工作安排已经敲定，现在着手准备所需材料", 65)),
-            (_window_context("下个月的计画已经确定，团队开始绘制图表", 64),
-             _window_context("新的图表安排已经敲定，现在着手准备绘图材料", 65))),
+            (_window_preceding_text("下个月的计划已经确定，团队开始准备资源", 64),
+             _window_preceding_text("新的工作安排已经敲定，现在着手准备所需材料", 65)),
+            (_window_preceding_text("下个月的计画已经确定，团队开始绘制图表", 64),
+             _window_preceding_text("新的图表安排已经敲定，现在着手准备绘图材料", 65))),
 
     # Preference change: same topic, but the historical personal preference
     # is explicitly incompatible with the query preference.
@@ -395,8 +395,8 @@ class BenchmarkCase:
     candidates: tuple
     expected_candidate: str
     history_selection: str
-    query_text: str
-    history_text: str
+    query_preceding_text: str
+    recorded_preceding_text: str
     version_summary: str
 
     def payload(self):
@@ -411,13 +411,9 @@ class BenchmarkCase:
             "candidates": list(self.candidates),
             "expected_candidate": self.expected_candidate,
             "history_selection": self.history_selection,
-            "query_text": self.query_text,
-            "history_text": self.history_text,
+            "query_preceding_text": self.query_preceding_text,
+            "recorded_preceding_text": self.recorded_preceding_text,
         }
-
-    def versionless_payload(self):
-        return self.payload()
-
 
 def _canonical_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -432,17 +428,20 @@ def case_version_summary(case):
     """Return the stable digest bound to every case's complete content."""
     return "%s:%s" % (
         BENCHMARK_VERSION,
-        _sha256_text(_canonical_json(case.versionless_payload()))[:24],
+        _sha256_text(_canonical_json(case.payload()))[:24],
     )
 
 
-def _make_case(family, relation, ordinal, query_text, history_text,
+def _make_case(family, relation, ordinal, query_preceding_text,
+               recorded_preceding_text,
                history_selection):
     if "window_64" in family["axes"] and relation == "hard_negative":
         # Keep every labelled boundary case as a 64/over-64 pair even when
         # the hard-negative wording has a different natural length.
-        history_text = ("前" + history_text if ordinal == 1
-                        else history_text[-64:])
+        recorded_preceding_text = (
+            "前" + recorded_preceding_text if ordinal == 1
+            else recorded_preceding_text[-64:]
+        )
     case_id = "%s-%s-%02d" % (relation, family["family_id"], ordinal)
     case = BenchmarkCase(
         case_id=case_id,
@@ -453,8 +452,8 @@ def _make_case(family, relation, ordinal, query_text, history_text,
         candidates=family["candidates"],
         expected_candidate=family["target"],
         history_selection=history_selection,
-        query_text=query_text,
-        history_text=history_text,
+        query_preceding_text=query_preceding_text,
+        recorded_preceding_text=recorded_preceding_text,
         version_summary="",
     )
     return replace(case, version_summary=case_version_summary(case))
@@ -503,7 +502,7 @@ def benchmark_manifest():
         "tau": BENCHMARK_TAU,
         "k_evidence": BENCHMARK_K_EVIDENCE,
         "fixture_distractor_digest": _sha256_text(
-            _canonical_json(FIXTURE_DISTRACTOR_CONTEXTS)),
+            _canonical_json(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)),
         "cases": case_payloads,
     }
     return {
@@ -521,9 +520,9 @@ def benchmark_manifest():
         "k_evidence": BENCHMARK_K_EVIDENCE,
         "half_life": "inf",
         "saturation_k": BENCHMARK_SATURATION_K,
-        "fixture_distractor_count": len(FIXTURE_DISTRACTOR_CONTEXTS),
+        "fixture_distractor_count": len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS),
         "fixture_distractor_digest": _sha256_text(
-            _canonical_json(FIXTURE_DISTRACTOR_CONTEXTS)),
+            _canonical_json(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)),
         "benchmark_digest": _sha256_text(_canonical_json(digest_payload)),
         "case_ids": [case.case_id for case in cases],
         "case_summaries": [
@@ -585,7 +584,7 @@ CREATE TABLE retractions (
 class SyntheticFacts:
     """One disposable facts root for one benchmark query."""
 
-    def __init__(self, case, distractor_contexts):
+    def __init__(self, case, distractor_preceding_texts):
         self.root = tempfile.mkdtemp(prefix="semantic_benchmark_")
         self.db_path = os.path.join(self.root, "facts.sqlite3")
         self.connection = sqlite3.connect(self.db_path)
@@ -597,19 +596,21 @@ class SyntheticFacts:
              ("history_id", "synthetic-benchmark"),
              ("store_epoch", "synthetic-epoch"),
              ("hlc_physical_ms", "1000000"),
-             ("hlc_logical", str(len(distractor_contexts) + 1)),
+             ("hlc_logical", str(len(distractor_preceding_texts) + 1)),
              ("created_at_ms", "1000000")),
         )
-        self.vectors = {}
         self.target_event_id = "target-" + case.case_id
         self._insert_event(
-            self.target_event_id, case.choice_problem, case.history_text,
+            self.target_event_id, case.choice_problem,
+            case.recorded_preceding_text,
             case.history_selection, (1000000, 1), case.candidates,
         )
-        for index, context in enumerate(distractor_contexts, start=1):
+        for index, preceding_text in enumerate(distractor_preceding_texts,
+                                                start=1):
             event_id = "distractor-%s-%02d" % (case.case_id, index)
             self._insert_event(
-                event_id, case.choice_problem, context, case.candidates[-1],
+                event_id, case.choice_problem, preceding_text,
+                case.candidates[-1],
                 (1000000, index + 1), case.candidates,
             )
         self.connection.commit()
@@ -713,33 +714,75 @@ def _failure_detail(case, result, target_event_id, target_cosine):
     }
 
 
-def run_fixture_gate():
-    """Run all cases with controlled vectors through the exact oracle."""
-    cases = benchmark_cases()
-    params = _benchmark_params()
+def _fixture_vector_factory(spec, case, fixture):
+    """Controlled vectors for the model-free oracle plumbing gate."""
+    del spec
+    target_cosine = 0.97 if case.relation == "positive" else 0.10
+    vector_by_event = {
+        fixture.target_event_id: _unit_vector(target_cosine),
+    }
+    for index in range(len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)):
+        event_id = "distractor-%s-%02d" % (case.case_id, index + 1)
+        vector_by_event[event_id] = _unit_vector(0.95 - index * 0.005)
+    return (1.0, 0.0, 0.0, 0.0), vector_by_event, target_cosine
+
+
+def _coverage_pass(coverage):
+    if coverage is None:
+        return True
+    return (coverage["axes_present"] and coverage["bpe_seam_pass"]
+            and coverage["window_boundary_pass"]
+            and coverage.get("window_projection_pass", True))
+
+
+def _run_representation_gate(cases, params, vector_factory,
+                             representation_ids, vector_fixture,
+                             coverage=None, include_failure_details=False):
+    """Run one shared exact-oracle gate for fixture and real vectors."""
+    positive_total = sum(case.relation == "positive" for case in cases)
+    negative_total = sum(case.relation == "hard_negative" for case in cases)
     results = {}
     for spec in first_round_specs():
         positive_passed = 0
+        positive_above_tau = 0
+        positive_in_top_k = 0
+        positive_matched = 0
         negative_passed = 0
+        negative_above_tau = 0
+        negative_in_top_k = 0
+        kept_counts = []
         failed = []
+        failure_details = []
         for case in cases:
-            fixture = SyntheticFacts(case, FIXTURE_DISTRACTOR_CONTEXTS)
+            fixture = SyntheticFacts(case, FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
             try:
-                vector_by_event = {
-                    fixture.target_event_id: _unit_vector(
-                        0.97 if case.relation == "positive" else 0.10),
-                }
-                for index in range(len(FIXTURE_DISTRACTOR_CONTEXTS)):
-                    event_id = "distractor-%s-%02d" % (case.case_id, index + 1)
-                    vector_by_event[event_id] = _unit_vector(0.95 - index * 0.005)
+                query_vector, vector_by_event, target_cosine = vector_factory(
+                    spec, case, fixture,
+                )
                 reader = FactReader(fixture.db_path)
                 try:
                     result = _run_oracle_case(
-                        case, reader, (1.0, 0.0, 0.0, 0.0),
-                        vector_by_event, params,
+                        case, reader, query_vector, vector_by_event, params,
                     )
                 finally:
                     reader.close()
+                target = next((entry for entry in result.kept
+                               if entry.event_id == fixture.target_event_id),
+                              None)
+                target_in_top_k = target is not None
+                target_above_tau = target_cosine > params.tau
+                kept_counts.append(len(result.kept))
+                if case.relation == "positive":
+                    positive_above_tau += int(target_above_tau)
+                    positive_in_top_k += int(target_in_top_k)
+                    expected_index = case.candidates.index(
+                        case.expected_candidate)
+                    matched = (target is not None
+                               and target.matched_candidate == expected_index)
+                    positive_matched += int(matched)
+                else:
+                    negative_above_tau += int(target_above_tau)
+                    negative_in_top_k += int(target_in_top_k)
                 passed = _case_passed(case, result, fixture.target_event_id)
                 if case.relation == "positive":
                     positive_passed += int(passed)
@@ -747,28 +790,62 @@ def run_fixture_gate():
                     negative_passed += int(passed)
                 if not passed:
                     failed.append(case.case_id)
+                    if include_failure_details:
+                        failure_details.append(_failure_detail(
+                            case, result, fixture.target_event_id,
+                            target_cosine,
+                        ))
             finally:
                 fixture.close()
-        positive_total = sum(case.relation == "positive" for case in cases)
-        negative_total = sum(case.relation == "hard_negative" for case in cases)
-        results[spec.short_name] = {
-            "representation_id": "fixture:%s" % spec.short_name,
+        quality_pass = (positive_passed / positive_total >= 0.95
+                        and negative_passed / negative_total >= 0.95)
+        representation_result = {
+            "representation_id": representation_ids[spec.short_name],
+            "vector_fixture": vector_fixture,
             "positive": {
                 "passed": positive_passed,
                 "total": positive_total,
                 "rate": positive_passed / positive_total,
+                "above_tau": positive_above_tau,
+                "in_exact_top_k": positive_in_top_k,
+                "matched_expected_candidate": positive_matched,
                 "threshold": 0.95,
             },
             "hard_negative": {
                 "passed": negative_passed,
                 "total": negative_total,
                 "rate": negative_passed / negative_total,
+                "above_tau": negative_above_tau,
+                "in_exact_top_k": negative_in_top_k,
                 "threshold": 0.95,
             },
+            "exact_top_k": {
+                "k_evidence": params.k_evidence,
+                "kept_min": min(kept_counts),
+                "kept_max": max(kept_counts),
+                "kept_at_k": sum(count == params.k_evidence
+                                  for count in kept_counts),
+            },
             "failed_case_ids": failed,
-            "gate_pass": (positive_passed / positive_total >= 0.95
-                          and negative_passed / negative_total >= 0.95),
+            "gate_pass": quality_pass and _coverage_pass(coverage),
         }
+        if include_failure_details:
+            representation_result["failure_details"] = failure_details
+        results[spec.short_name] = representation_result
+    return results
+
+
+def run_fixture_gate():
+    """Run all cases with controlled vectors through the exact oracle."""
+    cases = benchmark_cases()
+    representation_ids = {
+        spec.short_name: "fixture:%s" % spec.short_name
+        for spec in first_round_specs()
+    }
+    results = _run_representation_gate(
+        cases, _benchmark_params(), _fixture_vector_factory,
+        representation_ids, "shared_controlled_unit_vectors",
+    )
     return {
         "contract": CONTRACT_ID,
         "benchmark": benchmark_manifest(),
@@ -779,7 +856,7 @@ def run_fixture_gate():
     }
 
 
-def _real_model_vectors(model_path, contexts):
+def _real_model_vectors(model_path, preceding_texts):
     """Load Qwen once and return all four representation vectors."""
     from hidden_state import HiddenStateExtractor
     from server import ModelState
@@ -790,12 +867,12 @@ def _real_model_vectors(model_path, contexts):
     vectors = {spec.short_name: {} for spec in specs}
     exact_specs = [spec for spec in specs if spec.kind == "exact"]
     split_spec = next(spec for spec in specs if spec.kind == "split_reuse")
-    for context in contexts:
-        exact = extractor.exact_all(context)
+    for preceding_text in preceding_texts:
+        exact = extractor.exact_all(preceding_text)
         for spec in exact_specs:
-            vectors[spec.short_name][context] = exact[spec.layer]
-        vectors[split_spec.short_name][context] = extractor.split_reuse(
-            context)[0]
+            vectors[spec.short_name][preceding_text] = exact[spec.layer]
+        vectors[split_spec.short_name][preceding_text] = extractor.split_reuse(
+            preceding_text)[0]
     representation_ids = {
         spec.short_name: extractor.representation_id(spec)
         for spec in specs
@@ -804,40 +881,66 @@ def _real_model_vectors(model_path, contexts):
     return vectors, representation_ids, identity, state.tokenizer
 
 
-def _coverage_report(tokenizer):
+def _coverage_report(tokenizer, vectors):
     """Check that the authored boundary axes exercise the #60 seams."""
-    from representations import seam_changed, split_tokenization_for
+    from representations import (seam_changed, split_tokenization_for,
+                                 window_text)
 
     cases = benchmark_cases()
     bpe_cases = [case for case in cases if "bpe_seam" in case.axes]
     seam_hits = 0
+    seam_checks = 0
     for case in bpe_cases:
-        prefix, prefix_ids, tail, tail_ids = split_tokenization_for(
-            tokenizer, case.query_text,
-        )
-        exact_ids = tokenizer.encode(prefix + tail, add_special_tokens=False)
-        seam_hits += int(seam_changed(prefix, prefix_ids, tail, tail_ids,
-                                      exact_ids))
+        for preceding_text in (case.query_preceding_text,
+                               case.recorded_preceding_text):
+            prefix, prefix_ids, tail, tail_ids = split_tokenization_for(
+                tokenizer, preceding_text,
+            )
+            exact_ids = tokenizer.encode(prefix + tail,
+                                         add_special_tokens=False)
+            seam_checks += 1
+            seam_hits += int(seam_changed(prefix, prefix_ids, tail, tail_ids,
+                                          exact_ids))
     window_cases = [case for case in cases if "window_64" in case.axes]
     exact_windows = sum(
-        len(case.query_text) == 64 or len(case.history_text) == 64
+        len(case.query_preceding_text) == 64
+        or len(case.recorded_preceding_text) == 64
         for case in window_cases
     )
     long_windows = sum(
-        len(case.query_text) > 64 or len(case.history_text) > 64
+        len(case.query_preceding_text) > 64
+        or len(case.recorded_preceding_text) > 64
         for case in window_cases
     )
+    projection_checks = 0
+    projection_hits = 0
+    for case in window_cases:
+        for preceding_text in (case.query_preceding_text,
+                               case.recorded_preceding_text):
+            if len(preceding_text) <= 64:
+                continue
+            truncated = window_text(preceding_text, 64)
+            for representation_vectors in vectors.values():
+                projection_checks += 1
+                projection_hits += int(
+                    tuple(representation_vectors[preceding_text])
+                    == tuple(representation_vectors[truncated])
+                )
     axis_counts = benchmark_manifest()["axis_counts"]
     return {
         "axes_present": all(axis_counts[axis] > 0 for axis in AXES),
         "bpe_cases": len(bpe_cases),
+        "bpe_seam_checks": seam_checks,
         "bpe_seam_hits": seam_hits,
-        "bpe_seam_pass": seam_hits == len(bpe_cases),
+        "bpe_seam_pass": seam_hits == seam_checks,
         "window_cases": len(window_cases),
         "window_exact_64": exact_windows,
         "window_over_64": long_windows,
         "window_boundary_pass": (exact_windows == len(window_cases)
                                  and long_windows == len(window_cases)),
+        "window_projection_checks": projection_checks,
+        "window_projection_hits": projection_hits,
+        "window_projection_pass": projection_hits == projection_checks,
     }
 
 
@@ -847,81 +950,41 @@ def run_real_model_gate(model_path):
     if not os.path.isdir(model_path) or not os.path.exists(
             os.path.join(model_path, "model.safetensors")):
         raise RuntimeError("model not found at %s" % model_path)
+    from representations import window_text
+
     cases = benchmark_cases()
-    contexts = set(FIXTURE_DISTRACTOR_CONTEXTS)
+    preceding_texts = set(FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
     for case in cases:
-        contexts.add(case.query_text)
-        contexts.add(case.history_text)
+        preceding_texts.add(case.query_preceding_text)
+        preceding_texts.add(case.recorded_preceding_text)
+        if "window_64" in case.axes:
+            preceding_texts.add(window_text(case.query_preceding_text, 64))
+            preceding_texts.add(window_text(case.recorded_preceding_text, 64))
     vectors, representation_ids, identity, tokenizer = _real_model_vectors(
-        model_path, sorted(contexts),
+        model_path, sorted(preceding_texts),
     )
-    coverage = _coverage_report(tokenizer)
+    coverage = _coverage_report(tokenizer, vectors)
     params = _benchmark_params()
-    results = {}
-    for spec in first_round_specs():
-        positive_passed = 0
-        negative_passed = 0
-        failed = []
-        failure_details = []
-        for case in cases:
-            fixture = SyntheticFacts(case, FIXTURE_DISTRACTOR_CONTEXTS)
-            try:
-                vector_by_event = {
-                    fixture.target_event_id:
-                        vectors[spec.short_name][case.history_text],
-                }
-                for index, context in enumerate(FIXTURE_DISTRACTOR_CONTEXTS,
-                                                 start=1):
-                    event_id = "distractor-%s-%02d" % (case.case_id, index)
-                    vector_by_event[event_id] = vectors[spec.short_name][context]
-                reader = FactReader(fixture.db_path)
-                try:
-                    result = _run_oracle_case(
-                        case, reader,
-                        vectors[spec.short_name][case.query_text],
-                        vector_by_event, params,
-                    )
-                finally:
-                    reader.close()
-                passed = _case_passed(case, result, fixture.target_event_id)
-                if case.relation == "positive":
-                    positive_passed += int(passed)
-                else:
-                    negative_passed += int(passed)
-                if not passed:
-                    failed.append(case.case_id)
-                    failure_details.append(_failure_detail(
-                        case, result, fixture.target_event_id,
-                        _vector_cosine(
-                            vectors[spec.short_name][case.query_text],
-                            vectors[spec.short_name][case.history_text],
-                        ),
-                    ))
-            finally:
-                fixture.close()
-        positive_total = sum(case.relation == "positive" for case in cases)
-        negative_total = sum(case.relation == "hard_negative" for case in cases)
-        quality_pass = (positive_passed / positive_total >= 0.95
-                        and negative_passed / negative_total >= 0.95)
-        results[spec.short_name] = {
-            "representation_id": representation_ids[spec.short_name],
-            "positive": {
-                "passed": positive_passed,
-                "total": positive_total,
-                "rate": positive_passed / positive_total,
-                "threshold": 0.95,
-            },
-            "hard_negative": {
-                "passed": negative_passed,
-                "total": negative_total,
-                "rate": negative_passed / negative_total,
-                "threshold": 0.95,
-            },
-            "failed_case_ids": failed,
-            "failure_details": failure_details,
-            "gate_pass": quality_pass and coverage["axes_present"]
-            and coverage["bpe_seam_pass"] and coverage["window_boundary_pass"],
+    def real_model_vector_factory(spec, case, fixture):
+        vector_by_event = {
+            fixture.target_event_id:
+                vectors[spec.short_name][case.recorded_preceding_text],
         }
+        for index, preceding_text in enumerate(
+                FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
+            event_id = "distractor-%s-%02d" % (case.case_id, index)
+            vector_by_event[event_id] = vectors[spec.short_name][
+                preceding_text]
+        query_vector = vectors[spec.short_name][case.query_preceding_text]
+        target_vector = vectors[spec.short_name][case.recorded_preceding_text]
+        return (query_vector, vector_by_event,
+                _vector_cosine(query_vector, target_vector))
+
+    results = _run_representation_gate(
+        cases, params, real_model_vector_factory, representation_ids,
+        "qwen3_hidden_state_extractor", coverage=coverage,
+        include_failure_details=True,
+    )
     return {
         "contract": CONTRACT_ID,
         "benchmark": benchmark_manifest(),
@@ -931,7 +994,7 @@ def run_real_model_gate(model_path):
             "tokenizer_digest": identity.tokenizer_digest[:16],
             "mlxlm_version": identity.mlxlm_version,
             "hidden_dim": identity.hidden_dim,
-            "context_count": len(contexts),
+            "preceding_text_count": len(preceding_texts),
         },
         "coverage": coverage,
         "representations": results,
