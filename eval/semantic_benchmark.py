@@ -842,17 +842,17 @@ def _run_representation_gate(cases, params, vector_factory,
                 "kept_at_k": sum(count == params.k_evidence
                                   for count in kept_counts),
             },
-            "fixture_mechanism_pass": (
-                not require_fixture_mechanism
-                or (max(kept_counts) == params.k_evidence
-                    and threshold_boundary_pass)
-            ),
             "failed_case_ids": failed,
             "gate_pass": (quality_pass and _coverage_pass(coverage)
                           and (not require_fixture_mechanism
                                or (max(kept_counts) == params.k_evidence
                                    and threshold_boundary_pass))),
         }
+        if require_fixture_mechanism:
+            representation_result["fixture_mechanism_pass"] = (
+                max(kept_counts) == params.k_evidence
+                and threshold_boundary_pass
+            )
         if include_failure_details:
             representation_result["failure_details"] = failure_details
         results[spec.short_name] = representation_result
