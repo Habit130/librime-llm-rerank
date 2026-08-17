@@ -217,6 +217,63 @@ class WalkForwardCausalityTest(unittest.TestCase):
         finally:
             facts.close()
 
+    def test_actionable_requires_candidate_evidence(self):
+        """Actionable = non-zero evidence for at least one candidate of the
+        current group (spec #43).  History whose selection matches no
+        candidate contributes mass but no candidate evidence, so it is NOT
+        actionable (review finding A4)."""
+        facts = SyntheticFacts()
+        try:
+            # e1 selects 丙, which is absent from e2's competition.
+            facts.add_event("e1", "wo", "ctx1", "丙", ("丙",), (100, 0))
+            facts.add_event("e2", "wo", "ctx2", "我", ("我", "握"), (200, 0),
+                            display_rank=1, display_page=1)
+            replay, (outcomes, _) = replay_for(facts, {
+                "ctx1": (1.0, 0.0, 0.0, 0.0),
+                "ctx2": (0.9, 0.436, 0.0, 0.0),
+            }, {
+                ("luna_pinyin", "wo", "丙"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "我"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "握"): (0.0, 1.0, 0.0, 0.0),
+            })
+            by_id = {o.event_id: o for o in outcomes}
+            # e2 sees e1 (kept) with total mass > 0, but 丙 matches no
+            # candidate of (我, 握) -> s_c = 0 for both -> not actionable.
+            self.assertIn("e1", by_id["e2"].kept_ids)
+            self.assertGreater(by_id["e2"].total_mass, 0.0)
+            self.assertFalse(by_id["e2"].actionable)
+        finally:
+            facts.close()
+
+    def test_duplicate_normalized_candidates_first_match(self):
+        """Candidates that normalize equal (於/于 -> 于) are tolerated and
+        resolve to the FIRST normalized-equal candidate, exactly like the
+        oracle's match attribution (review finding B3)."""
+        facts = SyntheticFacts()
+        try:
+            # e1 selects 於 (simplifies to 于); e2's competition contains
+            # both 于 and 於.  The oracle attributes 於's evidence to the
+            # first normalized-equal candidate (于 at index 0).
+            facts.add_event("e1", "yu", "ctx1", "於", ("於",), (100, 0))
+            facts.add_event("e2", "yu", "ctx2", "於", ("于", "於"), (200, 0),
+                            display_rank=2, display_page=1)
+            replay, (outcomes, _) = replay_for(facts, {
+                "ctx1": (1.0, 0.0, 0.0, 0.0),
+                "ctx2": (0.9, 0.436, 0.0, 0.0),
+            }, {
+                ("luna_pinyin", "yu", "於"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "yu", "于"): (1.0, 0.0, 0.0, 0.0),
+            })
+            by_id = {o.event_id: o for o in outcomes}
+            # e1's selection 於 matches e2's candidate 于 (first
+            # normalized-equal) -> evidence lands on index 0.
+            self.assertTrue(by_id["e2"].actionable)
+            self.assertEqual(by_id["e2"].selection_index, 0)
+            # selection_index resolves to the first normalized-equal too.
+            self.assertEqual(by_id["e2"].kept_matches, (0,))
+        finally:
+            facts.close()
+
     def test_page2_confirmation_not_reconstructable(self):
         """display_page > 1: the absolute rank depends on the page size the
         facts do not record, so the base position is not reconstructable and

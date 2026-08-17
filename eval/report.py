@@ -68,6 +68,16 @@ def build_report(engine_version, snapshot, replay_summary, tau_status,
     """
     if not snapshot or not snapshot.get("sha256"):
         raise ReportError("snapshot record is required")
+    identity = snapshot.get("identity") or {}
+    max_hlc = None
+    try:
+        max_hlc = [int(identity.get("hlc_physical_ms", "-1")),
+                   int(identity.get("hlc_logical", "-1"))]
+    except (TypeError, ValueError):
+        max_hlc = None
+    representation_ids = []
+    for grid_result in grid_results or []:
+        representation_ids.append(grid_result.get("representation"))
     report = {
         "contract": "AC-70-v1",
         "engine": {
@@ -77,13 +87,12 @@ def build_report(engine_version, snapshot, replay_summary, tau_status,
         },
         "snapshot": {
             "sha256": snapshot["sha256"],
-            "history_id": (snapshot.get("identity") or {}).get("history_id"),
-            "store_epoch": (snapshot.get("identity") or {}).get(
-                "store_epoch"),
-            "max_hlc": (snapshot.get("identity") or {}).get(
-                "hlc_physical_ms"),
+            "history_id": identity.get("history_id"),
+            "store_epoch": identity.get("store_epoch"),
+            "max_hlc": max_hlc,
             "status": snapshot.get("status"),
         },
+        "representations": representation_ids,
         "seed": seed,
         "environment": environment_summary(),
         "replay": replay_summary,
@@ -116,7 +125,18 @@ def render_markdown(report):
         "- Milestone: **%s** (%s)" % (report["milestone"]["state"],
                                       report["milestone"]["reason"]),
         "- Selection: %s" % report["selection"],
+        "- Representations: %s" % ", ".join(
+            report.get("representations") or []),
         "",
+    ]
+    if report.get("model"):
+        lines.append("## Model / tokenizer summary")
+        lines.append("")
+        lines.append("```json")
+        lines.append(json.dumps(report["model"], ensure_ascii=False, indent=2))
+        lines.append("```")
+        lines.append("")
+    lines.extend([
         "## Replay summary",
         "",
         "```json",
@@ -143,7 +163,7 @@ def render_markdown(report):
         "",
         "## Decision record",
         "",
-    ]
+    ])
     for decision in report["decisions"]:
         lines.append("- %s" % decision)
     lines.append("")

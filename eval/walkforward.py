@@ -175,7 +175,17 @@ class FrozenFacts:
                 for row in rows}
 
     def competition(self, event_id):
-        """Recorded competition texts in recorded (merge) order."""
+        """Recorded competition texts in recorded (merge) order.
+
+        The oracle matches candidates by simplified-NFC text and, on a tie,
+        attributes history evidence to the first normalized-equal
+        candidate (oracle.compute_evidence enumerates candidates in order
+        and breaks at the first match).  The engine mirrors that: texts
+        that normalize equal are tolerated (e.g. 於/于 both simplify to 于),
+        and every duplicate-aware lookup (selection index, base
+        reconstruction) resolves to the first normalized-equal candidate,
+        exactly like the oracle — never silently to a later one.
+        """
         try:
             rows = self._conn.execute(
                 "SELECT text FROM selection_candidates"
@@ -403,8 +413,10 @@ class EventOutcome:
     - ``scheme_rank``: the scheme's rank of the final selection under
       base_proxy + gamma*s_c; None when the selection is absent from the
       recorded competition set.
-    - ``actionable``: the scheme had non-zero evidence for at least one
-      candidate of the group at replay time (score-first memory).
+    - ``actionable``: the scheme held non-zero evidence for at least one
+      candidate of the group at replay time (score-first memory) — the
+      spec's per-candidate actionable definition; kept history matching no
+      candidate contributes mass but no candidate evidence.
     - ``kept_ids`` / ``kept_weights`` / ``kept_matches``: kept contribution
       event ids, a_i and the matched candidate index (-1 when the history
       selection matched no candidate), needed for pollution decomposition.
@@ -524,6 +536,12 @@ class WalkForwardReplay:
                                    and target.display_rank == 1) else 2)
             scheme_rank = self._scheme_rank(target, s, gamma)
             selection_index = self._selection_index(target)
+            # Actionable = the scheme's memory held non-zero evidence for
+            # AT LEAST ONE candidate of the current group (spec #43: "足以
+            # 对当前至少一个候选形成非零检索证据的历史").  Kept history
+            # whose selection matches no candidate contributes mass but no
+            # candidate evidence, so it is not actionable.
+            actionable = any(value > 0.0 for value in s)
             outcomes.append(EventOutcome(
                 event_id=target.event_id,
                 hlc=target.hlc,
@@ -532,7 +550,7 @@ class WalkForwardReplay:
                 competition_complete=target.competition_complete,
                 baseline_rank=baseline_rank,
                 scheme_rank=scheme_rank,
-                actionable=total_mass > 0.0,
+                actionable=actionable,
                 total_mass=total_mass,
                 candidate_count=len(target.competition),
                 selection_index=selection_index,
@@ -583,11 +601,18 @@ class WalkForwardReplay:
 
     @staticmethod
     def _selection_index(target):
-        """Candidate index (0-based) of the final selection in the group."""
-        try:
-            return target.competition.index(target.final_selection_text)
-        except ValueError:
-            return None
+        """Candidate index (0-based) of the final selection in the group.
+
+        Resolves to the FIRST candidate whose simplified-NFC text equals
+        the selection's simplified-NFC text, mirroring the oracle's
+        match-text attribution (duplicates like 於/于 both simplify to
+        于 resolve to the first, exactly like compute_evidence).
+        """
+        selection = match_text(target.final_selection_text)
+        for index, text in enumerate(target.competition):
+            if match_text(text) == selection:
+                return index
+        return None
 
     @staticmethod
     def _base_reconstruction(target):
@@ -603,6 +628,11 @@ class WalkForwardReplay:
         the recorded confirmation position, and γ=0 reproduces the shadow
         baseline.
 
+        The selection's candidate index is the first simplified-NFC-equal
+        candidate (same rule as the oracle's match attribution), so
+        normalized duplicates (於/于) resolve deterministically and
+        consistently with evidence attribution.
+
         Returns a list of ``(index, base_rank)`` in pinned order where
         ``base_rank`` is 1-based, or None when the confirmation position is
         not reconstructable from the facts (selection absent from the
@@ -611,9 +641,10 @@ class WalkForwardReplay:
         record; those events are excluded from scheme ranking and reported
         in the reconstruction-fidelity diagnostic).
         """
+        selection = match_text(target.final_selection_text)
         selection_index = None
         for index, text in enumerate(target.competition):
-            if text == target.final_selection_text:
+            if match_text(text) == selection:
                 selection_index = index
                 break
         if selection_index is None:
@@ -648,6 +679,9 @@ class WalkForwardReplay:
         reconstruction = cls._base_reconstruction(target)
         if reconstruction is None:
             return None
+        selection_candidate_index = cls._selection_index(target)
+        if selection_candidate_index is None:
+            return None
         selection_rank = None
         base_score = {}
         scores = []
@@ -658,7 +692,7 @@ class WalkForwardReplay:
             s = s_by_index[index] if index < len(s_by_index) else 0.0
             score = base_score[index] + gamma * s
             scores.append((score, index, rank))
-            if index == target.competition.index(target.final_selection_text):
+            if index == selection_candidate_index:
                 selection_score = score
                 selection_rank = rank
         if selection_rank is None:

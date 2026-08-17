@@ -198,6 +198,51 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
         self.assertFalse(gate["pass"])
         self.assertLess(gate["top1_diff"][1][0], -0.01)
 
+    def test_finite_h_gate_rejects_majority_pollution_rate_regression(self):
+        """The finite-H pollution gate must gate the majority-pollution
+        RATE difference (pollution_mass >= 0.5 share), not the mean mass:
+        a finite-H cell that turns half the events majority-polluted must
+        fail the +1pp gate (review finding D3, decisive case)."""
+        from walkforward import EventOutcome
+
+        def make(event_ids, polluted):
+            """polluted: iterable of booleans; polluted events carry
+            kept_matches all != selection (pollution mass 1.0), clean
+            events carry kept_matches == selection (mass 0.0)."""
+            outcomes = []
+            for i, (event_id, is_polluted) in enumerate(
+                    zip(event_ids, polluted)):
+                if is_polluted:
+                    matches = (1, 2)   # none == selection_index 0
+                else:
+                    matches = (0, 0)   # all == selection_index 0
+                outcomes.append(EventOutcome(
+                    event_id=event_id, hlc=(1000 + i, 0),
+                    key=("s", "word", "k%d" % (i % 4)),
+                    confirmation_source="explicit_current",
+                    competition_complete=True, baseline_rank=1,
+                    scheme_rank=1, actionable=True, total_mass=2.0,
+                    candidate_count=3, selection_index=0,
+                    kept_ids=("h1", "h2"), kept_weights=(1.0, 1.0),
+                    kept_matches=matches))
+            return outcomes
+
+        ids = ["e%d" % i for i in range(100)]
+        # H=inf: 50 polluted (mass 1.0) + 50 clean (mass 0.0) -> majority
+        # rate 0.5, mean mass 0.5.
+        inf_outcomes = make(ids, [i < 50 for i in range(100)])
+        # finite-H: all 100 polluted -> majority rate 1.0, mean mass 1.0.
+        finite_outcomes = make(ids, [True] * 100)
+        gate = finite_h_gate(
+            {"outcomes": inf_outcomes},
+            {"outcomes": finite_outcomes},
+            seed=42, replicates=10000)
+        # The majority-pollution rate rose from 0.5 to 1.0 (+50pp) -> the
+        # gate must FAIL on the rate leg.
+        self.assertFalse(gate["pass"])
+        self.assertGreater(gate["majority_pollution_diff"][0], 0.01)
+        self.assertGreater(gate["majority_pollution_diff"][1][1], 0.01)
+
     def test_calibratable_path_attaches_finite_h_gates(self):
         """When τ is calibratable, evaluated cells carry the finite-H gate
         against their H=inf twin (a limited max_cells scan keeps the test

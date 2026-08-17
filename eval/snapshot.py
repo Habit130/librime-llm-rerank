@@ -114,6 +114,10 @@ def take_snapshot(source_db, target_dir, status_cli=None):
     os.close(fd)
     try:
         source = sqlite3.connect(source_db, timeout=3.0)
+        # Read-only enforcement: the Online Backup API is the only
+        # operation and performs no writes, but a stray write path must
+        # fail closed (mirrors the oracle's query_only guard).
+        source.execute("PRAGMA query_only=ON;")
         try:
             target = sqlite3.connect(snapshot_path)
             try:

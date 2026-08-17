@@ -128,7 +128,12 @@ DECISION_RECORD = [
 
 
 def real_providers(model_path):
-    """The four first-round representations behind #60 hidden-state vectors."""
+    """The four first-round representations behind #60 hidden-state vectors.
+
+    Returns (providers, identity) where identity is the #60
+    ModelTokenIdentity (model/tokenizer digests, mlx-lm version, hidden
+    dim) the report fingerprints.
+    """
     from representations import first_round_specs
     from hidden_state import HiddenStateExtractor, \
         HiddenStateRepresentationProvider
@@ -140,7 +145,7 @@ def real_providers(model_path):
     for spec in first_round_specs():
         providers[spec.short_name] = HiddenStateRepresentationProvider(
             extractor, spec)
-    return providers
+    return providers, extractor.identity
 
 
 def main():
@@ -175,8 +180,9 @@ def main():
                 "fixture:driver-smoke",
                 {}, {}),
         }
+        model_identity = None
     else:
-        providers = real_providers(args.model)
+        providers, model_identity = real_providers(args.model)
 
     # -- replay + grid -------------------------------------------------------
     facts = FrozenFacts(snapshot["path"])
@@ -211,10 +217,14 @@ def main():
 
     # -- report ---------------------------------------------------------------
     tau_status = {r["representation"]: r["tau"] for r in grid_results}
+    extra = {}
+    if model_identity is not None:
+        from report import model_summary
+        extra["model"] = model_summary(model_identity)
     report = build_report(
         ENGINE_VERSION, snapshot, replay_summary, tau_status, grid_results,
         milestone, BENCHMARK_69_REFERENCE, DECISION_RECORD,
-        seed=args.seed)
+        seed=args.seed, extra=extra)
     report_path = os.path.join(args.work_dir, "diagnostic-report.json")
     markdown_path = os.path.join(args.work_dir, "diagnostic-report.md")
     with open(report_path, "w", encoding="utf-8") as handle:

@@ -169,6 +169,8 @@ def _cell_outcomes(replay, cell, gamma=None):
 def _rate_fn(metric):
     def fn(outcome):
         if metric == "top1":
+            if outcome.scheme_rank is None:
+                return None
             return 1.0 if outcome.scheme_rank == 1 else 0.0
         raise GridError("unknown rate metric %r" % metric)
     return fn
@@ -205,6 +207,8 @@ def _stratum_gates(outcomes, seed, replicates=10000):
             continue
 
         def top1_fn(o):
+            if o.scheme_rank is None:
+                return None  # non-reconstructable: excluded, never a miss
             return 1.0 if o.scheme_rank == 1 else 0.0
 
         def baseline_fn(o):
@@ -258,6 +262,8 @@ def run_cell(replay, cell, seed, replicates=10000):
     majority = poll["majority_share"] if poll else None
 
     def top1_fn(o):
+        if o.scheme_rank is None:
+            return None  # non-reconstructable: excluded, never a miss
         return 1.0 if o.scheme_rank == 1 else 0.0
 
     def baseline_fn(o):
@@ -453,6 +459,8 @@ def finite_h_gate(inf_cell, finite_cell, seed, replicates=10000,
     def top1_fn(outcome):
         if not outcome.competition_complete or not outcome.actionable:
             return None
+        if outcome.scheme_rank is None:
+            return None  # non-reconstructable: excluded, never a miss
         return 1.0 if outcome.scheme_rank == 1 else 0.0
 
     def mispromotion_fn(outcome):
@@ -464,10 +472,15 @@ def finite_h_gate(inf_cell, finite_cell, seed, replicates=10000,
             return None
         return 0.0 if outcome.scheme_rank == 1 else 1.0
 
-    def pollution_fn(outcome):
+    def majority_pollution_fn(outcome):
+        """1.0 iff the event's pollution mass is >= 0.5 (spec's
+        majority-pollution indicator); None when not measurable."""
         if not outcome.actionable:
             return None
-        return pollution_mass(outcome)
+        mass = pollution_mass(outcome)
+        if mass is None:
+            return None
+        return 1.0 if mass >= 0.5 else 0.0
 
     def diff_for(fn, events_left, events_right):
         values = []
@@ -506,7 +519,10 @@ def finite_h_gate(inf_cell, finite_cell, seed, replicates=10000,
 
     top1_diff = diff_for(top1_fn, pairs_finite, pairs_inf)
     misp_diff = diff_for(mispromotion_fn, pairs_finite, pairs_inf)
-    poll_diff = diff_for(pollution_fn, pairs_finite, pairs_inf)
+    # Spec: majority-pollution-RATE difference CI upper bound <= +1pp.
+    # The per-event indicator is pollution_mass >= 0.5, so the gated
+    # statistic is the difference in the majority-polluted event share.
+    poll_diff = diff_for(majority_pollution_fn, pairs_finite, pairs_inf)
 
     top1_ok = top1_diff[1][0] is None or top1_diff[1][0] >= -0.01
     misp_ok = misp_diff[1][1] is None or misp_diff[1][1] <= 0.01
