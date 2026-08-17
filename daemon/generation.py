@@ -315,9 +315,18 @@ def _open_fact_store(facts_root):
     if not os.path.isfile(db_path):
         raise BuildError("fact store not found: %s" % db_path)
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True,
-                               timeout=0)
+        # Read-only open semantics (AC-65-v1 repair): sqlite 3.54.0 returns
+        # SQLITE_CANTOPEN for a ``file:...?mode=ro`` URI open of a WAL
+        # store with an active in-process writer (3.53.3 succeeds; see
+        # docs/publish-atomic.md).  Open the plain path and enforce
+        # read-only in the engine with ``PRAGMA query_only=ON`` (every
+        # write statement fails with SQLITE_READONLY -- the same
+        # fail-closed guarantee, independent of the versioned URI
+        # behavior).  The macOS WAL -shm concurrent-open transient
+        # (SQLITE_BUSY) is absorbed by a short busy wait.
+        conn = sqlite3.connect(db_path, timeout=2.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON;")
         return conn
     except sqlite3.Error as error:
         raise BuildError("cannot open fact store: %s" % error)

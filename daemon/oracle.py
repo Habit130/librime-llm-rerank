@@ -310,8 +310,18 @@ class FactReader:
         if not os.path.isfile(db_path):
             raise OracleError("fact store not found: %s" % db_path)
         try:
-            self._conn = sqlite3.connect("file:%s?mode=ro" % db_path,
-                                         uri=True, timeout=0)
+            # Read-only open semantics (AC-65-v1 repair): sqlite 3.54.0
+            # returns SQLITE_CANTOPEN for a ``file:...?mode=ro`` URI open
+            # of a WAL store with an active in-process writer (3.53.3
+            # succeeds; docs/publish-atomic.md).  Open the plain path and
+            # enforce read-only in the engine with ``PRAGMA
+            # query_only=ON`` -- every write statement fails with
+            # SQLITE_READONLY, the same fail-closed guarantee, independent
+            # of the versioned URI behavior.  The short busy wait absorbs
+            # the macOS WAL -shm concurrent-open SQLITE_BUSY transient
+            # (the daemon's worker + query gate pattern).
+            self._conn = sqlite3.connect(db_path, timeout=2.0)
+            self._conn.execute("PRAGMA query_only=ON;")
         except sqlite3.Error as error:
             raise OracleError("cannot open fact store: %s" % error)
         self._conn.row_factory = sqlite3.Row

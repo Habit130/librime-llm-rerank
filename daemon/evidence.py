@@ -283,6 +283,19 @@ class EvidenceService:
             provider.representation_id(), params, gamma)
 
     def config_identity(self):
+        """The identity the daemon currently serves.
+
+        With a delta machine (#63/#65), the served identity follows the
+        machine's published snapshot representation: a publish switch swaps
+        the served representation exactly when the in-memory pointer swaps,
+        so a request's config identity never mismatches what the snapshot
+        would actually compute.  Without a machine it is the configured
+        identity (the offline/calibration path).
+        """
+        if self._machine is not None:
+            representation_id = self._machine.snapshot_representation_id()
+            return compose_config_identity(representation_id, self._params,
+                                           self._gamma)
         return self._config_identity
 
     def _db_path(self):
@@ -294,7 +307,11 @@ class EvidenceService:
         The catch-up gate (AC63-1) re-reads the facts identity inside
         ``ensure_caught_up``; only a snapshot covering the facts' current
         watermark is returned, otherwise a true ``not_caught_up`` fault is
-        raised -- never a stale-watermark success (AC63-6).
+        raised -- never a stale-watermark success (AC63-6).  The query
+        vector comes from the snapshot itself (#65): the snapshot binds its
+        own representation at publish time, so a single query can never mix
+        the old and the new representation/projection/index identity even
+        while a publish switch is in flight (SCN-65-5).
         """
         schema_id = request["schema_id"]
         category = request["category"]
@@ -308,7 +325,7 @@ class EvidenceService:
                               snapshot.consumed[0], snapshot.consumed[1])
 
         try:
-            query_vector = self._provider.query_vector(preceding_text)
+            query_vector = snapshot.query_vector(preceding_text)
         except EvidenceError:
             raise
         except Exception as error:  # noqa: BLE001 - fail closed

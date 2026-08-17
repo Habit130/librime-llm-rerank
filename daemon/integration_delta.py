@@ -221,7 +221,6 @@ def main():
     fixture = _make_synthetic_facts(args.events)
     facts_root = os.path.dirname(fixture.db_path)
     derived_root = os.path.join(facts_root, "derived")
-    delta_path = os.path.join(derived_root, "delta.sqlite3")
     env_before = _env_snapshot()
 
     state = ModelState(args.model)
@@ -241,6 +240,10 @@ def main():
     gen = build_generation(facts_root, provider, derived_root,
                            chunk_rows=args.chunk_rows)
     generation_id = gen.generation_id
+    # #65: the checkpoint is per-generation
+    # (delta/<generation_id>/delta.sqlite3).
+    delta_path = os.path.join(derived_root, "delta", generation_id,
+                              "delta.sqlite3")
     findings["base_generation_id"] = generation_id
     findings["base_rows"] = gen.row_count
     gen.close()

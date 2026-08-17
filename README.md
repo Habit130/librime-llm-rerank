@@ -368,8 +368,8 @@ facts must carry the same `store_epoch` and the same active event set, and
 event vectors come from the mmap'd file, so the evidence is bit-identical to
 the canonical oracle on the same facts and vectors. `GenerationRepresentationProvider`
 exposes the generation behind the #61 `RepresentationProvider` seam (the
-online/delta integration and staging blue-green publish are deferred to
-#63/#64/#65).
+online/delta integration is #63; the staging blue-green publish is
+#64/#65).
 
 The real-model provider (`HiddenStateRepresentationProvider` in
 `daemon/hidden_state.py`) recomputes each event's vector from the raw
@@ -481,6 +481,54 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 # real-model: chunked build + byte-identity, crash/resume, epoch and
 # desired change discard, deterministic block, active serving
 daemon/.venv/bin/python daemon/integration_staging.py --events 24
+```
+
+## Atomic blue-green publish
+
+`daemon/publish.py` atomically switches the serving identity from the
+current active generation to a `ready` staging generation
+(Habit130/squirrel#65): after the publish-time reopen verification
+(checksums, event set, row mapping, vectors, exact-oracle probes), the
+publish reads the current facts watermark `H1` under a short daemon-
+internal lock, absorbs `(H0, H1]` additions and whole-commit retractions
+into the staging generation's **own** delta checkpoint
+(`delta/<generation_id>/delta.sqlite3`, the spec's "active generation 与
+staging generation 各自拥有独立 delta checkpoint"), then durably replaces
+`<derived_root>/active_manifest.json` (temp + fsync + rename + parent
+fsync) and swaps the in-memory query pointer through the delta machine's
+`publish_switch` handshake:
+
+- A crash before the manifest replace leaves the complete old active (and
+  a publish that failed before the commit rolls the container rename back,
+  so the publisher retries); a crash after the manifest replace loads the
+  complete new generation on restart — the manifest, not the config, is
+  then the source of truth for the active identity (SCN-65-2/3).
+- Facts committed after `H1` (e.g. during the publish) are caught up by
+  the new active before the next successful query — never a
+  stale-watermark success (SCN-65-4); fact writes are never blocked by the
+  publish (SCN-65-6).
+- One query never mixes the old and the new representation / projection /
+  index identity: the served query vector is bound to the snapshot's own
+  representation (SCN-65-5).
+- A store epoch change mid-publish aborts with the old active intact
+  (SCN-65-7). Deterministic delta-embed faults mark the staging `blocked`
+  with the event named; `retry()` re-arms it.
+- The retired active generation and its checkpoint are retained — physical
+  retention/compaction/rollback belong to #66/#67.
+- Old generations are never updated in place, and the desired
+  configuration never reinterprets the active generation.
+
+Design decisions are recorded in `docs/publish-atomic.md`.
+
+Evidence commands:
+
+```sh
+# model-free gate (no MLX/model)
+python3 -m unittest discover -s daemon -p 'test_*.py'
+# real-model: ready-staging publish with (H0,H1] replay, manifest replace,
+# pointer swap, restart-from-manifest, epoch-abort, fact writes during
+# the publish window (24 synthetic events)
+daemon/.venv/bin/python daemon/integration_publish.py --events 24
 ```
 
 ## Frozen baseline policy identity

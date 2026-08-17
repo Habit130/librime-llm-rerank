@@ -11,9 +11,16 @@ query snapshot.  Every evidence query first reads the facts' identity
 snapshot has caught up to that watermark; a snapshot behind the watermark is
 a true fault (``not_caught_up``), never a stale success.
 
-Checkpoint layout (spec clause "持久 delta 与立即可见性"):
+Checkpoint layout (spec clause "持久 delta 与立即可见性"; #65 makes the
+checkpoint per-generation so the active and the staging generation each own
+one, "active generation 与 staging generation 各自拥有独立 delta checkpoint"):
 
-    <derived_root>/delta.sqlite3     single WAL, synchronous=FULL checkpoint
+    <derived_root>/delta/<generation_id>/delta.sqlite3
+                                             single WAL, synchronous=FULL
+                                             checkpoint bound to that base
+                                             generation (the staging
+                                             machine's builds and the #65
+                                             publish create one per staging)
 
     meta             delta_schema_version, base_generation_id, store_epoch,
                      representation_id, vector_dimension, base HLC (H0),
@@ -45,6 +52,20 @@ publishing fails after a commit, the next cycle resumes from the committed
 checkpoint watermark (never re-embeds) and re-publishes.  A catch-up that
 cannot finish within a request's deadline fails that request with
 ``not_caught_up`` (AC63-6); the worker keeps working for the next request.
+
+Publish switch (#65): ``publish_switch`` is the in-memory query-pointer
+swap of the blue-green publish.  The #65 publisher durably prepares the new
+base generation (already moved into ``generations/``), its own delta
+checkpoint (``delta/<generation_id>/delta.sqlite3``, covering ``(H0, H1]``)
+and the replaced active manifest; then this machine's worker atomically
+swaps generation, provider, checkpoint mirror and snapshot under the
+machine condition -- a query sees either the complete old identity or the
+complete new identity, never a mix (SCN-65-5).  The swap is synchronous for
+the publisher (a condition handshake with a deadline); a worker parked by
+maintenance delays the handshake to the deadline, and the publisher retries
+on its next poll.  After the swap the catch-up worker continues on the new
+checkpoint, absorbing facts past ``H1`` before the next successful query
+(SCN-65-4).
 """
 
 import contextlib
@@ -63,10 +84,15 @@ from generation import (BuildBlockedError, BuildError, Generation,
 from oracle import (FactReader, OracleError, StoredEvent)
 
 DELTA_SCHEMA_VERSION = "delta-schema-v1"
+DELTA_DIRNAME = "delta"
 DELTA_FILENAME = "delta.sqlite3"
 # Spec: delta 使用 WAL 和 synchronous=FULL.
 DELTA_JOURNAL_MODE = "wal"
 DELTA_SYNC_MODE = "full"
+# Default deadline for the #65 publish-switch handshake when the caller does
+# not pass one (the switch reopens and re-verifies the whole generation, so
+# the wait is bounded but generous).
+DEFAULT_PUBLISH_SWITCH_DEADLINE_S = 60.0
 # Same standard the generation builder applies to its vectors (unit norm
 # within FP32 rounding tolerance); a dirty vector blocks the batch.
 UNIT_NORM_TOLERANCE = 1e-3
@@ -156,10 +182,37 @@ class DeltaBlocked(DeltaError):
 # Fact-store read helpers (read-only, mirror the oracle's as-of semantics)
 # ---------------------------------------------------------------------------
 
+# The fact-store WAL on macOS can transiently return SQLITE_BUSY when two
+# threads open fresh read-only connections at the same instant (the -shm
+# read-marker handshake).  The daemon's hot path runs exactly that pattern
+# (worker catch-up + query gate + the #65 publisher/switch), so fact reads
+# get a short busy wait instead of a spurious fail-fast fault; a genuinely
+# held exclusive lock (maintenance) still faults after the wait.
+#
+# Read-only open semantics (AC-65-v1 repair): sqlite 3.54.0 returns
+# SQLITE_CANTOPEN ("unable to open database file") for a
+# ``file:<path>?mode=ro`` URI open of a WAL database whose data was written
+# before the WAL switch, while an in-process writer connection is open
+# (sqlite 3.53.3 succeeds; docs/publish-atomic.md "WAL read-only open
+# semantics across sqlite versions").  Fact reads therefore open the plain
+# path and enforce read-only in the engine instead: ``PRAGMA query_only=ON``
+# rejects every data-modifying statement with SQLITE_READONLY -- the same
+# fail-closed guarantee as ``mode=ro``, without depending on the versioned
+# URI behavior.  The file must already exist (a plain open would otherwise
+# create it), so callers that can reach a missing store must check first.
+FACT_READ_BUSY_TIMEOUT_S = 2.0
+
+
 def _open_facts_ro(facts_root):
     db_path = os.path.join(facts_root, "facts.sqlite3")
-    conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=0)
-    conn.row_factory = sqlite3.Row
+    if not os.path.isfile(db_path):
+        raise DeltaError("fact store not found: %s" % db_path)
+    try:
+        conn = sqlite3.connect(db_path, timeout=FACT_READ_BUSY_TIMEOUT_S)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON;")
+    except sqlite3.Error as error:
+        raise DeltaError("cannot open fact store: %s" % error)
     return conn
 
 
@@ -327,11 +380,17 @@ class DeltaSnapshot:
     built only from committed delta state and the verified base generation,
     and it is published atomically; readers may keep using an old snapshot
     while a newer one is published (immutability by construction).
+
+    ``query_provider`` (#65) is the representation provider current when the
+    snapshot was published: the snapshot's query vectors are bound to the
+    snapshot's own representation, so a single query can never mix the old
+    and the new representation/projection/index identity (SCN-65-5), even
+    while a publish switch is in flight.
     """
 
     def __init__(self, store_epoch, base_generation_id, representation_id,
                  vector_dimension, consumed, events, row_source, generation,
-                 delta_vectors, change_seq):
+                 delta_vectors, change_seq, query_provider=None):
         self._store_epoch = store_epoch
         self._base_generation_id = base_generation_id
         self._representation_id = representation_id
@@ -342,6 +401,7 @@ class DeltaSnapshot:
         self._generation = generation
         self._delta_vectors = dict(delta_vectors)
         self._change_seq = change_seq
+        self._query_provider = query_provider
 
     @property
     def store_epoch(self):
@@ -393,6 +453,17 @@ class DeltaSnapshot:
         """Short stable signature for assertions (tests and health)."""
         return (self._store_epoch, self._consumed, self._change_seq,
                 self._base_generation_id)
+
+    def query_vector(self, preceding_text):
+        """The query vector in THIS snapshot's representation (#65).
+
+        Bound to the provider current at publish time, so a query served
+        from this snapshot always uses the same representation as the
+        stored event vectors it is compared against.
+        """
+        if self._query_provider is None:
+            raise DeltaError("snapshot has no query provider")
+        return self._query_provider.query_vector(preceding_text)
 
 
 class DeltaSnapshotReader:
@@ -628,8 +699,12 @@ def open_delta_checkpoint(path, generation, provider, facts_root):
             raise DeltaRejected(
                 "delta consumed watermark %r outside [H0=%r, facts=%r]"
                 % (consumed, base_hlc, facts_max))
-        if change_seq < 0:
+        if change_seq < -1:
             raise DeltaRejected("delta change_seq is negative")
+        # change_seq == -1 is the legitimate fresh state of a generation
+        # with no post-H0 changes (the #65 publish writes an empty
+        # checkpoint for an empty (H0,H1] window); the max_row_seq check
+        # below still rejects any row that contradicts it.
         rows = conn.execute(
             "SELECT event_id, commit_id, schema_id, canonical_segment_input,"
             " category, final_selection_text, hlc_physical_ms, hlc_logical,"
@@ -777,10 +852,21 @@ class DeltaStateMachine:
         self._delta_change_seq = -1
         self._blocked = None  # type: Optional[DeltaBlocked]
         self._pending_rebuild = None  # (target_epoch, complete or None)
+        self._pending_publish = None  # #65 publish-switch record or None
+        self._publish_result = None   # (ok, error) of the last switch
         self._last_error = None
         self._worker = None  # type: Optional[threading.Thread]
 
-        self._delta_path = os.path.join(derived_root, DELTA_FILENAME)
+        # #65: the checkpoint is per-generation (spec: active 与 staging 各自
+        # 拥有独立 delta checkpoint), under delta/<generation_id>/.
+        self._delta_path = os.path.join(
+            derived_root, DELTA_DIRNAME, generation_id, DELTA_FILENAME)
+        try:
+            os.makedirs(os.path.dirname(self._delta_path), mode=0o700,
+                        exist_ok=True)
+        except OSError as error:
+            raise DeltaError("cannot create delta checkpoint root: %s"
+                             % error)
         try:
             os.makedirs(derived_root, mode=0o700, exist_ok=True)
         except OSError as error:
@@ -951,19 +1037,20 @@ class DeltaStateMachine:
     # Snapshot publication (only the worker writes; lock held)
     # ------------------------------------------------------------------
 
-    def _publish_snapshot_locked(self):
-        """Project the current committed state into a new snapshot.
+    def _build_snapshot(self, generation, provider, base_commits, checkpoint):
+        """Project one committed state into a new snapshot (no side effects).
 
-        Must be called with ``self._condition`` held; publishes the new
-        snapshot and wakes every waiting request.  Base rows keep their
-        vectors behind the generation mmap (no second resident copy); delta
-        rows are served from the unpacked mirror.
+        Base rows keep their vectors behind the generation mmap (no second
+        resident copy); delta rows are served from the unpacked mirror.
+        ``checkpoint`` is a dict with ``events``, ``retractions``,
+        ``consumed`` and ``change_seq`` -- either the machine's in-memory
+        mirror or a freshly parsed publish checkpoint.
         """
         items = []
-        for index in range(self._generation.row_count):
-            row = self._generation.row_event(index)
+        for index in range(generation.row_count):
+            row = generation.row_event(index)
             event_id = row["event_id"]
-            commit_id = self._base_commits.get(event_id)
+            commit_id = base_commits.get(event_id)
             if commit_id is None:
                 raise DeltaRejected(
                     "generation row %s has no fact commit" % event_id)
@@ -978,9 +1065,9 @@ class DeltaStateMachine:
                 "hlc": tuple(row["hlc"]),
                 "source": "base",
             })
-        for item in self._delta_events:
+        for item in checkpoint["events"]:
             items.append(dict(item, source="delta"))
-        active = _project_active(items, self._retractions)
+        active = _project_active(items, checkpoint["retractions"])
         snapshot_events = []
         row_source = {}
         delta_vectors = {}
@@ -997,17 +1084,33 @@ class DeltaStateMachine:
             if item["source"] == "delta":
                 delta_vectors[item["event_id"]] = _unpack_vector(
                     item["vector"])
-        self._snapshot = DeltaSnapshot(
-            store_epoch=self._generation.store_epoch,
-            base_generation_id=self._generation.generation_id,
-            representation_id=self._generation.representation_id,
-            vector_dimension=self._generation.vector_dimension,
-            consumed=self._delta_consumed,
+        return DeltaSnapshot(
+            store_epoch=generation.store_epoch,
+            base_generation_id=generation.generation_id,
+            representation_id=generation.representation_id,
+            vector_dimension=generation.vector_dimension,
+            consumed=checkpoint["consumed"],
             events=snapshot_events,
             row_source=row_source,
-            generation=self._generation,
+            generation=generation,
             delta_vectors=delta_vectors,
-            change_seq=self._delta_change_seq)
+            change_seq=checkpoint["change_seq"],
+            query_provider=provider)
+
+    def _publish_snapshot_locked(self):
+        """Project the current committed state into a new snapshot.
+
+        Must be called with ``self._condition`` held; publishes the new
+        snapshot and wakes every waiting request.
+        """
+        checkpoint = {
+            "events": self._delta_events,
+            "retractions": self._retractions,
+            "consumed": self._delta_consumed,
+            "change_seq": self._delta_change_seq,
+        }
+        self._snapshot = self._build_snapshot(
+            self._generation, self._provider, self._base_commits, checkpoint)
         self._condition.notify_all()
 
     def _verify_snapshot_vs_facts(self, snapshot):
@@ -1055,18 +1158,27 @@ class DeltaStateMachine:
             self._wake_event.clear()
 
     def _cycle(self):
-        """One worker iteration: pending rebuild, then catch-up attempt.
+        """One worker iteration: pending publish, pending rebuild, then
+        catch-up attempt.
 
-        While a deterministic block is recorded the worker parks: catch-up
-        stays halted (no repeated embedding of the failing batch, no
-        repeated diagnosis writes) until ``retry()`` or a rebuild clears
-        it.  This also keeps the delta free of concurrent writers during
-        the maintenance ``retry()`` path.
+        A pending publish switch (#65) is processed first: it is the
+        linearization point of the blue-green transaction, and it clears any
+        deterministic catch-up block (a publish is a representation/config
+        change -- spec: 输入、配置或实现改变 clears a block).  While a
+        deterministic block is recorded the worker parks: catch-up stays
+        halted (no repeated embedding of the failing batch, no repeated
+        diagnosis writes) until ``retry()`` or a rebuild clears it.  This
+        also keeps the delta free of concurrent writers during the
+        maintenance ``retry()`` path.
         """
         with self._condition:
+            pending_publish = self._pending_publish
             pending = self._pending_rebuild
             snapshot = self._snapshot
             blocked = self._blocked
+        if pending_publish is not None:
+            self._perform_publish_switch(pending_publish)
+            return
         if pending is not None:
             self._perform_rebuild(pending)
             return
@@ -1105,6 +1217,15 @@ class DeltaStateMachine:
             self._snapshot = None
             self._blocked = None
             self._pending_rebuild = None
+            # A queued publish switch is aborted by the epoch change; the
+            # old active stays intact and the manifest keeps pointing at it
+            # until the next publish overwrites it.  The handshake waiter
+            # gets the explicit abort (never a silent no-result).
+            if self._pending_publish is not None:
+                self._pending_publish = None
+                self._publish_result = (
+                    False, "store epoch changed; publish aborted (SCN-65-7)")
+                self._condition.notify_all()
             target_epoch = pending[0] if pending is not None else None
         if target_epoch is None:
             identity = read_facts_identity(self._facts_root)
@@ -1139,9 +1260,153 @@ class DeltaStateMachine:
             self._generations.append(generation)
             self._base_commits = base_commits
             self._delta_consumed = tuple(generation.source_hlc)
+            self._delta_path = os.path.join(
+                self._derived_root, DELTA_DIRNAME, generation.generation_id,
+                DELTA_FILENAME)
+            try:
+                os.makedirs(os.path.dirname(self._delta_path), mode=0o700,
+                            exist_ok=True)
+            except OSError:
+                pass  # the next write re-creates it; nothing is lost
             self._publish_snapshot_locked()
         if pending is not None and pending[1] is not None:
             pending[1](pending[0])
+
+    # ------------------------------------------------------------------
+    # Publish switch (#65): the in-memory query-pointer swap
+    # ------------------------------------------------------------------
+
+    def publish_switch(self, generation_id, checkpoint_path, provider,
+                       expected_epoch, deadline=None):
+        """The #65 in-memory pointer swap, synchronous for the publisher.
+
+        Queues the switch on the worker thread and waits (bounded by
+        ``deadline``, default ``DEFAULT_PUBLISH_SWITCH_DEADLINE_S``) for it
+        to complete: the worker reopens and re-verifies the published
+        generation and its delta checkpoint, then atomically swaps
+        generation / provider / checkpoint mirror / snapshot under the
+        machine condition.  Returns ``(ok, error)``; on failure the old
+        active identity is left serving untouched.  A second caller joins
+        the in-flight switch instead of queueing a second one.
+
+        The caller (the #65 publisher) has already made the active manifest
+        durable before calling; a crash after this point therefore loads
+        the complete new generation on restart, exactly the SCN-65-3
+        semantics.
+        """
+        if not generation_id or not isinstance(generation_id, str):
+            raise DeltaError("generation_id must be a non-empty string")
+        if not checkpoint_path or not isinstance(checkpoint_path, str):
+            raise DeltaError("checkpoint_path must be a non-empty string")
+        if not isinstance(provider, RepresentationProvider):
+            raise DeltaError("provider must be a RepresentationProvider")
+        if not expected_epoch or not isinstance(expected_epoch, str):
+            raise DeltaError("expected_epoch must be a non-empty string")
+        if deadline is None:
+            deadline = self._now() + DEFAULT_PUBLISH_SWITCH_DEADLINE_S
+        with self._condition:
+            if self._closed:
+                return False, "delta machine is closed"
+            if self._pending_publish is None:
+                self._pending_publish = (generation_id, checkpoint_path,
+                                         provider, expected_epoch)
+                self._publish_result = None
+                self._wake_event.set()
+            while self._pending_publish is not None:
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    # The record stays queued: a worker parked by
+                    # maintenance processes it once resumed, and the
+                    # publisher retries the handshake on its next poll.
+                    return False, "publish switch timed out waiting for " \
+                                  "the worker"
+                self._condition.wait(min(remaining, self._poll_interval))
+        result = self._publish_result
+        if result is None:
+            return False, "publish switch produced no result"
+        return result
+
+    def _perform_publish_switch(self, pending):
+        """Worker-side swap: verify, then swap, then publish (SCN-65-5).
+
+        Nothing is swapped until every verification passed: the facts epoch
+        still matches the publish's expected epoch (SCN-65-7 aborts the
+        switch, leaving the old active untouched), the published generation
+        reopens with the full verification (checksums, event set, row
+        mapping, vectors, exact-oracle probes), its delta checkpoint binds
+        to it, and the projected active set equals the facts at the
+        checkpoint's consumed watermark.  The swap itself happens under the
+        machine condition, so ``ensure_caught_up`` observers atomically see
+        either the complete old snapshot or the complete new one.
+        """
+        generation_id, checkpoint_path, provider, expected_epoch = pending
+        generation = None
+        if not os.path.isabs(checkpoint_path):
+            # The publisher addresses the checkpoint manifest-relative
+            # ("delta/<id>/delta.sqlite3"); resolve against the derived
+            # root for the verification and as the new active path.
+            checkpoint_path = os.path.join(self._derived_root, checkpoint_path)
+        try:
+            identity = read_facts_identity(self._facts_root)
+            if identity is None or identity[0] != expected_epoch:
+                self._finish_publish(
+                    False, "store epoch changed; publish aborted (SCN-65-7)")
+                return
+            generation = open_generation(
+                self._generation_dir(generation_id))
+            checkpoint = open_delta_checkpoint(
+                checkpoint_path, generation, provider, self._facts_root)
+            base_commits = _read_base_commit_ids(
+                self._facts_root, tuple(generation.source_hlc))
+            missing = [event_id for event_id in generation.event_ids()
+                       if event_id not in base_commits]
+            if missing:
+                raise DeltaRejected(
+                    "published generation rows lack fact commits: %s"
+                    % ", ".join(sorted(missing)[:5]))
+            snapshot = self._build_snapshot(generation, provider,
+                                            base_commits, checkpoint)
+            self._verify_snapshot_vs_facts(snapshot)
+        except (DeltaRejected, DeltaError, GenerationRejected) as error:
+            if generation is not None:
+                try:
+                    generation.close()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            reason = getattr(error, "reason", None) or str(error)
+            self._finish_publish(False,
+                                 "publish switch rejected: %s" % reason)
+            return
+        with self._condition:
+            if self._closed:
+                try:
+                    generation.close()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+                self._finish_publish(False, "delta machine is closed")
+                return
+            self._generation = generation
+            self._generations.append(generation)
+            self._provider = provider
+            self._base_commits = base_commits
+            self._delta_events = checkpoint["events"]
+            self._retractions = checkpoint["retractions"]
+            self._delta_consumed = checkpoint["consumed"]
+            self._delta_change_seq = checkpoint["change_seq"]
+            self._delta_path = checkpoint_path
+            self._declared_generation_id = generation_id
+            # A publish is a representation/config change: any deterministic
+            # catch-up block of the old identity no longer applies.
+            self._blocked = None
+            self._snapshot = snapshot
+            self._condition.notify_all()
+        self._finish_publish(True, None)
+
+    def _finish_publish(self, ok, error):
+        with self._condition:
+            self._pending_publish = None
+            self._publish_result = (ok, error)
+            self._condition.notify_all()
 
     def _enter_blocked(self, blocked):
         # Persist the diagnosis BEFORE publishing the block: when a waiting
@@ -1427,6 +1692,26 @@ class DeltaStateMachine:
         with self._condition:
             return self._snapshot
 
+    def snapshot_representation_id(self):
+        """The representation identity currently served (#65).
+
+        Follows the published snapshot so the evidence service's config
+        identity switches exactly when the served identity switches; falls
+        back to the configured provider while no snapshot is published.
+        """
+        with self._condition:
+            snapshot = self._snapshot
+            if snapshot is not None:
+                return snapshot.representation_id
+            return self._provider.representation_id()
+
+    def delta_checkpoint_path(self):
+        """The active checkpoint path (follows rebuilds and publish
+        switches, so operators and tests always address the served
+        checkpoint)."""
+        with self._condition:
+            return self._delta_path
+
     # ------------------------------------------------------------------
     # Coordinator seams (maintenance prepare / epoch recovery)
     # ------------------------------------------------------------------
@@ -1465,6 +1750,13 @@ class DeltaStateMachine:
         with self._condition:
             self._snapshot = None
             self._blocked = None
+            if self._pending_publish is not None:
+                self._pending_publish = None
+                self._publish_result = (
+                    False, "publish aborted by derived-state invalidation")
+                self._condition.notify_all()
+            else:
+                self._publish_result = None
             self._condition.notify_all()
         _drop_delta_checkpoint(self._delta_path)
         self._delta_events = []
@@ -1575,7 +1867,9 @@ def _validate_vector(vector, dimension):
 # Config wiring (server.py builds the machine when the config declares it)
 # ---------------------------------------------------------------------------
 
-def build_delta_machine_from_config(facts_root, config, builder_lock=None):
+def build_delta_machine_from_config(facts_root, config, builder_lock=None,
+                                    active_generation_id=None,
+                                    active_representation_id=None):
     """Construct the delta machine from the evidence config dict.
 
     The config must declare the active generation explicitly (no directory
@@ -1592,6 +1886,14 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None):
     ``builder_lock`` (#64) is the shared single-builder lease: the machine's
     rebuild path acquires it around every generation build so it never
     embeds concurrently with the staging machine.
+
+    ``active_generation_id`` / ``active_representation_id`` (#65) override
+    the config's declared active with the durable active manifest (the
+    runtime publish replaces the active without any config edit, so the
+    manifest -- not the config -- is the source of truth for what is
+    active after a restart).  The representation override is what lets the
+    fixture seam serve the published representation; the real hidden-state
+    provider plugs at the same seam.
     """
     if "derived_root" not in config and "generation_id" not in config:
         return None
@@ -1606,6 +1908,21 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None):
             raise ValueError("derived_root must be a non-empty string")
         if not generation_id or not isinstance(generation_id, str):
             raise ValueError("generation_id must be a non-empty string")
+        if active_generation_id is not None:
+            if not isinstance(active_generation_id, str) \
+                    or not active_generation_id:
+                raise ValueError("active_generation_id must be a non-empty "
+                                 "string")
+            generation_id = active_generation_id
+        representation_id = config["representation_id"]
+        if (not representation_id or not isinstance(representation_id, str)):
+            raise ValueError("representation_id must be a non-empty string")
+        if active_representation_id is not None:
+            if not isinstance(active_representation_id, str) \
+                    or not active_representation_id:
+                raise ValueError("active_representation_id must be a "
+                                 "non-empty string")
+            representation_id = active_representation_id
         deadline = float(config.get("catch_up_deadline_ms", 5000)) / 1000.0
         poll = float(config.get("poll_interval_ms", 500)) / 1000.0
         if deadline <= 0 or poll <= 0:
@@ -1613,21 +1930,24 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None):
     except (KeyError, TypeError, ValueError) as error:
         raise EvidenceError("evidence_unavailable",
                             "malformed delta config: %s" % error)
-    provider = _build_provider_from_config(config)
+    provider = _build_provider_from_config(config,
+                                           representation_id=representation_id)
     return DeltaStateMachine(facts_root, derived_root, provider,
                              generation_id, catch_up_deadline=deadline,
                              poll_interval=poll, builder_lock=builder_lock)
 
 
-def _build_provider_from_config(config):
+def _build_provider_from_config(config, representation_id=None):
     """The fixture representation seam behind the config (mirrors evidence.py).
 
     Kept here (not imported from evidence.py) to avoid a module-level import
     cycle: delta.py already imports evidence.py for the seam and the faults.
+    ``representation_id`` (#65) overrides the config's declared id so the
+    active manifest's published representation can be served.
     """
     from evidence import FixtureRepresentationProvider
     try:
-        representation_id = config["representation_id"]
+        representation_id = representation_id or config["representation_id"]
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}
         default_query = config.get("default_query")

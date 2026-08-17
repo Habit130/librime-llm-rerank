@@ -110,7 +110,7 @@ class StagingBuildMachine:
                  active_representation_id, active_generation_id,
                  chunk_rows=CHUNK_ROWS, probe_params=PROBE_PARAMS,
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
-                 start_worker=True, builder_lock=None):
+                 start_worker=True, builder_lock=None, publish_lock=None):
         if not facts_root:
             raise StagingError("facts root missing")
         if not derived_root:
@@ -148,6 +148,13 @@ class StagingBuildMachine:
         self._probe_params = probe_params
         self._poll_interval = float(poll_interval)
         self._builder_lock = builder_lock
+        # #65: the publish transaction and every state-machine cycle that
+        # touches the staging namespace serialize on this lock, so the
+        # publisher's verify/rename of a ready container can never race a
+        # worker cycle (resume/finalize/reverify/discard) over the same
+        # directory.  Optional: without a lock the machine behaves exactly
+        # as #64 (no publisher wired).
+        self._publish_lock = publish_lock
         self._condition = threading.Condition()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
@@ -161,6 +168,7 @@ class StagingBuildMachine:
         self._current_dir = None
         self._current_progress = None
         self._ready_generation_id = None
+        self._ready_staging_dir = None
         self._ready_verified = False
         self._last_error = None
         self._last_discard_reason = None
@@ -195,7 +203,14 @@ class StagingBuildMachine:
                 continue
             self._idle_event.clear()
             try:
-                self._cycle()
+                # #65: every cycle that touches the staging namespace is
+                # serialized against the publish transaction (the publisher
+                # holds the same lock for its whole verify/rename/switch).
+                if self._publish_lock is not None:
+                    with self._publish_lock:
+                        self._cycle()
+                else:
+                    self._cycle()
             except Exception as error:  # noqa: BLE001 - never die
                 with self._condition:
                     self._last_error = "staging worker fault: %s" % error
@@ -582,6 +597,7 @@ class StagingBuildMachine:
             return
         with self._condition:
             self._ready_generation_id = pinned["generation_id"]
+            self._ready_staging_dir = staging_dir
             self._last_error = None
             self._condition.notify_all()
 
@@ -610,6 +626,11 @@ class StagingBuildMachine:
             return
         with self._condition:
             self._ready_verified = True
+            # A machine that found an already-ready record (e.g. after a
+            # restart) surfaces the same ready state as one that built it,
+            # so the #65 publisher can pick it up.
+            self._ready_generation_id = progress["generation_id"]
+            self._ready_staging_dir = staging_dir
 
     def _verify_container_dance(self, staging_dir):
         """Run the full reopen verification with progress.json moved aside.
@@ -720,6 +741,84 @@ class StagingBuildMachine:
                 self._blocked = None
                 self._blocked_epoch = None
                 self._last_error = None
+                self._ready_generation_id = None
+                self._ready_staging_dir = None
+
+    # ------------------------------------------------------------------
+    # Publish seams (#65): the publisher calls these under the publish
+    # lock, so none of them can race a worker cycle.
+    # ------------------------------------------------------------------
+
+    def provider(self):
+        """The current desired provider (the publisher's embed seam)."""
+        with self._condition:
+            return self._provider
+
+    def verify_publishable(self, staging_dir):
+        """The #65 publish preconditions over one ready staging.
+
+        Re-loads the record (it must be the machine's own ``ready``
+        staging), re-runs the resume gate (epoch / H0 / fingerprints /
+        builder version, recomputed from the facts at the recorded H0) and
+        the full reopen verification -- file checksums, chunk records,
+        row/event bijection, vector finiteness + unit norm, and the fixed
+        exact-oracle probes (spec clause 6; AC65-1) -- with the progress
+        record parked outside the container.  Returns ``(progress, pinned)``
+        on success; raises ``StagingError`` naming the first failing check
+        on any failure.
+        """
+        progress = self._load_progress(staging_dir)
+        if progress is None:
+            raise StagingError("staging record missing or unusable")
+        if progress.get("status") != "ready":
+            raise StagingError("staging status is %r, need ready"
+                               % progress.get("status"))
+        try:
+            events, pinned = self._resume_gate(progress)
+        except _ResumeGateError as error:
+            raise StagingError("staging resume gate failed: %s"
+                               % error.reason)
+        except BuildError as error:
+            raise StagingError("staging resume gate read failed: %s"
+                               % error)
+        try:
+            self._verify_container_dance(staging_dir)
+        except GenerationRejected as error:
+            raise StagingError("staging reopen verification failed: %s"
+                               % error.reason)
+        return progress, pinned
+
+    def publish_reject(self, staging_dir, reason):
+        """#65: a ready staging that fails the publish preconditions is
+        marked discarded -- never published, rebuilt on the next cycle."""
+        self._discard(staging_dir, reason, own=True)
+
+    def publish_block(self, reason, blocked_events, phase="delta"):
+        """#65: record a deterministic publish-time block on the ready
+        staging (spec: 确定性失败保持 blocked; the fault names the events).
+
+        The publisher owns the publish lock while calling this, so it never
+        races the worker; the worker re-derives the block from the record
+        on its next cycle (``retry()`` clears it).
+        """
+        staging_dir = self._ready_staging_dir
+        progress = (self._load_progress(staging_dir)
+                    if staging_dir is not None else None)
+        if progress is None or progress.get("status") != "ready":
+            return
+        record = dict(progress)
+        record["status"] = "blocked"
+        record["blocked_events"] = list(blocked_events)
+        record["reason"] = reason
+        record["phase"] = phase
+        try:
+            self._write_progress(staging_dir, record)
+        except OSError:
+            pass  # best effort; the block re-derives on restart
+        with self._condition:
+            self._ready_verified = False
+            self._ready_generation_id = None
+            self._ready_staging_dir = None
 
     # ------------------------------------------------------------------
     # I/O helpers
@@ -864,6 +963,7 @@ class StagingBuildMachine:
                 "blocked": blocked,
                 "blocked_events": blocked_events,
                 "ready_generation_id": self._ready_generation_id,
+                "ready_staging_dir": self._ready_staging_dir,
                 "last_error": self._last_error,
                 "last_discard_reason": self._last_discard_reason,
             }
@@ -905,7 +1005,10 @@ class StagingBuildMachine:
 # Config wiring (server.py builds the machine when the config declares it)
 # ---------------------------------------------------------------------------
 
-def build_staging_machine_from_config(facts_root, config, builder_lock=None):
+def build_staging_machine_from_config(facts_root, config, builder_lock=None,
+                                      active_generation_id=None,
+                                      active_representation_id=None,
+                                      publish_lock=None):
     """Construct the staging machine from the evidence config dict.
 
     The config distinguishes desired from active (spec "配置区分 desired 与
@@ -921,7 +1024,12 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None):
 
     Returns None when neither ``derived_root`` nor ``generation_id`` is
     declared (mirrors the delta machine's gate); declaring only one is a
-    configuration fault.
+    configuration fault.  ``active_generation_id`` /
+    ``active_representation_id`` (#65) override the config's declared
+    active with the durable active manifest, exactly like the delta
+    machine's seam, so the machine gates against what is actually active.
+    ``publish_lock`` (#65) serializes every state-machine cycle with the
+    publish transaction (see the constructor).
     """
     if "derived_root" not in config and "generation_id" not in config:
         return None
@@ -936,12 +1044,24 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None):
             raise ValueError("derived_root must be a non-empty string")
         if not generation_id or not isinstance(generation_id, str):
             raise ValueError("generation_id must be a non-empty string")
-        active_representation_id = config["representation_id"]
-        if (not active_representation_id or not isinstance(
-                active_representation_id, str)):
+        if active_generation_id is not None:
+            if not isinstance(active_generation_id, str) \
+                    or not active_generation_id:
+                raise ValueError("active_generation_id must be a non-empty "
+                                 "string")
+            generation_id = active_generation_id
+        active_representation_id_value = config["representation_id"]
+        if (not active_representation_id_value or not isinstance(
+                active_representation_id_value, str)):
             raise ValueError("representation_id must be a non-empty string")
+        if active_representation_id is not None:
+            if not isinstance(active_representation_id, str) \
+                    or not active_representation_id:
+                raise ValueError("active_representation_id must be a "
+                                 "non-empty string")
+            active_representation_id_value = active_representation_id
         desired_representation_id = config.get(
-            "desired_representation_id", active_representation_id)
+            "desired_representation_id", active_representation_id_value)
         if (not desired_representation_id or not isinstance(
                 desired_representation_id, str)):
             raise ValueError("desired_representation_id must be a non-empty "
@@ -954,8 +1074,9 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None):
                             "malformed staging config: %s" % error)
     provider = _build_desired_provider(config, desired_representation_id)
     return StagingBuildMachine(
-        facts_root, derived_root, provider, active_representation_id,
-        generation_id, poll_interval=poll, builder_lock=builder_lock)
+        facts_root, derived_root, provider, active_representation_id_value,
+        generation_id, poll_interval=poll, builder_lock=builder_lock,
+        publish_lock=publish_lock)
 
 
 def _build_desired_provider(config, desired_representation_id):

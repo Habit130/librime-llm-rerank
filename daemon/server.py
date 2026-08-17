@@ -34,6 +34,7 @@ from control import run_control_server, validate_control_path
 from coordinator import MaintenanceCoordinator
 from delta import build_delta_machine_from_config
 from staging import build_staging_machine_from_config
+from publish import (build_publisher_from_config, read_active_manifest)
 from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
                       build_evidence_service_from_config)
 
@@ -985,27 +986,54 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
     if evidence_config is not None:
-        # #63/#64 wiring: when the config declares a derived root and an
+        # #63/#64/#65 wiring: when the config declares a derived root and an
         # active generation, the delta state machine becomes both the
         # evidence snapshot source and the coordinator's derived-state
         # recovery, and the staging machine (if the config declares a
         # desired representation different from the active one) resumably
         # builds the target generation in the background.  Both builders
         # share the single-builder lease (spec "一次只运行一个 builder").
+        # #65: the active manifest -- not the config -- is the source of
+        # truth for what is active after a runtime publish, so both machines
+        # and the evidence service resolve the active generation id and
+        # representation from it when present and valid; the publisher
+        # performs the blue-green switch (its transaction and the staging
+        # worker serialize on the shared publish lock).
         builder_lock = threading.Lock()
+        publish_lock = threading.Lock()
+        active_generation_id = None
+        active_representation_id = None
+        try:
+            derived_root = evidence_config.get("derived_root")
+        except (KeyError, TypeError, ValueError):
+            derived_root = None
+        if derived_root:
+            manifest, _reason = read_active_manifest(derived_root)
+            if manifest is not None:
+                active_generation_id = manifest["generation_id"]
+                active_representation_id = manifest["representation_id"]
         machine = build_delta_machine_from_config(
-            facts_root, evidence_config, builder_lock=builder_lock)
+            facts_root, evidence_config, builder_lock=builder_lock,
+            active_generation_id=active_generation_id,
+            active_representation_id=active_representation_id)
         coordinator = MaintenanceCoordinator(
             facts_root, recovery=machine, auto_open_fact_handle=True)
         if machine is not None:
             coordinator.register_builder(machine)
         staging_machine = build_staging_machine_from_config(
-            facts_root, evidence_config, builder_lock=builder_lock)
+            facts_root, evidence_config, builder_lock=builder_lock,
+            active_generation_id=active_generation_id,
+            active_representation_id=active_representation_id,
+            publish_lock=publish_lock)
+        publisher = build_publisher_from_config(
+            facts_root, evidence_config, staging_machine, machine,
+            publish_lock)
         state.evidence_service = build_evidence_service_from_config(
             facts_root, evidence_config, machine=machine)
     else:
         machine = None
         staging_machine = None
+        publisher = None
         coordinator = (
             MaintenanceCoordinator(facts_root, auto_open_fact_handle=True)
             if facts_root else None
@@ -1095,6 +1123,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             machine.close()
         if staging_machine is not None:
             staging_machine.close()
+        if publisher is not None:
+            publisher.close()
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
