@@ -468,13 +468,31 @@ class CliTest(unittest.TestCase):
     # -- reserved maintenance commands --------------------------------------
 
     def test_reserved_commands_return_not_implemented(self):
-        # backup create/verify are implemented since #55; restore, rebuild
-        # and quarantine remain reserved.
+        # backup create/verify, migrate and restore are implemented since
+        # #55/#58/#56; rebuild, quarantine and the #57 restore flags remain
+        # reserved.
         cases = [
-            ("restore",),
             ("rebuild",),
             ("quarantine", "list"),
             ("quarantine", "purge", "op-1", "deadbeef"),
+        ]
+        for args in cases:
+            with self.subTest(command=args):
+                rc, out, err = self.run_cli(*args)
+                self.assertEqual(2, rc, args)
+                self.assertIn("not_implemented", out + err)
+
+    def test_restore_reserved_flags_return_not_implemented(self):
+        # The #57 flags (unreadable-current handling, quarantine,
+        # --expect-no-store) stay reserved even though the healthy restore
+        # path is implemented.
+        cases = [
+            ("restore", "--from", "x.squirrel-memory-backup",
+             "--discard-current", "--accept-unreadable-current"),
+            ("restore", "--from", "x.squirrel-memory-backup",
+             "--discard-current", "--expect-current-fingerprint", "deadbeef"),
+            ("restore", "--from", "x.squirrel-memory-backup",
+             "--discard-current", "--expect-no-store"),
         ]
         for args in cases:
             with self.subTest(command=args):

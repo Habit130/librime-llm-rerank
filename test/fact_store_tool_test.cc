@@ -680,4 +680,147 @@ TEST_F(FactStoreToolTest, MigrateSnapshotWithTestStepToHead) {
   sqlite3_close(db);
 }
 
+// ---------------------------------------------------------------------------
+// Restore epoch-minting seam (Habit130/squirrel#56)
+// ---------------------------------------------------------------------------
+
+TEST_F(FactStoreToolTest, PrepareRestoreMintsNewEpochKeepingHistory) {
+  PopulateLiveStore();
+  const fs::path output = fs::path(tmp_dir_) / "snapshot.sqlite3";
+  ASSERT_EQ(0, RunTool({"snapshot", "--root", store_root_.string(),
+                        "--output", output.string()}).first);
+  // The snapshot's own durable epoch/history, read directly.
+  sqlite3* before = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(output.c_str(), &before,
+                                       SQLITE_OPEN_READONLY, nullptr));
+  const std::string snapshot_epoch = QueryText(
+      before, "SELECT value FROM meta WHERE key='store_epoch';");
+  const std::string snapshot_history = QueryText(
+      before, "SELECT value FROM meta WHERE key='history_id';");
+  sqlite3_close(before);
+
+  auto result = RunTool({"prepare-restore", "--db", output.string()});
+  ASSERT_EQ(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos, result.second.find("\"ok\":true"));
+  EXPECT_NE(std::string::npos,
+            result.second.find("\"status\":\"prepared\""));
+  const std::string new_epoch = JsonField(result.second, "store_epoch");
+  EXPECT_EQ(32u, new_epoch.size());
+  EXPECT_NE(snapshot_epoch, new_epoch);
+  EXPECT_EQ(snapshot_epoch,
+            JsonField(result.second, "previous_store_epoch"));
+  // history_id is preserved; the facts and HLC are preserved verbatim.
+  EXPECT_EQ(snapshot_history, JsonField(result.second, "history_id"));
+  EXPECT_EQ("1", JsonField(result.second, "event_count"));
+  EXPECT_EQ("2", JsonField(result.second, "candidate_count"));
+  EXPECT_EQ("0", JsonField(result.second, "retraction_count"));
+  // The durable meta now carries the new epoch and the old one is gone.
+  sqlite3* after = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(output.c_str(), &after,
+                                       SQLITE_OPEN_READONLY, nullptr));
+  EXPECT_EQ(new_epoch, QueryText(
+      after, "SELECT value FROM meta WHERE key='store_epoch';"));
+  EXPECT_EQ(snapshot_history, QueryText(
+      after, "SELECT value FROM meta WHERE key='history_id';"));
+  EXPECT_EQ(1LL, QueryCount(after, "SELECT COUNT(*) FROM selection_events;"));
+  sqlite3_close(after);
+  // The prepared file still validates as a standalone store.
+  auto inspect = RunTool({"inspect", "--db", output.string()});
+  ASSERT_EQ(0, inspect.first) << inspect.second;
+  EXPECT_EQ(new_epoch, JsonField(inspect.second, "store_epoch"));
+  EXPECT_EQ(snapshot_history, JsonField(inspect.second, "history_id"));
+}
+
+TEST_F(FactStoreToolTest, PrepareRestoreRejectsSupportedOldWithoutMigration) {
+  PopulateLiveStore();
+  const fs::path output = fs::path(tmp_dir_) / "snapshot.sqlite3";
+  ASSERT_EQ(0, RunTool({"snapshot", "--root", store_root_.string(),
+                        "--output", output.string()}).first);
+  // With the test predecessor step the head is 2; a v1 file is supported-old
+  // and must fail closed (the restore operation migrates the staging copy
+  // first, never here).
+  setenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS", "1", 1);
+  auto result = RunTool({"prepare-restore", "--db", output.string()});
+  unsetenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS");
+  ASSERT_EQ(1, result.first);
+  EXPECT_NE(std::string::npos,
+            result.second.find("\"needs_migration\""));
+  // The file's facts and epoch are unchanged.
+  sqlite3* db = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(output.c_str(), &db,
+                                       SQLITE_OPEN_READONLY, nullptr));
+  EXPECT_EQ("1", QueryText(db,
+      "SELECT value FROM meta WHERE key='fact_schema_version';"));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM selection_events;"));
+  sqlite3_close(db);
+}
+
+TEST_F(FactStoreToolTest, PrepareRestoreRejectsTooNewVersion) {
+  PopulateLiveStore();
+  const fs::path output = fs::path(tmp_dir_) / "snapshot.sqlite3";
+  ASSERT_EQ(0, RunTool({"snapshot", "--root", store_root_.string(),
+                        "--output", output.string()}).first);
+  {
+    sqlite3* db = nullptr;
+    ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(output.c_str(), &db,
+                                         SQLITE_OPEN_READWRITE, nullptr));
+    ASSERT_EQ(SQLITE_OK, sqlite3_exec(
+        db, "UPDATE meta SET value='99' WHERE key='fact_schema_version';",
+        nullptr, nullptr, nullptr));
+    sqlite3_close(db);
+  }
+  auto result = RunTool({"prepare-restore", "--db", output.string()});
+  ASSERT_EQ(1, result.first);
+  EXPECT_NE(std::string::npos,
+            result.second.find("\"unsupported_version\""));
+}
+
+TEST_F(FactStoreToolTest, PrepareRestoreFailsClosedOnCorruptFile) {
+  const fs::path text = fs::path(tmp_dir_) / "not-a-db.sqlite3";
+  {
+    FILE* file = std::fopen(text.c_str(), "w");
+    ASSERT_NE(nullptr, file);
+    std::fputs("this is not a database", file);
+    std::fclose(file);
+  }
+  auto result = RunTool({"prepare-restore", "--db", text.string()});
+  ASSERT_EQ(1, result.first);
+  EXPECT_NE(std::string::npos, result.second.find("\"ok\":false"));
+}
+
+TEST_F(FactStoreToolTest, PrepareRestoreNeverTouchesTheLiveRoot) {
+  // A stale staging path must never point at the live root; prepare-restore
+  // takes --db only and a live store is WAL-mode, which the seam refuses, so
+  // the live store's epoch must be untouched.
+  PopulateLiveStore();
+  int64_t physical = 0;
+  int64_t logical = 0;
+  std::string epoch;
+  std::string history_id;
+  {
+    FactStore store(store_root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    ASSERT_EQ(FactStore::Status::kOk,
+              store.ReadStoreIdentity(&physical, &logical, &epoch,
+                                      &history_id));
+  }
+  auto result = RunTool({"prepare-restore", "--db",
+                         (store_root_ / "facts.sqlite3").string()});
+  ASSERT_EQ(1, result.first);
+  EXPECT_NE(std::string::npos, result.second.find("\"ok\":false"));
+  {
+    FactStore store(store_root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+    int64_t now_physical = 0;
+    int64_t now_logical = 0;
+    std::string now_epoch;
+    ASSERT_EQ(FactStore::Status::kOk,
+              store.ReadStoreIdentity(&now_physical, &now_logical, &now_epoch,
+                                      nullptr));
+    EXPECT_EQ(epoch, now_epoch);
+    EXPECT_EQ(physical, now_physical);
+    EXPECT_EQ(logical, now_logical);
+  }
+}
+
 }  // namespace

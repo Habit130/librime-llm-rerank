@@ -349,11 +349,18 @@ FactStore::Status FactStore::Open(OpenMode mode) {
     return status_;
   }
   // This is deliberately before VerifyDbFile and sqlite3_open_v2: those
-  // operations can create or mutate facts.sqlite3, WAL and SHM files.
-  if (!maintenance_lock_.Acquire(root_, MaintenanceLock::Mode::kShared, true)) {
-    status_ = maintenance_lock_.busy() ? Status::kMaintenanceLocked
-                                       : Status::kDbOpenFailed;
-    return status_;
+  // operations can create or mutate facts.sqlite3, WAL and SHM files. The
+  // exclusive mode is the maintenance semantics without the shared lock:
+  // the caller already holds the exclusive maintenance lease (the restore
+  // operation's backup-current snapshot runs inside the exclusive
+  // replacement window), so acquiring a shared lock here would deadlock.
+  if (mode != OpenMode::kExclusive) {
+    if (!maintenance_lock_.Acquire(root_, MaintenanceLock::Mode::kShared,
+                                   true)) {
+      status_ = maintenance_lock_.busy() ? Status::kMaintenanceLocked
+                                         : Status::kDbOpenFailed;
+      return status_;
+    }
   }
   if (Status file_status = VerifyDbFile(); file_status != Status::kOk) {
     status_ = file_status;
@@ -1304,6 +1311,38 @@ FactStore::Status FactStore::InspectSnapshotFile(const path& db_path,
                                      FactStore::OpenMode::kRecorder);
   sqlite3_close(db);
   return valid ? Status::kOk : Status::kDbCorrupt;
+}
+
+FactStore::Status FactStore::ReadStats(SnapshotStats* stats) {
+  if (!db_ || !stats) {
+    status_ = Status::kDbOpenFailed;
+    return status_;
+  }
+  // The store is already open and validated; stats are read-only derived
+  // from the durable meta and fact tables (never written).
+  string value;
+  int64_t schema_version = -1;
+  int64_t event_format_version = -1;
+  if (!ReadMetaText(db_, kMetaFactSchemaVersion, &value) ||
+      !ParseInt64(value, &schema_version) || schema_version < 0 ||
+      !ReadMetaText(db_, kMetaEventFormatVersion, &value) ||
+      !ParseInt64(value, &event_format_version) ||
+      event_format_version < 0) {
+    status_ = Status::kDbClockInvalid;
+    return status_;
+  }
+  if (!ReadClock(db_, &stats->hlc_physical_ms, &stats->hlc_logical) ||
+      !ReadIdentity(db_, &stats->store_epoch, &stats->history_id) ||
+      !QueryFactCounts(db_, stats) ||
+      !QueryEventStats(db_, &stats->event_hlc_physical_ms,
+                       &stats->event_hlc_logical, &stats->event_format_min,
+                       &stats->event_format_max)) {
+    status_ = Status::kDbClockInvalid;
+    return status_;
+  }
+  stats->fact_schema_version = static_cast<int>(schema_version);
+  stats->event_format_version = static_cast<int>(event_format_version);
+  return status_;
 }
 
 bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,

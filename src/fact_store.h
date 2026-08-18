@@ -62,7 +62,11 @@ class FactStore {
   // supported-old stores read-write so the Online Backup API can snapshot
   // them for the migrate operation; fact content is never modified by that
   // open. Too-new or missing-step stores fail closed in BOTH modes.
-  enum class OpenMode { kRecorder, kMaintenance };
+  // kExclusive is the maintenance semantics WITHOUT acquiring the shared
+  // maintenance lock: the caller already holds the exclusive maintenance
+  // lease (a restore's backup-current snapshot runs inside the exclusive
+  // replacement window), so a shared acquisition would self-deadlock.
+  enum class OpenMode { kRecorder, kMaintenance, kExclusive };
 
   // One immutable selection event destined for the fact store. HLC fields and
   // commit_id are filled in by PersistBatch inside the transaction.
@@ -201,6 +205,12 @@ class FactStore {
   // or foreign-key failures and impossible count/clock states. Does not
   // require a root directory structure or a maintenance lease.
   static Status InspectSnapshotFile(const path& db_path, SnapshotStats* stats);
+
+  // Reads the durable identity, clock, fact counts and event HLC high-water
+  // of the OPEN store into `stats` (maintenance semantics; never writes).
+  // Used by the restore plan display through `fact_store_tool stats`;
+  // Python never re-derives fact semantics.
+  Status ReadStats(SnapshotStats* stats);
 
   // Stable code strings for diagnostics; never contains raw text.
   static const char* StatusCode(Status status);
