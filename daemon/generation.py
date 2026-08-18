@@ -77,6 +77,11 @@ import sqlite3
 import struct
 import tempfile
 
+from compat import (  # noqa: E402
+    EXACT_BACKEND,
+    FP32_ROW_MAJOR_LE,
+    compose_index_fingerprint,
+)
 from evidence import (EvidenceError, RepresentationProvider)
 from oracle import (FactReader, OracleError, OracleParams, OracleQuery,
                     StoredEvent, choice_problem_key, compute_evidence)
@@ -85,9 +90,14 @@ BUILD_VERSION = "shadow-generation-builder-v1"
 MANIFEST_VERSION = "shadow-generation-manifest-v1"
 PROGRESS_VERSION = "shadow-generation-progress-v1"
 GENERATION_ID_PREFIX = "shadow-gen-v1"
-VECTOR_FORMAT = "fp32-row-major-little-endian"
-RETRIEVAL_BACKEND = "exact"
+VECTOR_FORMAT = FP32_ROW_MAJOR_LE
+RETRIEVAL_BACKEND = EXACT_BACKEND
 RETRIEVAL_PARAMS = {}
+# #66: the projection semantics of the served active state (row projection,
+# retraction handling, choice-problem keys, HLC metadata interpretation).
+# Bound into every generation identity so a projection change is a comparable
+# identity change, not a forever-constant (executor decision; SCN-66-3/4).
+PROJECTION_VERSION = "delta-schema-v1+generation-manifest-v1"
 # Spec #43: builder 按确定事件清单分块构建,每块记录 row 范围和 checksum.
 CHUNK_ROWS = 256
 # Fixed exact-oracle probes recorded in the manifest (spec "精确 oracle 和
@@ -637,7 +647,9 @@ def _read_snapshot(facts_root, as_of=None):
     return store_epoch, as_of, events
 
 
-def _prepare_target(events, provider, store_epoch, source_hlc):
+def _prepare_target(events, provider, store_epoch, source_hlc,
+                    projection_version=PROJECTION_VERSION,
+                    index_fingerprint=None):
     """The deterministic build target over one frozen snapshot.
 
     Validates every event (a violation blocks with the event named), derives
@@ -645,6 +657,15 @@ def _prepare_target(events, provider, store_epoch, source_hlc):
     container identity and generation id (spec: staging 固定目标 epoch、H0、
     全部 fingerprints、builder 版本与确定事件清单).  Returns a dict with
     ``rows``, ``rows_fingerprint``, ``identity`` and ``generation_id``.
+
+    ``projection_version`` and ``index_fingerprint`` are the #66 layered
+    identity fields (spec "分层兼容身份"): they are bound into the generation
+    identity (and therefore the content-addressed generation id), so a
+    projection or index-fingerprint change produces a different generation
+    and the compatibility matrix can compare them item by item.  The default
+    values are the daemon's current projection semantics and the composed
+    exact-only index fingerprint; the staging machine passes the desired
+    values from its config seam.
     """
     rows = []
     for stored in events:
@@ -659,12 +680,17 @@ def _prepare_target(events, provider, store_epoch, source_hlc):
         rows.append(_metadata_row(stored.event_id, key,
                                   stored.final_selection_text, stored.hlc))
     fingerprint = _rows_fingerprint(rows)
+    if index_fingerprint is None:
+        index_fingerprint = compose_index_fingerprint(
+            backend=RETRIEVAL_BACKEND, params=RETRIEVAL_PARAMS)
     identity = {
         "store_epoch": store_epoch,
         "source_hlc": [source_hlc[0], source_hlc[1]],
         "representation_id": provider.representation_id(),
         "vector_dimension": provider.vector_dimension(),
         "vector_format": VECTOR_FORMAT,
+        "projection_version": projection_version,
+        "index_fingerprint": index_fingerprint,
         "builder_version": BUILD_VERSION,
         "retrieval_backend": RETRIEVAL_BACKEND,
         "retrieval_params": RETRIEVAL_PARAMS,
@@ -680,7 +706,7 @@ def _prepare_target(events, provider, store_epoch, source_hlc):
 
 def _build_chunks(staging_dir, vectors_path, events, provider, dimension,
                   chunk_rows, generation_id, progress, start_row=0,
-                  prefix_digest=None, chunk_limit=None):
+                  prefix_digest=None, chunk_limit=None, vector_source=None):
     """Embed vector chunks [start_row, ...) and advance progress.
 
     ``start_row`` is the first row NOT yet covered by a verified chunk
@@ -697,6 +723,15 @@ def _build_chunks(staging_dir, vectors_path, events, provider, dimension,
     the last verified chunk.  Returns ``(chunks, full_sha256)`` where
     ``chunks`` are the newly written records; ``full_sha256`` covers the
     whole file.
+
+    ``vector_source`` (#66) is the #66 reuse seam: a callable
+    ``(stored) -> vector`` that the matrix may substitute for the provider's
+    ``event_vector`` when the compatibility matrix explicitly permits vector
+    reuse (projection-only change with identical representation and verified
+    old checksums, or a registered tested-equivalent format converter).  When
+    None, the provider embeds as before.  A ``vector_source`` that raises
+    ``EvidenceError`` blocks the build naming the event, exactly like a
+    provider fault -- reuse is never a silent fallback.
     """
     chunks = []
     full_sha = prefix_digest.copy() if prefix_digest else hashlib.sha256()
@@ -718,7 +753,10 @@ def _build_chunks(staging_dir, vectors_path, events, provider, dimension,
             for stored in events[start:end]:
                 event_id = stored.event_id
                 try:
-                    vector = provider.event_vector(stored)
+                    if vector_source is not None:
+                        vector = vector_source(stored)
+                    else:
+                        vector = provider.event_vector(stored)
                 except EvidenceError as error:
                     raise BuildBlockedError(
                         "cannot build generation: %s (event %s)"
@@ -1034,7 +1072,9 @@ def _verify_identity(manifest):
     for key, label in (
             ("store_epoch", "store_epoch"),
             ("representation_id", "representation_id"),
-            ("builder_version", "builder_version")):
+            ("builder_version", "builder_version"),
+            ("projection_version", "projection_version"),
+            ("index_fingerprint", "index_fingerprint")):
         value = identity.get(key)
         if not isinstance(value, str) or not value:
             raise GenerationRejected(
@@ -1332,6 +1372,14 @@ class Generation:
         return self._manifest["identity"]["representation_id"]
 
     @property
+    def projection_version(self):
+        return self._manifest["identity"]["projection_version"]
+
+    @property
+    def index_fingerprint(self):
+        return self._manifest["identity"]["index_fingerprint"]
+
+    @property
     def vector_dimension(self):
         return self._manifest["identity"]["vector_dimension"]
 
@@ -1433,6 +1481,55 @@ class GenerationRepresentationProvider(RepresentationProvider):
 
     def vector_dimension(self):
         return self._generation.vector_dimension
+
+
+class VectorReuseSource:
+    """#66: serve stored vectors from a verified old generation.
+
+    The compatibility matrix substitutes this source for the provider's
+    ``event_vector`` when it explicitly permits vector reuse: a
+    projection-only change with an identical representation and verified old
+    vector checksums (``reuse_vectors``), or a vector-format change routed
+    through a registered tested-equivalent converter (``convert_vectors``).
+
+    ``generation`` must be an already-verified ``Generation`` (its checksums
+    were verified by ``open_generation`` -- that is the checksum gate the
+    matrix requires before reuse is allowed).  ``converter`` is an optional
+    registered ``VectorFormatConverter`` whose ``convert`` maps the stored
+    rows to the desired format and whose equivalence test is the converter's
+    own responsibility.  An event missing from the old generation raises
+    ``EvidenceError``: the builder then blocks naming the event -- reuse is
+    never a silent re-embed, and the matrix never guesses (SCN-66-4).
+    """
+
+    def __init__(self, generation, converter=None):
+        if not isinstance(generation, Generation):
+            raise EvidenceError("representation_fault",
+                                "reuse source needs a verified Generation")
+        self._generation = generation
+        self._converter = converter
+        self._event_rows = {}
+        for row in range(generation.row_count):
+            meta = generation.row_event(row)
+            self._event_rows[meta["event_id"]] = row
+
+    def event_vector(self, event):
+        row = self._event_rows.get(event.event_id)
+        if row is None:
+            raise EvidenceError(
+                "representation_fault",
+                "vector reuse: event %s not in the old generation"
+                % event.event_id)
+        vector = self._generation.vector(row)
+        if self._converter is not None:
+            vector = self._converter.convert(vector)
+        return vector
+
+    def close(self):
+        try:
+            self._generation.close()
+        except Exception:  # noqa: BLE001 - best effort on close
+            pass
 
 
 # ---------------------------------------------------------------------------

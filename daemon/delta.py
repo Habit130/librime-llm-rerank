@@ -246,6 +246,30 @@ def read_facts_identity(facts_root):
     return store_epoch, (physical, logical)
 
 
+def read_facts_schema_version(facts_root):
+    """The fact store's ``fact_schema_version``, or None when the store is
+    missing (#66: the fact schema is part of the layered compat identity --
+    ``fact_schema_version`` bounds the decodable range of the fact tables,
+    event format and HLC).  A store without a provable schema version is a
+    true fault (refuse), never an implicit default."""
+    db_path = os.path.join(facts_root, "facts.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    conn = None
+    try:
+        conn = _open_facts_ro(facts_root)
+        rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    except sqlite3.Error as error:
+        raise DeltaError("fact store read failed: %s" % error)
+    finally:
+        if conn is not None:
+            conn.close()
+    version = rows.get("fact_schema_version")
+    if not version or not isinstance(version, str):
+        raise DeltaError("fact store schema version is missing or malformed")
+    return version
+
+
 def _read_fact_changes(facts_root, lower, upper):
     """All changes with HLC in (lower, upper], in fact order.
 
@@ -811,7 +835,7 @@ class DeltaStateMachine:
                  catch_up_deadline=DEFAULT_CATCH_UP_DEADLINE_S,
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
                  now=time.monotonic, sleep=time.sleep, start_worker=True,
-                 builder_lock=None):
+                 builder_lock=None, refuse_reason=None):
         if not facts_root:
             raise DeltaError("facts root missing")
         if not derived_root:
@@ -835,6 +859,11 @@ class DeltaStateMachine:
         self._now = now
         self._sleep = sleep
         self._builder_lock = builder_lock
+        # #66 refuse-load: a present-but-invalid / unknown active manifest
+        # refuses the load of derived state (SCN-66-10); the machine never
+        # falls back to the config-declared active.  Requests fail closed
+        # (pass-through) and status reports the refusal.
+        self._refuse_reason = refuse_reason
         self._condition = threading.Condition()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
@@ -873,6 +902,17 @@ class DeltaStateMachine:
             raise DeltaError("cannot create derived root: %s" % error)
 
         # -- load (or build) the base generation -------------------------
+        if self._refuse_reason is not None:
+            # #66: refuse to load derived state per an unknown/broken active
+            # manifest.  No generation is loaded or built, no snapshot is
+            # published; every request fails closed with the refusal and the
+            # worker parks (a publish of a fresh, valid generation clears
+            # the refusal via publish_switch).
+            if start_worker:
+                self._worker = threading.Thread(
+                    target=self._run, name="delta-catch-up", daemon=True)
+                self._worker.start()
+            return
         try:
             generation = self._load_or_build_generation()
         except DeltaBlocked as error:
@@ -883,6 +923,11 @@ class DeltaStateMachine:
             self._blocked = error
             generation = None
         if generation is None:
+            # Either a deterministic build block (above) or a #66
+            # refuse-on-broken-published-identity (``_refuse_reason`` was set
+            # by ``_load_or_build_generation``).  Both park the worker; every
+            # request fails closed (representation_fault / active_identity_
+            # refused) until retry()/a valid publish clears the state.
             if start_worker:
                 self._worker = threading.Thread(
                     target=self._run, name="delta-catch-up", daemon=True)
@@ -985,19 +1030,61 @@ class DeltaStateMachine:
         return os.path.join(self._derived_root, "generations", generation_id)
 
     def _load_or_build_generation(self):
-        """The declared active generation if it matches the facts epoch.
+        """Load the declared active generation, or rebuild from facts.
 
-        A missing, corrupt, identity-unknown or stale-epoch generation is
-        rebuilt from facts (spec: 删除 generation 后可确定性全量重建; the
-        declared id is the desired active, and the machine serves whatever
-        current generation it had to build).
+        Two distinct paths (AC66-8 / SCN-66-10 / SCN-66-12):
+
+        - **Nothing published yet** (no active manifest, or a manifest
+          naming a different generation): the #63 rebuild-from-facts path
+          applies -- there is nothing to refuse, and the declared id is the
+          desired active.  A missing generation directory, or one that is
+          simply absent, rebuilds deterministically (spec: 删除 generation
+          后可确定性全量重建).
+        - **A present-but-invalid / unknown active manifest**: refuse the
+          load (SCN-66-10); never a config-active fallback, never a rebuild
+          into the refused identity.
+        - **A published identity is present but broken**: a durable active
+          manifest names a generation whose directory is missing or whose
+          ``open_generation`` fails (checksum / unknown format / unsupported
+          backend / identity mismatch).  This *refuses* the load rather than
+          rebuilding into the broken identity; the machine must not serve a
+          freshly built container as the successful active for a broken
+          published identity.  ``_build_generation_now()`` is never called
+          for it; the worker parks in the refused state and only a valid
+          publish clears it.
         """
         generation_dir = self._generation_dir(self._declared_generation_id)
-        generation = None
+        published, refuse_reason = self._published_identity_state()
+        if refuse_reason is not None:
+            # A present-but-invalid / unknown active manifest refuses the
+            # load (SCN-66-10): never a config-active fallback, never a
+            # rebuild into the refused identity.
+            self._refuse_reason = refuse_reason
+            return None
+        if not os.path.isdir(generation_dir):
+            if published:
+                # A durable publish names a generation directory that is
+                # missing: a broken published identity -> refuse (AC66-8),
+                # never rebuild-and-serve into the refused identity.
+                self._refuse_reason = (
+                    "published generation %s is missing"
+                    % self._declared_generation_id)
+                return None
+            # Nothing published for the declared identity: rebuild from facts.
+            return self._build_generation_now()
         try:
             generation = open_generation(generation_dir)
-        except GenerationRejected:
-            generation = None
+        except GenerationRejected as error:
+            if published:
+                # A durable publish names a generation that fails reopen: a
+                # broken published identity -> refuse (never rebuild-and-serve
+                # into the refused identity).  The refusal is recorded on the
+                # machine and the caller parks the worker.
+                self._refuse_reason = error.reason
+                return None
+            # No durable publish: the config-declared active is still
+            # "nothing published yet" -> #63 rebuild-from-facts.
+            return self._build_generation_now()
         if generation is not None:
             identity = read_facts_identity(self._facts_root)
             if identity is None:
@@ -1009,12 +1096,39 @@ class DeltaStateMachine:
             if identity[0] == generation.store_epoch:
                 return generation
             # The declared generation belongs to a different store epoch:
-            # derived state must never be reinterpreted across epochs.
+            # derived state must never be reinterpreted across epochs.  This
+            # is an epoch change (rebuild), not a broken identity (refuse):
+            # no active manifest promised this generation for the new epoch.
             try:
                 generation.close()
             except Exception:  # noqa: BLE001 - best effort
                 pass
         return self._build_generation_now()
+
+    def _published_identity_state(self):
+        """``(published, refuse_reason)`` for the declared generation id.
+
+        The active manifest is the durable source of truth for what is
+        published (#65/#66):
+
+        - no manifest -> ``(False, None)``: nothing published yet, the
+          #63 rebuild-from-facts path applies (AC66-8);
+        - a present-but-invalid / unknown manifest -> ``(False, reason)``:
+          refuse the load (SCN-66-10), never a config-active fallback;
+        - a valid manifest naming the declared id -> ``(True, None)``: the
+          generation must reopen cleanly or the load refuses (AC66-8);
+        - a valid manifest naming a *different* id -> ``(False, None)``: the
+          declared id is not the published one (stale config), so there is
+          nothing published for it.
+        """
+        from publish import read_active_manifest
+        manifest, reason = read_active_manifest(self._derived_root)
+        if reason is not None:
+            return False, reason
+        if manifest is None:
+            return False, None
+        return (manifest.get("generation_id") == self._declared_generation_id,
+                None)
 
     def _build_generation_now(self):
         # The single-builder constraint (spec "一次只运行一个 builder"):
@@ -1176,8 +1290,18 @@ class DeltaStateMachine:
             pending = self._pending_rebuild
             snapshot = self._snapshot
             blocked = self._blocked
+            refuse_reason = self._refuse_reason
         if pending_publish is not None:
+            # A publish switch is processed even while refused (#66): it is
+            # the linearization point that reopens and re-verifies a fresh,
+            # complete generation, and it clears the refusal on success --
+            # queries fail closed until a valid publish, then recover.
             self._perform_publish_switch(pending_publish)
+            return
+        if refuse_reason is not None:
+            # #66 refuse-load: park the worker; only a publish of a fresh,
+            # valid generation (publish_switch, above) clears the refusal.
+            # No catch-up, no rebuild -- the active identity cannot be trusted.
             return
         if pending is not None:
             self._perform_rebuild(pending)
@@ -1396,8 +1520,11 @@ class DeltaStateMachine:
             self._delta_path = checkpoint_path
             self._declared_generation_id = generation_id
             # A publish is a representation/config change: any deterministic
-            # catch-up block of the old identity no longer applies.
+            # catch-up block of the old identity no longer applies, and a
+            # #66 refuse-load is cleared by a freshly published, fully
+            # verified generation (a valid active now exists).
             self._blocked = None
+            self._refuse_reason = None
             self._snapshot = snapshot
             self._condition.notify_all()
         self._finish_publish(True, None)
@@ -1657,6 +1784,14 @@ class DeltaStateMachine:
         """
         if deadline is None:
             deadline = self._now() + self._catch_up_deadline
+        with self._condition:
+            if self._refuse_reason is not None:
+                # #66 refuse-load: the active identity is unknown / broken /
+                # missing a compat declaration.  Requests fail closed
+                # (pass-through), never a silent fallback to the
+                # config-declared active (SCN-66-10).
+                raise EvidenceError(
+                    "active_identity_refused", self._refuse_reason)
         facts_identity = read_facts_identity(self._facts_root)
         if facts_identity is None:
             raise EvidenceError(
@@ -1800,6 +1935,7 @@ class DeltaStateMachine:
                 "delta_generation_id": (
                     snapshot.base_generation_id
                     if snapshot is not None else None),
+                "delta_refuse_reason": self._refuse_reason,
             }
 
     def close(self):
@@ -1869,7 +2005,8 @@ def _validate_vector(vector, dimension):
 
 def build_delta_machine_from_config(facts_root, config, builder_lock=None,
                                     active_generation_id=None,
-                                    active_representation_id=None):
+                                    active_representation_id=None,
+                                    refuse_reason=None):
     """Construct the delta machine from the evidence config dict.
 
     The config must declare the active generation explicitly (no directory
@@ -1894,6 +2031,11 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
     active after a restart).  The representation override is what lets the
     fixture seam serve the published representation; the real hidden-state
     provider plugs at the same seam.
+
+    ``refuse_reason`` (#66) refuses the load of derived state (a present-but-
+    invalid / unknown active manifest): the machine never falls back to the
+    config-declared active; requests fail closed with
+    ``active_identity_refused`` and status reports the refusal.
     """
     if "derived_root" not in config and "generation_id" not in config:
         return None
@@ -1934,7 +2076,8 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
                                            representation_id=representation_id)
     return DeltaStateMachine(facts_root, derived_root, provider,
                              generation_id, catch_up_deadline=deadline,
-                             poll_interval=poll, builder_lock=builder_lock)
+                             poll_interval=poll, builder_lock=builder_lock,
+                             refuse_reason=refuse_reason)
 
 
 def _build_provider_from_config(config, representation_id=None):

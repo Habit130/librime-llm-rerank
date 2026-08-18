@@ -514,11 +514,40 @@ fsync) and swaps the in-memory query pointer through the delta machine's
   (SCN-65-7). Deterministic delta-embed faults mark the staging `blocked`
   with the event named; `retry()` re-arms it.
 - The retired active generation and its checkpoint are retained — physical
-  retention/compaction/rollback belong to #66/#67.
+  retention/compaction/rollback belong to #67.
 - Old generations are never updated in place, and the desired
   configuration never reinterprets the active generation.
 
 Design decisions are recorded in `docs/publish-atomic.md`.
+
+## Compatibility matrix (Squirrel#66)
+
+`daemon/compat.py` is the single reuse/load authority for derived state.
+The desired and active layered identities (fact schema version,
+representation id, vector format version, projection version, index
+fingerprint, store epoch) are compared item by item and the matrix returns
+the exact action union the build path must execute:
+
+- `store_epoch` change -> invalidate all derived state, full rebuild from
+  current facts (SCN-66-1).
+- `representation_id` change -> re-embed all active events (SCN-66-2).
+- only `projection_version` change (same representation) -> rebuild the
+  projection from facts and reuse vectors by event_id when the old
+  checksums verify (SCN-66-3/4).
+- only `vector_format_version` change -> reuse FP32 only through a
+  registered tested-equivalent converter, otherwise re-embed (never a
+  byte-cast) (SCN-66-5/6).
+- only `index_fingerprint` change -> no model, no projection rebuild; in
+  the exact-only envelope this is a planned no-op with reason
+  `no_ann_sidecar` (SCN-66-7, RISK-66-1).
+- only query parameters change -> explicit no-op for the base (SCN-66-8).
+- multi-layer change -> the action union, never a guessed smaller action
+  (SCN-66-9).
+- unknown identity / missing compat declaration / checksum failure ->
+  refuse the load; no config-active fallback (SCN-66-10/12).
+- during a desired build the status reports both fingerprints and the
+  mismatch reasons; active queries still use the active identity only
+  (SCN-66-11).
 
 Evidence commands:
 

@@ -57,17 +57,36 @@ import os
 import shutil
 import threading
 
-from delta import read_facts_identity  # noqa: E402
+import compat  # noqa: E402
+from compat import (  # noqa: E402
+    ACTION_NOOP,
+    ACTION_REBUILD_INDEX,
+    ACTION_REBUILD_PROJECTION,
+    ACTION_REUSE_VECTORS,
+    ACTION_CONVERT_VECTORS,
+    LAYER_INDEX,
+    LAYER_PROJECTION,
+    LAYER_REPRESENTATION,
+    LAYER_STORE_EPOCH,
+    LAYER_VECTOR_FORMAT,
+    compose_index_fingerprint,
+    find_converter,
+    plan_actions,
+)
+from delta import read_facts_identity, read_facts_schema_version  # noqa: E402
 from evidence import EvidenceError, RepresentationProvider  # noqa: E402
 from generation import (  # noqa: E402
     BUILD_VERSION,
     CHUNK_ROWS,
     PROBE_PARAMS,
     PROGRESS_FILENAME,
+    PROJECTION_VERSION,
+    VECTOR_FORMAT,
     BuildBlockedError,
     BuildError,
     BuildProgressError,
     GenerationRejected,
+    VectorReuseSource,
     _build_chunks,
     _canonical_json,
     _compose_manifest,
@@ -110,7 +129,10 @@ class StagingBuildMachine:
                  active_representation_id, active_generation_id,
                  chunk_rows=CHUNK_ROWS, probe_params=PROBE_PARAMS,
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
-                 start_worker=True, builder_lock=None, publish_lock=None):
+                 start_worker=True, builder_lock=None, publish_lock=None,
+                 active_identity=None, projection_version=PROJECTION_VERSION,
+                 index_fingerprint=None, vector_format_version=VECTOR_FORMAT,
+                 refuse_reason=None):
         if not facts_root:
             raise StagingError("facts root missing")
         if not derived_root:
@@ -139,15 +161,33 @@ class StagingBuildMachine:
         if not isinstance(dimension, int) or dimension < 1:
             raise StagingError("provider vector_dimension must be a "
                                "positive integer")
+        if not projection_version or not isinstance(projection_version, str):
+            raise StagingError("projection_version must be a non-empty string")
+        if index_fingerprint is not None and not isinstance(
+                index_fingerprint, str):
+            raise StagingError("index_fingerprint must be a string or None")
+        if not vector_format_version or not isinstance(
+                vector_format_version, str):
+            raise StagingError("vector_format_version must be a non-empty "
+                               "string")
         self._facts_root = facts_root
         self._derived_root = derived_root
         self._provider = provider
         self._active_representation_id = active_representation_id
         self._active_generation_id = active_generation_id
+        self._active_identity = active_identity
+        self._projection_version = projection_version
+        self._index_fingerprint = index_fingerprint
+        self._vector_format_version = vector_format_version
         self._chunk_rows = chunk_rows
         self._probe_params = probe_params
         self._poll_interval = float(poll_interval)
         self._builder_lock = builder_lock
+        # #66 refuse-load: a present-but-invalid / unknown active manifest
+        # refuses the load of derived state.  The staging machine idles and
+        # reports the refusal (never builds against an unknown active);
+        # nothing-published still follows the existing first-build path.
+        self._refuse_reason = refuse_reason
         # #65: the publish transaction and every state-machine cycle that
         # touches the staging namespace serialize on this lock, so the
         # publisher's verify/rename of a ready container can never race a
@@ -172,6 +212,8 @@ class StagingBuildMachine:
         self._ready_verified = False
         self._last_error = None
         self._last_discard_reason = None
+        self._last_plan = None  # #66 matrix plan of the last cycle
+        self._reuse_source = None  # #66 open VectorReuseSource, if any
         self._worker = None  # type: Optional[threading.Thread]
         try:
             os.makedirs(derived_root, mode=0o700, exist_ok=True)
@@ -238,6 +280,14 @@ class StagingBuildMachine:
         facts_epoch, _facts_max = facts_identity
         with self._condition:
             blocked = self._blocked
+            refuse_reason = self._refuse_reason
+        if refuse_reason is not None:
+            # #66 refuse-load: a broken/unknown active identity is a refuse,
+            # never a config-active fallback and never a build against it.
+            # This is distinct from "nothing published yet" (the existing
+            # first-build path); the machine idles and reports the reason.
+            self._sync_state(None, None)
+            return
         if blocked is not None:
             progress = self._current_progress
             if progress is None or progress.get("status") != "blocked":
@@ -259,9 +309,40 @@ class StagingBuildMachine:
             return
         desired_repr = target["identity"]["representation_id"]
 
-        if desired_repr == self._active_representation_id:
-            # desired == active: never build (spec: desired/active 区分);
-            # any leftover record is obsolete.
+        # -- #66: the compatibility matrix decides what to build ----------
+        try:
+            fact_schema_version = read_facts_schema_version(self._facts_root)
+        except DeltaError as error:
+            self._set_last_error("fact schema read failed: %s" % error)
+            return
+        desired_identity = self._desired_identity(facts_epoch,
+                                                  fact_schema_version)
+        active_identity = self._active_identity_value(facts_epoch,
+                                                      fact_schema_version)
+        plan = plan_actions(desired_identity, active_identity,
+                            facts_schema_version=fact_schema_version)
+        self._last_plan = plan
+
+        if plan["refuse_load"]:
+            # Unknown active identity / missing compat declaration / fact
+            # schema change: refuse to build against it; never fall back to
+            # the config-declared active (SCN-66-10).  The query path fails
+            # closed independently (the delta machine refuses the load); the
+            # staging machine records the refusal and idles.
+            self._set_last_error("compat matrix refuses: %s"
+                                 % plan["refuse_reason"])
+            self._mark_stale_records_discarded(facts_epoch, desired_repr)
+            self._sync_state(target, None)
+            return
+
+        if plan["actions"] == [ACTION_NOOP] \
+                or plan["actions"] == [ACTION_REBUILD_INDEX]:
+            # desired == active (noop: base layers identical, at most the
+            # query config identity differs) OR an index-fingerprint-only
+            # change (rebuild_index; in this exact-only envelope that is a
+            # planned no-op with reason ``no_ann_sidecar`` -- no model, no
+            # projection rebuild, RISK-66-1 / SCN-66-7).  Either way: no
+            # build; any leftover record is obsolete.
             self._mark_stale_records_discarded(facts_epoch, desired_repr)
             self._sync_state(target, None)
             return
@@ -403,7 +484,60 @@ class StagingBuildMachine:
         """The fresh desired target over the current facts snapshot."""
         store_epoch, source_hlc, events = _read_snapshot(self._facts_root)
         return _prepare_target(events, self._provider, store_epoch,
-                               source_hlc)
+                               source_hlc,
+                               projection_version=self._projection_version,
+                               index_fingerprint=self._index_fingerprint)
+
+    def _desired_identity(self, facts_epoch, fact_schema_version):
+        """The daemon's desired layered identity (spec "分层兼容身份").
+
+        ``store_epoch`` and ``fact_schema_version`` come from the current
+        facts (read-only); the generation-bound layers come from the desired
+        provider and the config seam.  The query-config identity is NOT part
+        of the generation identity -- it stays on the evidence seam
+        (compose_config_identity), so a query-parameter-only change never
+        reaches the matrix as a base difference.
+        """
+        if self._index_fingerprint is None:
+            index_fingerprint = compose_index_fingerprint()
+        else:
+            index_fingerprint = self._index_fingerprint
+        return {
+            compat.LAYER_STORE_EPOCH: facts_epoch,
+            compat.LAYER_FACT_SCHEMA: fact_schema_version,
+            compat.LAYER_REPRESENTATION:
+                self._provider.representation_id(),
+            compat.LAYER_VECTOR_FORMAT: self._vector_format_version,
+            compat.LAYER_PROJECTION: self._projection_version,
+            compat.LAYER_INDEX: index_fingerprint,
+        }
+
+    def _active_identity_value(self, facts_epoch, fact_schema_version):
+        """The active layered identity this machine gates against.
+
+        When the config seam passed a manifest-derived ``active_identity``
+        (#65/#66), that is the durable active identity (the manifest is the
+        source of truth after a publish).  Without one (config-declared
+        active, nothing published yet) the machine composes the active from
+        the configured ACTIVE representation + the current facts -- so when
+        the desired representation equals the active one the matrix returns
+        the ``noop`` gate and no build happens (the #64 behavior preserved),
+        and when it differs the matrix returns ``reembed``.
+        """
+        if self._active_identity is not None:
+            return self._active_identity
+        if self._index_fingerprint is None:
+            index_fingerprint = compose_index_fingerprint()
+        else:
+            index_fingerprint = self._index_fingerprint
+        return {
+            compat.LAYER_STORE_EPOCH: facts_epoch,
+            compat.LAYER_FACT_SCHEMA: fact_schema_version,
+            compat.LAYER_REPRESENTATION: self._active_representation_id,
+            compat.LAYER_VECTOR_FORMAT: self._vector_format_version,
+            compat.LAYER_PROJECTION: self._projection_version,
+            compat.LAYER_INDEX: index_fingerprint,
+        }
 
     def _resume_gate(self, progress):
         """AC64-3 gate: epoch, H0, all fingerprints and the builder version
@@ -426,7 +560,9 @@ class StagingBuildMachine:
                 % (store_epoch, recorded["store_epoch"]))
         try:
             pinned = _prepare_target(events, self._provider, store_epoch,
-                                     source_hlc)
+                                     source_hlc,
+                                     projection_version=self._projection_version,
+                                     index_fingerprint=self._index_fingerprint)
         except BuildBlockedError as error:
             raise _ResumeGateError(
                 "pinned events no longer validate: %s" % error.message)
@@ -485,6 +621,62 @@ class StagingBuildMachine:
             self._ready_verified = False
             self._last_error = None
 
+    def _vector_source_for(self, plan, pinned):
+        """The #66 vector source for a build, or None (embed via provider).
+
+        When the matrix explicitly permits vector reuse
+        (``vector_reuse == "event_id"`` for a projection-only change with an
+        identical representation, or ``"convert"`` for a registered tested
+        equivalent converter), the build reuses the stored vectors of the
+        verified active generation instead of re-running the model.  The old
+        generation is reopened here -- ``open_generation`` runs the full
+        checksum / identity / probe verification, which is the checksum gate
+        the matrix requires (SCN-66-3).  If the old generation cannot be
+        reopened (checksum failure), reuse is NOT allowed: per the matrix the
+        build re-embeds (SCN-66-4) -- never a silent byte-cast, never a
+        guessed reuse.
+        """
+        reuse = plan.get("vector_reuse")
+        if reuse not in ("event_id", "convert"):
+            return None
+        if not self._active_generation_id:
+            return None
+        # Cache the open reuse source across chunk embeds: the old
+        # generation stays open (its mmap alive) until the build is ready /
+        # discarded / closed.  Only the first embed opens it.
+        if self._reuse_source is not None:
+            return self._reuse_source.event_vector
+        active_dir = self._published_dir(self._active_generation_id)
+        try:
+            generation = open_generation(active_dir)
+        except GenerationRejected as error:
+            # Checksum / identity failure on the reuse source: fall back to
+            # re-embedding (SCN-66-4), never a silent reuse.
+            self._set_last_error(
+                "vector reuse refused: active generation %s failed reopen "
+                "(%s); re-embedding" % (self._active_generation_id,
+                                        error.reason))
+            return None
+        converter = None
+        if reuse == "convert":
+            source = pinned["identity"]["vector_format"]
+            target = self._vector_format_version
+            converter = find_converter(source, target)
+            if converter is None:
+                try:
+                    generation.close()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+                return None
+        try:
+            source = VectorReuseSource(generation, converter=converter)
+        except EvidenceError as error:
+            self._set_last_error("vector reuse source failed: %s"
+                                 % error.message)
+            return None
+        self._reuse_source = source
+        return source.event_vector
+
     def _resume_build(self, staging_dir, progress, pinned):
         """Resume from the last verified chunk, or finalize a completed
         build (SCN-64-2: 瞬时中断从最后已验证块续跑).
@@ -516,6 +708,10 @@ class StagingBuildMachine:
             self._discard(staging_dir, error.reason, own=True)
             return
         if next_row < total_rows:
+            vector_source = None
+            if self._last_plan is not None:
+                vector_source = self._vector_source_for(self._last_plan,
+                                                        pinned)
             try:
                 with self._lease():
                     _build_chunks(staging_dir, vectors_path, events,
@@ -523,7 +719,8 @@ class StagingBuildMachine:
                                   self._chunk_rows,
                                   progress["generation_id"], progress,
                                   start_row=next_row,
-                                  prefix_digest=prefix_sha, chunk_limit=1)
+                                  prefix_digest=prefix_sha, chunk_limit=1,
+                                  vector_source=vector_source)
             except BuildBlockedError as error:
                 self._enter_blocked(error, staging_dir, progress)
             return  # one chunk per cycle; the next cycle continues
@@ -595,6 +792,7 @@ class StagingBuildMachine:
             self._set_last_error("cannot mark the staging ready: %s"
                                  % error)
             return
+        self._close_reuse_source()
         with self._condition:
             self._ready_generation_id = pinned["generation_id"]
             self._ready_staging_dir = staging_dir
@@ -743,6 +941,19 @@ class StagingBuildMachine:
                 self._last_error = None
                 self._ready_generation_id = None
                 self._ready_staging_dir = None
+        if own:
+            self._close_reuse_source()
+
+    def _close_reuse_source(self):
+        """Close the #66 vector reuse source (the opened active generation)
+        once the build no longer needs it (ready / discarded / closed)."""
+        reuse_source = self._reuse_source
+        self._reuse_source = None
+        if reuse_source is not None:
+            try:
+                reuse_source.close()
+            except Exception:  # noqa: BLE001 - best effort on close
+                pass
 
     # ------------------------------------------------------------------
     # Publish seams (#65): the publisher calls these under the publish
@@ -951,6 +1162,8 @@ class StagingBuildMachine:
                 blocked_events = list(self._blocked.blocked_events)
             elif progress is not None and progress.get("status") == "blocked":
                 blocked_events = list(progress.get("blocked_events") or [])
+            plan = (dict(self._last_plan)
+                    if self._last_plan is not None else None)
             return {
                 "desired_representation_id":
                     self._provider.representation_id(),
@@ -966,11 +1179,14 @@ class StagingBuildMachine:
                 "ready_staging_dir": self._ready_staging_dir,
                 "last_error": self._last_error,
                 "last_discard_reason": self._last_discard_reason,
+                "compatibility": plan,
             }
 
     def health(self):
         with self._condition:
             progress = self._current_progress
+            plan = (dict(self._last_plan)
+                    if self._last_plan is not None else None)
             return {
                 "staging_target_generation_id": self._target_generation_id,
                 "staging_status": (progress.get("status")
@@ -983,6 +1199,8 @@ class StagingBuildMachine:
                 "staging_ready_generation_id": self._ready_generation_id,
                 "staging_last_error": self._last_error,
                 "staging_last_discard_reason": self._last_discard_reason,
+                "staging_compatibility": plan,
+                "staging_refuse_reason": self._refuse_reason,
             }
 
     def close(self):
@@ -999,6 +1217,7 @@ class StagingBuildMachine:
         with self._condition:
             self._current_dir = None
             self._current_progress = None
+        self._close_reuse_source()
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1227,12 @@ class StagingBuildMachine:
 def build_staging_machine_from_config(facts_root, config, builder_lock=None,
                                       active_generation_id=None,
                                       active_representation_id=None,
-                                      publish_lock=None):
+                                      publish_lock=None,
+                                      active_identity=None,
+                                      projection_version=PROJECTION_VERSION,
+                                      index_fingerprint=None,
+                                      vector_format_version=VECTOR_FORMAT,
+                                      refuse_reason=None):
     """Construct the staging machine from the evidence config dict.
 
     The config distinguishes desired from active (spec "配置区分 desired 与
@@ -1021,6 +1245,11 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
                                          (default: the configured
                                          ``representation_id`` == the active
                                          one, i.e. "nothing to build")
+        desired_projection_version: <id> the desired projection version
+                                         (default: the current constant)
+        desired_index_fingerprint: <id>  the desired index fingerprint
+                                         (default: the composed exact-only
+                                         fingerprint)
 
     Returns None when neither ``derived_root`` nor ``generation_id`` is
     declared (mirrors the delta machine's gate); declaring only one is a
@@ -1028,8 +1257,14 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
     ``active_representation_id`` (#65) override the config's declared
     active with the durable active manifest, exactly like the delta
     machine's seam, so the machine gates against what is actually active.
-    ``publish_lock`` (#65) serializes every state-machine cycle with the
-    publish transaction (see the constructor).
+    ``active_identity`` (#66) is the full layered identity of the active
+    state (from the active manifest); without one the machine composes the
+    config-declared active identity itself.  ``refuse_reason`` (#66) is a
+    present-but-invalid / unknown active manifest: the machine idles and
+    reports the refusal instead of building against an unknown active.
+    ``publish_lock`` (#65)
+    serializes every state-machine cycle with the publish transaction (see
+    the constructor).
     """
     if "derived_root" not in config and "generation_id" not in config:
         return None
@@ -1066,6 +1301,24 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
                 desired_representation_id, str)):
             raise ValueError("desired_representation_id must be a non-empty "
                              "string")
+        desired_projection_version = config.get(
+            "desired_projection_version", projection_version)
+        if (not desired_projection_version or not isinstance(
+                desired_projection_version, str)):
+            raise ValueError("desired_projection_version must be a "
+                             "non-empty string")
+        desired_index_fingerprint = config.get(
+            "desired_index_fingerprint", index_fingerprint)
+        if desired_index_fingerprint is not None and not isinstance(
+                desired_index_fingerprint, str):
+            raise ValueError("desired_index_fingerprint must be a string or "
+                             "None")
+        desired_vector_format = config.get(
+            "desired_vector_format_version", vector_format_version)
+        if (not desired_vector_format or not isinstance(
+                desired_vector_format, str)):
+            raise ValueError("desired_vector_format_version must be a "
+                             "non-empty string")
         poll = float(config.get("staging_poll_interval_ms", 2000)) / 1000.0
         if poll <= 0:
             raise ValueError("staging_poll_interval_ms must be positive")
@@ -1078,7 +1331,11 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
     return StagingBuildMachine(
         facts_root, derived_root, provider, active_representation_id_value,
         generation_id, poll_interval=poll, builder_lock=builder_lock,
-        publish_lock=publish_lock)
+        publish_lock=publish_lock, active_identity=active_identity,
+        projection_version=desired_projection_version,
+        index_fingerprint=desired_index_fingerprint,
+        vector_format_version=desired_vector_format,
+        refuse_reason=refuse_reason)
 
 
 def _build_desired_provider(config, desired_representation_id, seed=None):

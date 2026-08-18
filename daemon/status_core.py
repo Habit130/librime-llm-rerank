@@ -408,6 +408,10 @@ def probe_daemon(socket_path, deadline_s=HEALTH_DEADLINE_SECONDS):
             "model_identity": health.get("model_identity"),
             "daemon_pid": health.get("pid"),
             "context_window": health.get("context_window"),
+            # #66: the daemon's desired/active fingerprints and mismatch
+            # reasons (privacy-clean; None when the daemon does not report
+            # them).
+            "compatibility": health.get("compatibility"),
         }
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError,
             socket.timeout):
@@ -426,6 +430,7 @@ def _serving_section(observed_at, state):
         "model_identity": None,
         "daemon_pid": None,
         "context_window": None,
+        "compatibility": None,
     }
 
 
@@ -734,5 +739,35 @@ def render_human(report):
             serving_line += f"; policy {serving['policy_id']}"
         serving_line += ")"
     lines.append(serving_line)
+    compatibility = serving.get("compatibility")
+    if isinstance(compatibility, dict):
+        if compatibility.get("refuse_load"):
+            lines.append(
+                "compatibility: refused (%s)"
+                % (compatibility.get("refuse_reason") or "unknown_identity"))
+        else:
+            active = compatibility.get("active")
+            if active is None:
+                lines.append("compatibility: no active generation declared")
+            else:
+                actions = compatibility.get("actions") or []
+                lines.append(
+                    "compatibility: %s (actions: %s)"
+                    % (_identity_short(active),
+                       ", ".join(actions) if actions else "none"))
+                for mismatch in compatibility.get("mismatches") or []:
+                    lines.append("  mismatch %s: %s"
+                                 % (mismatch.get("layer"),
+                                    mismatch.get("reason")))
     lines.append(f"exit: {report.get('exit_code', 2)}")
     return "\n".join(lines)
+
+
+def _identity_short(identity):
+    """A privacy-clean one-line identity summary (fingerprints only)."""
+    if not isinstance(identity, dict):
+        return "unknown"
+    return "repr=%s proj=%s index=%s" % (
+        identity.get("representation_id"),
+        identity.get("projection_version"),
+        identity.get("index_fingerprint"))
