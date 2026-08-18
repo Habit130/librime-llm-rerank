@@ -28,13 +28,32 @@
 //       snapshot (integrity, foreign keys, schema/meta/identity invariants,
 //       no WAL dependency, owner-only 0600, fsync) and print its stats.
 //       Concurrent fact writers are never blocked; the snapshot corresponds
-//       to one consistent SQLite read point.
+//       to one consistent SQLite read point. Supported-old stores can be
+//       snapshotted (maintenance open) so the migrate operation can upgrade
+//       a verified snapshot.
 //
 //   fact_store_tool inspect --db <path>
 //       Read-only validation and stats of one standalone fact store
 //       database file (a snapshot or an extracted backup member). Rejects
-//       WAL-dependent, corrupt or version-incompatible files. Never touches
-//       the live facts root.
+//       WAL-dependent, corrupt, too-new or (in the recorder semantics)
+//       supported-old files. Never touches the live facts root.
+//
+//   fact_store_tool schema --root <dir>
+//       Open the live store in the maintenance mode and print its durable
+//       schema disposition (fact_schema_version, event_format_version,
+//       disposition: current|needs_migration|unsupported|missing_step).
+//       Never writes; never migrates. A missing store is reported as
+//       {"status":"no_store"}.
+//
+//   fact_store_tool migrate --db <path>
+//       Migrate ONE standalone database file (a snapshot or an extracted
+//       backup member) in place to the current schema head. The file must
+//       not be the live locked root (the caller owns staging and quiesce).
+//       The whole ordered step chain runs in one SQLite transaction with
+//       pre-commit validation; on any failure the file's facts are
+//       unchanged. When SQUIRREL_FACT_MIGRATE_TEST_STEPS is set the
+//       test-registered predecessor step is loaded (decision B), so the
+//       operation tests can drive a real supported-old -> head path.
 //
 // Success output is a single JSON line. Failures print
 // {"ok":false,"status":"<stable code>"} and exit 1. Output never contains
@@ -42,10 +61,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
+#include "fact_migrator.h"
 #include "fact_store.h"
 #include "rime/common.h"
 
@@ -143,7 +165,9 @@ void EmitSnapshotStats(const rime::FactStore::SnapshotStats& stats) {
   payload += ",\"store_epoch\":";
   WriteJsonString(&payload, stats.store_epoch.c_str());
   AppendJsonInt(&payload, "\"fact_schema_version\"",
-                rime::kFactSchemaVersion);
+                stats.fact_schema_version);
+  AppendJsonInt(&payload, "\"event_format_version\"",
+                stats.event_format_version);
   AppendJsonInt(&payload, "\"event_format_version_min\"",
                 stats.event_format_min);
   AppendJsonInt(&payload, "\"event_format_version_max\"",
@@ -161,9 +185,78 @@ void EmitSnapshotStats(const rime::FactStore::SnapshotStats& stats) {
   std::printf("%s\n", payload.c_str());
 }
 
+const char* SchemaDispositionCodeName(rime::SchemaDispositionCode disposition) {
+  switch (disposition) {
+    case rime::SchemaDispositionCode::kCurrent:
+      return "current";
+    case rime::SchemaDispositionCode::kNeedsMigration:
+      return "needs_migration";
+    case rime::SchemaDispositionCode::kUnsupported:
+      return "unsupported";
+    case rime::SchemaDispositionCode::kMissingStep:
+      return "missing_step";
+  }
+  return "unknown";
+}
+
+// One JSON line describing the live store's durable schema disposition.
+void EmitSchemaDisposition(const rime::FactStore::SnapshotStats& stats,
+                           rime::SchemaDispositionCode disposition) {
+  std::string payload = "{\"ok\":true,\"fact_schema_version\":";
+  payload += std::to_string(stats.fact_schema_version);
+  payload += ",\"event_format_version\":";
+  payload += std::to_string(stats.event_format_version);
+  payload += ",\"disposition\":";
+  WriteJsonString(&payload, SchemaDispositionCodeName(disposition));
+  payload += ",\"history_id\":";
+  WriteJsonString(&payload, stats.history_id.c_str());
+  payload += ",\"store_epoch\":";
+  WriteJsonString(&payload, stats.store_epoch.c_str());
+  payload += "}";
+  std::printf("%s\n", payload.c_str());
+}
+
+// One JSON line with the migrate result (identity, versions, epoch rule and
+// projection counts; never any event content).
+void EmitMigrationResult(const rime::FactMigrationResult& result) {
+  std::string payload = "{\"ok\":true,\"status\":";
+  WriteJsonString(&payload,
+                  rime::FactMigrationStatusCode(result.status));
+  payload += ",\"from_version\":";
+  payload += std::to_string(result.from_version);
+  payload += ",\"to_version\":";
+  payload += std::to_string(result.to_version);
+  payload += ",\"events_projected\":";
+  payload += std::to_string(result.events_projected);
+  payload += ",\"events_preserved\":";
+  payload += std::to_string(result.events_preserved);
+  payload += ",\"epoch_changed\":";
+  payload += result.epoch_changed ? "true" : "false";
+  payload += ",\"history_id\":";
+  WriteJsonString(&payload, result.history_id.c_str());
+  payload += ",\"store_epoch\":";
+  WriteJsonString(&payload, result.store_epoch.c_str());
+  payload += "}";
+  std::printf("%s\n", payload.c_str());
+}
+
 bool PathExists(const path& target) {
   struct stat st;
   return lstat(target.c_str(), &st) == 0;
+}
+
+// Strict integer parse for the durable schema versions; any malformed value
+// fails the schema command closed.
+bool ParseSchemaInt(const char* text, int64_t* value) {
+  if (!text || !*text)
+    return false;
+  errno = 0;
+  char* end = nullptr;
+  long long parsed = std::strtoll(text, &end, 10);
+  if (errno == ERANGE || end != text + std::strlen(text))
+    return false;
+  *value = static_cast<int64_t>(parsed);
+  return true;
 }
 
 bool IsExactOwnerMode(const path& target, mode_t mode) {
@@ -178,8 +271,8 @@ bool IsExactOwnerMode(const path& target, mode_t mode) {
 // is enough for an operator to recover a broken invocation.
 int Usage() {
   std::fprintf(stderr,
-               "usage: fact_store_tool <verify|create-empty|snapshot|inspect>"
-               " --root <dir>|--db <path> [--output <path>]\n");
+               "usage: fact_store_tool <verify|create-empty|snapshot|inspect|"
+               "schema|migrate> --root <dir>|--db <path> [--output <path>]\n");
   return 2;
 }
 
@@ -190,7 +283,7 @@ int RunVerify(const path& root) {
     return 1;
   }
   FactStore store(root);
-  FactStore::Status status = store.Open();
+  FactStore::Status status = store.Open(FactStore::OpenMode::kMaintenance);
   if (status != FactStore::Status::kOk) {
     EmitFailure(FactStore::StatusCode(status));
     return 1;
@@ -285,7 +378,7 @@ int RunSnapshot(const path& root, const path& output) {
     return 1;
   }
   FactStore store(root);
-  FactStore::Status status = store.Open();
+  FactStore::Status status = store.Open(FactStore::OpenMode::kMaintenance);
   if (status != FactStore::Status::kOk) {
     EmitFailure(FactStore::StatusCode(status));
     return 1;
@@ -297,6 +390,179 @@ int RunSnapshot(const path& root, const path& output) {
     return 1;
   }
   EmitSnapshotStats(stats);
+  return 0;
+}
+
+// Decision B seam loader: when SQUIRREL_FACT_MIGRATE_TEST_STEPS is set the
+// test-registered predecessor step v1 -> v2 is loaded so the supported-old
+// -> head path is real. The default variant is interpretation-preserving
+// ("stamp"); SQUIRREL_FACT_MIGRATE_TEST_STEPS=changing registers the
+// interpretation-changing variant ("recode") so the operation tests prove a
+// new store_epoch end to end. The env var must never be set in production
+// deployments; the operation tests set it per-process. Every command that
+// consults the step table (schema, migrate) loads it.
+void LoadTestMigrationStepsIfRequested() {
+  const char* mode = getenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS");
+  if (!mode)
+    return;
+  if (std::strcmp(mode, "changing") == 0) {
+    rime::RegisterTestMigrationStep(1, 2, true, "recode");
+  } else {
+    rime::RegisterTestMigrationStep(1, 2, false, "stamp");
+  }
+}
+
+// Reads the live store's schema disposition. Never writes and never
+// migrates; the disposition is derived from the C++ step table (Python
+// never re-derives it). Unlike the maintenance open, a too-new or gap store
+// is REPORTED with its disposition (exit 0) so the migrate operation can
+// give an explicit, distinct report; only unreadable/corrupt stores fail.
+int RunSchema(const path& root) {
+  LoadTestMigrationStepsIfRequested();
+  path db_path = root / "facts.sqlite3";
+  if (!PathExists(db_path)) {
+    EmitFailure("no_store");
+    return 1;
+  }
+  struct stat st;
+  if (lstat(db_path.c_str(), &st) != 0) {
+    EmitFailure("no_store");
+    return 1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    EmitFailure("db_symlink");
+    return 1;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    EmitFailure("db_not_regular");
+    return 1;
+  }
+  if (st.st_uid != getuid()) {
+    EmitFailure("db_owner");
+    return 1;
+  }
+  if ((st.st_mode & 0777) != 0600) {
+    EmitFailure("db_permission");
+    return 1;
+  }
+  // Read the durable meta directly with a read-write open (no CREATE, never
+  // writes). A WAL live store cannot be opened read-only on this host; the
+  // maintenance open would refuse a too-new store, and this command must
+  // report that disposition rather than fail. Reading meta alone is the C++
+  // fact semantics; Python never re-derives it.
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READWRITE,
+                      nullptr) != SQLITE_OK) {
+    if (db) {
+      sqlite3_close(db);
+    }
+    EmitFailure("db_open_failed");
+    return 1;
+  }
+  int64_t schema_version = -1;
+  int64_t event_format_version = -1;
+  string history_id;
+  string store_epoch;
+  bool ok = true;
+  sqlite3_stmt* stmt = nullptr;
+  const char* kMeta = "SELECT key, value FROM meta;";
+  if (sqlite3_prepare_v2(db, kMeta, -1, &stmt, nullptr) != SQLITE_OK) {
+    ok = false;
+  }
+  while (ok && sqlite3_step(stmt) == SQLITE_ROW) {
+    const unsigned char* key = sqlite3_column_text(stmt, 0);
+    const unsigned char* value = sqlite3_column_text(stmt, 1);
+    if (!key || !value) {
+      ok = false;
+      break;
+    }
+    const char* key_text = reinterpret_cast<const char*>(key);
+    const char* value_text = reinterpret_cast<const char*>(value);
+    if (std::strcmp(key_text, "fact_schema_version") == 0) {
+      if (!ParseSchemaInt(value_text, &schema_version))
+        ok = false;
+    } else if (std::strcmp(key_text, "event_format_version") == 0) {
+      if (!ParseSchemaInt(value_text, &event_format_version))
+        ok = false;
+    } else if (std::strcmp(key_text, "history_id") == 0) {
+      history_id = value_text;
+    } else if (std::strcmp(key_text, "store_epoch") == 0) {
+      store_epoch = value_text;
+    }
+  }
+  if (stmt) {
+    sqlite3_finalize(stmt);
+  }
+  sqlite3_close(db);
+  if (!ok || schema_version < 0 || event_format_version < 0 ||
+      history_id.empty() || store_epoch.empty()) {
+    EmitFailure("db_clock_invalid");
+    return 1;
+  }
+  rime::FactStore::SnapshotStats stats;
+  stats.fact_schema_version = static_cast<int>(schema_version);
+  stats.event_format_version = static_cast<int>(event_format_version);
+  stats.history_id = history_id;
+  stats.store_epoch = store_epoch;
+  // The disposition must account for BOTH durable versions (SCN-58-5): a
+  // store whose event_format_version exceeds the canonical format this build
+  // writes is too new even when fact_schema_version matches the head — the
+  // recorder Open() fails closed on it, so the migrate operation must report
+  // `unsupported`, never `current`.
+  rime::SchemaDispositionCode disposition =
+      rime::DispositionFor(static_cast<int>(schema_version));
+  if (event_format_version > rime::kEventFormatVersion) {
+    disposition = rime::SchemaDispositionCode::kUnsupported;
+  }
+  EmitSchemaDisposition(stats, disposition);
+  return 0;
+}
+
+// Migrates ONE standalone database file in place (a snapshot or an extracted
+// backup member), never the live locked root. The whole ordered step chain
+// runs in one SQLite transaction with pre-commit validation; any failure
+// leaves the file's facts unchanged. The test seam is loaded when
+// SQUIRREL_FACT_MIGRATE_TEST_STEPS is set (decision B).
+int RunMigrate(const path& db_path) {
+  if (db_path.empty()) {
+    EmitFailure("no_db");
+    return 1;
+  }
+  struct stat st;
+  if (lstat(db_path.c_str(), &st) != 0) {
+    EmitFailure("no_store");
+    return 1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    EmitFailure("db_symlink");
+    return 1;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    EmitFailure("db_not_regular");
+    return 1;
+  }
+  if (st.st_uid != getuid() || (st.st_mode & 0777) != 0600) {
+    EmitFailure("db_permission");
+    return 1;
+  }
+  LoadTestMigrationStepsIfRequested();
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &db,
+                      SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+    if (db) {
+      sqlite3_close(db);
+    }
+    EmitFailure("db_open_failed");
+    return 1;
+  }
+  rime::FactMigrationResult result = rime::MigrateFile(db);
+  sqlite3_close(db);
+  if (result.status != rime::FactMigrationStatus::kOk &&
+      result.status != rime::FactMigrationStatus::kNoMigration) {
+    EmitFailure(rime::FactMigrationStatusCode(result.status));
+    return 1;
+  }
+  EmitMigrationResult(result);
   return 0;
 }
 
@@ -358,5 +624,9 @@ int main(int argc, char* argv[]) {
                                                                     output);
   if (std::strcmp(command, "inspect") == 0)
     return db_path.empty() ? Usage() : RunInspect(db_path);
+  if (std::strcmp(command, "schema") == 0)
+    return root.empty() ? Usage() : RunSchema(root);
+  if (std::strcmp(command, "migrate") == 0)
+    return db_path.empty() ? Usage() : RunMigrate(db_path);
   return Usage();
 }

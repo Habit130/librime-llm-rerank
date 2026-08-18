@@ -271,6 +271,104 @@ class FactStoreHelper:
             payload, dict) else None
         raise _HelperFailed(status or "helper_failed")
 
+    def schema(self, root, phase="preflight"):
+        """Read the live store's durable schema disposition through the C++
+        seam. Returns {"fact_schema_version", "event_format_version",
+        "disposition", "history_id", "store_epoch"} or raises. Never writes,
+        never migrates; the disposition is derived from the C++ step table.
+        """
+        import subprocess
+        runner = self._run or subprocess.run
+        try:
+            completed = runner(
+                [self.helper_path, "schema", "--root", root],
+                capture_output=True, text=True, timeout=120)
+        except OSError as error:
+            raise OperationFailed(
+                "fact_store_helper_unavailable", phase=phase,
+                retryable=False, cause={"error": error.strerror})
+        except Exception as error:
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"error": type(error).__name__})
+        if completed.returncode not in (0, 1):
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"exit": completed.returncode})
+        try:
+            payload = json.loads((completed.stdout or "").strip() or "null")
+        except ValueError:
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if not isinstance(payload, dict):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if not payload.get("ok"):
+            raise _HelperFailed(payload.get("status") or "helper_failed")
+        disposition = payload.get("disposition")
+        if disposition not in ("current", "needs_migration", "unsupported",
+                               "missing_step"):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False)
+        for key in ("fact_schema_version", "event_format_version"):
+            if type(payload.get(key)) is not int:
+                raise OperationFailed(
+                    "fact_store_helper_invalid", phase=phase, retryable=False)
+        if (not _valid_identity_token(payload.get("history_id") or "")
+                or not _valid_identity_token(payload.get("store_epoch") or "")):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False)
+        return payload
+
+    def migrate(self, db_path, phase="staging"):
+        """Migrate ONE standalone database file (a snapshot or an extracted
+        backup member) in place to the current schema head through the C++
+        seam. Returns the migrate result envelope. On failure the file's
+        facts are unchanged (the whole chain runs in one SQLite transaction).
+        """
+        import subprocess
+        runner = self._run or subprocess.run
+        try:
+            completed = runner(
+                [self.helper_path, "migrate", "--db", db_path],
+                capture_output=True, text=True, timeout=120)
+        except OSError as error:
+            raise OperationFailed(
+                "fact_store_helper_unavailable", phase=phase,
+                retryable=False, cause={"error": error.strerror})
+        except Exception as error:
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"error": type(error).__name__})
+        if completed.returncode not in (0, 1):
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"exit": completed.returncode})
+        try:
+            payload = json.loads((completed.stdout or "").strip() or "null")
+        except ValueError:
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if not isinstance(payload, dict):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if not payload.get("ok"):
+            raise _HelperFailed(payload.get("status") or "helper_failed")
+        if (type(payload.get("from_version")) is not int
+                or type(payload.get("to_version")) is not int
+                or type(payload.get("events_projected")) is not int
+                or type(payload.get("events_preserved")) is not int
+                or type(payload.get("epoch_changed")) is not bool
+                or not _valid_identity_token(payload.get("history_id") or "")
+                or not _valid_identity_token(payload.get("store_epoch") or "")):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False)
+        return payload
+
     def _parse_snapshot_stats(self, payload):
         """Validate and normalize the C++ snapshot stats envelope."""
         stats = {
@@ -292,7 +390,8 @@ class FactStoreHelper:
         }
         if (not _valid_identity_token(stats["history_id"])
                 or not _valid_identity_token(stats["store_epoch"])
-                or stats["fact_schema_version"] != 1
+                or type(stats["fact_schema_version"]) is not int
+                or stats["fact_schema_version"] < 1
                 or any(type(stats[key]) is not int
                        for key in ("commit_count", "event_count",
                                    "candidate_count", "retraction_count",

@@ -268,7 +268,17 @@ def _read_facts(facts_root):
             except (TypeError, ValueError):
                 return None
 
-        if meta.get("fact_schema_version") != str(FACT_SCHEMA_VERSION):
+        # Fact schema / event-format classification stays honest: the C++
+        # build ships no migration steps (head 1), so ANY store whose
+        # versions differ from the current pair is not decodable by this
+        # build — a too-new or a gap store are both blocked, never silently
+        # accepted. A supported-old disposition (needs_migration) is only
+        # ever reported by the C++ seam (the migrate operation's preflight);
+        # Python never re-derives the step table.
+        schema_version = meta_int("fact_schema_version")
+        event_format_version = meta_int("event_format_version")
+        if (schema_version != FACT_SCHEMA_VERSION
+                or event_format_version != 1):
             return _facts_section(observed_at, "blocked",
                                   "db_unsupported_version")
         physical = meta_int("hlc_physical_ms")
