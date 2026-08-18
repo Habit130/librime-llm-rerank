@@ -142,18 +142,6 @@ class FactStore {
                              int64_t hlc_logical,
                               vector<Event>* out);
 
-  // Reads the durable schema versions of one standalone fact store file and
-  // derives the schema disposition from the C++ step table. Unlike Open(),
-  // this NEVER fails closed on a too-new or gap store: it reports the
-  // disposition so the migrate operation can give an explicit, distinct
-  // report (unsupported / missing_step) instead of a generic fault. Never
-  // writes and never migrates. Requires a regular owner-owned file; a
-  // missing/unreadable/corrupt store reports kDbOpenFailed/kDbCorrupt.
-  static Status ReadSchemaFile(const path& db_path,
-                               int64_t* schema_version,
-                               int64_t* event_format_version,
-                               SchemaDispositionCode* disposition);
-
   // Reads the current durable identity and clock while holding a shared lock.
   // Used by maintenance reopen checks and never exposes private event text.
   // `history_id` is optional; pass nullptr when only the epoch is needed.

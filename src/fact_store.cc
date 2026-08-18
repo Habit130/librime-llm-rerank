@@ -382,6 +382,80 @@ FactStore::Status FactStore::Open(OpenMode mode) {
     maintenance_lock_.Release();
     return status_;
   }
+
+  // Classify the store BEFORE any write (Spec #43 / AC-58-v1: Open() of a
+  // supported-old schema returns kNeedsMigration, does not create an empty
+  // DB, does NOT write and stops recording; Open() of a higher/unknown
+  // version stays kDbUnsupportedVersion). A fresh store has no meta table
+  // yet and falls through to the creation path below.
+  bool has_meta = false;
+  {
+    sqlite3_stmt* stmt = nullptr;
+    const char* kHasMeta = "SELECT COUNT(*) FROM sqlite_master"
+        " WHERE type='table' AND name='meta';";
+    bool query_ok = sqlite3_prepare_v2(db_, kHasMeta, -1, &stmt, nullptr) ==
+                     SQLITE_OK;
+    if (query_ok && sqlite3_step(stmt) == SQLITE_ROW) {
+      has_meta = sqlite3_column_int64(stmt, 0) > 0;
+    }
+    if (stmt) {
+      sqlite3_finalize(stmt);
+    }
+    if (!query_ok) {
+      status_ = Status::kDbCorrupt;
+      sqlite3_close(db_);
+      db_ = nullptr;
+      maintenance_lock_.Release();
+      return status_;
+    }
+  }
+  if (has_meta) {
+    string value;
+    int64_t schema_version = -1;
+    int64_t event_format_version = -1;
+    if (!ReadMetaText(db_, kMetaFactSchemaVersion, &value) ||
+        !ParseInt64(value, &schema_version) || schema_version < 0 ||
+        !ReadMetaText(db_, kMetaEventFormatVersion, &value) ||
+        !ParseInt64(value, &event_format_version) ||
+        event_format_version < 0) {
+      status_ = Status::kDbClockInvalid;
+      sqlite3_close(db_);
+      db_ = nullptr;
+      maintenance_lock_.Release();
+      return status_;
+    }
+    // Too-new event format always fails closed (SCN-58-5).
+    if (event_format_version > kEventFormatVersion) {
+      status_ = Status::kDbUnsupportedVersion;
+      sqlite3_close(db_);
+      db_ = nullptr;
+      maintenance_lock_.Release();
+      return status_;
+    }
+    // The migrator's step table is the single source of truth for schema
+    // disposition. A too-new or gap store fails closed in both modes; a
+    // supported-old store returns kNeedsMigration in the recorder mode
+    // (never written, recording stops) and proceeds in the maintenance mode.
+    SchemaDispositionCode disposition =
+        DispositionFor(static_cast<int>(schema_version));
+    if (disposition == SchemaDispositionCode::kUnsupported ||
+        disposition == SchemaDispositionCode::kMissingStep) {
+      status_ = Status::kDbUnsupportedVersion;
+      sqlite3_close(db_);
+      db_ = nullptr;
+      maintenance_lock_.Release();
+      return status_;
+    }
+    if (disposition == SchemaDispositionCode::kNeedsMigration &&
+        mode == OpenMode::kRecorder) {
+      status_ = Status::kNeedsMigration;
+      sqlite3_close(db_);
+      db_ = nullptr;
+      maintenance_lock_.Release();
+      return status_;
+    }
+  }
+
   if (Exec(db_, "PRAGMA journal_mode=WAL;") != SQLITE_OK ||
       Exec(db_, "PRAGMA synchronous=FULL;") != SQLITE_OK ||
       Exec(db_, "PRAGMA foreign_keys=ON;") != SQLITE_OK) {
@@ -472,7 +546,10 @@ FactStore::Status FactStore::Open(OpenMode mode) {
     return status_;
   }
 
-  bool has_meta = false;
+  // The schema DDL above is idempotent, so a store that already exists (and
+  // was classified as current above) re-runs it harmlessly inside the
+  // transaction. Only a fresh store needs meta initialization; an existing
+  // current store re-validates its meta.
   if (!QueryBoolValue(db_, "SELECT EXISTS(SELECT 1 FROM meta);", &has_meta)) {
     Exec(db_, "ROLLBACK;");
     status_ = Status::kDbClockInvalid;
@@ -808,61 +885,6 @@ FactStore::Status FactStore::VerifyEmpty(bool* empty) {
       *empty = false;
   }
   return status_;
-}
-
-FactStore::Status FactStore::ReadSchemaFile(const path& db_path,
-                                            int64_t* schema_version,
-                                            int64_t* event_format_version,
-                                            SchemaDispositionCode* disposition) {
-  if (db_path.empty() || !schema_version || !event_format_version ||
-      !disposition) {
-    return Status::kDbOpenFailed;
-  }
-  struct stat st;
-  if (lstat(db_path.c_str(), &st) != 0) {
-    return Status::kDbOpenFailed;
-  }
-  if (S_ISLNK(st.st_mode)) {
-    return Status::kDbSymlink;
-  }
-  if (!S_ISREG(st.st_mode)) {
-    return Status::kDbNotRegular;
-  }
-  if (st.st_uid != getuid()) {
-    return Status::kDbOwner;
-  }
-  if (!IsExactMode(st, kFileMode)) {
-    return Status::kDbPermission;
-  }
-  sqlite3* db = nullptr;
-  if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) !=
-      SQLITE_OK) {
-    if (db) {
-      sqlite3_close(db);
-    }
-    return Status::kDbOpenFailed;
-  }
-  bool quick_ok = false;
-  if (!QueryQuickCheck(db, &quick_ok) || !quick_ok) {
-    sqlite3_close(db);
-    return Status::kDbCorrupt;
-  }
-  string value;
-  bool ok = ReadMetaText(db, kMetaFactSchemaVersion, &value) &&
-            ParseInt64(value, schema_version) && *schema_version >= 0 &&
-            ReadMetaText(db, kMetaEventFormatVersion, &value) &&
-            ParseInt64(value, event_format_version) &&
-            *event_format_version >= 0;
-  sqlite3_close(db);
-  if (!ok) {
-    return Status::kDbClockInvalid;
-  }
-  // The migrator's ordered step table is the single source of truth for
-  // schema disposition (SCN-58-5/6). Unlike Open(), this NEVER fails closed
-  // on a too-new or gap store: it reports the disposition so the migrate
-  // operation can give an explicit, distinct report.
-  *disposition = DispositionFor(static_cast<int>(*schema_version));
-  return Status::kOk;
 }
 
 FactStore::Status FactStore::CheckpointTruncate() {

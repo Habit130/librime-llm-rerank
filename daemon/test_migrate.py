@@ -296,6 +296,38 @@ class MigrateStepTests(MigrateEnv):
             connection.close()
         self.assertEqual(1, count)
 
+    def test_changing_step_generates_new_epoch_end_to_end(self):
+        # Interpretation-changing test step (recode): the staged migration
+        # gets a NEW store_epoch (history_id preserved), and the operation
+        # must publish it — the epoch gate accepts the new epoch because the
+        # staged file derives from the same history.
+        os.environ["SQUIRREL_FACT_MIGRATE_TEST_STEPS"] = "changing"
+        identity = self.make_supported_old_store()
+        # Give the seeded event an old per-row event format so the changing
+        # projection actually fires and rewrites preceding_text.
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        connection = sqlite3.connect(db_path)
+        connection.execute("UPDATE selection_events SET"
+                           " event_format_version = 0 WHERE"
+                           " event_id = 'migrate-event-0'")
+        connection.commit()
+        connection.close()
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec)
+        operation_id = record["operation_id"]
+        record = self.run_to_terminal(spec, operation_id)
+        self.assertEqual("succeeded", record["state"], record["error"])
+        result = record["result"]
+        self.assertEqual("migrated", result["outcome"])
+        # history_id is preserved; store_epoch is a FRESH one.
+        self.assertEqual(identity["history_id"], result["history_id"])
+        self.assertNotEqual(identity["store_epoch"], result["store_epoch"])
+        self.assertEqual("current", self.live_disposition())
+        self.assertNotEqual(identity["store_epoch"],
+                            _meta_value(db_path, "store_epoch"))
+        self.assertEqual(identity["history_id"],
+                         _meta_value(db_path, "history_id"))
+
     def test_current_store_is_noop(self):
         # A store already at the head (production head 1, seam off) is a
         # pure no-op: no migration, no staging, no control traffic, no

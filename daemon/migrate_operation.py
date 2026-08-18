@@ -68,14 +68,6 @@ def _staging_root(root, operation_id):
     return os.path.join(root, MIGRATE_DIRNAME, operation_id)
 
 
-def _staging_store_dir(root, operation_id):
-    return os.path.join(_staging_root(root, operation_id), "store")
-
-
-def _staging_db_path(root, operation_id):
-    return os.path.join(_staging_store_dir(root, operation_id), FACTS_DB)
-
-
 def _staging_snapshot_path(root, operation_id):
     return os.path.join(_staging_root(root, operation_id), SNAPSHOT_FILE)
 
@@ -284,17 +276,21 @@ class MigrateSpec:
                 raise MaintenanceError("epoch_mismatch")
             else:
                 # The staged file must still be the migrated head store and
-                # carry the same epoch/history the preflight saw; verify via
-                # the C++ seam (Python never interprets fact rows). `migrate`
-                # is idempotent: a file already at the head returns
-                # no_migration, and the reported identity is the durable one.
+                # must derive from the SAME live history the preflight saw.
+                # `migrate` is idempotent: a file already at the head returns
+                # no_migration. The staged history must match the live
+                # history (the snapshot was taken from this store). The
+                # staged epoch may be the live one (interpretation-
+                # preserving step) or a fresh one (interpretation-changing
+                # step, spec #43 "改变解释的迁移生成新 epoch") — both are
+                # valid to publish; history_id is always preserved.
                 try:
                     result = self.helper.migrate(staged, phase="publishing")
                 except (_HelperFailed, OperationFailed):
                     raise MaintenanceError("staging_invalid")
                 if result.get("status") not in ("migrated", "no_migration"):
                     raise MaintenanceError("staging_invalid")
-                if result.get("store_epoch") != live["store_epoch"]:
+                if result.get("history_id") != live["history_id"]:
                     raise MaintenanceError("epoch_mismatch")
                 replace_fact_database(self.root, staged, lease)
             # Prime the published store under the lease: on this host a WAL

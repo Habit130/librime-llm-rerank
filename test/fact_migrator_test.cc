@@ -144,6 +144,21 @@ void SetSchemaVersion(const fs::path& path, int schema_version,
   sqlite3_close(db);
 }
 
+// Sets every event row's OWN event_format_version to `format`. The per-row
+// projection dispatches on it: a row with an old format (below the canonical
+// format) is projected by the step's rule; a row at the canonical format is
+// preserved verbatim.
+void SetRowEventFormat(const fs::path& path, int format) {
+  sqlite3* db = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(path.c_str(), &db,
+                                       SQLITE_OPEN_READWRITE, nullptr));
+  std::string sql = "UPDATE selection_events SET event_format_version = " +
+                    std::to_string(format) + ";";
+  ASSERT_EQ(SQLITE_OK,
+            sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr));
+  sqlite3_close(db);
+}
+
 // Canonical dump of all event rows; used to prove rollback leaves the facts
 // unchanged.
 std::string DumpEvents(sqlite3* db) {
@@ -301,6 +316,9 @@ TEST_F(FactMigratorTest, PreservingStepKeepsHistoryAndEpoch) {
   EXPECT_EQ(1, result.from_version);
   EXPECT_EQ(2, result.to_version);
   EXPECT_FALSE(result.epoch_changed);
+  // The rows are already in the canonical event format (1), so the
+  // interpretation-preserving step preserves them verbatim; the durable
+  // schema version is what the chain advanced.
   EXPECT_EQ(3, result.events_projected);
   // The interpretation did not change: history_id AND store_epoch are
   // preserved.
@@ -355,6 +373,7 @@ TEST_F(FactMigratorTest, ChangingStepGeneratesNewEpochKeepsHistory) {
   FixtureStore fixture;
   MakeV1Store(path, 2, &fixture);
   SetSchemaVersion(path, 1, 1);
+  SetRowEventFormat(path, 0);  // per-row old format so projection fires
   sqlite3* db = OpenWritable(path);
   ASSERT_TRUE(db);
   FactMigrationResult result = MigrateFile(db);
@@ -381,6 +400,7 @@ TEST_F(FactMigratorTest, ChangingStepCanonicalizesPrecedingText) {
   FixtureStore fixture;
   MakeV1Store(path, 1, &fixture);
   SetSchemaVersion(path, 1, 1);
+  SetRowEventFormat(path, 0);  // per-row old format so projection fires
   // Make the single event's preceding_text longer than 64 Unicode chars
   // (65 ASCII chars here; "recode" truncates to the last 64).
   sqlite3* seed = nullptr;
@@ -414,6 +434,7 @@ TEST_F(FactMigratorTest, ChangingStepRejectsInvalidUtf8) {
   FixtureStore fixture;
   MakeV1Store(path, 1, &fixture);
   SetSchemaVersion(path, 1, 1);
+  SetRowEventFormat(path, 0);  // per-row old format so projection fires
   sqlite3* seed = nullptr;
   ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(path.c_str(), &seed,
                                        SQLITE_OPEN_READWRITE, nullptr));
@@ -447,6 +468,7 @@ TEST_F(FactMigratorTest, MissingFieldBlocksMigrationAndSkipsNothing) {
   FixtureStore fixture;
   MakeV1Store(path, 2, &fixture);
   SetSchemaVersion(path, 1, 1);
+  SetRowEventFormat(path, 0);  // per-row old format so projection fires
   RebuildEventsWithoutNotNullAndNullField(path, "migrate-event-0");
   sqlite3* db = OpenWritable(path);
   ASSERT_TRUE(db);
@@ -475,21 +497,23 @@ TEST_F(FactMigratorTest, ValidationFailureRollsBackWholeChain) {
   FixtureStore fixture;
   MakeV1Store(path, 3, &fixture);
   SetSchemaVersion(path, 1, 1);
+  SetRowEventFormat(path, 0);  // per-row old format so projection fires
   sqlite3* db = OpenWritable(path);
   ASSERT_TRUE(db);
   FactMigrationResult result = MigrateFile(db);
   sqlite3_close(db);
   ASSERT_EQ(FactMigrationStatus::kValidationFailed, result.status);
-  // The chain rolled back: the file is still v1 with the original rows.
+  // The chain rolled back: the file is still v1 with the original rows at
+  // their original (old) event format — the projection never committed.
   sqlite3* check = nullptr;
   ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(path.c_str(), &check,
                                        SQLITE_OPEN_READONLY, nullptr));
   EXPECT_EQ("1", QueryText(check,
       "SELECT value FROM meta WHERE key='fact_schema_version';"));
   EXPECT_EQ(3LL, QueryCount(check, "SELECT COUNT(*) FROM selection_events;"));
-  EXPECT_EQ(0LL, QueryCount(check,
+  EXPECT_EQ(3LL, QueryCount(check,
       "SELECT COUNT(*) FROM selection_events WHERE"
-      " event_format_version <> 1;"));
+      " event_format_version = 0;"));
   sqlite3_close(check);
 }
 
@@ -503,6 +527,7 @@ TEST_F(FactMigratorTest, CrashBeforeCommitLeavesCompleteOldSchema) {
   FixtureStore fixture;
   MakeV1Store(path, 2, &fixture);
   SetSchemaVersion(path, 1, 1);
+  SetRowEventFormat(path, 0);  // per-row old format so projection fires
   // Simulate a crash right after the step applied but before COMMIT: the
   // whole transaction rolls back and the file stays at the complete old
   // schema with the old epoch and unchanged rows.

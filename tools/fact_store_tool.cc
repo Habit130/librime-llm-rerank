@@ -394,12 +394,20 @@ int RunSnapshot(const path& root, const path& output) {
 }
 
 // Decision B seam loader: when SQUIRREL_FACT_MIGRATE_TEST_STEPS is set the
-// test-registered predecessor step v1 -> v2 (interpretation-preserving) is
-// loaded so the supported-old -> head path is real. The env var must never
-// be set in production deployments; the operation tests set it per-process.
-// Every command that consults the step table (schema, migrate) loads it.
+// test-registered predecessor step v1 -> v2 is loaded so the supported-old
+// -> head path is real. The default variant is interpretation-preserving
+// ("stamp"); SQUIRREL_FACT_MIGRATE_TEST_STEPS=changing registers the
+// interpretation-changing variant ("recode") so the operation tests prove a
+// new store_epoch end to end. The env var must never be set in production
+// deployments; the operation tests set it per-process. Every command that
+// consults the step table (schema, migrate) loads it.
 void LoadTestMigrationStepsIfRequested() {
-  if (getenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS")) {
+  const char* mode = getenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS");
+  if (!mode)
+    return;
+  if (std::strcmp(mode, "changing") == 0) {
+    rime::RegisterTestMigrationStep(1, 2, true, "recode");
+  } else {
     rime::RegisterTestMigrationStep(1, 2, false, "stamp");
   }
 }

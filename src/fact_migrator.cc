@@ -28,9 +28,9 @@ const char* kMetaStoreEpoch = "store_epoch";
 const char* kMetaClockPhysicalMs = "hlc_physical_ms";
 const char* kMetaClockLogical = "hlc_logical";
 
-// One ordered migration step registered in the step table.
+// One ordered migration step registered in the step table. `from` is the
+// map key (the version the step migrates FROM); `to` is from + 1.
 struct MigrationStep {
-  int from = 0;
   int to = 0;
   bool changes_interpretation = false;
   string projection;  // "stamp" | "recode" | "dup_hlc"
@@ -160,6 +160,7 @@ bool ReadIdentity(sqlite3* db, string* store_epoch, string* history_id) {
 struct CanonicalRow {
   string event_id;
   string commit_id;
+  int event_format_version = kEventFormatVersion;
   string schema_id;
   string canonical_segment_input;
   int64_t span_start = 0;
@@ -211,8 +212,13 @@ CanonicalRow ReadRow(sqlite3_stmt* stmt) {
         reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
   else
     row.missing_required_field = true;
-  // Column 2 is event_format_version (metadata of the row, not projected
-  // content).
+  // Column 2 is the row's OWN event_format_version; the per-row projection
+  // dispatches on it (spec #43: every old event is projected through its
+  // event format version). A NULL format is unconvertible.
+  if (!ColumnIsNull(stmt, 2))
+    row.event_format_version = sqlite3_column_int(stmt, 2);
+  else
+    row.missing_required_field = true;
   if (!ColumnIsNull(stmt, 3))
     row.schema_id =
         reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
@@ -365,26 +371,41 @@ string TruncateToLastUnicodeChars(const string& text, size_t max_chars) {
 }
 
 // ---------------------------------------------------------------------------
-// Projection
+// Projection (per-row, keyed by the row's OWN event_format_version)
 // ---------------------------------------------------------------------------
 
-// Deterministically projects one old-format row to the canonical form.
-// Returns false (unconvertible) when a required field is missing or the
-// row cannot be deterministically converted. A false return blocks the
-// migration; the row is never skipped.
-bool ProjectRow(CanonicalRow* row, const string& projection) {
+// Deterministically projects one row to the canonical form. The projection
+// is selected by the row's own `event_format_version` (spec #43: "每条旧事件
+// 必须通过其 event_format_version 确定性投影为当前规范事件"), NOT by the
+// step: a row already in the canonical format is preserved unchanged, a row
+// in a supported-old format is deterministically projected (the step's
+// `projection` selects the interpretation rule), and a row in an unknown or
+// too-new format is unconvertible. Returns false (unconvertible) when a
+// required field is missing or the row cannot be deterministically
+// converted. A false return blocks the migration; the row is never skipped.
+bool ProjectRow(CanonicalRow* row, const MigrationStep& step) {
   if (row->missing_required_field)
     return false;
-  if (projection == "recode") {
+  if (row->event_format_version == kEventFormatVersion)
+    return true;  // already canonical: preserved verbatim
+  if (row->event_format_version < 0 ||
+      row->event_format_version > kEventFormatVersion)
+    return false;  // unknown / too-new format: unconvertible
+  // Supported-old format: apply the step's deterministic interpretation
+  // rule. A preserving step ("stamp") rewrites only the format marker;
+  // an interpretation-changing step ("recode") additionally canonicalizes
+  // preceding_text to the last 64 Unicode characters.
+  if (step.projection == "recode") {
     if (!IsValidUtf8(row->preceding_text))
       return false;
     row->preceding_text = TruncateToLastUnicodeChars(row->preceding_text, 64);
-  } else if (projection == "dup_hlc") {
+  } else if (step.projection == "dup_hlc") {
     // Test-only: make every row share one HLC so pre-commit validation
     // fails and proves rollback.
     row->hlc_physical_ms = 1;
     row->hlc_logical = 1;
   }
+  row->event_format_version = kEventFormatVersion;
   return true;
 }
 
@@ -449,11 +470,11 @@ const char* kCreateActiveEventsView =
     " WHERE NOT EXISTS (SELECT 1 FROM retractions r"
     "                   WHERE r.commit_id = e.commit_id);";
 
-// Applies one step: reads every row under the head layout, projects it
-// deterministically to the canonical form and rewrites the rows by event_id,
-// then ensures the active-events view exists. Runs inside the chain
-// transaction; any unconvertible row aborts with kProjectionFailed so the
-// whole chain rolls back.
+// Applies one step: reads every row under the head layout, projects each row
+// deterministically THROUGH ITS OWN event_format_version to the canonical
+// form and rewrites the rows by event_id, then ensures the active-events
+// view exists. Runs inside the chain transaction; any unconvertible row
+// aborts with kProjectionFailed so the whole chain rolls back.
 FactMigrationStatus ApplyStep(sqlite3* db, const MigrationStep& step) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, kSelectHead, -1, &stmt, nullptr) != SQLITE_OK)
@@ -461,7 +482,7 @@ FactMigrationStatus ApplyStep(sqlite3* db, const MigrationStep& step) {
   std::vector<CanonicalRow> rows;
   while (sqlite3_step(stmt) == SQLITE_ROW) {
     CanonicalRow row = ReadRow(stmt);
-    if (!ProjectRow(&row, step.projection)) {
+    if (!ProjectRow(&row, step)) {
       sqlite3_finalize(stmt);
       return FactMigrationStatus::kProjectionFailed;
     }
@@ -672,7 +693,6 @@ void RegisterTestMigrationStep(int from_version, int to_version,
   if (to_version != from_version + 1 || from_version < 0 || !projection)
     return;
   MigrationStep step;
-  step.from = from_version;
   step.to = to_version;
   step.changes_interpretation = changes_interpretation;
   step.projection = projection;
@@ -773,6 +793,19 @@ FactMigrationResult MigrateFile(sqlite3* db) {
       ok = false;
     }
   }
+  // Event-count equality (spec #43 "提交前校验事件数"): the projection must
+  // never add, drop or skip a row — the event count after the chain equals
+  // the count before it. A mismatch is a validation failure and rolls the
+  // whole chain back.
+  if (ok) {
+    int64_t after_events = -1;
+    if (!QueryCount(db, "SELECT COUNT(*) FROM selection_events;",
+                    &after_events) ||
+        after_events != total_events) {
+      ok = false;
+      result.status = FactMigrationStatus::kValidationFailed;
+    }
+  }
   if (ok && !ValidateMigratedStore(db)) {
     ok = false;
     result.status = FactMigrationStatus::kValidationFailed;
@@ -790,8 +823,11 @@ FactMigrationResult MigrateFile(sqlite3* db) {
   result.status = FactMigrationStatus::kOk;
   result.to_version = head;
   result.epoch_changed = epoch_changed;
-  // Every row of the store passed through a deterministic projection during
-  // the chain; none were skipped and none existed in an unprojected form.
+  // Every row passed through the per-row projection during the chain: rows
+  // already in the canonical format were preserved verbatim, supported-old
+  // rows were deterministically projected. None were skipped (an
+  // unconvertible row would have blocked with kProjectionFailed), and the
+  // pre-commit event-count equality proved none were added or dropped.
   result.events_projected = total_events;
   result.events_preserved = 0;
   if (!ReadIdentity(db, &result.store_epoch, &result.history_id))
