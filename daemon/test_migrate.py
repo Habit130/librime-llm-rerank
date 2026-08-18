@@ -363,6 +363,52 @@ class MigrateStepTests(MigrateEnv):
         # Live DB unchanged.
         self.assertEqual("99", _meta_value(db_path, "fact_schema_version"))
 
+    def test_too_new_event_format_blocks_in_preflight(self):
+        # SCN-58-5: a store whose event_format_version exceeds the canonical
+        # format is too new even when fact_schema_version matches the head.
+        identity = self.make_live_store(seed=True)
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        connection = sqlite3.connect(db_path)
+        connection.execute("UPDATE meta SET value='5' WHERE"
+                           " key='event_format_version'")
+        connection.commit()
+        connection.close()
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("schema_unsupported", record["error"]["code"])
+        self.assertEqual("5", _meta_value(db_path, "event_format_version"))
+
+    def test_unconvertible_event_blocks_without_crashing(self):
+        # SCN-58-4: an event that cannot be deterministically projected must
+        # block the migration with a stable report; the executor must never
+        # crash with a leaked helper exception (record stuck running).
+        os.environ["SQUIRREL_FACT_MIGRATE_TEST_STEPS"] = "changing"
+        identity = self.make_supported_old_store()
+        # Give the seeded event an old format AND invalid UTF-8 in a field
+        # the changing projection must canonicalize, making it unconvertible.
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "UPDATE selection_events SET event_format_version = 0,"
+            " preceding_text = CAST(x'FF' AS TEXT)"
+            " WHERE event_id = 'migrate-event-0'")
+        connection.commit()
+        connection.close()
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec)
+        operation_id = record["operation_id"]
+        record = self.run_to_terminal(spec, operation_id)
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("migration_blocked", record["error"]["code"])
+        self.assertEqual("projection_failed",
+                         record["error"]["cause"]["fault_code"])
+        # Live DB unchanged: still supported-old, same epoch.
+        self.assertEqual("needs_migration", self.live_disposition())
+        self.assertEqual(identity["store_epoch"],
+                         _meta_value(db_path, "store_epoch"))
+
     def test_missing_step_blocks_in_preflight(self):
         self.make_live_store(seed=True)
         # Remove the test seam so the head is 1 again; then set the store's

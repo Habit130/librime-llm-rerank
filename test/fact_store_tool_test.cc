@@ -611,6 +611,25 @@ TEST_F(FactStoreToolTest, SchemaMissingStoreReportsNoStore) {
   EXPECT_NE(std::string::npos, result.second.find("\"no_store\""));
 }
 
+TEST_F(FactStoreToolTest, SchemaTooNewEventFormatReportsUnsupported) {
+  // A store whose event_format_version exceeds the canonical format this
+  // build writes is too new (SCN-58-5): the recorder Open() fails closed on
+  // it, so the migrate operation must see `unsupported`, never `current`.
+  PopulateLiveStore();
+  sqlite3* db = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((store_root_ / "facts.sqlite3").c_str(),
+                                       &db, SQLITE_OPEN_READWRITE, nullptr));
+  ASSERT_EQ(SQLITE_OK, sqlite3_exec(
+      db, "UPDATE meta SET value='5' WHERE key='event_format_version';",
+      nullptr, nullptr, nullptr));
+  sqlite3_close(db);
+  auto result = RunTool({"schema", "--root", store_root_.string()});
+  ASSERT_EQ(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos,
+            result.second.find("\"disposition\":\"unsupported\""));
+  EXPECT_EQ("5", JsonField(result.second, "event_format_version"));
+}
+
 TEST_F(FactStoreToolTest, MigrateCurrentFileIsNoOp) {
   PopulateLiveStore();
   const fs::path output = fs::path(tmp_dir_) / "snapshot.sqlite3";

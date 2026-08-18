@@ -215,12 +215,25 @@ class MigrateSpec:
         # 2. Migrate the STAGING copy (never the live root): one SQLite
         #    transaction per ordered step chain with pre-commit validation.
         #    Any failure leaves the staging file unchanged; the live DB is
-        #    never touched.
+        #    never touched. A C++ fail-closed status (projection_failed for
+        #    an unconvertible event, validation_failed, missing_step,
+        #    unsupported_version) is a DETERMINISTIC blocked outcome — the
+        #    executor must report it, never crash with a leaked helper
+        #    exception.
         migrated = _staging_migrated_path(self.root, operation_id)
         os.replace(snapshot, migrated)
         try:
             result = self.helper.migrate(migrated, phase="staging")
-        except (_HelperFailed, OperationFailed):
+        except _HelperFailed as error:
+            self._remove_staging(operation_id)
+            raise OperationBlocked(
+                "migration_blocked", phase="staging",
+                remediation="the migration of the safety snapshot failed "
+                            "closed; the live store is unchanged. Fix the "
+                            "cause (e.g. an event that cannot be projected) "
+                            "and retry migrate",
+                cause={"fault_code": error.status})
+        except OperationFailed:
             self._remove_staging(operation_id)
             raise
         manifest = {

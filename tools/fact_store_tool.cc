@@ -504,8 +504,17 @@ int RunSchema(const path& root) {
   stats.event_format_version = static_cast<int>(event_format_version);
   stats.history_id = history_id;
   stats.store_epoch = store_epoch;
-  EmitSchemaDisposition(stats, rime::DispositionFor(
-      static_cast<int>(schema_version)));
+  // The disposition must account for BOTH durable versions (SCN-58-5): a
+  // store whose event_format_version exceeds the canonical format this build
+  // writes is too new even when fact_schema_version matches the head — the
+  // recorder Open() fails closed on it, so the migrate operation must report
+  // `unsupported`, never `current`.
+  rime::SchemaDispositionCode disposition =
+      rime::DispositionFor(static_cast<int>(schema_version));
+  if (event_format_version > rime::kEventFormatVersion) {
+    disposition = rime::SchemaDispositionCode::kUnsupported;
+  }
+  EmitSchemaDisposition(stats, disposition);
   return 0;
 }
 
