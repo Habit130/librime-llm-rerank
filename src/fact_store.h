@@ -13,6 +13,7 @@
 
 #include <rime/common.h>
 
+#include "fact_migrator.h"
 #include "maintenance_lock.h"
 
 namespace rime {
@@ -46,12 +47,22 @@ class FactStore {
     kDbOwner,           // facts.sqlite3 is owned by another user
     kDbPermission,      // facts.sqlite3 mode is not exactly 0600
     kDbCorrupt,         // quick_check failed
-    kDbUnsupportedVersion,  // fact schema or event format version mismatch
+    kDbUnsupportedVersion,  // fact schema is newer than this build supports
+    kNeedsMigration,    // supported-old schema: recording must stop until the
+                        // migrate operation runs (never migrated in Open())
     kDbClockInvalid,    // meta clock/history rows are missing or malformed
     kDbOpenFailed,      // sqlite could not open the database
     kDbWriteFailed,     // a persist transaction failed
     kMaintenanceLocked, // an exclusive maintenance lease is active
   };
+
+  // How Open() classifies a supported-old schema. The recorder path (the
+  // default) must never write: Open() returns kNeedsMigration and stops
+  // recording. The maintenance path (fact_store_tool snapshot/verify) opens
+  // supported-old stores read-write so the Online Backup API can snapshot
+  // them for the migrate operation; fact content is never modified by that
+  // open. Too-new or missing-step stores fail closed in BOTH modes.
+  enum class OpenMode { kRecorder, kMaintenance };
 
   // One immutable selection event destined for the fact store. HLC fields and
   // commit_id are filled in by PersistBatch inside the transaction.
@@ -91,8 +102,12 @@ class FactStore {
   // Verifies the root, opens (or creates) facts.sqlite3, applies WAL /
   // foreign keys / synchronous=FULL and the v1 schema. Returns kOk only when
   // recording may proceed; any other status leaves the store closed and the
-  // files untouched.
-  Status Open();
+  // files untouched. A supported-old schema returns kNeedsMigration in the
+  // default recorder mode without writing (recording stops); the migrate
+  // operation owns bringing the store to the current schema. The maintenance
+  // mode is used by the fact_store_tool seam so it can snapshot and verify
+  // supported-old stores.
+  Status Open(OpenMode mode = OpenMode::kRecorder);
   bool is_open() const { return db_ != nullptr; }
   Status status() const { return status_; }
 
@@ -127,6 +142,18 @@ class FactStore {
                              int64_t hlc_logical,
                               vector<Event>* out);
 
+  // Reads the durable schema versions of one standalone fact store file and
+  // derives the schema disposition from the C++ step table. Unlike Open(),
+  // this NEVER fails closed on a too-new or gap store: it reports the
+  // disposition so the migrate operation can give an explicit, distinct
+  // report (unsupported / missing_step) instead of a generic fault. Never
+  // writes and never migrates. Requires a regular owner-owned file; a
+  // missing/unreadable/corrupt store reports kDbOpenFailed/kDbCorrupt.
+  static Status ReadSchemaFile(const path& db_path,
+                               int64_t* schema_version,
+                               int64_t* event_format_version,
+                               SchemaDispositionCode* disposition);
+
   // Reads the current durable identity and clock while holding a shared lock.
   // Used by maintenance reopen checks and never exposes private event text.
   // `history_id` is optional; pass nullptr when only the epoch is needed.
@@ -153,6 +180,8 @@ class FactStore {
   struct SnapshotStats {
     string history_id;
     string store_epoch;
+    int fact_schema_version = -1;  // the store's durable schema version
+    int event_format_version = -1;
     int64_t hlc_physical_ms = 0;
     int64_t hlc_logical = 0;
     int64_t event_hlc_physical_ms = -1;  // -1: no events in the snapshot
@@ -193,7 +222,7 @@ class FactStore {
   Status VerifyRoot();
   Status VerifyDbFile();
   Status InitializeMeta();
-  Status ValidateMeta();
+  Status ValidateMeta(OpenMode mode);
   bool EnsureFileModes();
 
   path root_;

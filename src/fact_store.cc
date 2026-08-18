@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "fact_store.h"
+#include "fact_migrator.h"
 #include "recorder_session.h"
 
 namespace rime {
@@ -280,15 +281,46 @@ bool ParseInt64(const string& text, int64_t* value) {
 
 }  // namespace
 
-FactStore::Status FactStore::ValidateMeta() {
+namespace {
+
+// The store's durable event-format version must never exceed the canonical
+// event format this build writes (SCN-58-5: too new fails closed).
+bool EventFormatIsTooNew(int64_t event_format_version) {
+  return event_format_version > kEventFormatVersion;
+}
+
+}  // namespace
+
+FactStore::Status FactStore::ValidateMeta(OpenMode mode) {
   string value;
+  int64_t schema_version = -1;
   if (!ReadMetaText(db_, kMetaFactSchemaVersion, &value) ||
-      value != std::to_string(kFactSchemaVersion)) {
+      !ParseInt64(value, &schema_version) || schema_version < 0) {
+    return Status::kDbClockInvalid;
+  }
+  int64_t event_format_version = -1;
+  if (!ReadMetaText(db_, kMetaEventFormatVersion, &value) ||
+      !ParseInt64(value, &event_format_version) || event_format_version < 0) {
+    return Status::kDbClockInvalid;
+  }
+  if (EventFormatIsTooNew(event_format_version)) {
     return Status::kDbUnsupportedVersion;
   }
-  if (!ReadMetaText(db_, kMetaEventFormatVersion, &value) ||
-      value != std::to_string(kEventFormatVersion)) {
+  // The migrator's ordered step table is the single source of truth for
+  // schema disposition; Python never re-derives it.
+  SchemaDispositionCode disposition =
+      DispositionFor(static_cast<int>(schema_version));
+  if (disposition == SchemaDispositionCode::kUnsupported ||
+      disposition == SchemaDispositionCode::kMissingStep) {
     return Status::kDbUnsupportedVersion;
+  }
+  if (disposition == SchemaDispositionCode::kNeedsMigration) {
+    // A supported-old store is migratable. The recorder must never write to
+    // it (recording stops until the migrate operation runs); the maintenance
+    // mode may open it read-write so the Online Backup API can snapshot it,
+    // but never modifies fact content.
+    if (mode == OpenMode::kRecorder)
+      return Status::kNeedsMigration;
   }
   if (!ReadMetaText(db_, kMetaHistoryId, &value) || value.empty() ||
       !ReadMetaText(db_, kMetaStoreEpoch, &value) || value.empty()) {
@@ -305,7 +337,7 @@ FactStore::Status FactStore::ValidateMeta() {
   return Status::kOk;
 }
 
-FactStore::Status FactStore::Open() {
+FactStore::Status FactStore::Open(OpenMode mode) {
   status_ = Status::kOk;
   if (db_) {
     sqlite3_close(db_);
@@ -450,7 +482,7 @@ FactStore::Status FactStore::Open() {
     return status_;
   }
   Status meta_status =
-      has_meta ? ValidateMeta() : InitializeMeta();
+      has_meta ? ValidateMeta(mode) : InitializeMeta();
   if (meta_status != Status::kOk) {
     Exec(db_, "ROLLBACK;");
     status_ = meta_status;
@@ -778,6 +810,61 @@ FactStore::Status FactStore::VerifyEmpty(bool* empty) {
   return status_;
 }
 
+FactStore::Status FactStore::ReadSchemaFile(const path& db_path,
+                                            int64_t* schema_version,
+                                            int64_t* event_format_version,
+                                            SchemaDispositionCode* disposition) {
+  if (db_path.empty() || !schema_version || !event_format_version ||
+      !disposition) {
+    return Status::kDbOpenFailed;
+  }
+  struct stat st;
+  if (lstat(db_path.c_str(), &st) != 0) {
+    return Status::kDbOpenFailed;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    return Status::kDbSymlink;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    return Status::kDbNotRegular;
+  }
+  if (st.st_uid != getuid()) {
+    return Status::kDbOwner;
+  }
+  if (!IsExactMode(st, kFileMode)) {
+    return Status::kDbPermission;
+  }
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) !=
+      SQLITE_OK) {
+    if (db) {
+      sqlite3_close(db);
+    }
+    return Status::kDbOpenFailed;
+  }
+  bool quick_ok = false;
+  if (!QueryQuickCheck(db, &quick_ok) || !quick_ok) {
+    sqlite3_close(db);
+    return Status::kDbCorrupt;
+  }
+  string value;
+  bool ok = ReadMetaText(db, kMetaFactSchemaVersion, &value) &&
+            ParseInt64(value, schema_version) && *schema_version >= 0 &&
+            ReadMetaText(db, kMetaEventFormatVersion, &value) &&
+            ParseInt64(value, event_format_version) &&
+            *event_format_version >= 0;
+  sqlite3_close(db);
+  if (!ok) {
+    return Status::kDbClockInvalid;
+  }
+  // The migrator's ordered step table is the single source of truth for
+  // schema disposition (SCN-58-5/6). Unlike Open(), this NEVER fails closed
+  // on a too-new or gap store: it reports the disposition so the migrate
+  // operation can give an explicit, distinct report.
+  *disposition = DispositionFor(static_cast<int>(*schema_version));
+  return Status::kOk;
+}
+
 FactStore::Status FactStore::CheckpointTruncate() {
   if (!db_) {
     status_ = Status::kDbOpenFailed;
@@ -947,20 +1034,46 @@ bool QueryFactCounts(sqlite3* db, FactStore::SnapshotStats* stats) {
 
 // Full read-only validation and stats of one standalone fact store file.
 // Shared by the snapshot publish path and the offline backup verifier; the
-// verifier never reads live state and never opens the file writable.
-bool InspectSnapshotHandle(sqlite3* db, FactStore::SnapshotStats* stats) {
-  string mode;
-  if (!QueryJournalMode(db, &mode) || mode == "wal") {
+// verifier never reads live state and never opens the file writable. `mode`
+// selects the version acceptance: the snapshot path (maintenance) must be
+// able to inspect a supported-old store so the migrate operation can snapshot
+// it; the backup verifier (recorder semantics) fails closed on any store
+// that is not exactly current.
+bool InspectSnapshotHandle(sqlite3* db, FactStore::SnapshotStats* stats,
+                           FactStore::OpenMode mode) {
+  string mode_text;
+  if (!QueryJournalMode(db, &mode_text) || mode_text == "wal") {
     return false;
   }
   if (!QueryIntegrityCheck(db) || !QueryForeignKeyCheck(db)) {
     return false;
   }
   string value;
+  int64_t schema_version = -1;
+  int64_t event_format_version = -1;
   if (!ReadMetaText(db, kMetaFactSchemaVersion, &value) ||
-      value != std::to_string(kFactSchemaVersion) ||
+      !ParseInt64(value, &schema_version) || schema_version < 0 ||
       !ReadMetaText(db, kMetaEventFormatVersion, &value) ||
-      value != std::to_string(kEventFormatVersion)) {
+      !ParseInt64(value, &event_format_version) ||
+      event_format_version < 0) {
+    return false;
+  }
+  stats->fact_schema_version = static_cast<int>(schema_version);
+  stats->event_format_version = static_cast<int>(event_format_version);
+  if (event_format_version > kEventFormatVersion) {
+    return false;  // too-new event format fails closed in every mode
+  }
+  SchemaDispositionCode disposition =
+      DispositionFor(static_cast<int>(schema_version));
+  if (disposition == SchemaDispositionCode::kUnsupported ||
+      disposition == SchemaDispositionCode::kMissingStep) {
+    return false;
+  }
+  if (disposition == SchemaDispositionCode::kNeedsMigration &&
+      mode == FactStore::OpenMode::kRecorder) {
+    // The backup verifier must not bless a supported-old store as a valid
+    // backup of current facts; the migrate operation snapshots it in the
+    // maintenance mode instead.
     return false;
   }
   if (!ReadClock(db, &stats->hlc_physical_ms, &stats->hlc_logical) ||
@@ -1113,7 +1226,8 @@ FactStore::Status FactStore::SnapshotTo(const path& output_path,
     }
     return status_;
   }
-  bool valid = InspectSnapshotHandle(check, stats);
+  bool valid = InspectSnapshotHandle(check, stats,
+                                     FactStore::OpenMode::kMaintenance);
   sqlite3_close(check);
   if (!valid) {
     status_ = Status::kDbCorrupt;
@@ -1164,7 +1278,8 @@ FactStore::Status FactStore::InspectSnapshotFile(const path& db_path,
     }
     return Status::kDbOpenFailed;
   }
-  bool valid = InspectSnapshotHandle(db, stats);
+  bool valid = InspectSnapshotHandle(db, stats,
+                                     FactStore::OpenMode::kRecorder);
   sqlite3_close(db);
   return valid ? Status::kOk : Status::kDbCorrupt;
 }
@@ -1259,6 +1374,8 @@ const char* FactStore::StatusCode(Status status) {
       return "db_corrupt";
     case Status::kDbUnsupportedVersion:
       return "db_unsupported_version";
+    case Status::kNeedsMigration:
+      return "needs_migration";
     case Status::kDbClockInvalid:
       return "db_clock_invalid";
     case Status::kDbOpenFailed:
@@ -1298,7 +1415,11 @@ const char* FactStore::StatusMessage(Status status) {
     case Status::kDbCorrupt:
       return "facts.sqlite3 failed the integrity check";
     case Status::kDbUnsupportedVersion:
-      return "facts.sqlite3 schema or event format is not supported";
+      return "facts.sqlite3 schema or event format is newer than this build "
+             "supports";
+    case Status::kNeedsMigration:
+      return "facts.sqlite3 uses a supported-old schema; recording is "
+             "stopped until the migrate operation upgrades it";
     case Status::kDbClockInvalid:
       return "facts.sqlite3 meta clock state is missing or invalid";
     case Status::kDbOpenFailed:

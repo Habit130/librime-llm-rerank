@@ -102,6 +102,31 @@ std::string JsonField(const std::string& payload, const char* key) {
                                ? std::string::npos : end - pos);
 }
 
+std::string QueryText(sqlite3* db, const char* sql) {
+  sqlite3_stmt* stmt = nullptr;
+  std::string result;
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    return result;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    const unsigned char* text = sqlite3_column_text(stmt, 0);
+    if (text)
+      result = reinterpret_cast<const char*>(text);
+  }
+  sqlite3_finalize(stmt);
+  return result;
+}
+
+long long QueryCount(sqlite3* db, const char* sql) {
+  sqlite3_stmt* stmt = nullptr;
+  long long result = -1;
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    return result;
+  if (sqlite3_step(stmt) == SQLITE_ROW)
+    result = sqlite3_column_int64(stmt, 0);
+  sqlite3_finalize(stmt);
+  return result;
+}
+
 class FactStoreToolTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -563,6 +588,77 @@ TEST_F(FactStoreToolTest, ConcurrentWriterSnapshotIsConsistent) {
   // The durable clock advanced past the snapshot's read point and the
   // snapshot never exceeded what existed on disk.
   EXPECT_GE(final_physical, clock_physical);
+}
+
+// ---------------------------------------------------------------------------
+// Schema disposition seam (Habit130/squirrel#58)
+// ---------------------------------------------------------------------------
+
+TEST_F(FactStoreToolTest, SchemaReportsCurrentDisposition) {
+  PopulateLiveStore();
+  auto result = RunTool({"schema", "--root", store_root_.string()});
+  ASSERT_EQ(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos, result.second.find("\"ok\":true"));
+  EXPECT_NE(std::string::npos, result.second.find("\"disposition\":\"current\""));
+  EXPECT_EQ("1", JsonField(result.second, "fact_schema_version"));
+  EXPECT_EQ("1", JsonField(result.second, "event_format_version"));
+  EXPECT_FALSE(JsonField(result.second, "store_epoch").empty());
+}
+
+TEST_F(FactStoreToolTest, SchemaMissingStoreReportsNoStore) {
+  auto result = RunTool({"schema", "--root", store_root_.string()});
+  ASSERT_EQ(1, result.first);
+  EXPECT_NE(std::string::npos, result.second.find("\"no_store\""));
+}
+
+TEST_F(FactStoreToolTest, MigrateCurrentFileIsNoOp) {
+  PopulateLiveStore();
+  const fs::path output = fs::path(tmp_dir_) / "snapshot.sqlite3";
+  ASSERT_EQ(0, RunTool({"snapshot", "--root", store_root_.string(),
+                        "--output", output.string()}).first);
+  // Without the test seam the production head is 1 and the snapshot is
+  // already current: migrating is a validated no-op.
+  auto result = RunTool({"migrate", "--db", output.string()});
+  ASSERT_EQ(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos, result.second.find("\"status\":\"no_migration\""));
+  EXPECT_EQ("1", JsonField(result.second, "to_version"));
+}
+
+// ---------------------------------------------------------------------------
+// Migrate seam with the test predecessor step (decision B)
+// ---------------------------------------------------------------------------
+
+TEST_F(FactStoreToolTest, MigrateSnapshotWithTestStepToHead) {
+  PopulateLiveStore();
+  const fs::path output = fs::path(tmp_dir_) / "snapshot.sqlite3";
+  ASSERT_EQ(0, RunTool({"snapshot", "--root", store_root_.string(),
+                        "--output", output.string()}).first);
+  // The snapshot is a v1 store; the test predecessor v1 -> v2 (preserving)
+  // is registered by the env seam in the migrate subprocess.
+  setenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS", "1", 1);
+  auto result = RunTool({"migrate", "--db", output.string()});
+  unsetenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS");
+  ASSERT_EQ(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos,
+            result.second.find("\"status\":\"migrated\""));
+  EXPECT_EQ("1", JsonField(result.second, "from_version"));
+  EXPECT_EQ("2", JsonField(result.second, "to_version"));
+  EXPECT_EQ("false", JsonField(result.second, "epoch_changed"));
+  // Verify the migrated file's durable meta directly: schema version 2,
+  // canonical event format, facts intact, epoch preserved (interpretation-
+  // preserving step).
+  sqlite3* db = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2(output.c_str(), &db,
+                                       SQLITE_OPEN_READONLY, nullptr));
+  EXPECT_EQ("2", QueryText(db,
+      "SELECT value FROM meta WHERE key='fact_schema_version';"));
+  EXPECT_EQ("1", QueryText(db,
+      "SELECT value FROM meta WHERE key='event_format_version';"));
+  EXPECT_EQ(1LL, QueryCount(db, "SELECT COUNT(*) FROM selection_events;"));
+  EXPECT_EQ(0LL, QueryCount(db,
+      "SELECT COUNT(*) FROM selection_events WHERE"
+      " event_format_version <> 1;"));
+  sqlite3_close(db);
 }
 
 }  // namespace

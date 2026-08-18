@@ -431,6 +431,62 @@ TEST_F(FactStoreTest, UnsupportedSchemaVersionStopsRecording) {
   ASSERT_FALSE(store.is_open());
 }
 
+TEST_F(FactStoreTest, SupportedOldSchemaNeedsMigrationInRecorderMode) {
+  // With a registered test predecessor step (decision B) a below-head store
+  // is supported-old: the recorder must refuse to write (kNeedsMigration,
+  // recording stops) while the maintenance open may snapshot it.
+  RegisterTestMigrationStep(1, 2, false, "stamp");
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  }
+  sqlite3* db = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((root_ / "facts.sqlite3").c_str(),
+                                       &db, SQLITE_OPEN_READWRITE, nullptr));
+  ASSERT_EQ(SQLITE_OK, sqlite3_exec(
+      db, "UPDATE meta SET value='1' WHERE key='fact_schema_version';",
+      nullptr, nullptr, nullptr));
+  sqlite3_close(db);
+  // Recorder open: supported-old -> kNeedsMigration, closed, no writing.
+  {
+    FactStore recorder(root_);
+    ASSERT_EQ(FactStore::Status::kNeedsMigration, recorder.Open());
+    ASSERT_FALSE(recorder.is_open());
+    EXPECT_STREQ("needs_migration", FactStore::StatusCode(recorder.status()));
+  }
+  // Maintenance open: supported-old opens read-write so the migrate
+  // operation can snapshot it; facts are not modified.
+  {
+    FactStore maintenance(root_);
+    ASSERT_EQ(FactStore::Status::kOk,
+              maintenance.Open(FactStore::OpenMode::kMaintenance));
+    ASSERT_TRUE(maintenance.is_open());
+  }
+  ResetTestMigrationSteps();
+}
+
+TEST_F(FactStoreTest, SupportedOldSchemaWithoutStepFailsClosed) {
+  // No test step registered: a below-head store (version 0) is a missing
+  // step, never silently migratable or writable — it fails closed in both
+  // modes.
+  {
+    FactStore store(root_);
+    ASSERT_EQ(FactStore::Status::kOk, store.Open());
+  }
+  sqlite3* db = nullptr;
+  ASSERT_EQ(SQLITE_OK, sqlite3_open_v2((root_ / "facts.sqlite3").c_str(),
+                                       &db, SQLITE_OPEN_READWRITE, nullptr));
+  ASSERT_EQ(SQLITE_OK, sqlite3_exec(
+      db, "UPDATE meta SET value='0' WHERE key='fact_schema_version';",
+      nullptr, nullptr, nullptr));
+  sqlite3_close(db);
+  FactStore recorder(root_);
+  ASSERT_EQ(FactStore::Status::kDbUnsupportedVersion, recorder.Open());
+  FactStore maintenance(root_);
+  ASSERT_EQ(FactStore::Status::kDbUnsupportedVersion,
+            maintenance.Open(FactStore::OpenMode::kMaintenance));
+}
+
 TEST_F(FactStoreTest, CorruptDbStopsRecording) {
   fs::create_directories(root_);
   chmod(root_.c_str(), 0700);
