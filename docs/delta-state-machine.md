@@ -157,6 +157,15 @@ the checkpoint. Restart paths:
   (spec clause 不扫描目录猜测最新 generation). After a runtime publish
   (#65) the durable active manifest resolves the active generation id and
   representation at startup; the config seam receives them as overrides.
+- **Refuse-load (#66)**: a present-but-invalid / unknown active manifest
+  refuses the load of derived state — the machine is constructed in a
+  refused state (`refuse_reason`) and every request fails closed with
+  `active_identity_refused`; there is no config-active fallback (SCN-66-10).
+  The refusal clears when a fresh, fully verified generation is published
+  (`publish_switch`).  The machine's epoch-change rebuild decision routes
+  through the compatibility matrix (`compat.py`): a `store_epoch` change is
+  `invalidate_all` — discard all derived state and rebuild from current
+  facts.
 - The config seam stays fixture-driven (like #61 today); the real
   hidden-state provider plugs at the same `RepresentationProvider` seam and
   is exercised by `integration_delta.py`.
@@ -169,8 +178,12 @@ the checkpoint. Restart paths:
   a cache keyed by `representation_id` + `preceding_text` digest (verified
   against the raw UTF-8 text) could later slot in without touching the state
   machine.
-- Compaction/rollback (#66/#67), ANN, real-data replay (#70), deployment:
-  out of scope, recorded as deferred in the delivery contract.
+- Compaction/rollback/retention (#67), ANN (#78/#79), real-data replay
+  (#70), deployment: out of scope, recorded as deferred in the delivery
+  contract.  The #66 compatibility matrix (`compat.py`) is the single
+  reuse/load authority the machine's epoch-rebuild and refuse-load paths
+  route through; it does not change the delta machine's serving semantics
+  beyond routing its epoch-change rebuild decision through the matrix.
 - The blue-green publish itself is delivered (#65): `publish_switch` is the
   in-memory pointer swap; the durable manifest, the staging-side delta and
   the publish lock are documented in `docs/publish-atomic.md`.

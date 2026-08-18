@@ -92,8 +92,38 @@ embeds on the next cycle. All records except the live one are invalidated
 (marked `discarded` with the precise reason — epoch / desired / builder
 version change, or an obsolete target). Records are **marked, never
 deleted** by this machine: physical cleanup belongs to `clear` (already
-implemented) and the #66 retention work; deletion would risk racing the
+implemented) and the #67 retention work; deletion would risk racing the
 delta machine's transient one-shot staging directory.
+
+## #66: the compatibility matrix decides what to build
+
+The machine does not compare identities from file appearance: every cycle
+runs the compatibility matrix (`compat.py`) over the desired vs active
+layered identities (`store_epoch`, `fact_schema_version`,
+`representation_id`, `vector_format_version`, `projection_version`,
+`index_fingerprint`).  The matrix returns the action union:
+
+- desired == active, or only the query-config identity differs -> `noop`:
+  no build (the #64 desired/active gate, now via the matrix).
+- `store_epoch` changed -> `invalidate_all`: the existing epoch-discard
+  path rebuilds from current facts.
+- `representation_id` changed -> `reembed`: build as before.
+- only `projection_version` changed (same representation) ->
+  `rebuild_projection` + `reuse_vectors`: the build reuses the verified
+  active generation's vectors by event_id (`VectorReuseSource`) instead of
+  re-running the model; a checksum failure on the reuse source falls back
+  to re-embedding (SCN-66-4), never a guessed reuse.
+- only `vector_format_version` changed -> `convert_vectors` through a
+  registered tested-equivalent converter, else `reembed` (never byte-cast).
+- only `index_fingerprint` changed -> `rebuild_index`, resolved in this
+  exact-only envelope to a no-op with reason `no_ann_sidecar` (RISK-66-1):
+  no build, no model, no projection rebuild.
+- a present-but-invalid / unknown active identity refuses the build
+  (SCN-66-10); the machine idles and reports the refusal.
+
+The machine's `status()` / `health()` report the last matrix plan
+(desired/active fingerprints, mismatch reasons, planned actions) so the
+daemon's status surface shows what would change and why (SCN-66-11).
 
 ## Resume gate (AC64-3, SCN-64-3)
 
@@ -209,23 +239,30 @@ real-model integration.
   "representation_id": "<active representation id>",  // #63, unchanged
   "desired_representation_id": "<desired target>",    // #64 (default: the
                                                       // active one = idle)
+  "desired_projection_version": "<desired projection>",   // #66 (default:
+                                                          // current constant)
+  "desired_index_fingerprint": "<desired index digest>",  // #66 (default: the
+                                                          // composed exact-only
+                                                          // fingerprint)
+  "desired_vector_format_version": "<desired format>",    // #66 (default:
+                                                          // current format)
   "staging_poll_interval_ms": 2000
 }
 ```
 
 The active machine is constructed exactly as before; the staging machine
-derives its target from the desired representation only. The desired
-configuration never reinterprets the active generation (its provider
-instance and generation id are untouched), and `retarget()` — the runtime
-seam for "新 desired fingerprint 可以取消尚未发布的旧 staging" — swaps only
-the desired provider.
+derives its target from the desired representation and the desired layered
+identity fields (#66). The desired configuration never reinterprets the
+active generation (its provider instance and generation id are untouched),
+and `retarget()` — the runtime seam for "新 desired fingerprint 可以取消尚未
+发布的旧 staging" — swaps only the desired provider.
 
 ## Deferred by decision
 
-- Compaction/retention/rollback (#66/#67), ANN probes (#78/#79),
+- Compaction/retention/rollback (#67), ANN probes (#78/#79),
   real-data replay (#70), deployment: out of scope, recorded as deferred in
   the delivery contract. Physical deletion of discarded staging records
-  belongs to clear and #66, not to this machine.
+  belongs to clear and #67, not to this machine.
 - The publish itself is delivered (#65): the publish lock, the staging's own
   delta checkpoint, the active manifest and the pointer swap are documented
   in `docs/publish-atomic.md`.

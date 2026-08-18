@@ -60,6 +60,7 @@ import sqlite3
 import threading
 import time
 
+import compat  # noqa: E402
 from delta import (  # noqa: E402
     DELTA_FILENAME,
     DELTA_SCHEMA_VERSION,
@@ -86,8 +87,9 @@ ACTIVE_MANIFEST_VERSION = "active-manifest-v1"
 # The projection semantics of the served active state (row projection,
 # retraction handling, choice-problem keys, HLC metadata): a change to any
 # of those needs a new projection version in the manifest (spec "分层兼容
-# 身份").  Bound here to the #63 delta schema + #62 container projection.
-PROJECTION_VERSION = "delta-schema-v1+generation-manifest-v1"
+# 身份").  The canonical constant lives in generation.py and is bound into
+# every generation identity (#66); the active manifest records the
+# generation-bound value, not a separate forever-constant.
 DEFAULT_PUBLISH_POLL_INTERVAL_S = 2.0
 DEFAULT_SWITCH_DEADLINE_S = 300.0
 WRITE_BUSY_TIMEOUT_S = 5.0
@@ -170,8 +172,9 @@ def read_active_manifest(derived_root):
 
     ``reason`` is None for a missing manifest (the config-declared active
     applies) and a diagnosis string for a present-but-invalid one (the
-    caller must not load derived state per an unknown identity; the config
-    fallback applies and #66/#67 own manifest repair).
+    caller must not load derived state per an unknown identity; #66 refuses
+    the load -- there is no config-active fallback for a broken/unknown
+    active manifest).
     """
     path = os.path.join(derived_root, ACTIVE_MANIFEST_FILENAME)
     if not os.path.isfile(path):
@@ -187,11 +190,60 @@ def read_active_manifest(derived_root):
     return value, None
 
 
+def active_identity_from_manifest(manifest):
+    """The layered identity recorded by a valid active manifest (#66).
+
+    Maps the active manifest's orthogonal identity fields onto the
+    ``IDENTITY_LAYERS`` shape the compatibility matrix compares, so the
+    staging / delta / status paths can run ``plan_actions`` against it
+    field by field.  Privacy-clean: identity strings and digests only.
+    """
+    return {
+        compat.LAYER_STORE_EPOCH: manifest["store_epoch"],
+        compat.LAYER_FACT_SCHEMA: manifest["fact_schema_version"],
+        compat.LAYER_REPRESENTATION: manifest["representation_id"],
+        compat.LAYER_VECTOR_FORMAT: manifest["vector_format_version"],
+        compat.LAYER_PROJECTION: manifest["projection_version"],
+        compat.LAYER_INDEX: manifest["index_fingerprint"],
+    }
+
+
+def resolve_active_identity(derived_root, facts_schema_version=None):
+    """(active_identity, refuse_reason): the durable active identity.
+
+    - No manifest -> ``(None, None)``: the config-declared active applies
+      (nothing published yet; #63/#65 startup).
+    - Valid manifest -> the layered identity; the caller then decides build
+      actions via the matrix.
+    - Present-but-invalid / unknown / missing compat declaration ->
+      ``(None, reason)``: REFUSE.  The caller must not load derived state per
+      the config-declared active (SCN-66-10) -- semantic requests fail
+      closed / pass through, and status reports the refusal.
+    """
+    manifest, reason = read_active_manifest(derived_root)
+    if manifest is None and reason is not None:
+        return None, reason
+    if manifest is None:
+        return None, None
+    identity = active_identity_from_manifest(manifest)
+    refuse = compat.refuse_load_reason(
+        identity, facts_schema_version=facts_schema_version)
+    if refuse is not None:
+        return None, refuse
+    return identity, None
+
+
 def _compose_active_manifest(generation, checkpoint_path,
                              fact_schema_version):
     """The active manifest over one verified generation (spec "分层兼容
     身份"): the orthogonal identities the startup and the next publish
-    compare against."""
+    compare against.
+
+    ``projection_version`` and ``index_fingerprint`` come from the generation
+    identity (#66): the manifest records the generation-bound layers, so the
+    active identity is comparable field by field with the desired one and a
+    broken or unknown active is never silently reinterpreted.
+    """
     identity = generation.identity()
     return {
         "manifest_version": ACTIVE_MANIFEST_VERSION,
@@ -201,8 +253,8 @@ def _compose_active_manifest(generation, checkpoint_path,
         "fact_schema_version": fact_schema_version,
         "representation_id": identity["representation_id"],
         "vector_format_version": identity["vector_format"],
-        "projection_version": PROJECTION_VERSION,
-        "index_fingerprint": identity["retrieval_backend"],
+        "projection_version": identity["projection_version"],
+        "index_fingerprint": identity["index_fingerprint"],
         "retrieval_params": identity["retrieval_params"],
         "delta_checkpoint": checkpoint_path,
         "builder_version": identity["builder_version"],

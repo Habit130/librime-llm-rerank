@@ -1289,8 +1289,13 @@ class RestartTest(PublishBase):
                          env.active_generation_id)
         self.assertEqual(snapshot.representation_id, ACTIVE_REPR)
 
-    def test_invalid_manifest_falls_back_to_the_config_active(self):
+    def test_invalid_manifest_refuses_load(self):
+        """#66 refuse-load contract: a present-but-invalid active manifest
+        must NOT fall back to the config-declared active (SCN-66-10).  The
+        machine is constructed in a refused state; requests fail closed with
+        ``active_identity_refused`` and status reports the refusal."""
         from delta import build_delta_machine_from_config
+        from evidence import EvidenceError
         env = self.make_env()
         with open(env.manifest_path(), "w", encoding="utf-8") as handle:
             handle.write("{not json")
@@ -1302,11 +1307,17 @@ class RestartTest(PublishBase):
             "generation_id": env.active_generation_id,
             "representation_id": ACTIVE_REPR,
         }
-        machine = build_delta_machine_from_config(env.facts_root, config)
+        machine = build_delta_machine_from_config(
+            env.facts_root, config, refuse_reason=reason)
         self.machines.append(machine)
-        snapshot = machine.ensure_caught_up()
-        self.assertEqual(snapshot.base_generation_id,
-                         env.active_generation_id)
+        with self.assertRaises(EvidenceError) as raised:
+            machine.ensure_caught_up()
+        self.assertEqual("active_identity_refused",
+                         raised.exception.code)
+        self.assertIn("unreadable", raised.exception.message)
+        # The refusal is reported by the machine's health.
+        health = machine.health()
+        self.assertEqual(reason, health["delta_refuse_reason"])
 
 
 # ---------------------------------------------------------------------------

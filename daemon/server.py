@@ -33,6 +33,7 @@ import time
 from control import run_control_server, validate_control_path
 from coordinator import MaintenanceCoordinator
 from delta import build_delta_machine_from_config
+import compat  # noqa: E402
 from staging import build_staging_machine_from_config
 from publish import (build_publisher_from_config, read_active_manifest)
 from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
@@ -119,6 +120,71 @@ FROZEN_KNOWN_KEYS = ("rule", "model", "tokenizer", "norm", "fail",
 def daemon_model_identity(state):
     path = getattr(state, "model_path", None) or MODEL_PATH
     return os.path.basename(os.path.normpath(path))
+
+
+def build_compat_report(evidence_config, facts_root, active_identity,
+                        refuse_reason, staging_machine, machine):
+    """The privacy-clean desired/active compatibility report for status.
+
+    Composes the desired layered identity from the evidence config + current
+    facts, the active identity from the active manifest (or the refusal), and
+    runs the compatibility matrix to produce the mismatch reasons and the
+    planned action union (spec: status 必须报告 desired 与 active 指纹和不匹配
+    原因; SCN-66-11).  Only identity strings and digests -- never raw text,
+    candidates or embeddings.
+    """
+    from delta import read_facts_identity, read_facts_schema_version
+    from compat import (compose_index_fingerprint, plan_actions,
+                        LAYER_STORE_EPOCH, LAYER_FACT_SCHEMA,
+                        LAYER_REPRESENTATION, LAYER_VECTOR_FORMAT,
+                        LAYER_PROJECTION, LAYER_INDEX, FP32_ROW_MAJOR_LE)
+    from generation import PROJECTION_VERSION
+    report = {"refuse_load": refuse_reason is not None,
+              "refuse_reason": refuse_reason,
+              "desired": None, "active": None, "mismatches": [],
+              "actions": []}
+    try:
+        facts_identity = read_facts_identity(facts_root)
+        facts_schema_version = read_facts_schema_version(facts_root)
+    except Exception:  # noqa: BLE001 - a missing/unreadable store means
+        facts_identity = None
+        facts_schema_version = None
+    if facts_identity is None:
+        return report
+    facts_epoch = facts_identity[0]
+    try:
+        desired_repr = evidence_config.get(
+            "desired_representation_id",
+            evidence_config.get("representation_id"))
+        desired_projection = evidence_config.get(
+            "desired_projection_version", PROJECTION_VERSION)
+        desired_index = evidence_config.get("desired_index_fingerprint")
+        if not desired_index:
+            desired_index = compose_index_fingerprint()
+        desired_format = evidence_config.get(
+            "desired_vector_format_version", FP32_ROW_MAJOR_LE)
+    except (KeyError, TypeError, ValueError):
+        return report
+    desired = {
+        LAYER_STORE_EPOCH: facts_epoch,
+        LAYER_FACT_SCHEMA: facts_schema_version,
+        LAYER_REPRESENTATION: desired_repr,
+        LAYER_VECTOR_FORMAT: desired_format,
+        LAYER_PROJECTION: desired_projection,
+        LAYER_INDEX: desired_index,
+    }
+    report["desired"] = desired
+    report["active"] = active_identity
+    if active_identity is None:
+        return report
+    try:
+        plan = plan_actions(desired, active_identity,
+                            facts_schema_version=facts_schema_version)
+    except Exception:  # noqa: BLE001 - the report never takes the daemon down
+        return report
+    report["mismatches"] = plan.get("mismatches", [])
+    report["actions"] = plan.get("actions", [])
+    return report
 
 
 def parse_frozen_baseline_id(declared_id):
@@ -529,6 +595,7 @@ def protocol_error(
         "maintenance_in_progress": "scoring is temporarily quiesced for maintenance",
         "evidence_unavailable": "evidence service is not configured",
         "config_identity_mismatch": "declared evidence config identity does not match the daemon",
+        "active_identity_refused": "the active identity is unknown, broken or missing a compat declaration",
         "fact_identity_mismatch": "fact store epoch does not match the request",
         "not_caught_up": "daemon fact snapshot is behind the request watermark",
         "fact_store_fault": "fact store is missing or unreadable",
@@ -622,6 +689,9 @@ def handle_health(state, request, coordinator=None):
     }
     if coordinator is not None:
         response["health"].update(coordinator.health())
+    compatibility = getattr(state, "compatibility_report", None)
+    if compatibility is not None:
+        response["health"]["compatibility"] = compatibility
     return response
 
 
@@ -759,6 +829,7 @@ def handle_evidence_request(state, data, coordinator=None,
 _EVIDENCE_FAULT_CODES = frozenset((
     "evidence_unavailable",
     "config_identity_mismatch",
+    "active_identity_refused",
     "fact_identity_mismatch",
     "not_caught_up",
     "fact_store_fault",
@@ -986,36 +1057,53 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
     if evidence_config is not None:
-        # #63/#64/#65 wiring: when the config declares a derived root and an
-        # active generation, the delta state machine becomes both the
+        # #63/#64/#65/#66 wiring: when the config declares a derived root and
+        # an active generation, the delta state machine becomes both the
         # evidence snapshot source and the coordinator's derived-state
         # recovery, and the staging machine (if the config declares a
-        # desired representation different from the active one) resumably
-        # builds the target generation in the background.  Both builders
-        # share the single-builder lease (spec "一次只运行一个 builder").
+        # desired identity different from the active one) resumably builds the
+        # target generation in the background.  Both builders share the
+        # single-builder lease (spec "一次只运行一个 builder").
         # #65: the active manifest -- not the config -- is the source of
         # truth for what is active after a runtime publish, so both machines
         # and the evidence service resolve the active generation id and
         # representation from it when present and valid; the publisher
         # performs the blue-green switch (its transaction and the staging
         # worker serialize on the shared publish lock).
+        # #66: a present-but-invalid / unknown active manifest REFUSES the
+        # load of derived state -- there is no config-active fallback
+        # (SCN-66-10).  The machines are constructed in a refused state and
+        # every evidence request fails closed (pass-through); status reports
+        # the refusal reason.
         builder_lock = threading.Lock()
         publish_lock = threading.Lock()
         active_generation_id = None
         active_representation_id = None
+        active_identity = None
+        refuse_reason = None
         try:
             derived_root = evidence_config.get("derived_root")
         except (KeyError, TypeError, ValueError):
             derived_root = None
         if derived_root:
-            manifest, _reason = read_active_manifest(derived_root)
-            if manifest is not None:
-                active_generation_id = manifest["generation_id"]
-                active_representation_id = manifest["representation_id"]
+            from delta import read_facts_schema_version
+            try:
+                facts_schema_version = read_facts_schema_version(facts_root)
+            except Exception:  # noqa: BLE001 - the manifest may predate facts
+                facts_schema_version = None
+            from publish import resolve_active_identity
+            active_identity, refuse_reason = resolve_active_identity(
+                derived_root, facts_schema_version=facts_schema_version)
+            if active_identity is not None and refuse_reason is None:
+                active_generation_id = (
+                    read_active_manifest(derived_root)[0]["generation_id"])
+                active_representation_id = active_identity[
+                    compat.LAYER_REPRESENTATION]
         machine = build_delta_machine_from_config(
             facts_root, evidence_config, builder_lock=builder_lock,
             active_generation_id=active_generation_id,
-            active_representation_id=active_representation_id)
+            active_representation_id=active_representation_id,
+            refuse_reason=refuse_reason)
         coordinator = MaintenanceCoordinator(
             facts_root, recovery=machine, auto_open_fact_handle=True)
         if machine is not None:
@@ -1024,12 +1112,15 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             facts_root, evidence_config, builder_lock=builder_lock,
             active_generation_id=active_generation_id,
             active_representation_id=active_representation_id,
-            publish_lock=publish_lock)
+            publish_lock=publish_lock, active_identity=active_identity)
         publisher = build_publisher_from_config(
             facts_root, evidence_config, staging_machine, machine,
             publish_lock)
         state.evidence_service = build_evidence_service_from_config(
             facts_root, evidence_config, machine=machine)
+        state.compatibility_report = build_compat_report(
+            evidence_config, facts_root, active_identity, refuse_reason,
+            staging_machine, machine)
     else:
         machine = None
         staging_machine = None

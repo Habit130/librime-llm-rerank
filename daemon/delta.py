@@ -246,6 +246,30 @@ def read_facts_identity(facts_root):
     return store_epoch, (physical, logical)
 
 
+def read_facts_schema_version(facts_root):
+    """The fact store's ``fact_schema_version``, or None when the store is
+    missing (#66: the fact schema is part of the layered compat identity --
+    ``fact_schema_version`` bounds the decodable range of the fact tables,
+    event format and HLC).  A store without a provable schema version is a
+    true fault (refuse), never an implicit default."""
+    db_path = os.path.join(facts_root, "facts.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    conn = None
+    try:
+        conn = _open_facts_ro(facts_root)
+        rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    except sqlite3.Error as error:
+        raise DeltaError("fact store read failed: %s" % error)
+    finally:
+        if conn is not None:
+            conn.close()
+    version = rows.get("fact_schema_version")
+    if not version or not isinstance(version, str):
+        raise DeltaError("fact store schema version is missing or malformed")
+    return version
+
+
 def _read_fact_changes(facts_root, lower, upper):
     """All changes with HLC in (lower, upper], in fact order.
 
@@ -811,7 +835,7 @@ class DeltaStateMachine:
                  catch_up_deadline=DEFAULT_CATCH_UP_DEADLINE_S,
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
                  now=time.monotonic, sleep=time.sleep, start_worker=True,
-                 builder_lock=None):
+                 builder_lock=None, refuse_reason=None):
         if not facts_root:
             raise DeltaError("facts root missing")
         if not derived_root:
@@ -835,6 +859,11 @@ class DeltaStateMachine:
         self._now = now
         self._sleep = sleep
         self._builder_lock = builder_lock
+        # #66 refuse-load: a present-but-invalid / unknown active manifest
+        # refuses the load of derived state (SCN-66-10); the machine never
+        # falls back to the config-declared active.  Requests fail closed
+        # (pass-through) and status reports the refusal.
+        self._refuse_reason = refuse_reason
         self._condition = threading.Condition()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
@@ -873,6 +902,17 @@ class DeltaStateMachine:
             raise DeltaError("cannot create derived root: %s" % error)
 
         # -- load (or build) the base generation -------------------------
+        if self._refuse_reason is not None:
+            # #66: refuse to load derived state per an unknown/broken active
+            # manifest.  No generation is loaded or built, no snapshot is
+            # published; every request fails closed with the refusal and the
+            # worker parks (a publish of a fresh, valid generation clears
+            # the refusal via publish_switch).
+            if start_worker:
+                self._worker = threading.Thread(
+                    target=self._run, name="delta-catch-up", daemon=True)
+                self._worker.start()
+            return
         try:
             generation = self._load_or_build_generation()
         except DeltaBlocked as error:
@@ -1176,6 +1216,12 @@ class DeltaStateMachine:
             pending = self._pending_rebuild
             snapshot = self._snapshot
             blocked = self._blocked
+            refuse_reason = self._refuse_reason
+        if refuse_reason is not None:
+            # #66 refuse-load: park the worker; only a publish of a fresh,
+            # valid generation (publish_switch) clears the refusal.  No
+            # catch-up, no rebuild -- the active identity cannot be trusted.
+            return
         if pending_publish is not None:
             self._perform_publish_switch(pending_publish)
             return
@@ -1396,8 +1442,11 @@ class DeltaStateMachine:
             self._delta_path = checkpoint_path
             self._declared_generation_id = generation_id
             # A publish is a representation/config change: any deterministic
-            # catch-up block of the old identity no longer applies.
+            # catch-up block of the old identity no longer applies, and a
+            # #66 refuse-load is cleared by a freshly published, fully
+            # verified generation (a valid active now exists).
             self._blocked = None
+            self._refuse_reason = None
             self._snapshot = snapshot
             self._condition.notify_all()
         self._finish_publish(True, None)
@@ -1657,6 +1706,14 @@ class DeltaStateMachine:
         """
         if deadline is None:
             deadline = self._now() + self._catch_up_deadline
+        with self._condition:
+            if self._refuse_reason is not None:
+                # #66 refuse-load: the active identity is unknown / broken /
+                # missing a compat declaration.  Requests fail closed
+                # (pass-through), never a silent fallback to the
+                # config-declared active (SCN-66-10).
+                raise EvidenceError(
+                    "active_identity_refused", self._refuse_reason)
         facts_identity = read_facts_identity(self._facts_root)
         if facts_identity is None:
             raise EvidenceError(
@@ -1800,6 +1857,7 @@ class DeltaStateMachine:
                 "delta_generation_id": (
                     snapshot.base_generation_id
                     if snapshot is not None else None),
+                "delta_refuse_reason": self._refuse_reason,
             }
 
     def close(self):
@@ -1869,7 +1927,8 @@ def _validate_vector(vector, dimension):
 
 def build_delta_machine_from_config(facts_root, config, builder_lock=None,
                                     active_generation_id=None,
-                                    active_representation_id=None):
+                                    active_representation_id=None,
+                                    refuse_reason=None):
     """Construct the delta machine from the evidence config dict.
 
     The config must declare the active generation explicitly (no directory
@@ -1894,6 +1953,11 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
     active after a restart).  The representation override is what lets the
     fixture seam serve the published representation; the real hidden-state
     provider plugs at the same seam.
+
+    ``refuse_reason`` (#66) refuses the load of derived state (a present-but-
+    invalid / unknown active manifest): the machine never falls back to the
+    config-declared active; requests fail closed with
+    ``active_identity_refused`` and status reports the refusal.
     """
     if "derived_root" not in config and "generation_id" not in config:
         return None
@@ -1934,7 +1998,8 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
                                            representation_id=representation_id)
     return DeltaStateMachine(facts_root, derived_root, provider,
                              generation_id, catch_up_deadline=deadline,
-                             poll_interval=poll, builder_lock=builder_lock)
+                             poll_interval=poll, builder_lock=builder_lock,
+                             refuse_reason=refuse_reason)
 
 
 def _build_provider_from_config(config, representation_id=None):

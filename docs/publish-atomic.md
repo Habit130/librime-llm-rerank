@@ -22,15 +22,20 @@ generation — never a partial or mixed state.
 active pointer — the source of truth for "what is active" after a runtime
 publish (the config's `generation_id`/`representation_id` are the operator's
 *desired* values and become stale at publish). It records the orthogonal
-identities the spec requires (fact schema version, representation id,
-vector format version, projection version, index fingerprint) plus the
-active generation binding (id, store epoch, H0) and its delta checkpoint
-path (`delta/<generation_id>/delta.sqlite3`, manifest-relative, validated
-to stay under the derived root). The config seam (`server.py`) resolves the
-active id + representation from the manifest at startup; a missing manifest
-falls back to the config, a malformed manifest is diagnosed and ignored
-(no derived state is loaded per an unknown identity; #66/#67 own manifest
-repair).
+identities the spec requires (fact schema version, representation id, vector
+format version, projection version, index fingerprint) plus the active
+generation binding (id, store epoch, H0) and its delta checkpoint path
+(`delta/<generation_id>/delta.sqlite3`, manifest-relative, validated to stay
+under the derived root). The config seam (`server.py`) resolves the active id
++ representation from the manifest at startup; a missing manifest falls back
+to the config, and a **present-but-invalid / unknown manifest refuses the
+load** (#66 refuse-load contract, SCN-66-10): the daemon never interprets a
+broken/unknown active manifest as the config-declared active — semantic
+requests fail closed (`active_identity_refused`, pass-through) and status
+reports the refusal. The projection version and the index fingerprint are
+recorded from the *generation* identity (`projection_version`,
+`index_fingerprint`), so the active identity is comparable field by field
+with the desired one via the compatibility matrix (`compat.py`, #66).
 
 Publish durability order (each step fsynced before the next):
 
@@ -82,7 +87,7 @@ validation, change-seq consistency) plus the full generation reopen, and
 **adopts** it as the machine's active checkpoint. A leftover staging
 checkpoint from a crashed publish is deterministic derived state and is
 superseded by the next publish of the same generation id; an orphaned one
-is ignored at startup (nothing scans for it) and belongs to #66 retention.
+is ignored at startup (nothing scans for it) and belongs to #67 retention.
 `open_delta_checkpoint` accepts `change_seq == -1`: the legitimate fresh
 state of a generation whose `(H0,H1]` window was empty.
 
@@ -105,7 +110,7 @@ fsync-order instrumentation test and the restart tests.
 
 The publish never deletes: the retired active generation directory, its
 delta checkpoint, or any orphaned published container stay on disk.
-Rollback registration, compaction and retention are #66/#67. `clear`'s
+Rollback registration, compaction and retention are #67. `clear`'s
 derived-state allowlist already covers the `delta/` directory namespace
 (prefix `delta`).
 
@@ -145,11 +150,13 @@ scope here.)
 
 ## Deferred by decision
 
-- Rollback registration, compaction, retention, quarantine (#66/#67),
+- Rollback registration, compaction, retention, quarantine (#67),
   ANN probes (#78/#79), real-data replay (#70), deployment: out of scope.
 - The active manifest's query-parameter layer (H, γ, k, τ, K_evidence) is
   bound on the service side via the #61 config identity, not duplicated in
-  the manifest (the manifest records the generation-bound identities only).
+  the manifest (the manifest records the generation-bound identities only);
+  a query-parameter-only change is an explicit matrix no-op for the base
+  (#66, `compat.py`), never a rebuild.
 - The delta machine's own checkpoint path at *startup* is resolved from
   the manifest by the config seam, mirroring the fixture provider seam;
   the real hidden-state provider plugs at the same seam.
