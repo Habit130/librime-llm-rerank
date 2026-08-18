@@ -870,6 +870,24 @@ class RestoreSpec:
                             "retrying",
                 cause={"published": staged_identity["store_epoch"],
                        "reported": recovery.get("store_epoch")})
+        # The daemon reopen is the authoritative "rebuild durably queued"
+        # signal: `state` is "serving" (no rebuild needed) or "catching_up"
+        # (rebuild queued, not waited on) and `serving_ready` reports the
+        # serving availability separately. Persist it durably so the result
+        # reports fact_operation_succeeded and serving_ready separately
+        # (spec #43 "结果分别报告 fact_operation_succeeded 和 serving_ready";
+        # #68/#84 own waiting for a finished generation).
+        staged_manifest = _load_staged_manifest(
+            self.root, operation_id, self.euid)
+        if staged_manifest is not None:
+            staged_manifest["reopen"] = {
+                "store_epoch": recovery.get("store_epoch"),
+                "state": recovery.get("state"),
+                "serving_ready": recovery.get("serving_ready"),
+            }
+            _write_json_atomic(
+                _staging_manifest_path(self.root, operation_id),
+                staged_manifest, self.euid)
         return {"advance": True}
 
     def _step_reopening(self, record):
@@ -953,14 +971,24 @@ class RestoreSpec:
             os.fsync(root_fd)
         finally:
             os.close(root_fd)
-        serving_ready = None
-        if self.scoring_socket is not None:
-            try:
-                from status_core import probe_daemon
-                serving = probe_daemon(self.scoring_socket)
-                serving_ready = serving.get("state") == "up"
-            except Exception:
-                serving_ready = None
+        # serving_ready comes from the daemon reopen recorded in publishing
+        # (the authoritative "rebuild durably queued" signal: state
+        # catching_up with serving_ready False means queued, not done). The
+        # scoring probe is only a fallback when the staged manifest was lost.
+        reopen = (staged_manifest or {}).get("reopen") or {}
+        if reopen.get("serving_ready") is not None:
+            serving_ready = bool(reopen.get("serving_ready"))
+            rebuild_queued = reopen.get("state") == "catching_up"
+        else:
+            serving_ready = None
+            rebuild_queued = None
+            if self.scoring_socket is not None:
+                try:
+                    from status_core import probe_daemon
+                    serving = probe_daemon(self.scoring_socket)
+                    serving_ready = serving.get("state") == "up"
+                except Exception:
+                    serving_ready = None
         if outcome == "restored":
             fact_operation_succeeded = True
         else:
@@ -969,6 +997,7 @@ class RestoreSpec:
             "outcome": outcome,
             "fact_operation_succeeded": fact_operation_succeeded,
             "serving_ready": serving_ready,
+            "rebuild_queued": rebuild_queued,
             "old": old_identity,
             "new": new_identity,
             "cleanup_complete": True,

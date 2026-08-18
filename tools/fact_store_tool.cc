@@ -58,6 +58,7 @@
 // Success output is a single JSON line. Failures print
 // {"ok":false,"status":"<stable code>"} and exit 1. Output never contains
 // private fact text.
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -709,6 +710,19 @@ int RunPrepareRestore(const path& db_path) {
     EmitFailure(rime::FactRestoreStatusCode(result.status));
     return 1;
   }
+  // fsync the prepared file before reporting success: the new store_epoch
+  // (and every preserved fact) must be durable on the staging medium before
+  // the restore operation may publish it (spec #43 "每次成功恢复生成新的
+  // store_epoch"; a crash after prepare must never lose the mint).
+  int fd = open(db_path.c_str(), O_RDONLY | O_NOFOLLOW);
+  if (fd < 0 || fsync(fd) != 0) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    EmitFailure("fsync_failed");
+    return 1;
+  }
+  close(fd);
   EmitRestoreResult(result);
   return 0;
 }

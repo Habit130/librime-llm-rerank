@@ -68,8 +68,9 @@ struct FactRestoreResult {
 // root. The file must be at the current schema head; otherwise the function
 // fails closed with the corresponding status and the file is unchanged. On
 // success the new epoch is durable inside one committed SQLite transaction
-// and the file is re-validated before returning; the caller fsyncs the file
-// after the connection closes (the tool command owns that step).
+// and the file is re-validated before returning; the caller (the
+// fact_store_tool command) fsyncs the file after the connection closes so
+// the mint is durable on the staging medium before any publication.
 FactRestoreResult PrepareRestoreFile(sqlite3* db);
 
 }  // namespace rime

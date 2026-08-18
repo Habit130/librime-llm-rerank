@@ -1158,6 +1158,9 @@ def _print_restore_result(record, args):
           % ("yes" if result.get("serving_ready") is True
              else ("no" if result.get("serving_ready") is False
                    else "unknown")))
+    if result.get("rebuild_queued") is not None:
+        print("  rebuild_queued: %s" % ("yes" if result.get("rebuild_queued")
+                                        else "no"))
     old = result.get("old") or {}
     new = result.get("new") or {}
     print("  old history: %s (epoch %s)"

@@ -272,6 +272,7 @@ class FakeControlClient:
         self.prepare_ok = True
         self.prepare_code = None
         self.reopen_store_epoch = None
+        self.reopen_state = "serving"
         self.reopen_serving = True
 
     def __enter__(self):
@@ -294,7 +295,7 @@ class FakeControlClient:
 
     def reopen(self):
         self.steps.append("reopen")
-        return {"ok": True, "state": "serving",
+        return {"ok": True, "state": self.reopen_state,
                 "store_epoch": self.reopen_store_epoch,
                 "serving_ready": self.reopen_serving}
 
@@ -656,9 +657,44 @@ class RestoreStepTests(RestoreEnv):
         result = record["result"]
         self.assertTrue(result["fact_operation_succeeded"])
         # serving_ready is a separate field; with the fake daemon it reports
-        # the reopen state (here: serving).
-        self.assertIsNotNone(result["serving_ready"])
+        # the reopen state (here: serving, no rebuild queued).
         self.assertIn("serving_ready", result)
+        self.assertTrue(result["serving_ready"])
+        self.assertFalse(result["rebuild_queued"])
+
+    def test_result_reports_queued_rebuild_when_daemon_catching_up(self):
+        # The daemon reopen is the authoritative "rebuild durably queued"
+        # signal: a new epoch puts the coordinator in catching_up with
+        # serving_ready False — the restore reports fact_operation_succeeded
+        # True and serving_ready False (rebuild queued, never waited on).
+        live = self.make_live_store(seed=True)
+        backup_root = os.path.join(self._tmp, "BackupMachine6b")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, live["store_epoch"])
+        operation_id = record["operation_id"]
+        # Configure the fake daemon reopen as a new-epoch catching_up state.
+        for client in self.clients:
+            client.reopen_state = "catching_up"
+            client.reopen_serving = False
+        # The reopen response must report the new epoch for the publishing
+        # gate to accept it.
+        def catching_up_factory(path, opid):
+            client = FakeControlClient(path, opid)
+            client.reopen_state = "catching_up"
+            client.reopen_serving = False
+            self.clients.append(client)
+            return client
+        spec = self.build_spec(control_client_factory=catching_up_factory)
+        record = self.create_op(spec, backup, live["store_epoch"])
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("succeeded", record["state"], record["error"])
+        result = record["result"]
+        self.assertTrue(result["fact_operation_succeeded"])
+        self.assertFalse(result["serving_ready"])
+        self.assertTrue(result["rebuild_queued"])
 
     # -- SCN-56-8 -----------------------------------------------------------
 
