@@ -45,6 +45,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -86,6 +87,7 @@ from generation import (  # noqa: E402
 )
 from staging import StagingBuildMachine  # noqa: E402
 from test_generation import make_facts, make_provider  # noqa: E402
+from test_staging import _CountingProvider as CountingProvider  # noqa: E402
 
 ACTIVE_REPR = "compat-test-active-repr-v1"
 DESIRED_REPR = "compat-test-desired-repr-v1"
@@ -129,6 +131,14 @@ class MatrixUnitTest(unittest.TestCase):
                                                   proj=PROJ_V2))
         self.assertEqual([ACTION_INVALIDATE_ALL], union["actions"])
 
+    def test_epoch_change_collapses_vector_reuse_to_none(self):
+        # epoch+projection: the projection walk would stage reuse_vectors,
+        # but invalidate_all subsumes it -- vector_reuse must NOT leak the
+        # stale "event_id" marker (AC66-1 / AC66-7).
+        plan = plan_actions(identity(), identity(epoch="e2", proj=PROJ_V2))
+        self.assertEqual([ACTION_INVALIDATE_ALL], plan["actions"])
+        self.assertEqual("none", plan["vector_reuse"])
+
     def test_scn66_2_representation_change_reembeds_without_reuse(self):
         plan = plan_actions(identity(), identity(repr=DESIRED_REPR))
         self.assertEqual([ACTION_REEMBED], plan["actions"])
@@ -156,6 +166,15 @@ class MatrixUnitTest(unittest.TestCase):
         self.assertEqual([ACTION_REEMBED], plan["actions"])
         self.assertEqual("none", plan["vector_reuse"])
 
+    def test_format_and_projection_without_converter_collapses_to_none(self):
+        # format+projection without a converter: the projection walk stages
+        # reuse_vectors but the format change forces reembed -- vector_reuse
+        # must collapse to "none" (AC66-1 / AC66-7).
+        plan = plan_actions(identity(fmt=FORMAT_V2), identity(proj=PROJ_V2),
+                            converters={})
+        self.assertEqual([ACTION_REEMBED], plan["actions"])
+        self.assertEqual("none", plan["vector_reuse"])
+
     def test_scn66_6_format_change_with_tested_converter_reuses(self):
         converter = VectorFormatConverter(
             name="test-fp32-v2",
@@ -168,6 +187,26 @@ class MatrixUnitTest(unittest.TestCase):
                             converters=registry)
         self.assertEqual([ACTION_CONVERT_VECTORS], plan["actions"])
         self.assertEqual("convert", plan["vector_reuse"])
+        self.assertNotIn(ACTION_REEMBED, plan["actions"])
+
+    def test_convert_survives_collapse_over_reuse(self):
+        # format+projection with a converter: the projection walk stages
+        # reuse_vectors, the format walk stages convert_vectors.  convert
+        # subsumes reuse in the collapse and must survive it (AC66-1/7).
+        converter = VectorFormatConverter(
+            name="test-fp32-v2",
+            source_format=VECTOR_FORMAT,
+            target_format=FORMAT_V2,
+            convert=lambda data: data,
+            verify_equivalent=lambda left, right: left == right)
+        registry = {converter.key(): converter}
+        plan = plan_actions(identity(fmt=FORMAT_V2), identity(proj=PROJ_V2),
+                            converters=registry)
+        self.assertEqual(sorted([ACTION_CONVERT_VECTORS,
+                                 ACTION_REBUILD_PROJECTION]),
+                         plan["actions"])
+        self.assertEqual("convert", plan["vector_reuse"])
+        self.assertNotIn(ACTION_REUSE_VECTORS, plan["actions"])
         self.assertNotIn(ACTION_REEMBED, plan["actions"])
 
     def test_scn66_7_index_only_is_a_noop_with_reason(self):
@@ -456,6 +495,60 @@ class StagingMatrixTest(unittest.TestCase):
             self.assertEqual(DESIRED_REPR, opened.representation_id)
         finally:
             opened.close()
+
+    def test_epoch_and_projection_change_never_reuses_vectors(self):
+        # epoch+projection: invalidate_all subsumes the reuse candidate, so
+        # the full rebuild must re-embed (prove event_vector IS called --
+        # the inverse of the reuse test) and must never open a
+        # VectorReuseSource on the old epoch's generation.
+        env = self.make_env()
+        counting = CountingProvider(env.active_provider)
+        # Active identity carries a different epoch; the desired target
+        # carries a changed projection.  The matrix must plan invalidate_all
+        # with vector_reuse "none" (AC66-1 / AC66-7) and re-embed, not reuse
+        # the old generation's vectors.
+        active_identity = dict(env.active_identity)
+        active_identity[LAYER_STORE_EPOCH] = "e0"
+        machine = env.staging(provider=counting, projection_version=PROJ_V2,
+                              active_identity=active_identity)
+        self.machines.append(machine)
+        # The collapsed plan (vector_reuse "none") must never construct a
+        # reuse source: pin the seam so any open is caught.
+        with mock.patch("staging.VectorReuseSource",
+                        side_effect=AssertionError(
+                            "VectorReuseSource must not be opened")) as vs:
+            progress = env.run_to_ready(machine)
+        self.assertIsNotNone(progress)
+        self.assertFalse(vs.called)
+        plan = machine.status()["compatibility"]
+        self.assertEqual([ACTION_INVALIDATE_ALL], plan["actions"])
+        self.assertEqual("none", plan["vector_reuse"])
+        # The build re-embedded from facts rather than reusing old vectors.
+        self.assertGreater(counting.count, 0)
+        opened = self.open_ready_container(progress["generation_id"])
+        try:
+            self.assertEqual(ACTIVE_REPR, opened.representation_id)
+            self.assertEqual(PROJ_V2, opened.projection_version)
+        finally:
+            opened.close()
+
+    def test_refused_active_identity_idles_without_building(self):
+        # #66 refuse-load: a present-but-invalid/unknown active manifest
+        # refuses the staging build (idle + recorded reason), distinct from
+        # "nothing published yet" (the existing first-build path).
+        env = self.make_env()
+        machine = StagingBuildMachine(
+            env.facts_root, env.derived_root, env.desired_provider,
+            ACTIVE_REPR, env.active_generation_id, start_worker=False,
+            refuse_reason=REFUSE_UNKNOWN_IDENTITY)
+        self.machines.append(machine)
+        machine._cycle()
+        status = machine.status()
+        self.assertIsNone(status["progress"])
+        health = machine.health()
+        self.assertEqual(REFUSE_UNKNOWN_IDENTITY,
+                         health["staging_refuse_reason"])
+        self.assertEqual([], env.staging_dirs())
 
     def test_status_reports_desired_and_active_fingerprints(self):
         env = self.make_env()

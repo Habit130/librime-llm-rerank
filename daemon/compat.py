@@ -333,6 +333,26 @@ def _collapse_union(actions):
     return working
 
 
+def _vector_reuse_for(actions):
+    """The vector-reuse marker for a *collapsed* action union (AC66-1/7).
+
+    The marker is derived from the actions the builder will actually execute,
+    never from the raw per-layer walk: a reuse candidate that a wider action
+    subsumed must not survive the collapse.  ``convert_vectors`` wins over
+    ``reuse_vectors`` (a converter path still reuses the old generation's
+    vectors, just transformed); any full rebuild (``invalidate_all`` /
+    ``reembed``) means the old vectors are NOT reused.
+    """
+    actions = set(actions)
+    if ACTION_INVALIDATE_ALL in actions or ACTION_REEMBED in actions:
+        return "none"
+    if ACTION_CONVERT_VECTORS in actions:
+        return "convert"
+    if ACTION_REUSE_VECTORS in actions:
+        return "event_id"
+    return "none"
+
+
 def plan_actions(desired, active, converters=None,
                  facts_schema_version=None, query_identity=None):
     """The matrix decision for reaching ``desired`` from ``active``.
@@ -356,7 +376,15 @@ def plan_actions(desired, active, converters=None,
         refuse_load     bool
         refuse_reason   str | None
         reason          str | None (e.g. "no_ann_sidecar" for index-only)
+
+    ``vector_reuse`` is derived from the *collapsed* action union, never
+    from the per-layer walk: a collapse that subsumes a ``reuse_vectors`` /
+    ``convert_vectors`` candidate into ``reembed`` / ``invalidate_all`` must
+    not leak the stale ``"event_id"`` / ``"convert"`` marker (AC66-1/7).
     """
+    # Collapse first so the reuse marker can be derived from the actions the
+    # builder will actually execute (AC66-1 / AC66-7): walking the layers
+    # may have staged a reuse candidate that a wider action then subsumes.
     if desired is None or not isinstance(desired, dict):
         raise ValueError("desired identity must be a dict")
     for layer in IDENTITY_LAYERS:
@@ -385,7 +413,6 @@ def plan_actions(desired, active, converters=None,
         }
 
     raw = set()
-    vector_reuse = "none"
     reason = None
     for layer in IDENTITY_LAYERS:
         if desired[layer] == active.get(layer):
@@ -402,7 +429,6 @@ def plan_actions(desired, active, converters=None,
             converter = find_converter(source, target, registry)
             if converter is not None and converter.verify_equivalent:
                 raw.add(ACTION_CONVERT_VECTORS)
-                vector_reuse = "convert"
             else:
                 # No tested equivalent converter: re-embed, never byte-cast
                 # (SCN-66-5).
@@ -414,7 +440,6 @@ def plan_actions(desired, active, converters=None,
             # checksum verifies (checked by the caller via reopen).
             if desired[LAYER_REPRESENTATION] == active.get(LAYER_REPRESENTATION):
                 raw.add(ACTION_REUSE_VECTORS)
-                vector_reuse = "event_id"
         elif action == ACTION_REBUILD_INDEX:
             raw.add(ACTION_REBUILD_INDEX)
             # Exact-only envelope: no ANN sidecar to rebuild (RISK-66-1).
@@ -427,6 +452,10 @@ def plan_actions(desired, active, converters=None,
         raw.add(ACTION_NOOP)
 
     actions = sorted(_collapse_union(raw))
+    # The reuse marker follows the collapsed action union, never the raw
+    # per-layer walk: a wider action that subsumed a reuse candidate means
+    # the old vectors are NOT reused (AC66-1 / AC66-7).
+    vector_reuse = _vector_reuse_for(actions)
     return {
         "actions": actions,
         "mismatches": mismatch_reasons(desired, active),

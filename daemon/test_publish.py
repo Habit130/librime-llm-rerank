@@ -1292,15 +1292,22 @@ class RestartTest(PublishBase):
     def test_invalid_manifest_refuses_load(self):
         """#66 refuse-load contract: a present-but-invalid active manifest
         must NOT fall back to the config-declared active (SCN-66-10).  The
-        machine is constructed in a refused state; requests fail closed with
-        ``active_identity_refused`` and status reports the refusal."""
+        refusal is resolved through ``resolve_active_identity`` (never
+        injected by hand), the machine is constructed in a refused state,
+        requests fail closed with ``active_identity_refused`` and status
+        reports the refusal."""
         from delta import build_delta_machine_from_config
         from evidence import EvidenceError
+        from publish import resolve_active_identity
         env = self.make_env()
         with open(env.manifest_path(), "w", encoding="utf-8") as handle:
             handle.write("{not json")
-        manifest, reason = read_active_manifest(env.derived_root)
-        self.assertIsNone(manifest)
+        # The orchestration-required seam: resolve the refusal through the
+        # same resolver the server wiring uses, not by hand-injecting a
+        # reason string.
+        active_identity, reason = resolve_active_identity(env.derived_root)
+        self.assertIsNone(active_identity)
+        self.assertIsNotNone(reason)
         self.assertIn("unreadable", reason)
         config = {
             "derived_root": env.derived_root,
@@ -1318,6 +1325,134 @@ class RestartTest(PublishBase):
         # The refusal is reported by the machine's health.
         health = machine.health()
         self.assertEqual(reason, health["delta_refuse_reason"])
+
+    def test_invalid_manifest_is_discovered_by_the_machine(self):
+        """#66 refuse-load: the machine itself discovers a present-but-
+        unreadable active manifest (no hand-injected ``refuse_reason``) and
+        refuses the load -- never rebuild-and-serve under a broken manifest."""
+        from delta import DeltaStateMachine
+        from evidence import EvidenceError
+        env = self.make_env()
+        with open(env.manifest_path(), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        machine = DeltaStateMachine(
+            env.facts_root, env.derived_root, env.active_provider,
+            env.active_generation_id, poll_interval=0.01)
+        self.machines.append(machine)
+        with self.assertRaises(EvidenceError) as raised:
+            machine.ensure_caught_up()
+        self.assertEqual("active_identity_refused",
+                         raised.exception.code)
+        self.assertIn("unreadable", raised.exception.message)
+        self.assertIsNone(machine.snapshot())
+
+    def test_broken_published_generation_refuses_load(self):
+        """#66 AC66-8 / SCN-66-10 / SCN-66-12: a present active manifest
+        whose generation fails reopen (corrupted checksum) refuses the load
+        -- never rebuild-and-serve a fresh container as the successful
+        active for a broken published identity.  The machine discovers the
+        refusal from the manifest + reopen (not a hand-injected reason)."""
+        from delta import (build_delta_machine_from_config,
+                           read_facts_schema_version)
+        from evidence import EvidenceError
+        from generation import open_generation
+        from publish import (_compose_active_manifest,
+                             resolve_active_identity, write_active_manifest)
+        env = self.make_env()
+        # A durable active manifest pointing at the active generation, then
+        # corrupt the published vectors so reopen fails its checksum.
+        generation = open_generation(
+            env.published_dir(env.active_generation_id))
+        try:
+            manifest = _compose_active_manifest(
+                generation,
+                "delta/%s/delta.sqlite3" % env.active_generation_id,
+                read_facts_schema_version(env.facts_root))
+        finally:
+            generation.close()
+        write_active_manifest(env.derived_root, manifest)
+        _flip_byte(os.path.join(
+            env.published_dir(env.active_generation_id), "vectors.fp32"))
+        # The manifest is well-formed, so the identity resolver passes; the
+        # checksum failure is discovered by the machine's own reopen.
+        active_identity, reason = resolve_active_identity(
+            env.derived_root,
+            facts_schema_version=read_facts_schema_version(env.facts_root))
+        self.assertIsNotNone(active_identity)
+        self.assertIsNone(reason)
+        config = {
+            "derived_root": env.derived_root,
+            "generation_id": env.active_generation_id,
+            "representation_id": ACTIVE_REPR,
+        }
+        machine = build_delta_machine_from_config(
+            env.facts_root, config,
+            active_generation_id=manifest["generation_id"],
+            active_representation_id=ACTIVE_REPR)
+        self.machines.append(machine)
+        with self.assertRaises(EvidenceError) as raised:
+            machine.ensure_caught_up()
+        self.assertEqual("active_identity_refused",
+                         raised.exception.code)
+        self.assertIn("checksum", raised.exception.message)
+        health = machine.health()
+        self.assertIsNotNone(health["delta_refuse_reason"])
+        self.assertIn("checksum", health["delta_refuse_reason"])
+        # No freshly built generation is served under the broken identity.
+        self.assertIsNone(machine.snapshot())
+
+    def test_valid_publish_clears_the_refusal(self):
+        """#66 refuse-load recovery: queries fail closed until a valid
+        publish.  A machine refused on a broken published identity recovers
+        when a fresh, fully verified generation is published."""
+        from delta import (DeltaStateMachine, build_delta_machine_from_config,
+                           read_facts_schema_version)
+        from evidence import EvidenceError
+        from generation import open_generation
+        from publish import (_compose_active_manifest, publish_ready_staging,
+                             resolve_active_identity, write_active_manifest)
+        env = self.make_env()
+        # A durable manifest + corrupted published vectors -> refused.
+        generation = open_generation(
+            env.published_dir(env.active_generation_id))
+        try:
+            manifest = _compose_active_manifest(
+                generation,
+                "delta/%s/delta.sqlite3" % env.active_generation_id,
+                read_facts_schema_version(env.facts_root))
+        finally:
+            generation.close()
+        write_active_manifest(env.derived_root, manifest)
+        _flip_byte(os.path.join(
+            env.published_dir(env.active_generation_id), "vectors.fp32"))
+        config = {
+            "derived_root": env.derived_root,
+            "generation_id": env.active_generation_id,
+            "representation_id": ACTIVE_REPR,
+        }
+        machine = build_delta_machine_from_config(
+            env.facts_root, config,
+            active_generation_id=manifest["generation_id"],
+            active_representation_id=ACTIVE_REPR)
+        self.machines.append(machine)
+        with self.assertRaises(EvidenceError) as raised:
+            machine.ensure_caught_up()
+        self.assertEqual("active_identity_refused", raised.exception.code)
+        # Publish a fresh, valid generation (a NEW generation id) -- this
+        # clears the refusal and the machine serves the new identity.
+        builder = env.staging()
+        progress = env.run_to_ready(builder)
+        result = publish_ready_staging(
+            env.facts_root, env.derived_root, builder,
+            env.staging_dir(progress["generation_id"]),
+            progress["generation_id"], env.desired_provider, machine,
+            publish_lock=env.publish_lock)
+        self.assertTrue(result["ok"], result)
+        snapshot = machine.ensure_caught_up()
+        self.assertEqual(snapshot.base_generation_id,
+                         progress["generation_id"])
+        self.assertEqual(snapshot.representation_id, DESIRED_REPR)
+        self.assertIsNone(machine.health()["delta_refuse_reason"])
 
 
 # ---------------------------------------------------------------------------

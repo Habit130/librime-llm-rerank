@@ -162,10 +162,12 @@ the checkpoint. Restart paths:
   refused state (`refuse_reason`) and every request fails closed with
   `active_identity_refused`; there is no config-active fallback (SCN-66-10).
   The refusal clears when a fresh, fully verified generation is published
-  (`publish_switch`).  The machine's epoch-change rebuild decision routes
-  through the compatibility matrix (`compat.py`): a `store_epoch` change is
-  `invalidate_all` — discard all derived state and rebuild from current
-  facts.
+  (`publish_switch`).  The delta machine's epoch-change rebuild decision is a
+  direct `store_epoch` comparison in `_load_or_build_generation` — it does
+  not call `plan_actions` for that decision.  The compatibility matrix
+  (`compat.py`) expresses the same `store_epoch` change as `invalidate_all`
+  (discard all derived state and rebuild from current facts) and is the
+  authority the staging machine and the status report consult.
 - The config seam stays fixture-driven (like #61 today); the real
   hidden-state provider plugs at the same `RepresentationProvider` seam and
   is exercised by `integration_delta.py`.
@@ -181,12 +183,28 @@ the checkpoint. Restart paths:
 - Compaction/rollback/retention (#67), ANN (#78/#79), real-data replay
   (#70), deployment: out of scope, recorded as deferred in the delivery
   contract.  The #66 compatibility matrix (`compat.py`) is the single
-  reuse/load authority the machine's epoch-rebuild and refuse-load paths
-  route through; it does not change the delta machine's serving semantics
-  beyond routing its epoch-change rebuild decision through the matrix.
+  reuse/load authority the machine's refuse-load path routes through; it
+  does not change the delta machine's serving semantics.  The machine's
+  epoch-rebuild decision is a direct store-epoch comparison (above), not a
+  matrix call; the matrix independently plans the same `store_epoch` change
+  as `invalidate_all` for the staging/status surfaces.
 - The blue-green publish itself is delivered (#65): `publish_switch` is the
   in-memory pointer swap; the durable manifest, the staging-side delta and
   the publish lock are documented in `docs/publish-atomic.md`.
+- **Refuse on a broken published identity (#66)**: the compatibility matrix
+  (`compat.py`) is the single reuse/load authority.  When the durable active
+  manifest is present and valid but the generation it names fails reopen —
+  checksum failure, unknown vector format, unsupported retrieval backend, or
+  a bound-identity mismatch — the delta machine **refuses** the load
+  (`active_identity_refused`): the worker parks and queries fail closed
+  until a valid publish.  It never calls `_build_generation_now()` to serve
+  a freshly built container as the successful active for a broken published
+  identity.  Only the two distinct *rebuild* cases rebuild from facts: (a)
+  nothing published yet for the declared identity (no manifest / no
+  generation directory — the #63 first-build path), and (b) a `store_epoch`
+  change, where the old derived state is discarded and rebuilt for the new
+  epoch.  The desired staging machine may still build a **new** generation
+  toward a valid publish while the active identity is refused.
 - **Checkpoint layout** (#65): the checkpoint is per-generation
   (`delta/<generation_id>/delta.sqlite3`), so the active and the staging
   generation each own one (spec clause); `open_delta_checkpoint` accepts

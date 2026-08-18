@@ -131,7 +131,8 @@ class StagingBuildMachine:
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
                  start_worker=True, builder_lock=None, publish_lock=None,
                  active_identity=None, projection_version=PROJECTION_VERSION,
-                 index_fingerprint=None, vector_format_version=VECTOR_FORMAT):
+                 index_fingerprint=None, vector_format_version=VECTOR_FORMAT,
+                 refuse_reason=None):
         if not facts_root:
             raise StagingError("facts root missing")
         if not derived_root:
@@ -182,6 +183,11 @@ class StagingBuildMachine:
         self._probe_params = probe_params
         self._poll_interval = float(poll_interval)
         self._builder_lock = builder_lock
+        # #66 refuse-load: a present-but-invalid / unknown active manifest
+        # refuses the load of derived state.  The staging machine idles and
+        # reports the refusal (never builds against an unknown active);
+        # nothing-published still follows the existing first-build path.
+        self._refuse_reason = refuse_reason
         # #65: the publish transaction and every state-machine cycle that
         # touches the staging namespace serialize on this lock, so the
         # publisher's verify/rename of a ready container can never race a
@@ -274,6 +280,14 @@ class StagingBuildMachine:
         facts_epoch, _facts_max = facts_identity
         with self._condition:
             blocked = self._blocked
+            refuse_reason = self._refuse_reason
+        if refuse_reason is not None:
+            # #66 refuse-load: a broken/unknown active identity is a refuse,
+            # never a config-active fallback and never a build against it.
+            # This is distinct from "nothing published yet" (the existing
+            # first-build path); the machine idles and reports the reason.
+            self._sync_state(None, None)
+            return
         if blocked is not None:
             progress = self._current_progress
             if progress is None or progress.get("status") != "blocked":
@@ -1186,6 +1200,7 @@ class StagingBuildMachine:
                 "staging_last_error": self._last_error,
                 "staging_last_discard_reason": self._last_discard_reason,
                 "staging_compatibility": plan,
+                "staging_refuse_reason": self._refuse_reason,
             }
 
     def close(self):
@@ -1216,7 +1231,8 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
                                       active_identity=None,
                                       projection_version=PROJECTION_VERSION,
                                       index_fingerprint=None,
-                                      vector_format_version=VECTOR_FORMAT):
+                                      vector_format_version=VECTOR_FORMAT,
+                                      refuse_reason=None):
     """Construct the staging machine from the evidence config dict.
 
     The config distinguishes desired from active (spec "配置区分 desired 与
@@ -1243,7 +1259,10 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
     machine's seam, so the machine gates against what is actually active.
     ``active_identity`` (#66) is the full layered identity of the active
     state (from the active manifest); without one the machine composes the
-    config-declared active identity itself.  ``publish_lock`` (#65)
+    config-declared active identity itself.  ``refuse_reason`` (#66) is a
+    present-but-invalid / unknown active manifest: the machine idles and
+    reports the refusal instead of building against an unknown active.
+    ``publish_lock`` (#65)
     serializes every state-machine cycle with the publish transaction (see
     the constructor).
     """
@@ -1315,7 +1334,8 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
         publish_lock=publish_lock, active_identity=active_identity,
         projection_version=desired_projection_version,
         index_fingerprint=desired_index_fingerprint,
-        vector_format_version=desired_vector_format)
+        vector_format_version=desired_vector_format,
+        refuse_reason=refuse_reason)
 
 
 def _build_desired_provider(config, desired_representation_id, seed=None):

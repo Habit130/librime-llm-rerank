@@ -1112,7 +1112,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             facts_root, evidence_config, builder_lock=builder_lock,
             active_generation_id=active_generation_id,
             active_representation_id=active_representation_id,
-            publish_lock=publish_lock, active_identity=active_identity)
+            publish_lock=publish_lock, active_identity=active_identity,
+            refuse_reason=refuse_reason)
         publisher = build_publisher_from_config(
             facts_root, evidence_config, staging_machine, machine,
             publish_lock)
