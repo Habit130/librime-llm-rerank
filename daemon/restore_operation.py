@@ -54,7 +54,9 @@ from backup_operation import (
     _backup_id,
     _cleanup_verify_dir,
     _extract_member,
+    _now_iso,
     _open_verify_tempdir,
+    _output_absolute,
     build_manifest,
     parse_zip_structure,
     read_backup_manifest,
@@ -91,18 +93,10 @@ PUBLISHED_MARKER = "published.marker"
 STAGING_STORE_DIR = "store"
 BACKUP_CURRENT_SNAPSHOT = "backup-current.sqlite3"
 
-SAFE_ID_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-
 # Explicit, application-owned staging names; cleanup deletes only these.
 RESTORE_DERIVED_NAMES = (RESTORE_DIRNAME,)
 
 _PRISTINE_EPOCH = ""
-
-
-def _valid_identity_token(value):
-    return (isinstance(value, str) and 1 <= len(value) <= 64
-            and all(character in SAFE_ID_CHARS for character in value))
 
 
 def _staging_root(root, operation_id):
@@ -132,14 +126,6 @@ def _published_marker_path(root, operation_id):
 def _backup_current_snapshot_path(root, operation_id):
     return os.path.join(_staging_root(root, operation_id),
                         BACKUP_CURRENT_SNAPSHOT)
-
-
-def _output_absolute(output):
-    if not isinstance(output, str) or not output:
-        raise ValueError("backup-current path must be a path")
-    if "\x00" in output:
-        raise ValueError("backup-current path must not contain NUL")
-    return os.path.abspath(output)
 
 
 def _ensure_restore_dir(root, euid):
@@ -1027,15 +1013,6 @@ class RestoreSpec:
             steps=steps,
             cancel_phase="reopening",
         )
-
-
-def _now_iso(now=None):
-    from datetime import datetime, timezone
-    if callable(now):
-        return now().isoformat()
-    if now is not None:
-        return now
-    return datetime.now(timezone.utc).isoformat()
 
 
 def build_restore_spec(root, **seams):
