@@ -75,8 +75,42 @@ rename. A busy or incomplete checkpoint aborts before any sidecar removal.
 A failure or crash therefore exposes only the complete old store or the
 complete new store, never a new main database paired with old WAL/SHM files.
 
-This is a reusable maintenance seam only. Public restore and schema
-migration operations remain separate tickets.
+This is a reusable maintenance seam only. Public restore operations remain a
+separate ticket.
+
+## Fact schema migration
+
+`squirrel-semantic-memory migrate` upgrades a supported-old fact store to the
+current schema head. Fact schema evolution is owned exclusively by the C++
+writer (`fact_store_tool migrate`): the ordered, forward-only step table,
+the deterministic per-event-format projection and the pre-commit validation
+(counts, event/commit identities, HLC total order, foreign keys, schema
+invariants) all live in C++. Python only orchestrates the operation through
+the maintenance seam: a verified safety snapshot is created BEFORE any
+migration work (SQLite Online Backup API + full C++ validation), the
+migration runs on a staging copy of that snapshot inside one SQLite
+transaction per ordered step chain, and only a successfully migrated staging
+file is published with the atomic replace under the exclusive maintenance
+lease.
+
+A migration that does not change the interpretation of existing events
+preserves `history_id` AND `store_epoch`; a migration that changes event,
+HLC-order or other fact interpretation generates a new `store_epoch`
+(`history_id` is preserved). Every old event is deterministically projected
+to the current canonical event through its `event_format_version`; a missing
+field or an unconvertible event blocks the migration and the build — the
+event is never silently skipped. A store newer than the program supports, a
+missing migration step or a validation failure leaves the original database
+unchanged and stops event recording with an explicit report. Downgrades,
+best-effort in-place repair and creating an empty database to paper over a
+failure are all refused, and a crash at any point exposes only the complete
+old schema or the complete new schema (never a mix).
+
+The production schema head is currently v1 and ships no migration steps
+(decision B): a live v1 store is already current and `migrate` reports a
+no-op. The full supported-old -> head path is exercised through a
+test-registered predecessor step in the operation tests and the C++ migrator
+tests.
 
 ## Physical clear
 

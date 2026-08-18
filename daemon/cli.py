@@ -111,16 +111,21 @@ def default_paths():
 
 
 def default_registry(paths=None):
-    """The production operation registry (`clear`, `backup.create`; later
-    tickets add the remaining maintenance types)."""
+    """The production operation registry (`clear`, `backup.create`,
+    `migrate`; later tickets add the remaining maintenance types)."""
     from clear_operation import production_registry as clear_registry
     from backup_operation import production_registry as backup_registry
+    from migrate_operation import production_registry as migrate_registry
     paths = paths or default_paths()
     registry = clear_registry(
         paths["semantic_memory_root"],
         control_socket=paths["control_socket"],
         scoring_socket=paths["daemon_socket"])
     for spec in backup_registry(paths["semantic_memory_root"])._specs.values():
+        registry.register(spec)
+    for spec in migrate_registry(
+            paths["semantic_memory_root"],
+            control_socket=paths["control_socket"])._specs.values():
         registry.register(spec)
     return registry
 
@@ -224,6 +229,12 @@ def build_parser():
                        help="expected current store epoch (epoch CAS)")
     clear.add_argument("--json", action="store_true")
     clear.set_defaults(handler=_cmd_clear)
+
+    migrate = sub.add_parser(
+        "migrate", help="upgrade a supported-old fact store to the current "
+                        "schema (safety snapshot + staging + atomic replace)")
+    migrate.add_argument("--json", action="store_true")
+    migrate.set_defaults(handler=_cmd_migrate)
 
     rebuild = sub.add_parser("rebuild", help="reserved: rebuild derived "
                                              "state")
@@ -978,6 +989,77 @@ def _cmd_backup_create(args, paths):
         print(_json_dump(public_record(current)), flush=True)
     else:
         print("backup create did not complete: state %s (phase %s)"
+              % (current["state"], current["phase"]))
+        if current.get("error") is not None:
+            print("  error: %s" % current["error"]["code"])
+            print("  remediation: %s"
+                  % current["error"].get("remediation", ""))
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# migrate
+# ---------------------------------------------------------------------------
+
+def _print_migrate_result(record, args):
+    if args.json:
+        print(_json_dump(public_record(record)), flush=True)
+        return
+    result = record.get("result") or {}
+    print("migrate %s" % result.get("outcome", "completed"))
+    print("  schema: %s; event format: %s"
+          % (result.get("fact_schema_version", "unknown"),
+             result.get("event_format_version", "unknown")))
+    print("  history: %s (epoch %s)"
+          % (result.get("history_id") or "unknown",
+             result.get("store_epoch") or "unknown"))
+
+
+def _cmd_migrate(args, paths):
+    store = _operation_store(paths)
+    mode = "json" if args.json else "human"
+    try:
+        store.open(create=False)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    try:
+        record = create_operation(store, args.registry, "migrate", None)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    except ValueError as error:
+        return _store_operation_error(
+            OperationError("invalid_parameters", phase="cli",
+                           retryable=False, cause={
+                               "error": str(error)}), mode)
+
+    operation_id = record["operation_id"]
+    if args.json:
+        print(_json_line({
+            "operation_version": OPERATION_VERSION,
+            "operation_id": operation_id,
+            "type": "migrate",
+            "state": "running",
+        }), flush=True, file=sys.stderr)
+    else:
+        print("migrate started: operation %s" % operation_id)
+
+    def emit(entry):
+        if not args.json:
+            print(_human_event_line(entry), flush=True)
+
+    current, failure_code = _watch_detached_operation(
+        store, operation_id, emit, mode, "migrate")
+    if failure_code is not None:
+        return failure_code
+
+    if current["state"] in ("succeeded", "cancelled"):
+        _print_migrate_result(current, args)
+        return 0
+    if args.json:
+        print(_json_dump(public_record(current)), flush=True)
+    else:
+        print("migrate did not complete: state %s (phase %s)"
               % (current["state"], current["phase"]))
         if current.get("error") is not None:
             print("  error: %s" % current["error"]["code"])
