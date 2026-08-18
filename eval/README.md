@@ -162,3 +162,67 @@ test suite.
 
 The scoring policies under calibration are defined in
 `../docs/token-attribution.md`.
+
+## Offline α recalibration from real selection events (Habit130/squirrel#106)
+
+`recalibrate.py` + `primary_events.py` + `template_weights.py` +
+`daemon_scoring.py` + `decide.py` + `control_denominator.py` +
+`console_replay.py` + `recalib_report.py` + `run_recalibrate.py` implement
+the offline α recalibration of the mean-token LM coefficient over frozen
+real selection events (contract AC-106-v1):
+
+- **Primary denominator**: freeze-inclusive (`hlc >= 1786806466751/0`),
+  unretracted, **group-complete** (saved competition size `< 32`, NOT the
+  persisted `competition_complete` bit — spec #43 / #76 rewrite) events from
+  one consistent read-only facts snapshot (Online Backup API, SCN-106-1);
+  上文 = the stored `preceding_text` (asserted `<= 64` chars; empty is a
+  valid window, reported as a stratum, never a fault).
+- **Scoring seam (D-A106-1)**: `score(c) = α·mean_token_lm(c|上文) + β·weight(c)`,
+  γ=0.  The librime runtime dictionary weight is recovered from the template
+  compiled table (`rime_table_decompiler` dump of the librime build tree's
+  `luna_pinyin.table.bin`: `log(raw) - kS`, byte-verified against the
+  plugin `WeightScorer` verbose logs); the LM score comes from the daemon
+  `mean_token` protocol (same socket the plugin `LlmScorer` uses).  The
+  saved competition set is pinned by construction — only the recorded
+  candidates are ranked, never a regenerated set.  A saved candidate
+  without a finite weight or LM score makes the whole event 无法重放
+  (SCN-106-5), counted per reason.
+- **Decision**: primary-only top-1, then MRR, then smaller α; α=0 in the
+  selection domain; pre-declared grid `{0, 0.5, 1, 2, 3, 4, 5, 7, 10}` with
+  the #46 extension rule `{14, 20}` applied only when the winner is the
+  upper bound (SCN-106-11: an upper-bound winner after extension is not a
+  calibrated internal optimum).  Control metrics never enter `decide_final`
+  (SCN-106-6).  SCN-106-10: if the remaining primary set after 无法重放
+  falls below 1000 events or 100 keys, no α* is declared and the driver
+  hands back a specification blocker.
+- **Control denominator**: the committed 120/402 fixture's word cases with
+  in-sentence prefixes (`上文 = sentence[:source_start]`; empty-prefix cases
+  dropped and counted), ranked inside the engine competition set for the
+  pinyin in a disposable rime_dir (console + full template dict, the #46
+  pattern); published as a separate table that never selects.
+- **Report**: desensitized (event ids, HLCs, hashes, counts, ranks — never
+  raw 上文/candidate text), versioned with a report SHA-256, snapshot
+  SHA-256, HLC range, freeze watermark, inclusion/exclusion counts, per-α
+  top-1/MRR/M1/M2, 无法重放 counts, the α=0 fidelity diagnostic (reconstructed
+  α=0 top-1 vs observed confirmation), and the decision record.
+
+```sh
+# model-free gate:
+python3 -m unittest eval.test_recalibrate
+
+# full offline run (daemon venv; quiet machine for the real-model grid):
+daemon/.venv/bin/python eval/run_recalibrate.py \
+    --snapshot <snapshot.sqlite3> \
+    --decompiled-table <luna_pinyin.table.decompiled.txt> \
+    --daemon-socket <workdir>/sock/calib.sock \
+    --work-dir <local report dir> \
+    --console <librime>/build/bin/rime_api_console \
+    --template-dir <librime>/build/bin
+```
+
+The decompiled table is produced read-only from the librime build tree:
+
+```sh
+<librime>/build/bin/rime_table_decompiler \
+    <librime>/build/bin/luna_pinyin.table.bin luna_pinyin.table.decompiled.txt
+```
