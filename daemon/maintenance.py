@@ -420,6 +420,22 @@ def replace_fact_database(root, replacement_path, _lease=None,
                 raise MaintenanceError("replacement_failed") from error
         if _after_checkpoint is not None:
             _after_checkpoint()
+        # The replacement file's content must be durable BEFORE the atomic
+        # rename: after the rename the new main database IS this file, and a
+        # power loss must expose either the complete old store or the
+        # complete new store, never a new name carrying unfsynced bytes
+        # (SCN-56-8 / AC56-7; the caller's prepare-restore/migrate mint is a
+        # necessary but not sufficient condition — this fsync closes the
+        # window right before publication).
+        try:
+            replacement_fd = os.open(replacement_path,
+                                     os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as error:
+            raise MaintenanceError("replacement_failed") from error
+        try:
+            _fsync(replacement_fd)
+        finally:
+            os.close(replacement_fd)
         _replace(replacement_path, main_path)
         os.chmod(main_path, 0o600)
         _fsync(root_fd)
