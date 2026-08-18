@@ -75,8 +75,8 @@ rename. A busy or incomplete checkpoint aborts before any sidecar removal.
 A failure or crash therefore exposes only the complete old store or the
 complete new store, never a new main database paired with old WAL/SHM files.
 
-This is a reusable maintenance seam only. Public restore operations remain a
-separate ticket.
+This is the reusable maintenance seam that `restore` and `clear` publish
+their replacements through (see below).
 
 ## Fact schema migration
 
@@ -217,6 +217,58 @@ without leaving a target, a publish makes the operation uncancellable, and
 Ctrl-C in the foreground CLI only detaches (exit 130) while the detached
 executor continues. The same operation ID with the same parameters reuses
 the same backup; the same ID with different parameters is rejected.
+
+## Whole-store restore
+
+`squirrel-semantic-memory restore` atomically replaces the whole live fact
+store with a verified backup, preserving the backup's logical history
+(`history_id`, event/commit IDs, HLC state) while minting a **new**
+`store_epoch` through the C++ seam (`fact_store_tool prepare-restore`).
+Restore never merges events by ID.
+
+```text
+squirrel-semantic-memory restore --from <backup> \
+    (--backup-current <new-path> | --discard-current)
+squirrel-semantic-memory restore --from <backup> --yes \
+    --expect-store-epoch <epoch> (--backup-current <new-path> | --discard-current)
+```
+
+Preflight validates the container (exact member set, names, attributes,
+compression, sizes, ratios, CRC), the manifest, the extracted database's
+SHA-256/size/integrity, its schema version and the available space. A
+supported-old backup is classified through the migrate seam and is migrated
+**only on the staging copy** during staging — the backup original is never
+modified; a too-new or missing-step backup is refused in preflight. Every
+preflight failure leaves the current store untouched.
+
+Retention is explicit: the operator must choose `--backup-current <path>`
+XOR `--discard-current` before any mutation. `--backup-current` runs AFTER
+quiesce and BEFORE the replace, reusing the backup.create / snapshot path
+(owner-only destination, no-overwrite publication, independent
+verification); if that backup fails, the live store is unchanged.
+`--discard-current` never writes a current backup — restore never secretly
+saves the current store.
+
+Confirmation is exact: interactive use prints the plan (current
+history/epoch/event count -> backup history/high-water/event count) and
+requires typing `RESTORE <backup_id> OVER <current_store_epoch>` verbatim.
+Non-interactive use requires both `--yes` and `--expect-store-epoch`, which
+must match the current live epoch (a stale expectation is a zero-side-effect
+failure). Only a healthy current store can be restored over: an unreadable
+current store fails closed, and a missing store fails closed
+(`--accept-unreadable-current` / `--expect-current-fingerprint` /
+`--expect-no-store` are #57 and stay reserved).
+
+Crash recovery is phase-persistent. A crash before the atomic replace
+leaves the complete old store observable; after the replace the durable
+`published` marker and the staged identity let a retry recognize the
+already-published store without regenerating history or epoch. A cancel
+honored before publishing reopens the old state; after publishing the
+operation is uncancellable. Ctrl-C in the foreground CLI only detaches
+(exit 130) while the detached executor continues. The result reports
+`fact_operation_succeeded` and `serving_ready` separately: the restore
+waits for the daemon reopen and confirms the rebuild is durably queued, but
+never waits for a full generation rebuild.
 
 ## Exact retrieval-evidence oracle
 

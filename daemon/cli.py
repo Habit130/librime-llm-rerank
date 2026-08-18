@@ -26,11 +26,24 @@ The single supported public entry point for semantic-memory maintenance
                     extracted-database integrity and re-computed manifest
                     cross-checks; never reads live state, never connects to
                     or starts the daemon, never loads the model.
-  restore, rebuild, quarantine list|purge
+  restore           atomically replace the whole fact store with a verified
+                    backup (container + manifest + checksum + integrity +
+                    version + space preflight), preserving the backup's
+                    history/HLC but minting a NEW store_epoch through the
+                    C++ seam; requires an explicit --backup-current or
+                    --discard-current and an exact confirmation (interactive
+                    RESTORE <backup_id> OVER <epoch> or non-interactive
+                    --yes + --expect-store-epoch CAS); --backup-current runs
+                    after quiesce and before the replace and a failure
+                    leaves the live store unchanged.
+  rebuild, quarantine list|purge
                     RESERVED command surface (approved by spec #43): fully
                     parsed but dispatch to a stable `not_implemented` error;
                     they never fake success and never execute destructive
-                    behavior (#56/#57/#68 implement them).
+                    behavior (#57/#68 implement them).
+  restore --accept-unreadable-current / --expect-current-fingerprint /
+                    --expect-no-store: #57 stays RESERVED; these flags are
+                    parsed but dispatch to `not_implemented`.
 
 Output contracts (deterministic):
   - human text and --json carry stable version fields inside the document
@@ -112,10 +125,12 @@ def default_paths():
 
 def default_registry(paths=None):
     """The production operation registry (`clear`, `backup.create`,
-    `migrate`; later tickets add the remaining maintenance types)."""
+    `migrate`, `restore`; later tickets add the remaining maintenance
+    types)."""
     from clear_operation import production_registry as clear_registry
     from backup_operation import production_registry as backup_registry
     from migrate_operation import production_registry as migrate_registry
+    from restore_operation import production_registry as restore_registry
     paths = paths or default_paths()
     registry = clear_registry(
         paths["semantic_memory_root"],
@@ -126,6 +141,11 @@ def default_registry(paths=None):
     for spec in migrate_registry(
             paths["semantic_memory_root"],
             control_socket=paths["control_socket"])._specs.values():
+        registry.register(spec)
+    for spec in restore_registry(
+            paths["semantic_memory_root"],
+            control_socket=paths["control_socket"],
+            scoring_socket=paths["daemon_socket"])._specs.values():
         registry.register(spec)
     return registry
 
@@ -208,17 +228,31 @@ def build_parser():
     backup_verify.add_argument("--json", action="store_true")
     backup_verify.set_defaults(handler=_cmd_backup_verify)
 
-    restore = sub.add_parser("restore", help="reserved: restore a backup")
-    restore.add_argument("--from", dest="from_path", metavar="BACKUP")
-    restore.add_argument("--backup-current", metavar="PATH")
-    restore.add_argument("--discard-current", action="store_true")
-    restore.add_argument("--yes", action="store_true")
-    restore.add_argument("--expect-store-epoch", metavar="UUID")
+    restore = sub.add_parser(
+        "restore",
+        help="atomically replace the whole fact store with a verified "
+             "backup, minting a new store epoch")
+    restore.add_argument("--from", dest="from_path", metavar="BACKUP",
+                         required=True)
+    retain = restore.add_mutually_exclusive_group(required=True)
+    retain.add_argument("--backup-current", metavar="PATH",
+                        help="before replacing, snapshot the current store "
+                             "to this new path (must not exist)")
+    retain.add_argument("--discard-current", action="store_true",
+                        help="replace without keeping the current store; "
+                             "restore never secretly saves it")
+    restore.add_argument("--yes", action="store_true",
+                         help="non-interactive confirmation; requires "
+                              "--expect-store-epoch")
+    restore.add_argument("--expect-store-epoch", metavar="UUID",
+                         help="expected current store epoch (epoch CAS)")
+    # #57 stays reserved: unreadable-current handling, quarantine and
+    # --expect-no-store are not implemented in this build.
     restore.add_argument("--accept-unreadable-current", action="store_true")
     restore.add_argument("--expect-current-fingerprint", metavar="HASH")
     restore.add_argument("--expect-no-store", action="store_true")
     restore.add_argument("--json", action="store_true")
-    restore.set_defaults(handler=_cmd_reserved)
+    restore.set_defaults(handler=_cmd_restore)
 
     clear = sub.add_parser("clear", help="physically clear the semantic "
                                          "memory and start a new history")
@@ -1068,6 +1102,225 @@ def _cmd_migrate(args, paths):
     return 1
 
 
+# ---------------------------------------------------------------------------
+# restore
+# ---------------------------------------------------------------------------
+
+def _read_restore_plan(paths, from_path):
+    """Read-only plan for the restore confirmation: the live current
+    identity/stats and the backup manifest. Raises OperationError on a
+    fail-closed condition."""
+    from backup_operation import BackupError, read_backup_manifest
+    from clear_operation import FactStoreHelper, live_identity
+    from restore_operation import _verify_restore_backup
+    helper = FactStoreHelper()
+    identity_empty = live_identity(helper, paths["semantic_memory_root"])
+    if identity_empty is None:
+        raise OperationError(
+            "store_missing", phase="cli",
+            remediation="no facts database exists; there is nothing to "
+                        "restore over (restore never creates a store)",
+            cause=None)
+    identity, _empty = identity_empty
+    try:
+        live_stats = helper.stats(paths["semantic_memory_root"])
+    except Exception as error:
+        fault = getattr(error, "code", None) or getattr(error, "status", None)
+        raise OperationError(
+            "fact_store_unverifiable", phase="cli",
+            remediation="the live fact store failed closed validation; "
+                        "inspect and fix it before restoring",
+            cause={"fault_code": fault})
+    try:
+        # Full offline validation of the backup (container, manifest,
+        # checksum, integrity, version). This re-uses the restore preflight
+        # verify so the CLI never trusts an unvalidated container.
+        manifest, _stats, _disposition = _verify_restore_backup(
+            from_path, helper, phase="cli")
+    except BackupError as error:
+        raise OperationError(
+            error.code, phase="cli",
+            remediation="the backup failed offline validation; inspect it "
+                        "and re-create it if needed",
+            cause=error.cause)
+    return identity, live_stats, manifest
+
+
+def _print_restore_result(record, args):
+    if args.json:
+        print(_json_dump(public_record(record)), flush=True)
+        return
+    result = record.get("result") or {}
+    print("restore %s" % result.get("outcome", "completed"))
+    print("  fact_operation_succeeded: %s"
+          % ("yes" if result.get("fact_operation_succeeded") else "no"))
+    print("  serving_ready: %s"
+          % ("yes" if result.get("serving_ready") is True
+             else ("no" if result.get("serving_ready") is False
+                   else "unknown")))
+    if result.get("rebuild_queued") is not None:
+        print("  rebuild_queued: %s" % ("yes" if result.get("rebuild_queued")
+                                        else "no"))
+    old = result.get("old") or {}
+    new = result.get("new") or {}
+    print("  old history: %s (epoch %s)"
+          % (old.get("history_id") or "unknown",
+             old.get("store_epoch") or "unknown"))
+    print("  new history: %s (epoch %s)"
+          % (new.get("history_id") or "unknown",
+             new.get("store_epoch") or "unknown"))
+    if result.get("backup_id"):
+        print("  backup: %s" % result["backup_id"])
+        print("  backup history: %s (epoch %s)"
+              % (result.get("backup_history_id") or "unknown",
+                 result.get("backup_store_epoch") or "unknown"))
+    if result.get("backup_current_destination"):
+        print("  current store backed up to: %s"
+              % result["backup_current_destination"])
+    elif result.get("discarded_current"):
+        print("  current store discarded (explicit choice)")
+    if result.get("backup_event_count") is not None:
+        print("  backup facts: %s events" % result["backup_event_count"])
+    print("  %s" % result.get(
+        "plaintext_sensitive_declaration",
+        "this operation touches plaintext private input history"))
+
+
+def _cmd_restore(args, paths):
+    store = _operation_store(paths)
+    mode = "json" if args.json else "human"
+    try:
+        store.open(create=False)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    # #57 flags stay reserved: unreadable-current handling, quarantine and
+    # --expect-no-store are not implemented in this build.
+    if (args.accept_unreadable_current or args.expect_current_fingerprint
+            or args.expect_no_store):
+        command = "restore"
+        error = _not_implemented_error(command)
+        _render_error(error, mode)
+        return 2
+
+    if args.yes != (args.expect_store_epoch is not None):
+        # Non-interactive restore requires both confirmation and epoch CAS;
+        # there is deliberately no --force (spec #43).
+        error = make_error(
+            "confirmation_required", phase="cli",
+            remediation="provide both --yes and --expect-store-epoch, or run "
+                        "interactively and type the exact confirmation string",
+            cause=None)
+        _render_error(error, mode)
+        return 2
+
+    from_path = os.path.abspath(args.from_path)
+    try:
+        identity, live_stats, manifest = _read_restore_plan(paths, from_path)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    expected_epoch = identity["store_epoch"]
+    confirmation = "RESTORE %s OVER %s" % (manifest["backup_id"],
+                                           expected_epoch)
+    backup_watermark = manifest["hlc_high_water"]
+    description = (
+        "this replaces the whole local semantic memory with the backup, "
+        "keeping the backup's history and HLC but minting a new store epoch")
+    if args.yes:
+        if args.expect_store_epoch != expected_epoch:
+            error = make_error(
+                "store_epoch_mismatch", phase="cli",
+                remediation="re-run restore with --expect-store-epoch %s"
+                            % expected_epoch,
+                cause={"expected": args.expect_store_epoch,
+                       "actual": expected_epoch})
+            _render_error(error, mode)
+            return 2
+    else:
+        print("current:")
+        print("  history: %s" % identity["history_id"])
+        print("  epoch: %s" % identity["store_epoch"])
+        print("  events: %s"
+              % (live_stats.get("event_count") if live_stats else "unknown"))
+        print("backup:")
+        print("  id: %s" % manifest["backup_id"])
+        print("  history: %s" % manifest["history_id"])
+        print("  epoch: %s" % manifest["store_epoch"])
+        print("  events: %s" % manifest["event_count"])
+        print("  high-water: %s.%s"
+              % (backup_watermark["physical_ms"],
+                 backup_watermark["logical"]))
+        print(description)
+        print("type the exact string below to confirm:")
+        print(confirmation, flush=True)
+        try:
+            entered = sys.stdin.readline()
+        except (EOFError, OSError):
+            entered = ""
+        if entered.rstrip("\r\n") != confirmation:
+            error = make_error(
+                "confirmation_failed", phase="cli", retryable=True,
+                remediation="re-run restore and type the exact confirmation "
+                            "string",
+                cause=None)
+            _render_error(error, mode)
+            return 1
+
+    parameters = {
+        "from_path": from_path,
+        "backup_current": os.path.abspath(args.backup_current)
+        if args.backup_current else None,
+        "discard_current": args.discard_current,
+        "expect_store_epoch": expected_epoch,
+    }
+    try:
+        record = create_operation(store, args.registry, "restore", parameters)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    except ValueError as error:
+        return _store_operation_error(
+            OperationError("invalid_parameters", phase="cli",
+                           retryable=False, cause={
+                               "error": str(error)}), mode)
+
+    operation_id = record["operation_id"]
+    if args.json:
+        print(_json_line({
+            "operation_version": OPERATION_VERSION,
+            "operation_id": operation_id,
+            "type": "restore",
+            "state": "running",
+            "from_path": from_path,
+            "backup_id": manifest["backup_id"],
+        }), flush=True, file=sys.stderr)
+    else:
+        print("restore started: operation %s" % operation_id)
+
+    def emit(entry):
+        if not args.json:
+            print(_human_event_line(entry), flush=True)
+
+    current, failure_code = _watch_detached_operation(
+        store, operation_id, emit, mode, "restore")
+    if failure_code is not None:
+        return failure_code
+
+    if current["state"] in ("succeeded", "cancelled"):
+        _print_restore_result(current, args)
+        return 0
+    if args.json:
+        print(_json_dump(public_record(current)), flush=True)
+    else:
+        print("restore did not complete: state %s (phase %s)"
+              % (current["state"], current["phase"]))
+        if current.get("error") is not None:
+            print("  error: %s" % current["error"]["code"])
+            print("  remediation: %s"
+                  % current["error"].get("remediation", ""))
+    return 1
+
+
 def _print_verify_result(result, args):
     if args.json:
         print(_json_dump(result), flush=True)
@@ -1146,9 +1399,9 @@ def _reserved_command_name(args):
 def main(argv=None, registry=None):
     """Run the CLI. `registry` is the operation-type registry used by the
     internal `operation run` executor; production code passes None, which
-    loads the production registry (`clear`, `backup.create`; restore/rebuild/
-    quarantine arrive with their own tickets). Returns the process exit
-    code.
+    loads the production registry (`clear`, `backup.create`, `migrate`,
+    `restore`; rebuild/quarantine arrive with their own tickets). Returns
+    the process exit code.
     """
     if os.geteuid() == 0:
         error = make_error(

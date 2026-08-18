@@ -184,6 +184,40 @@ class FactStoreHelper:
                 "fact_store_helper_invalid", phase="staging", retryable=False)
         return identity, payload["empty"]
 
+    def stats(self, root, phase="preflight"):
+        """Read-only stats of the live store (identity, versions, counts,
+        HLC and event high-water marks) through the C++ seam. Used by the
+        restore plan display; never writes."""
+        payload = self._execute("stats", root, phase=phase)
+        stats = {
+            "history_id": payload.get("history_id"),
+            "store_epoch": payload.get("store_epoch"),
+            "fact_schema_version": payload.get("fact_schema_version"),
+            "event_format_version_min": payload.get(
+                "event_format_version_min"),
+            "event_format_version_max": payload.get(
+                "event_format_version_max"),
+            "commit_count": payload.get("commit_count"),
+            "event_count": payload.get("event_count"),
+            "candidate_count": payload.get("candidate_count"),
+            "retraction_count": payload.get("retraction_count"),
+            "hlc_physical_ms": payload.get("hlc_physical_ms"),
+            "hlc_logical": payload.get("hlc_logical"),
+            "event_hlc_physical_ms": payload.get("event_hlc_physical_ms"),
+            "event_hlc_logical": payload.get("event_hlc_logical"),
+        }
+        if (not _valid_identity_token(stats["history_id"])
+                or not _valid_identity_token(stats["store_epoch"])
+                or type(stats["fact_schema_version"]) is not int
+                or stats["fact_schema_version"] < 1
+                or any(type(stats[key]) is not int
+                       for key in ("commit_count", "event_count",
+                                   "candidate_count", "retraction_count",
+                                   "hlc_physical_ms", "hlc_logical"))):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False)
+        return stats
+
     def create_empty(self, root):
         """Create and validate a fresh empty store; returns its identity."""
         payload = self._execute("create-empty", root)
@@ -203,17 +237,26 @@ class FactStoreHelper:
                 "fact_store_helper_invalid", phase="staging", retryable=False)
         return identity
 
-    def snapshot(self, root, output, phase="staging"):
+    def snapshot(self, root, output, phase="staging", exclusive=False):
         """Create a consistent Online Backup snapshot of the live store at
         `root` into the not-yet-existing `output` file; returns the C++
         snapshot stats (identity, versions, counts, HLC high-water marks).
+
+        `exclusive=True` requests the exclusive-lease variant: the caller
+        already holds the exclusive maintenance lease (a restore's
+        backup-current snapshot runs inside the exclusive replacement
+        window), so the C++ seam opens the store without acquiring the
+        shared maintenance lock, which would otherwise self-deadlock.
         """
         import subprocess
         runner = self._run or subprocess.run
+        command = [self.helper_path, "snapshot", "--root", root, "--output",
+                   output]
+        if exclusive:
+            command.append("--exclusive")
         try:
             completed = runner(
-                [self.helper_path, "snapshot", "--root", root, "--output",
-                 output], capture_output=True, text=True, timeout=120)
+                command, capture_output=True, text=True, timeout=120)
         except OSError as error:
             raise OperationFailed(
                 "fact_store_helper_unavailable", phase=phase,
@@ -365,6 +408,59 @@ class FactStoreHelper:
                 or type(payload.get("epoch_changed")) is not bool
                 or not _valid_identity_token(payload.get("history_id") or "")
                 or not _valid_identity_token(payload.get("store_epoch") or "")):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False)
+        return payload
+
+    def prepare_restore(self, db_path, phase="staging"):
+        """Mint a NEW store_epoch in ONE standalone facts file (a staging
+        copy of an extracted backup member) through the C++ seam, preserving
+        history_id, every fact row and the HLC state. Returns the restore
+        result envelope. On failure the file's facts are unchanged and the
+        backup epoch is kept (the mint runs in one SQLite transaction).
+        """
+        import subprocess
+        runner = self._run or subprocess.run
+        try:
+            completed = runner(
+                [self.helper_path, "prepare-restore", "--db", db_path],
+                capture_output=True, text=True, timeout=120)
+        except OSError as error:
+            raise OperationFailed(
+                "fact_store_helper_unavailable", phase=phase,
+                retryable=False, cause={"error": error.strerror})
+        except Exception as error:
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"error": type(error).__name__})
+        if completed.returncode not in (0, 1):
+            raise OperationFailed(
+                "fact_store_helper_failed", phase=phase, retryable=True,
+                cause={"exit": completed.returncode})
+        try:
+            payload = json.loads((completed.stdout or "").strip() or "null")
+        except ValueError:
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if not isinstance(payload, dict):
+            raise OperationFailed(
+                "fact_store_helper_invalid", phase=phase, retryable=False,
+                cause=None)
+        if not payload.get("ok"):
+            raise _HelperFailed(payload.get("status") or "helper_failed")
+        if (not _valid_identity_token(payload.get("history_id") or "")
+                or not _valid_identity_token(payload.get("store_epoch") or "")
+                or not _valid_identity_token(
+                    payload.get("previous_store_epoch") or "")
+                or type(payload.get("fact_schema_version")) is not int
+                or type(payload.get("event_format_version")) is not int
+                or type(payload.get("hlc_physical_ms")) is not int
+                or type(payload.get("hlc_logical")) is not int
+                or type(payload.get("commit_count")) is not int
+                or type(payload.get("event_count")) is not int
+                or type(payload.get("candidate_count")) is not int
+                or type(payload.get("retraction_count")) is not int):
             raise OperationFailed(
                 "fact_store_helper_invalid", phase=phase, retryable=False)
         return payload

@@ -58,6 +58,7 @@
 // Success output is a single JSON line. Failures print
 // {"ok":false,"status":"<stable code>"} and exit 1. Output never contains
 // private fact text.
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -68,6 +69,7 @@
 #include <string>
 
 #include "fact_migrator.h"
+#include "fact_restore.h"
 #include "fact_store.h"
 #include "rime/common.h"
 
@@ -240,6 +242,31 @@ void EmitMigrationResult(const rime::FactMigrationResult& result) {
   std::printf("%s\n", payload.c_str());
 }
 
+// One JSON line with the restore prepare result (identity, versions, clock
+// and counts; never any event content).
+void EmitRestoreResult(const rime::FactRestoreResult& result) {
+  std::string payload = "{\"ok\":true,\"status\":";
+  WriteJsonString(&payload, rime::FactRestoreStatusCode(result.status));
+  payload += ",\"history_id\":";
+  WriteJsonString(&payload, result.history_id.c_str());
+  payload += ",\"store_epoch\":";
+  WriteJsonString(&payload, result.store_epoch.c_str());
+  payload += ",\"previous_store_epoch\":";
+  WriteJsonString(&payload, result.previous_store_epoch.c_str());
+  AppendJsonInt(&payload, "\"fact_schema_version\"",
+                result.fact_schema_version);
+  AppendJsonInt(&payload, "\"event_format_version\"",
+                result.event_format_version);
+  AppendJsonInt(&payload, "\"hlc_physical_ms\"", result.hlc_physical_ms);
+  AppendJsonInt(&payload, "\"hlc_logical\"", result.hlc_logical);
+  AppendJsonInt(&payload, "\"commit_count\"", result.commit_count);
+  AppendJsonInt(&payload, "\"event_count\"", result.event_count);
+  AppendJsonInt(&payload, "\"candidate_count\"", result.candidate_count);
+  AppendJsonInt(&payload, "\"retraction_count\"", result.retraction_count);
+  payload += "}";
+  std::printf("%s\n", payload.c_str());
+}
+
 bool PathExists(const path& target) {
   struct stat st;
   return lstat(target.c_str(), &st) == 0;
@@ -272,8 +299,30 @@ bool IsExactOwnerMode(const path& target, mode_t mode) {
 int Usage() {
   std::fprintf(stderr,
                "usage: fact_store_tool <verify|create-empty|snapshot|inspect|"
-               "schema|migrate> --root <dir>|--db <path> [--output <path>]\n");
+               "schema|migrate|stats|prepare-restore> --root <dir>|--db "
+               "<path> [--output <path>] [--exclusive]\n");
   return 2;
+}
+
+// Decision B seam loader: when SQUIRREL_FACT_MIGRATE_TEST_STEPS is set the
+// test-registered predecessor step v1 -> v2 is loaded so the supported-old
+// -> head path is real. The default variant is interpretation-preserving
+// ("stamp"); SQUIRREL_FACT_MIGRATE_TEST_STEPS=changing registers the
+// interpretation-changing variant ("recode") so the operation tests prove a
+// new store_epoch end to end. The env var must never be set in production
+// deployments; the operation tests set it per-process. Every command that
+// consults the step table (schema, migrate, verify, inspect, stats,
+// prepare-restore) loads it, so one environment classifies a file
+// identically in every subprocess.
+void LoadTestMigrationStepsIfRequested() {
+  const char* mode = getenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS");
+  if (!mode)
+    return;
+  if (std::strcmp(mode, "changing") == 0) {
+    rime::RegisterTestMigrationStep(1, 2, true, "recode");
+  } else {
+    rime::RegisterTestMigrationStep(1, 2, false, "stamp");
+  }
 }
 
 int RunVerify(const path& root) {
@@ -282,6 +331,11 @@ int RunVerify(const path& root) {
     EmitFailure("no_store");
     return 1;
   }
+  // The step table must be consistent across every command that consults it
+  // (verify, schema, migrate, inspect, stats and prepare-restore) so a
+  // migrated staging file verifies in the same environment that prepared it
+  // (decision B).
+  LoadTestMigrationStepsIfRequested();
   FactStore store(root);
   FactStore::Status status = store.Open(FactStore::OpenMode::kMaintenance);
   if (status != FactStore::Status::kOk) {
@@ -303,6 +357,32 @@ int RunVerify(const path& root) {
     return 1;
   }
   EmitIdentity(history_id, store_epoch, physical_ms, logical, false, empty);
+  return 0;
+}
+
+// Read-only stats of the live store (the restore plan display). The store
+// must be a healthy current store; Python never re-derives fact semantics.
+int RunStats(const path& root) {
+  path db_path = root / "facts.sqlite3";
+  if (!PathExists(db_path)) {
+    EmitFailure("no_store");
+    return 1;
+  }
+  // Same step-table consistency as verify/inspect (decision B).
+  LoadTestMigrationStepsIfRequested();
+  FactStore store(root);
+  FactStore::Status status = store.Open(FactStore::OpenMode::kMaintenance);
+  if (status != FactStore::Status::kOk) {
+    EmitFailure(FactStore::StatusCode(status));
+    return 1;
+  }
+  rime::FactStore::SnapshotStats stats;
+  status = store.ReadStats(&stats);
+  if (status != FactStore::Status::kOk) {
+    EmitFailure(FactStore::StatusCode(status));
+    return 1;
+  }
+  EmitSnapshotStats(stats);
   return 0;
 }
 
@@ -366,7 +446,7 @@ int RunCreateEmpty(const path& root) {
   return 0;
 }
 
-int RunSnapshot(const path& root, const path& output) {
+int RunSnapshot(const path& root, const path& output, bool exclusive) {
   if (output.empty()) {
     EmitFailure("no_output");
     return 1;
@@ -378,7 +458,9 @@ int RunSnapshot(const path& root, const path& output) {
     return 1;
   }
   FactStore store(root);
-  FactStore::Status status = store.Open(FactStore::OpenMode::kMaintenance);
+  FactStore::Status status = store.Open(
+      exclusive ? FactStore::OpenMode::kExclusive
+                : FactStore::OpenMode::kMaintenance);
   if (status != FactStore::Status::kOk) {
     EmitFailure(FactStore::StatusCode(status));
     return 1;
@@ -391,25 +473,6 @@ int RunSnapshot(const path& root, const path& output) {
   }
   EmitSnapshotStats(stats);
   return 0;
-}
-
-// Decision B seam loader: when SQUIRREL_FACT_MIGRATE_TEST_STEPS is set the
-// test-registered predecessor step v1 -> v2 is loaded so the supported-old
-// -> head path is real. The default variant is interpretation-preserving
-// ("stamp"); SQUIRREL_FACT_MIGRATE_TEST_STEPS=changing registers the
-// interpretation-changing variant ("recode") so the operation tests prove a
-// new store_epoch end to end. The env var must never be set in production
-// deployments; the operation tests set it per-process. Every command that
-// consults the step table (schema, migrate) loads it.
-void LoadTestMigrationStepsIfRequested() {
-  const char* mode = getenv("SQUIRREL_FACT_MIGRATE_TEST_STEPS");
-  if (!mode)
-    return;
-  if (std::strcmp(mode, "changing") == 0) {
-    rime::RegisterTestMigrationStep(1, 2, true, "recode");
-  } else {
-    rime::RegisterTestMigrationStep(1, 2, false, "stamp");
-  }
 }
 
 // Reads the live store's schema disposition. Never writes and never
@@ -584,6 +647,11 @@ int RunInspect(const path& db_path) {
     EmitFailure("db_not_regular");
     return 1;
   }
+  // The step table must be consistent across every command that consults it
+  // (schema, migrate, prepare-restore and inspect): a supported-old file is
+  // then classified identically in every subprocess of one environment
+  // (decision B).
+  LoadTestMigrationStepsIfRequested();
   rime::FactStore::SnapshotStats stats;
   FactStore::Status status =
       rime::FactStore::InspectSnapshotFile(db_path, &stats);
@@ -592,6 +660,70 @@ int RunInspect(const path& db_path) {
     return 1;
   }
   EmitSnapshotStats(stats);
+  return 0;
+}
+
+// Mints a NEW store_epoch in one standalone facts file (a staging copy of an
+// extracted backup member), preserving history_id, every fact row and the HLC
+// state. The whole mint runs in one SQLite transaction; on any failure the
+// file's facts are unchanged and the backup epoch is kept. The file must be a
+// current-head store; supported-old files fail closed with needs_migration so
+// the restore operation migrates the staging copy first.
+int RunPrepareRestore(const path& db_path) {
+  if (db_path.empty()) {
+    EmitFailure("no_db");
+    return 1;
+  }
+  struct stat st;
+  if (lstat(db_path.c_str(), &st) != 0) {
+    EmitFailure("no_store");
+    return 1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    EmitFailure("db_symlink");
+    return 1;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    EmitFailure("db_not_regular");
+    return 1;
+  }
+  if (st.st_uid != getuid() || (st.st_mode & 0777) != 0600) {
+    EmitFailure("db_permission");
+    return 1;
+  }
+  // The disposition table must include the test predecessor step (decision
+  // B) so a supported-old backup file is classified consistently with the
+  // migrate seam in the same subprocess environment.
+  LoadTestMigrationStepsIfRequested();
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(db_path.c_str(), &db,
+                      SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+    if (db) {
+      sqlite3_close(db);
+    }
+    EmitFailure("db_open_failed");
+    return 1;
+  }
+  rime::FactRestoreResult result = rime::PrepareRestoreFile(db);
+  sqlite3_close(db);
+  if (result.status != rime::FactRestoreStatus::kOk) {
+    EmitFailure(rime::FactRestoreStatusCode(result.status));
+    return 1;
+  }
+  // fsync the prepared file before reporting success: the new store_epoch
+  // (and every preserved fact) must be durable on the staging medium before
+  // the restore operation may publish it (spec #43 "每次成功恢复生成新的
+  // store_epoch"; a crash after prepare must never lose the mint).
+  int fd = open(db_path.c_str(), O_RDONLY | O_NOFOLLOW);
+  if (fd < 0 || fsync(fd) != 0) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    EmitFailure("fsync_failed");
+    return 1;
+  }
+  close(fd);
+  EmitRestoreResult(result);
   return 0;
 }
 
@@ -604,29 +736,37 @@ int main(int argc, char* argv[]) {
   path root;
   path output;
   path db_path;
-  for (int index = 2; index + 1 < argc; index += 2) {
-    if (std::strcmp(argv[index], "--root") == 0) {
-      root = path(argv[index + 1]);
-    } else if (std::strcmp(argv[index], "--output") == 0) {
-      output = path(argv[index + 1]);
-    } else if (std::strcmp(argv[index], "--db") == 0) {
-      db_path = path(argv[index + 1]);
+  bool exclusive = false;
+  for (int index = 2; index < argc; ++index) {
+    if (std::strcmp(argv[index], "--root") == 0 && index + 1 < argc) {
+      root = path(argv[++index]);
+    } else if (std::strcmp(argv[index], "--output") == 0 && index + 1 < argc) {
+      output = path(argv[++index]);
+    } else if (std::strcmp(argv[index], "--db") == 0 && index + 1 < argc) {
+      db_path = path(argv[++index]);
+    } else if (std::strcmp(argv[index], "--exclusive") == 0) {
+      exclusive = true;
     } else {
       return Usage();
     }
   }
   if (std::strcmp(command, "verify") == 0)
     return root.empty() ? Usage() : RunVerify(root);
+  if (std::strcmp(command, "stats") == 0)
+    return root.empty() ? Usage() : RunStats(root);
   if (std::strcmp(command, "create-empty") == 0)
     return root.empty() ? Usage() : RunCreateEmpty(root);
   if (std::strcmp(command, "snapshot") == 0)
     return (root.empty() || output.empty()) ? Usage() : RunSnapshot(root,
-                                                                    output);
+                                                                    output,
+                                                                    exclusive);
   if (std::strcmp(command, "inspect") == 0)
     return db_path.empty() ? Usage() : RunInspect(db_path);
   if (std::strcmp(command, "schema") == 0)
     return root.empty() ? Usage() : RunSchema(root);
   if (std::strcmp(command, "migrate") == 0)
     return db_path.empty() ? Usage() : RunMigrate(db_path);
+  if (std::strcmp(command, "prepare-restore") == 0)
+    return db_path.empty() ? Usage() : RunPrepareRestore(db_path);
   return Usage();
 }
