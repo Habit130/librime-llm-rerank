@@ -713,7 +713,7 @@ and the pre-build space estimate.
   never active-generation death (`no_ann_sidecar` pin, RISK-67-1).
 - **No healthy rollback** — the semantic path fails closed (pass-through)
   and a background rebuild from facts is queued; fact recording / IME commit
-  keep working (SCN-67-6).  The public `rebuild` CLI stays reserved (#68).
+  keep working (SCN-67-6).
 - **Dirty scheduling** — the delta machine counts new vectors + tombstones
   against the base active row count (soft-dirty at `max(2048, 5% of base
   rows)` compacted when idle; hard-dirty at 20,000 changes or 128 MiB
@@ -730,6 +730,69 @@ Evidence commands:
 ```sh
 # model-free fault injection (SCN-67-1..9)
 python3 -m unittest daemon.test_retention
+```
+
+## Explicit manual rebuild (Squirrel#68)
+
+`squirrel-semantic-memory rebuild` explicitly triggers a manual rebuild of
+the derived state (FP32 vectors, projection, delta and index) from facts,
+through the EXISTING staging machine — never a second builder.  The rebuild
+is a persistent #52 operation: it records an operation id AND a `build_id`
+(the content-addressed staging generation id), which are deliberately
+different; the same target already queued/building returns the same
+`build_id`, and the same operation id with the same normalized parameters is
+idempotent while different parameters are rejected (#52).
+
+```text
+squirrel-semantic-memory rebuild                      # auto
+squirrel-semantic-memory rebuild --full               # force full rebuild
+squirrel-semantic-memory rebuild --index-only         # ANN index only
+squirrel-semantic-memory rebuild --retry <build_id>   # continue a staging
+squirrel-semantic-memory rebuild --restart            # discard + rebuild
+squirrel-semantic-memory rebuild --wait               # observe only
+```
+
+- **auto** — the compatibility matrix chooses the minimum safe scope; a
+  healthy active that already matches the desired identity returns
+  `already_current` with no new generation (AC68-1).
+- **--full** — rebuilds FP32 / projection / delta / index from facts even
+  when the fingerprint is unchanged; only an explicit `--full` mints a new
+  generation for the same fingerprint (a fresh rebuild tag is bound into
+  the generation identity; AC68-2).
+- **--index-only** — allowed only when a healthy compatible FP32 + metadata
+  + projection exist AND a real ANN sidecar is present; otherwise an
+  EXPLICIT refusal (`no_ann_sidecar` / `index_only_*`), never a silent
+  upgrade to full (AC68-3, RISK-68-1).  In the exact-only envelope the
+  refusal is expected until #78/#79 land a real ANN backend; the allow
+  branch (only reachable with an injected real sidecar) re-verifies the
+  sidecar is a readable non-empty file before recording the outcome.
+- **--retry <build_id>** — continues an existing blocked/incomplete staging;
+  blocked builds never auto-retry (AC68-5).
+- **--restart** — discards the current staging, then rebuilds from scratch
+  (distinct from retry; AC68-5).
+- **--wait** — observes only; Ctrl-C detaches (exit 130) and the durable
+  build continues; cancellation is `operation cancel` and only before the
+  publish (AC68-6).
+
+Invariants (SCN-68-7/8/9): rebuild never modifies facts, `history_id`,
+`store_epoch` or the three schema switches; it never quiesces the plugin
+(no exclusive maintenance lease, no control socket); the current healthy
+generation keeps serving during the blue-green build; and one builder is
+preserved ACROSS processes — the rebuild executor takes a flock-based
+single-builder lease (`<derived_root>/.rebuild-builder.lock`) around every
+staging-machine cycle, so a concurrent rebuild (or a daemon staging worker
+wired to the same lock) serializes instead of running a second builder, and
+a crashed executor never wedges the lease (flock is kernel-released).  The
+supported envelope is throwaway derived roots (RISK-68-2); the CLI resolves
+the derived root from `SQUIRREL_SEMANTIC_MEMORY_DERIVED_ROOT` (else the
+conventional `derived` sibling of the facts store).
+
+Evidence commands:
+
+```sh
+# model-free: already_current, full mint, index-only refusal, build_id
+# identity, retry/restart, wait/cancel, no-quiesce, single builder
+python3 -m unittest daemon.test_rebuild
 ```
 
 ## Frozen baseline policy identity
