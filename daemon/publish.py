@@ -81,6 +81,10 @@ from generation import (  # noqa: E402
     _fsync_directory,
     _write_atomic,
 )
+from retention import (  # noqa: E402
+    compose_rollback_manifest,
+    register_healthy_rollback,
+)
 
 ACTIVE_MANIFEST_FILENAME = "active_manifest.json"
 ACTIVE_MANIFEST_VERSION = "active-manifest-v1"
@@ -558,6 +562,38 @@ def _publish_locked(facts_root, derived_root, staging_machine, staging_dir,
         from generation import open_generation
         generation = None
         try:
+            # #67 rollback registration, BEFORE the manifest swap (crash-
+            # robust): the just-retired healthy active becomes the rollback
+            # pointer.  A crash after the manifest replace then still loads
+            # the complete new generation AND keeps the retired healthy
+            # active as the rollback (SCN-67-2).  A damaged retired active
+            # is never registered -- the retained rollback (if any) stays
+            # in force.  Registration must not start deleting anything
+            # mid-switch (seam 1); the retention sweep runs after the
+            # successful publish below.
+            retired_id = None
+            try:
+                snapshot = delta_machine.snapshot()
+                if snapshot is not None:
+                    retired_id = snapshot.base_generation_id
+            except Exception:  # noqa: BLE001 - best effort
+                retired_id = None
+            if retired_id and retired_id != generation_id:
+                try:
+                    retired = open_generation(
+                        os.path.join(published_root, retired_id))
+                    try:
+                        register_healthy_rollback(
+                            derived_root, retired,
+                            os.path.join("delta", retired_id, DELTA_FILENAME),
+                            fact_schema_version)
+                    finally:
+                        try:
+                            retired.close()
+                        except Exception:  # noqa: BLE001 - best effort
+                            pass
+                except Exception:  # noqa: BLE001 - never register a damaged
+                    pass  # retired active (SCN-67-2); keep the old pointer
             generation = open_generation(
                 os.path.join(published_root, generation_id))
             manifest = _compose_active_manifest(
@@ -608,6 +644,17 @@ def _publish_locked(facts_root, derived_root, staging_machine, staging_dir,
                 "error": "publish switch fault: %s" % error}
     if not ok:
         return {"ok": False, "committed": True, "error": error}
+    # #67 retention (seam 1): runs only after a SUCCESSFUL publish, never
+    # mid-switch.  The newly published generation is active; the rollback
+    # pointer (registered before the swap above, or a surviving older one)
+    # is the retained rollback; everything outside {active, rollback,
+    # current staging} is deleted.  The only rollback is never deleted
+    # (SCN-67-2/3).
+    try:
+        from retention import sweep_from_manifests
+        sweep_from_manifests(derived_root, active_id=generation_id)
+    except Exception:  # noqa: BLE001 - best effort; never fail a publish
+        pass
     return {"ok": True, "committed": True, "error": None}
 
 
@@ -654,6 +701,7 @@ class GenerationPublisher:
         self._switched_generation_id = None
         self._last_error = None
         self._last_result = None
+        self._publish_success_hooks = []
         self._condition = threading.Condition()
         self._wake_event = threading.Event()
         self._stop_event = threading.Event()
@@ -734,6 +782,8 @@ class GenerationPublisher:
                     self._last_error = result["error"]
             elif not result["ok"]:
                 self._last_error = result["error"]
+        if result["ok"]:
+            self.notify_publish_success()
 
     # ------------------------------------------------------------------
     # Builder seams (mirror the staging machine)
@@ -746,6 +796,27 @@ class GenerationPublisher:
     def start(self):
         self._stop_event.clear()
         self._wake_event.set()
+
+    def add_publish_success_hook(self, hook):
+        """#67: register a callback invoked after every fully successful
+        publish (the config seam uses it to clear the staging machine's
+        forced-build flags once the delta has been absorbed)."""
+        if not callable(hook):
+            raise PublishError("publish success hook must be callable")
+        with self._condition:
+            self._publish_success_hooks.append(hook)
+
+    def notify_publish_success(self):
+        """#67: fire the publish-success hooks (a fully successful publish
+        means the active changed to a fresh generation that absorbed the
+        delta -- any forced compaction / no-rollback rebuild is satisfied)."""
+        with self._condition:
+            hooks = tuple(self._publish_success_hooks)
+        for hook in hooks:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
 
     def wait_idle(self, timeout=30.0):
         return self._idle_event.wait(timeout)

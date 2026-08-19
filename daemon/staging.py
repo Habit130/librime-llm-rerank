@@ -132,7 +132,8 @@ class StagingBuildMachine:
                  start_worker=True, builder_lock=None, publish_lock=None,
                  active_identity=None, projection_version=PROJECTION_VERSION,
                  index_fingerprint=None, vector_format_version=VECTOR_FORMAT,
-                 refuse_reason=None):
+                 refuse_reason=None, force_rebuild=False,
+                 disk_budget_bytes=None):
         if not facts_root:
             raise StagingError("facts root missing")
         if not derived_root:
@@ -188,6 +189,21 @@ class StagingBuildMachine:
         # reports the refusal (never builds against an unknown active);
         # nothing-published still follows the existing first-build path.
         self._refuse_reason = refuse_reason
+        # #67: a forced build.  ``_compaction_requested`` is set by the
+        # delta machine's dirty scheduling (compact the active fingerprint
+        # even though desired == active -- the matrix noop gate is bypassed);
+        # ``_force_rebuild`` is set by the config seam when recovery found no
+        # healthy rollback (rebuild from facts regardless of desired ==
+        # active).  Both mean "build the current target even though the
+        # matrix says noop"; one builder at a time is preserved because this
+        # machine is the single staging builder (shared builder lock).
+        self._compaction_requested = bool(force_rebuild)
+        self._force_rebuild = bool(force_rebuild)
+        # #67: derived-disk budget for the pre-build space estimate (spec
+        # "构建前预估三份派生状态的峰值空间").  None = no limit (backwards
+        # compatible with #64/#65/#66); a short budget keeps the current
+        # active and reports the error, never deleting the only rollback.
+        self._disk_budget_bytes = disk_budget_bytes
         # #65: the publish transaction and every state-machine cycle that
         # touches the staging namespace serialize on this lock, so the
         # publisher's verify/rename of a ready container can never race a
@@ -342,10 +358,34 @@ class StagingBuildMachine:
             # change (rebuild_index; in this exact-only envelope that is a
             # planned no-op with reason ``no_ann_sidecar`` -- no model, no
             # projection rebuild, RISK-66-1 / SCN-66-7).  Either way: no
-            # build; any leftover record is obsolete.
-            self._mark_stale_records_discarded(facts_epoch, desired_repr)
-            self._sync_state(target, None)
-            return
+            # build; any leftover record is obsolete -- UNLESS #67 forces
+            # one: a compaction (dirty delta, same fingerprint) or a
+            # no-rollback background rebuild-from-facts must bypass the
+            # matrix noop gate, and a ``ready`` staging of the same
+            # fingerprint must survive a restart for the publisher.
+            forced = self._compaction_requested or self._force_rebuild
+            if not forced:
+                ready_pending = self._find_ready_pending(
+                    facts_epoch, desired_repr)
+                if ready_pending is None:
+                    self._mark_stale_records_discarded(facts_epoch,
+                                                       desired_repr)
+                    self._sync_state(target, None)
+                    return
+                staging_dir, progress = ready_pending
+                self._mark_stale_records_discarded(
+                    facts_epoch, desired_repr, keep_dir=staging_dir)
+                if (progress["generation_id"] == self._active_generation_id
+                        or os.path.isdir(self._published_dir(
+                            progress["generation_id"]))):
+                    self._discard(staging_dir, "target is already published",
+                                  own=True)
+                    self._clear_forced()
+                    self._sync_state(target, None)
+                    return
+                self._reverify_ready(staging_dir, progress)
+                self._sync_state(target, progress)
+                return
 
         found = self._find_own_record(facts_epoch, desired_repr)
         if found is None:
@@ -373,11 +413,13 @@ class StagingBuildMachine:
         if os.path.isdir(self._published_dir(progress["generation_id"])):
             self._discard(staging_dir, "target is already published",
                           own=True)
+            self._clear_forced()
             self._sync_state(target, None)
             return
         if progress["generation_id"] == self._active_generation_id:
             self._discard(staging_dir, "target matches the active "
                           "generation", own=True)
+            self._clear_forced()
             self._sync_state(target, None)
             return
 
@@ -439,6 +481,103 @@ class StagingBuildMachine:
                 continue
             return path, progress
         return None
+
+    def _find_ready_pending(self, facts_epoch, desired_representation_id):
+        """A ``ready`` staging of the same fingerprint as the desired target
+        (a pending compaction / forced publish), or None.
+
+        On a restart the machine's normal noop gate would otherwise discard
+        a ready compaction staging (desired == active means "no build"); this
+        finder keeps exactly one such record alive for the publisher, gated
+        by the same epoch / representation / builder-version identity the
+        live-record scan applies.  Never a directory scan for a generation --
+        it reads only this machine's own staging namespace (the delta
+        machine's transient one-shot staging carries the ACTIVE
+        representation and can therefore never be selected).
+        """
+        staging_root = os.path.join(self._derived_root, "staging")
+        try:
+            entries = os.listdir(staging_root)
+        except OSError:
+            return None
+        for entry in sorted(entries):
+            path = os.path.join(staging_root, entry)
+            if not os.path.isdir(path):
+                continue
+            progress = self._load_progress(path)
+            if progress is None or progress.get("status") != "ready":
+                continue
+            identity = progress.get("identity") or {}
+            if identity.get("store_epoch") != facts_epoch:
+                continue
+            if identity.get("representation_id") != desired_representation_id:
+                continue
+            if identity.get("builder_version") != BUILD_VERSION:
+                continue
+            # Same fingerprint: the layered identity (excluding the source
+            # HLC) must match the current desired target.
+            if not self._same_fingerprint(progress, facts_epoch):
+                continue
+            return path, progress
+        return None
+
+    def _same_fingerprint(self, progress, facts_epoch):
+        """Layered identity equality (epoch / fact schema / representation /
+        vector format / projection / index) between a staging record and the
+        current desired target, ignoring the source HLC (which legitimately
+        differs for a compaction of the same fingerprint)."""
+        identity = progress.get("identity") or {}
+        try:
+            desired = self._desired_identity(
+                facts_epoch, read_facts_schema_version(self._facts_root))
+        except Exception:  # noqa: BLE001 - a schema read fault is not a match
+            return False
+        for layer in (compat.LAYER_STORE_EPOCH, compat.LAYER_FACT_SCHEMA,
+                      compat.LAYER_REPRESENTATION, compat.LAYER_VECTOR_FORMAT,
+                      compat.LAYER_PROJECTION, compat.LAYER_INDEX):
+            if identity.get(layer) != desired.get(layer):
+                return False
+        return True
+
+    def _clear_forced(self):
+        """Clear the #67 forced-build flags (compaction done / rebuild
+        published)."""
+        with self._condition:
+            self._compaction_requested = False
+            self._force_rebuild = False
+
+    def request_compaction(self):
+        """#67: the delta machine's dirty scheduler asks this single builder
+        to compact the active fingerprint (SCN-67-1).
+
+        Sets a flag; the next cycle computes the current target and builds it
+        even though the matrix says noop (desired == active).  A subsequent
+        successful publish (``notify_publish_success``) or the published
+        gates clear the flag.  Idempotent: repeated dirty cycles do not
+        enqueue a second build (one builder at a time).
+        """
+        with self._condition:
+            if self._closed:
+                return
+            self._compaction_requested = True
+            self._condition.notify_all()
+            self._wake_event.set()
+
+    def force_rebuild_from_facts(self):
+        """#67: queue a background rebuild-from-facts (no healthy rollback;
+        AC67-6).  Idempotent like ``request_compaction``."""
+        with self._condition:
+            if self._closed:
+                return
+            self._force_rebuild = True
+            self._condition.notify_all()
+            self._wake_event.set()
+
+    def notify_publish_success(self):
+        """#67: the publisher reports a successful publish -- the active
+        changed to a fresh generation that absorbed the delta, so any forced
+        build (compaction / no-rollback rebuild) is satisfied."""
+        self._clear_forced()
 
     def _mark_stale_records_discarded(self, facts_epoch,
                                       desired_representation_id,
@@ -589,6 +728,25 @@ class StagingBuildMachine:
         on the next cycle via ``_resume_build`` (one state-machine step
         per cycle: no unbounded recursion on repeated failures).
         """
+        # #67 pre-build space estimate (spec "构建前预估三份派生状态的峰值
+        # 空间"): when the projected peak of active + rollback + staging +
+        # delta exceeds the budget, keep the current active and report the
+        # error -- never delete the only rollback to free space (SCN-67-3).
+        if self._disk_budget_bytes is not None:
+            try:
+                from retention import check_build_space
+                rows = target.get("rows") or []
+                dimension = (target.get("identity") or {}).get(
+                    "vector_dimension") or 0
+                projected = len(rows) * max(dimension, 0) * 4 + 4096
+                ok, reason = check_build_space(
+                    self._derived_root, self._disk_budget_bytes,
+                    projected_staging_bytes=projected)
+            except Exception as error:  # noqa: BLE001 - fail closed
+                ok, reason = False, "space estimate failed: %s" % error
+            if not ok:
+                self._set_last_error(reason)
+                return
         try:
             if os.path.isdir(staging_dir) and not os.path.islink(
                     staging_dir):
@@ -1232,7 +1390,9 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
                                       projection_version=PROJECTION_VERSION,
                                       index_fingerprint=None,
                                       vector_format_version=VECTOR_FORMAT,
-                                      refuse_reason=None):
+                                      refuse_reason=None,
+                                      force_rebuild=False,
+                                      disk_budget_bytes=None):
     """Construct the staging machine from the evidence config dict.
 
     The config distinguishes desired from active (spec "配置区分 desired 与
@@ -1328,6 +1488,23 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
     provider = _build_desired_provider(
         config, desired_representation_id,
         seed=config.get("desired_seed"))
+    # #67 pre-build space budget (spec #43 disk gate: active + rollback +
+    # staging + delta <= 3 GiB).  The default applies when the config does
+    # not declare a budget; a short budget keeps the current active and
+    # reports the error, never deleting the only rollback (SCN-67-3).
+    from retention import DEFAULT_DERIVED_DISK_BUDGET_BYTES
+    budget = config.get("derived_disk_budget_bytes",
+                        DEFAULT_DERIVED_DISK_BUDGET_BYTES)
+    try:
+        budget = int(budget)
+    except (TypeError, ValueError) as error:
+        raise EvidenceError("evidence_unavailable",
+                            "malformed derived_disk_budget_bytes: %s"
+                            % error)
+    if budget < 0:
+        raise EvidenceError("evidence_unavailable",
+                            "derived_disk_budget_bytes must be "
+                            "non-negative")
     return StagingBuildMachine(
         facts_root, derived_root, provider, active_representation_id_value,
         generation_id, poll_interval=poll, builder_lock=builder_lock,
@@ -1335,7 +1512,8 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
         projection_version=desired_projection_version,
         index_fingerprint=desired_index_fingerprint,
         vector_format_version=desired_vector_format,
-        refuse_reason=refuse_reason)
+        refuse_reason=refuse_reason, force_rebuild=force_rebuild,
+        disk_budget_bytes=budget)
 
 
 def _build_desired_provider(config, desired_representation_id, seed=None):

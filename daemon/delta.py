@@ -101,6 +101,17 @@ UNIT_NORM_TOLERANCE = 1e-3
 DEFAULT_CATCH_UP_DEADLINE_S = 5.0
 DEFAULT_POLL_INTERVAL_S = 0.5
 
+# -- Dirty-scheduling thresholds (spec "压代、保留与回退") -------------------
+# Same fingerprint: delta 的新增向量数加 tombstone 数达到
+# max(2048, base active 行数的 5%) 时进入 soft-dirty (daemon 空闲时后台压代);
+# 达到 20,000 条变更或 128MiB 时进入 hard-dirty (即使持续有输入也以低优先级
+# 启动压代).  One builder at a time -- the compaction trigger hands the
+# request to the staging machine, which serializes on the shared builder lock.
+SOFT_DIRTY_MIN_CHANGES = 2048
+SOFT_DIRTY_RATIO = 0.05
+HARD_DIRTY_CHANGES = 20000
+HARD_DIRTY_BYTES = 128 * 1024 * 1024
+
 _META_KEYS = (
     "delta_schema_version",
     "base_generation_id",
@@ -835,7 +846,12 @@ class DeltaStateMachine:
                  catch_up_deadline=DEFAULT_CATCH_UP_DEADLINE_S,
                  poll_interval=DEFAULT_POLL_INTERVAL_S,
                  now=time.monotonic, sleep=time.sleep, start_worker=True,
-                 builder_lock=None, refuse_reason=None):
+                 builder_lock=None, refuse_reason=None,
+                 soft_dirty_min_changes=SOFT_DIRTY_MIN_CHANGES,
+                 soft_dirty_ratio=SOFT_DIRTY_RATIO,
+                 hard_dirty_changes=HARD_DIRTY_CHANGES,
+                 hard_dirty_bytes=HARD_DIRTY_BYTES,
+                 disk_budget_bytes=None):
         if not facts_root:
             raise DeltaError("facts root missing")
         if not derived_root:
@@ -859,6 +875,26 @@ class DeltaStateMachine:
         self._now = now
         self._sleep = sleep
         self._builder_lock = builder_lock
+        self._soft_dirty_min_changes = soft_dirty_min_changes
+        self._soft_dirty_ratio = soft_dirty_ratio
+        self._hard_dirty_changes = hard_dirty_changes
+        self._hard_dirty_bytes = hard_dirty_bytes
+        # #67: derived-disk budget for the pre-build space estimate (spec
+        # "构建前预估三份派生状态的峰值空间").  None = no limit (backwards
+        # compatible with #63/#65/#66); the config seam wires the 3 GiB
+        # spec gate by default.  A short budget keeps the current active and
+        # reports the error, never deleting the only rollback (SCN-67-3).
+        self._disk_budget_bytes = disk_budget_bytes
+        # #67: the compaction trigger (normally the staging machine's
+        # ``request_compaction``), wired by the config seam after both
+        # machines exist.  None keeps the machine fully self-contained (the
+        # #63/#65 behavior); dirty state is then only observable.
+        self._compaction_trigger = None
+        # #67: set by ``_recover_via_rollback`` when no healthy rollback
+        # exists -- the semantic path must fail closed and a background
+        # rebuild from facts must be queued (AC67-6).  The config seam reads
+        # it to force the staging machine's build.
+        self._force_rebuild_requested = False
         # #66 refuse-load: a present-but-invalid / unknown active manifest
         # refuses the load of derived state (SCN-66-10); the machine never
         # falls back to the config-declared active.  Requests fail closed
@@ -904,24 +940,31 @@ class DeltaStateMachine:
         # -- load (or build) the base generation -------------------------
         if self._refuse_reason is not None:
             # #66: refuse to load derived state per an unknown/broken active
-            # manifest.  No generation is loaded or built, no snapshot is
-            # published; every request fails closed with the refusal and the
-            # worker parks (a publish of a fresh, valid generation clears
-            # the refusal via publish_switch).
-            if start_worker:
-                self._worker = threading.Thread(
-                    target=self._run, name="delta-catch-up", daemon=True)
-                self._worker.start()
-            return
-        try:
-            generation = self._load_or_build_generation()
-        except DeltaBlocked as error:
-            # A deterministic build block at startup degrades to the blocked
-            # state (requests fail with representation_fault until retry())
-            # instead of taking the daemon down; the block re-derives on
-            # restart the same way.
-            self._blocked = error
-            generation = None
+            # manifest.  #67: still try the explicit rollback pointer first --
+            # a corrupt active manifest (discovered here or injected by the
+            # server's resolver) is recoverable when a healthy rollback
+            # exists.  Only when no healthy rollback exists does the machine
+            # park in the refused state (fail-closed passthrough + background
+            # rebuild), and a publish of a fresh, valid generation clears it.
+            generation = self._recover_via_rollback(
+                refuse_reason=self._refuse_reason,
+                damage=self._refuse_reason, isolate=False)
+            if generation is None:
+                if start_worker:
+                    self._worker = threading.Thread(
+                        target=self._run, name="delta-catch-up", daemon=True)
+                    self._worker.start()
+                return
+        else:
+            try:
+                generation = self._load_or_build_generation()
+            except DeltaBlocked as error:
+                # A deterministic build block at startup degrades to the
+                # blocked state (requests fail with representation_fault
+                # until retry()) instead of taking the daemon down; the
+                # block re-derives on restart the same way.
+                self._blocked = error
+                generation = None
         if generation is None:
             # Either a deterministic build block (above) or a #66
             # refuse-on-broken-published-identity (``_refuse_reason`` was set
@@ -1058,18 +1101,28 @@ class DeltaStateMachine:
         if refuse_reason is not None:
             # A present-but-invalid / unknown active manifest refuses the
             # load (SCN-66-10): never a config-active fallback, never a
-            # rebuild into the refused identity.
-            self._refuse_reason = refuse_reason
-            return None
+            # rebuild into the refused identity.  #67: try the explicit
+            # rollback pointer before giving up (SCN-67-5) -- a corrupt
+            # active manifest is recoverable when a healthy rollback exists.
+            # ``isolate=False``: the damage is the manifest itself, so no
+            # generation is provably bad -- the config-declared directory is
+            # left untouched (never a guess).
+            return self._recover_via_rollback(
+                refuse_reason=refuse_reason, damage=refuse_reason,
+                isolate=False)
         if not os.path.isdir(generation_dir):
             if published:
                 # A durable publish names a generation directory that is
-                # missing: a broken published identity -> refuse (AC66-8),
-                # never rebuild-and-serve into the refused identity.
-                self._refuse_reason = (
-                    "published generation %s is missing"
-                    % self._declared_generation_id)
-                return None
+                # missing: a broken published identity -> #67 rollback
+                # recovery (never rebuild-and-serve into the refused
+                # identity; AC66-8 keeps refusing only when no healthy
+                # rollback exists).
+                return self._recover_via_rollback(
+                    refuse_reason=(
+                        "published generation %s is missing"
+                        % self._declared_generation_id),
+                    damage="published generation %s is missing"
+                           % self._declared_generation_id)
             # Nothing published for the declared identity: rebuild from facts.
             return self._build_generation_now()
         try:
@@ -1077,11 +1130,12 @@ class DeltaStateMachine:
         except GenerationRejected as error:
             if published:
                 # A durable publish names a generation that fails reopen: a
-                # broken published identity -> refuse (never rebuild-and-serve
-                # into the refused identity).  The refusal is recorded on the
-                # machine and the caller parks the worker.
-                self._refuse_reason = error.reason
-                return None
+                # broken published identity -> #67 rollback recovery (isolate
+                # the damaged active, re-verify + catch up the rollback, then
+                # serve it; only when no healthy rollback exists does the load
+                # refuse and a background rebuild-from-facts get queued).
+                return self._recover_via_rollback(
+                    refuse_reason=error.reason, damage=error.reason)
             # No durable publish: the config-declared active is still
             # "nothing published yet" -> #63 rebuild-from-facts.
             return self._build_generation_now()
@@ -1104,6 +1158,163 @@ class DeltaStateMachine:
             except Exception:  # noqa: BLE001 - best effort
                 pass
         return self._build_generation_now()
+
+    def _recover_via_rollback(self, refuse_reason, damage, isolate=True):
+        """#67 rollback recovery for a damaged published active.
+
+        Called only for a *published* identity that cannot be served (corrupt
+        active manifest, missing generation directory, or a generation that
+        fails ``open_generation`` -- base / metadata / checksum damage).
+        Follows spec "损坏处理" exactly:
+
+        1. Isolate the damaged active generation (``isolated/`` under the
+           derived root) -- it must never be served and must never become a
+           rollback (SCN-67-2).  When the damage is the active manifest
+           itself (``isolate=False``) no generation is provably bad -- the
+           config-declared directory is left untouched (never a guess).
+        2. Read the EXPLICIT rollback pointer only (never scan
+           ``generations/`` -- SCN-67-7).
+        3. If a rollback exists and is healthy (``open_generation`` re-verifies
+           identity + checksums + probes) and its layered identity matches the
+           current facts epoch / runtime, catch its delta checkpoint up to the
+           current facts watermark (``publish._build_staging_delta``), durably
+           make it the active (write the active manifest), and return it for
+           serving.  A catch-up failure is NOT a semantic success: the load
+           refuses (AC67-5).
+        4. No healthy rollback -> refuse the load (semantic requests fail
+           closed / pass through) and record ``force_rebuild_requested`` so
+           the config seam queues a background rebuild from facts (AC67-6) --
+           fact recording / IME commit keep working (nothing here writes
+           facts).
+        """
+        from publish import (  # noqa: F401  (local import: publish imports delta)
+            _build_staging_delta, _compose_active_manifest, _read_fact_schema_version,
+            write_active_manifest,
+        )
+        from retention import (clear_rollback_manifest, isolate_generation,
+                               read_rollback_manifest, retention_sweep)
+        # 1. Isolate the damaged active generation (best effort; a directory
+        #    that no longer exists has nothing to isolate).
+        if isolate:
+            isolate_generation(self._derived_root, self._declared_generation_id,
+                               "active generation damaged: %s" % damage)
+        # 2. The explicit rollback pointer -- never a scan (SCN-67-7).
+        rollback, rollback_reason = read_rollback_manifest(self._derived_root)
+        if rollback is None:
+            # No healthy rollback: keep the ORIGINAL diagnosis as the
+            # fail-closed refusal (the #66 message contract is preserved --
+            # e.g. "active manifest unreadable: ..." / "checksum failure")
+            # and record that a background rebuild-from-facts must be queued
+            # (AC67-6; the config seam reads ``force_rebuild_requested``).
+            # A stale/unusable pointer is appended to the reason.
+            return self._refuse_recovery(
+                "%s%s" % (refuse_reason or damage,
+                          ("; unusable rollback pointer: %s" % rollback_reason)
+                          if rollback_reason else ""))
+        rollback_id = rollback["generation_id"]
+        if rollback_id == self._declared_generation_id:
+            # The pointer names the damaged generation itself: unusable.
+            return self._refuse_recovery(
+                "rollback pointer names the damaged active %s" % rollback_id,
+                clear_pointer=True)
+        try:
+            rollback_gen = open_generation(
+                self._generation_dir(rollback_id))
+        except GenerationRejected as error:
+            return self._refuse_recovery(
+                "rollback %s is damaged: %s" % (rollback_id, error.reason),
+                clear_pointer=True)
+        try:
+            facts_identity = read_facts_identity(self._facts_root)
+        except DeltaError as error:
+            try:
+                rollback_gen.close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+            raise DeltaError("fact store read failed: %s" % error)
+        if facts_identity is None:
+            return self._refuse_recovery("fact store is missing",
+                                         generation=rollback_gen)
+        facts_epoch, facts_max = facts_identity
+        # 3a. Re-verify identity + fingerprints + runtime support range
+        #     (AC67-5): the rollback must bind the current facts epoch and
+        #     the runtime's representation / dimension.
+        if rollback_gen.store_epoch != facts_epoch:
+            return self._refuse_recovery(
+                "rollback %s belongs to store epoch %r, facts are %r"
+                % (rollback_id, rollback_gen.store_epoch, facts_epoch),
+                generation=rollback_gen, clear_pointer=True)
+        if (rollback_gen.representation_id
+                != self._provider.representation_id()
+                or rollback_gen.vector_dimension
+                != self._provider.vector_dimension()):
+            return self._refuse_recovery(
+                "rollback %s identity does not match the runtime "
+                "(representation/dimension)" % rollback_id,
+                generation=rollback_gen)
+        # 3b. Catch the rollback's own delta checkpoint up to the current
+        #     facts watermark (AC67-5): only then may it serve.  A catch-up
+        #     failure (deterministic embed fault, epoch change) is NOT a
+        #     semantic success -- the load refuses.
+        progress = {
+            "generation_id": rollback_id,
+            "identity": {
+                "store_epoch": rollback_gen.store_epoch,
+                "source_hlc": list(rollback_gen.source_hlc),
+                "representation_id": rollback_gen.representation_id,
+                "vector_dimension": rollback_gen.vector_dimension,
+            },
+        }
+        try:
+            checkpoint_path = _build_staging_delta(
+                self._facts_root, self._derived_root, progress,
+                self._provider, facts_max)
+        except Exception as error:  # noqa: BLE001 - fail closed
+            return self._refuse_recovery(
+                "rollback catch-up failed: %s" % error,
+                generation=rollback_gen)
+        # 3c. Durable: the rollback becomes the active (the manifest is the
+        #     source of truth after recovery; a restart loads it directly).
+        try:
+            fact_schema_version = _read_fact_schema_version(self._facts_root)
+            if not fact_schema_version:
+                raise DeltaError("fact store schema version missing")
+            manifest = _compose_active_manifest(
+                rollback_gen, checkpoint_path, fact_schema_version)
+            write_active_manifest(self._derived_root, manifest)
+        except Exception as error:  # noqa: BLE001 - fail closed
+            return self._refuse_recovery(
+                "rollback activation failed: %s" % error,
+                generation=rollback_gen)
+        clear_rollback_manifest(self._derived_root)
+        from retention import live_staging_generation_ids
+        retention_sweep(self._derived_root, active_id=rollback_id,
+                        live_staging_ids=live_staging_generation_ids(
+                            self._derived_root))
+        # The machine now serves the recovered rollback as the active.
+        self._declared_generation_id = rollback_id
+        self._delta_path = os.path.join(
+            self._derived_root, DELTA_DIRNAME, rollback_id, DELTA_FILENAME)
+        self._refuse_reason = None
+        return rollback_gen
+
+    def _refuse_recovery(self, reason, generation=None, clear_pointer=False):
+        """#67 shared recovery-failure exit: park in the fail-closed refused
+        state and record that a background rebuild-from-facts must be queued
+        (AC67-6).  Closes the opened rollback generation (best effort) and
+        optionally clears an unusable rollback pointer.  Returns None so the
+        recovery path can ``return self._refuse_recovery(...)`` directly."""
+        if generation is not None:
+            try:
+                generation.close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+        if clear_pointer:
+            from retention import clear_rollback_manifest
+            clear_rollback_manifest(self._derived_root)
+        self._refuse_reason = reason
+        self._force_rebuild_requested = True
+        return None
 
     def _published_identity_state(self):
         """``(published, refuse_reason)`` for the declared generation id.
@@ -1137,6 +1348,35 @@ class DeltaStateMachine:
         # never run the model concurrently.
         lease = self._builder_lock or contextlib.nullcontext()
         with lease:
+            # #67 pre-build space estimate (spec "构建前预估三份派生状态的峰值
+            # 空间"): a short derived-disk budget keeps the current active and
+            # reports the error, never deleting the only rollback (SCN-67-3).
+            # A projected container is estimated from the active row count x
+            # dimension x 4 bytes; the estimate is best-effort (the build is
+            # the fail-closed authority for its own space needs).
+            # #67 pre-build space estimate (spec "构建前预估三份派生状态的峰值
+            # 空间"): a short derived-disk budget keeps the current active and
+            # reports the error, never deleting the only rollback (SCN-67-3).
+            # A projected container is estimated from the active row count x
+            # dimension x 4 bytes; the estimate is best-effort (the build is
+            # the fail-closed authority for its own space needs).  Without a
+            # budget (None) the estimate is skipped entirely.
+            if self._disk_budget_bytes is not None:
+                try:
+                    from generation import _read_snapshot
+                    from retention import check_build_space
+                    _store_epoch, _source_hlc, rows = _read_snapshot(
+                        self._facts_root)
+                    dimension = self._provider.vector_dimension()
+                    ok, reason = check_build_space(
+                        self._derived_root, self._disk_budget_bytes,
+                        projected_staging_bytes=len(rows) * dimension * 4
+                        + 4096)
+                except Exception as error:  # noqa: BLE001 - fail closed
+                    ok, reason = False, "space estimate failed: %s" % error
+                if not ok:
+                    raise DeltaError(
+                        "cannot rebuild the generation: %s" % reason)
             try:
                 return build_generation(self._facts_root, self._provider,
                                         self._derived_root)
@@ -1325,6 +1565,39 @@ class DeltaStateMachine:
                     or current.consumed != self._delta_consumed
                     or current.change_seq != self._delta_change_seq):
                 self._publish_snapshot_locked()
+        self._maybe_request_compaction(facts_identity)
+
+    def _maybe_request_compaction(self, facts_identity):
+        """#67 dirty scheduling: ask the single builder to compact.
+
+        - hard-dirty -> trigger even under input (low priority);
+        - soft-dirty -> trigger only when caught up (daemon idle).
+
+        The trigger is normally the staging machine's ``request_compaction``;
+        it is a no-op when none is wired.  The staging machine serializes
+        every build on the shared builder lock, so compaction never runs a
+        second builder (SCN-67-1).
+        """
+        with self._condition:
+            trigger = self._compaction_trigger
+            if trigger is None:
+                return
+            snapshot = self._snapshot
+            if snapshot is None:
+                return
+            consumed = snapshot.consumed
+        try:
+            state = self.dirty_state()
+        except Exception:  # noqa: BLE001 - scheduling is best effort
+            return
+        if state["hard_dirty"]:
+            trigger()
+            return
+        if not state["soft_dirty"]:
+            return
+        _facts_epoch, facts_max = facts_identity
+        if consumed >= facts_max:
+            trigger()
 
     def _perform_rebuild(self, pending):
         """Discard every piece of derived state and rebuild from facts.
@@ -1395,6 +1668,24 @@ class DeltaStateMachine:
             self._publish_snapshot_locked()
         if pending is not None and pending[1] is not None:
             pending[1](pending[0])
+        # #67: an epoch change discards ALL derived state -- the rollback
+        # pointer belongs to the old epoch (never reinterpreted) and every
+        # old-epoch generation is superseded; the retention sweep keeps only
+        # the freshly rebuilt active (SCN-67-8: facts untouched).  Runs
+        # after the completion callback so the coordinator handshake is not
+        # delayed by filesystem cleanup.  A live staging build is never
+        # deleted (the sweep is told the live staging ids).
+        try:
+            from retention import (clear_rollback_manifest,
+                                   live_staging_generation_ids,
+                                   retention_sweep)
+            clear_rollback_manifest(self._derived_root)
+            retention_sweep(self._derived_root,
+                            active_id=generation.generation_id,
+                            live_staging_ids=live_staging_generation_ids(
+                                self._derived_root))
+        except Exception:  # noqa: BLE001 - best effort cleanup
+            pass
 
     # ------------------------------------------------------------------
     # Publish switch (#65): the in-memory query-pointer swap
@@ -1848,6 +2139,80 @@ class DeltaStateMachine:
             return self._delta_path
 
     # ------------------------------------------------------------------
+    # Dirty scheduling and compaction (#67)
+    # ------------------------------------------------------------------
+
+    def set_compaction_trigger(self, trigger):
+        """Wire the compaction trigger (the staging machine's
+        ``request_compaction``).  The worker calls it when the delta crosses
+        the soft/hard-dirty thresholds so the single staging builder can
+        compact the active fingerprint (spec "一次只运行一个 builder")."""
+        if trigger is not None and not callable(trigger):
+            raise DeltaError("compaction trigger must be callable or None")
+        with self._condition:
+            self._compaction_trigger = trigger
+
+    def dirty_state(self):
+        """The dirty-scheduling state of the served delta (#67, AC67-1).
+
+        Counts new vectors + tombstones against the base active row count of
+        the current generation -- recomputed from the in-memory mirror and
+        the checkpoint size, never a directory scan of old generations
+        (seam 5):
+
+        - ``soft_dirty``: changes >= max(soft_dirty_min_changes,
+          soft_dirty_ratio * base_rows) -> compact when the daemon is idle.
+        - ``hard_dirty``: changes >= hard_dirty_changes OR the checkpoint
+          (incl. WAL sidecars) >= hard_dirty_bytes -> compact even under
+          input, at low priority.
+        """
+        with self._condition:
+            generation = self._generation
+            delta_events = len(self._delta_events)
+            retractions = len(self._retractions)
+            delta_path = self._delta_path
+        base_rows = generation.row_count if generation is not None else 0
+        changes = delta_events + retractions
+        soft = max(self._soft_dirty_min_changes,
+                   int(self._soft_dirty_ratio * base_rows))
+        delta_bytes = 0
+        if delta_path:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    delta_bytes += os.path.getsize(delta_path + suffix)
+                except OSError:
+                    pass
+        return {
+            "base_rows": base_rows,
+            "delta_changes": changes,
+            "soft_threshold": soft,
+            "soft_dirty": changes >= soft,
+            "hard_dirty": (changes >= self._hard_dirty_changes
+                           or delta_bytes >= self._hard_dirty_bytes),
+            "hard_changes_threshold": self._hard_dirty_changes,
+            "hard_bytes_threshold": self._hard_dirty_bytes,
+            "delta_bytes": delta_bytes,
+        }
+
+    def force_rebuild_requested(self):
+        """True when recovery found no healthy rollback (AC67-6).
+
+        The config seam reads this to force the staging machine's background
+        rebuild-from-facts; the semantic path fails closed meanwhile.
+        """
+        with self._condition:
+            return self._force_rebuild_requested
+
+    def refuse_reason(self):
+        """The current refuse-load reason, or None when the machine serves
+        (or is merely blocked).  The config seam uses this (not the
+        manifest-level resolution) to decide the staging machine's gate,
+        because the delta machine's rollback recovery may have cleared a
+        manifest-level refusal."""
+        with self._condition:
+            return self._refuse_reason
+
+    # ------------------------------------------------------------------
     # Coordinator seams (maintenance prepare / epoch recovery)
     # ------------------------------------------------------------------
 
@@ -2069,6 +2434,18 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
         poll = float(config.get("poll_interval_ms", 500)) / 1000.0
         if deadline <= 0 or poll <= 0:
             raise ValueError("deadlines must be positive")
+        # #67 pre-build space budget (spec #43 disk gate); the default
+        # applies when the config does not declare one.
+        from retention import DEFAULT_DERIVED_DISK_BUDGET_BYTES
+        budget = config.get("derived_disk_budget_bytes",
+                            DEFAULT_DERIVED_DISK_BUDGET_BYTES)
+        try:
+            budget = int(budget)
+        except (TypeError, ValueError) as error:
+            raise ValueError("malformed derived_disk_budget_bytes: %s"
+                             % error)
+        if budget < 0:
+            raise ValueError("derived_disk_budget_bytes must be non-negative")
     except (KeyError, TypeError, ValueError) as error:
         raise EvidenceError("evidence_unavailable",
                             "malformed delta config: %s" % error)
@@ -2077,7 +2454,8 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
     return DeltaStateMachine(facts_root, derived_root, provider,
                              generation_id, catch_up_deadline=deadline,
                              poll_interval=poll, builder_lock=builder_lock,
-                             refuse_reason=refuse_reason)
+                             refuse_reason=refuse_reason,
+                             disk_budget_bytes=budget)
 
 
 def _build_provider_from_config(config, representation_id=None):

@@ -62,7 +62,10 @@ HELPER_ENV = "SQUIRREL_FACT_STORE_HELPER"
 
 # Explicit, application-owned derived-state names. Cleanup (and the
 # already_clear check) deletes only these, nothing else under the root.
-DERIVED_DIR_NAMES = ("generations", "staging", "quarantine", CLEAR_DIRNAME)
+# ``isolated`` (#67) holds damaged active/rollback generations moved out of
+# serving; it is app-controlled derived state and is deleted by clear too.
+DERIVED_DIR_NAMES = ("generations", "staging", "quarantine", "isolated",
+                     CLEAR_DIRNAME)
 DERIVED_FILE_NAMES = (
     "active_manifest.json", "rollback_manifest.json", "derived_manifest.json",
 )
