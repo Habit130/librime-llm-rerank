@@ -4,8 +4,10 @@
 Per-event outcomes from ``walkforward.WalkForwardReplay`` are aggregated
 into the spec's metric families on their exact denominators:
 
-- **Complete-competition events** (``competition_complete``) are the only
-  events entering top-1 / MRR / mispromotion / event-count gates.
+- **Group-complete events** (saved competition size ``< 32``, the #76/#77
+  rewrite) are the only events entering top-1 / MRR / mispromotion /
+  safety / pollution / event-count gates.  The persisted
+  ``competition_complete`` bit is reported as a diagnostic only.
 - **Actionable events** (the scheme had non-zero evidence at replay time)
   are the main denominator for the scheme's ranking ability.
 - **Actionable union**: events actionable for *any* candidate scheme in a
@@ -38,7 +40,7 @@ class MetricsError(Exception):
 def _eligible(outcomes, complete_only=False, actionable_only=False):
     result = []
     for outcome in outcomes:
-        if complete_only and not outcome.competition_complete:
+        if complete_only and not outcome.group_complete:
             continue
         if actionable_only and not outcome.actionable:
             continue
@@ -107,7 +109,7 @@ def mispromotion_events(outcomes, complete_only=True):
     denominator = []
     numerator = []
     for o in outcomes:
-        if complete_only and not o.competition_complete:
+        if complete_only and not o.group_complete:
             continue
         if not o.actionable:
             continue
@@ -176,16 +178,22 @@ def majority_pollution_rate(outcomes, actionable_only=True):
 
 
 def coverage_report(outcomes):
-    """Coverage: complete-competition / replayable targets, overall+strata."""
+    """Coverage: group-complete / replayable targets, overall+strata.
+
+    Both count families are reported: the group-complete gate (size < 32,
+    the #76/#77 denominator) and the persisted competition_complete bit
+    (diagnostic only).
+    """
     total = len(outcomes)
-    complete = sum(1 for o in outcomes if o.competition_complete)
+    group_complete = sum(1 for o in outcomes if o.group_complete)
+    bit_complete = sum(1 for o in outcomes if o.competition_complete)
     strata = {}
     for o in outcomes:
         key = (o.confirmation_source,
                "1" if o.baseline_rank == 1 else ">1")
         entry = strata.setdefault(key, {"replayable": 0, "complete": 0})
         entry["replayable"] += 1
-        entry["complete"] += int(o.competition_complete)
+        entry["complete"] += int(o.group_complete)
     strata_report = {}
     for key, entry in strata.items():
         strata_report["%s/%s" % key] = {
@@ -196,8 +204,9 @@ def coverage_report(outcomes):
         }
     return {
         "replayable": total,
-        "complete": complete,
-        "coverage": complete / total if total else 0.0,
+        "group_complete": group_complete,
+        "competition_complete_bit": bit_complete,
+        "coverage": group_complete / total if total else 0.0,
         "strata": strata_report,
     }
 
@@ -206,7 +215,7 @@ def strata_of(outcomes, complete_only=False):
     """outcomes -> {(source, rank) : [outcomes]} cross-strata groups."""
     groups = defaultdict(list)
     for o in outcomes:
-        if complete_only and not o.competition_complete:
+        if complete_only and not o.group_complete:
             continue
         key = (o.confirmation_source,
                "1" if o.baseline_rank == 1 else ">1")
@@ -251,7 +260,7 @@ def stratified_metrics(outcomes, complete_only=True, actionable_only=True):
                 "frequency_band": band,
                 "count": len(band_outcomes),
                 "complete_count": sum(1 for o in band_outcomes
-                                      if o.competition_complete),
+                                      if o.group_complete),
                 "top1": top1(band_outcomes, complete_only=complete_only,
                              actionable_only=actionable_only),
                 "mrr": mrr(band_outcomes, complete_only=complete_only,

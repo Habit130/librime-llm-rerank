@@ -100,12 +100,12 @@ byte-for-byte summary regeneration. Must pass on the committed artifacts.
   `daemon/integration_cache_limit.py`, and an isolated daemon plus
   `daemon/integration_memory.py --socket <sock> --pid <pid>`.
 
-## Strict-HLC walk-forward evaluation (Habit130/squirrel#70)
+## Strict-HLC walk-forward evaluation (Habit130/squirrel#70/#77)
 
 `walkforward.py` + `metrics.py` / `bootstrap.py` / `calibration.py` /
-`grid.py` / `snapshot.py` / `report.py` implement the frozen-fact
-walk-forward quality and safety evaluation on top of the #59 exact oracle
-and the #60 hidden-state representations. The driver is
+`grid.py` / `shortlist.py` / `snapshot.py` / `report.py` implement the
+frozen-fact walk-forward quality and safety evaluation on top of the #59
+exact oracle and the #60 hidden-state representations. The driver is
 `run_walkforward.py`:
 
 ```sh
@@ -121,32 +121,56 @@ daemon/.venv/bin/python eval/run_walkforward.py \
   --model /Users/habit/Models/Qwen/Qwen3-0.6B-Base
 ```
 
-Engine contract (AC-70-v1; the decision record is embedded in every
-report):
+Engine contract (AC-70-v1 + AC-77-v1; the decision record is embedded in
+every report):
 
 - **Strict HLC walk-forward**: every target event replays with `as_of` =
   its commit HLC and the whole commit excluded — score first, then add to
   memory; only facts committed at-or-before and active at the point are
   visible; retractions apply as-of and never backfill (SCN-70-1).
-- **Incomplete competition** (`competition_complete=false`) provides
-  positive historical evidence only; it never enters top-1 / MRR /
-  mispromotion / event-count gates (SCN-70-2).
+- **Group-complete denominator (AC-77-v1 seam 3, #76/#77 rewrite)**: an
+  event enters the top-1 / MRR / mispromotion / safety / pollution /
+  event-count gates iff its saved same-group competition size is `< 32`
+  (`GROUP_COMPLETE_N`).  The persisted `competition_complete` bit is NOT
+  the gate — it is reported as a diagnostic only (a size-32 event with
+  bit=true is out; a size-10 event with bit=false is in).  Events that are
+  not group-complete still provide positive historical evidence
+  (SCN-70-2, rewritten).
 - **Actionable / actionable union / coverage / strata** are computed per
-  spec (SCN-70-3). The milestone counts are scheme-independent (reference
-  replay).
+  spec (SCN-70-3).  The #70 D7 selection-milestone gates are superseded
+  by the #76 start gate (group-complete replayable >= 1000, keys >= 100);
+  `explicit_indexed` / rank>1 / coverage / hard-neg / actionable are
+  report-only strata, never start gates, never claimed when thin.
 - **Bootstrap** is key-clustered with a fixed seed and >=10000 replicates,
   95% percentile CI, paired differences on the common actionable union
   (SCN-70-4).
-- **Pre-declared grid** (representations x H x K x gamma x k), τ per
-  representation only from the dev-prefix hard-negative protocol
-  (>=200 queries, Q95/Q97.5/Q99/Q99.5); below 200 the state is
-  `not_calibratable` and no τ is invented; Δ₁ single-event boundary
-  eliminates cells; finite-H gates compare each finite-H cell against its
-  H=inf twin (SCN-70-5). No continuous optimizer anywhere.
+- **Pre-declared grid** (representations x H x K x gamma x k), α frozen at
+  0 (AC-106-v2), τ per representation only from the dev-prefix
+  hard-negative protocol (>=200 queries, Q95/Q97.5/Q99/Q99.5); below 200
+  the state is `not_calibratable` and no τ is invented; Δ₁ single-event
+  boundary eliminates cells; finite-H gates compare each finite-H cell
+  against its H=inf twin (SCN-70-5).  No continuous optimizer anywhere.
+- **AC-77 hard gates** (spec #43, on the group-complete denominator):
+  overall safety (top-1 CI lower >= -0.5pp, MRR CI lower >= -0.005),
+  mispromotion (point <= 2%, CI upper <= 3%), majority pollution
+  (point <= 5%, CI upper <= 7.5%), finite-H vs H=inf (top-1 lower >= -1pp,
+  mispromotion/pollution upper <= +1pp), and the #69 fixed-benchmark
+  elimination (quoted F1: a representation that failed the fixed benchmark
+  cannot sit on the exact quality shortlist).
+- **Terminal outcome** (`shortlist.py`, AC-77-v1 seam 11): exactly one of
+  exact quality shortlist / 收窄声称 shortlist / 仅安全、涨幅未测准 /
+  无合格方案.  `+3pp` is a claim condition, not a ticket-fail: it may be
+  claimed only when the actionable group-complete sample (>= 1000) and the
+  correction / explicit_indexed strata (>= 200) are sufficient; thin
+  strata are reported, never claimed.  No ANN / production winner is
+  picked here (#80).  When 无合格方案, live `γ` stays 0 and the report
+  lists the next rerun milestones (可作用组完整 1500/2000/3000/5000,
+  then +2500).
 - **Report** is desensitized: code/model summaries, fingerprints, snapshot
-  SHA-256, HLC range, inclusion/exclusion counts, coverage, strata,
-  milestone state and the #69 fixed-benchmark gate state (quoted, not
-  re-adjudicated); never raw preceding/candidate text (SCN-70-6).
+  SHA-256, HLC range, inclusion/exclusion counts (including the
+  group-complete size<32 count and the persisted bit count), coverage,
+  strata, terminal outcome and the #69 fixed-benchmark gate state (quoted,
+  not re-adjudicated); never raw preceding/candidate text (SCN-70-6).
 
 Base-score reconstruction: the facts persist only the recorded competition
 order and the confirmation position of the final selection, so the scheme

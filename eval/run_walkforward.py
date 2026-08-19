@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Walk-forward evaluation driver (Habit130/squirrel#70).
+"""Walk-forward evaluation driver (Habit130/squirrel#70/#77).
 
 Usage:
 
@@ -18,12 +18,15 @@ Modes:
 - real mode (default): loads the Qwen3-0.6B-Base model via the daemon's
   #60 extractor, takes a frozen snapshot with the Online Backup API (live
   recorder undisturbed, SCN-70-7), replays all four first-round
-  representations over the pre-declared grid, and writes the desensitized
-  diagnostic report (JSON + Markdown) into ``--work-dir``.
+  representations over the pre-declared grid at α=0 (AC-106-v2), applies
+  the AC-77-v1 hard gates on the group-complete denominator, and writes
+  the desensitized diagnostic report (JSON + Markdown) into ``--work-dir``.
 
 The report never contains raw preceding text, candidate text or traces:
 only ids, hashes, numbers and counts.  Nothing here writes the live store,
-restarts the daemon, or touches ``~/Library/Rime``.
+restarts the daemon, or touches ``~/Library/Rime``.  The terminal outcome
+is one of: exact quality shortlist / 收窄声称 shortlist / 仅安全、涨幅未测准 /
+无合格方案 (AC-77-v1 seam 11).  Live ``γ`` stays 0.
 """
 
 import argparse
@@ -42,7 +45,8 @@ from walkforward import (  # noqa: E402
     WalkForwardReplay)
 from snapshot import take_snapshot  # noqa: E402
 from report import build_report, render_markdown  # noqa: E402
-from grid import run_representation  # noqa: E402
+from grid import data_counts, run_representation, start_gate_passed  # noqa: E402
+from shortlist import assemble_shortlist  # noqa: E402
 
 
 # #69 fixed-benchmark gate state, quoted from the #69 acceptance record
@@ -71,7 +75,7 @@ BENCHMARK_69_REFERENCE = {
                 "quotes the state and does not re-adjudicate it",
 }
 
-# Engine decision record (delivery contract AC-70-v1).
+# Engine decision record (delivery contracts AC-70-v1 / AC-77-v1).
 DECISION_RECORD = [
     "D1 walk-forward order: targets replay in strict HLC total order; each "
     "query's as_of is the event's commit HLC and the whole commit is "
@@ -112,18 +116,36 @@ DECISION_RECORD = [
     "'not_calibratable' and no τ is invented.",
     "D6 no continuous optimizer: the scan is a flat pre-declared product "
     "grid (representations x H x K x gamma x k, τ per representation). "
+    "α is frozen at 0 (AC-106-v2); grid cells do not vary α. "
     "Finite-H gates compare paired differences on the common actionable "
     "union with key-clustered bootstrap (fixed seed, >=10000 replicates, "
     "95% CI).",
-    "D7 selection milestones: at the current sample size the report is a "
-    "diagnostic only ('诊断报告,不选方案'); the earliest selection needs "
-    ">=1000 actionable complete-competition events, >=100 keys, >=200 "
-    "explicit_indexed and >=200 confirmation-rank >1 events.",
+    "D7 (superseded by AC-77-v1): the #70 selection-milestone gates "
+    "(1000 actionable-complete / 100 keys / 200 explicit_indexed / 200 "
+    "rank>1) are no longer a start gate.  The #76 start gate is "
+    "group-complete replayable >= 1000 and >= 100 choice-problem keys; the "
+    "milestone counts are claim/stratum rules only.",
     "D8 snapshot: SQLite Online Backup API copy (SCN-70-7); live status "
     "watermark captured before and after, gap state must be 'none' and the "
     "high-water monotonic; the copy is integrity-checked and SHA-256 "
     "fingerprinted; the live store, daemon, ~/Library/Rime and the librime "
     "build tree are untouched.",
+    "D9 group-complete gate (AC-77-v1 seam 3): an event enters the top-1 / "
+    "MRR / mispromotion / safety / pollution / event-count gates iff its "
+    "saved same-group competition size < N (N=32).  The persisted "
+    "competition_complete bit is NOT the gate — it is reported as a "
+    "diagnostic only.  A size-32 event with bit=true is out; a size-10 "
+    "event with bit=false is in.",
+    "D10 terminal outcome (AC-77-v1 seam 11): exactly one of "
+    "exact quality shortlist / 收窄声称 shortlist / 仅安全、涨幅未测准 / "
+    "无合格方案 is emitted by shortlist.py.  No ANN, no production winner, "
+    "no live γ enable; #43 「唯一方案选择」 is deferred to #80.",
+    "D11 #69 fixed-benchmark elimination (quoted F1): all four first-round "
+    "representations fail both 95% gates at the benchmark parameters "
+    "(tau=0.90, K=8).  A representation that failed the fixed benchmark "
+    "cannot enter the exact quality shortlist; its walk-forward still runs "
+    "and is reported as a diagnostic.  This report quotes the state and "
+    "does not re-adjudicate it.",
 ]
 
 
@@ -164,13 +186,34 @@ def main():
     parser.add_argument("--replicates", type=int, default=10000)
     parser.add_argument("--max-cells", type=int, default=None,
                         help="limit grid cells (driver smoke only)")
+    parser.add_argument("--snapshot", default=None,
+                        help="reuse an existing frozen snapshot (path); "
+                             "defaults to taking a fresh one")
     args = parser.parse_args()
 
     os.makedirs(args.work_dir, exist_ok=True)
 
     # -- frozen snapshot (SCN-70-7) -----------------------------------------
-    snapshot = take_snapshot(args.live_db, args.work_dir,
-                             status_cli=args.status_cli)
+    if args.snapshot:
+        if not os.path.isfile(args.snapshot):
+            sys.exit("error: snapshot not found: %s" % args.snapshot)
+        from snapshot import sha256_file
+        import sqlite3
+        conn = sqlite3.connect(args.snapshot)
+        try:
+            identity = dict(conn.execute("SELECT key, value FROM meta"))
+        finally:
+            conn.close()
+        snapshot = {
+            "path": os.path.abspath(args.snapshot),
+            "sha256": sha256_file(args.snapshot),
+            "identity": identity,
+            "status": {"status_check": "skipped"},
+        }
+    else:
+        snapshot = take_snapshot(args.live_db, args.work_dir,
+                                 status_cli=args.status_cli)
+    print("snapshot sha256: %s" % snapshot["sha256"])
 
     # -- representation providers -------------------------------------------
     if args.fixture:
@@ -211,9 +254,38 @@ def main():
     finally:
         facts.close()
 
-    # -- milestone (overall diagnostic state) --------------------------------
-    milestone = grid_results[0]["milestone"] if grid_results else {
-        "state": "diagnostic", "reason": "no representations"}
+    # -- data state + terminal decision (AC-77-v1) ---------------------------
+    data = grid_results[0]["data"] if grid_results else {}
+    start_ok = start_gate_passed(data)
+    # The #69 fixed-benchmark record (quoted F1) uses the short names
+    # (exact_l14 / exact_l21 / exact_l28 / split_l28); the engine's
+    # representation ids carry the "_last" pooling suffix
+    # (exact_l14_last / ... / split_l28_last).  All four first-round
+    # representations fail the fixed benchmark (quoted F1, not
+    # re-adjudicated): positive 24/22/48/46% (need >=95%), hard-negative
+    # no-evidence 39/42/30/30% (need >=95%).  Map the short names onto the
+    # scanned ids so the elimination is exact; any representation not in
+    # the #69 record is NOT marked failed.
+    benchmark_69_short = set(BENCHMARK_69_REFERENCE["real_model_measurements"])
+    benchmark_fail = set()
+    for grid_result in grid_results:
+        name = grid_result["representation"]
+        if name in benchmark_69_short or name.rsplit("_", 1)[0] in \
+                benchmark_69_short:
+            benchmark_fail.add(name)
+    decision = assemble_shortlist(grid_results, data, benchmark_fail)
+    if not start_ok:
+        # The #76 start gate did not pass on this snapshot: the milestone
+        # run cannot form a shortlist.  Emit 无合格方案 with the rerun
+        # milestones (live γ stays 0).
+        decision["outcome"] = "无合格方案"
+        decision["start_gate_passed"] = False
+        decision["start_gate_reason"] = (
+            "group-complete replayable %d (need >=1000) and/or keys %d "
+            "(need >=100)" % (data.get("group_complete", 0),
+                              data.get("keys", 0)))
+    else:
+        decision["start_gate_passed"] = True
 
     # -- report ---------------------------------------------------------------
     tau_status = {r["representation"]: r["tau"] for r in grid_results}
@@ -221,9 +293,24 @@ def main():
     if model_identity is not None:
         from report import model_summary
         extra["model"] = model_summary(model_identity)
+    # Pre-declared grid manifest (AC-77 seam 5): the frozen candidate space
+    # written before metrics — no extra cells, no continuous optimizer.
+    from grid import (GAMMAS, HALF_LIVES, K_EVIDENCE, SATURATION_KS,
+                      predeclared_cells)
+    extra["grid_manifest"] = {
+        "declared_before_metrics": True,
+        "alpha": 0.0,  # AC-106-v2: frozen offline baseline; no α grid
+        "half_lives": [("inf" if h == float("inf") else h)
+                       for h in HALF_LIVES],
+        "k_evidence": list(K_EVIDENCE),
+        "gamma": list(GAMMAS),
+        "saturation_k": list(SATURATION_KS),
+        "tau_quantiles": ["Q95", "Q97.5", "Q99", "Q99.5"],
+        "cells_per_representation": len(predeclared_cells("x")),
+    }
     report = build_report(
         ENGINE_VERSION, snapshot, replay_summary, tau_status, grid_results,
-        milestone, BENCHMARK_69_REFERENCE, DECISION_RECORD,
+        decision, BENCHMARK_69_REFERENCE, DECISION_RECORD,
         seed=args.seed, extra=extra)
     report_path = os.path.join(args.work_dir, "diagnostic-report.json")
     markdown_path = os.path.join(args.work_dir, "diagnostic-report.md")
@@ -234,7 +321,11 @@ def main():
         handle.write(render_markdown(report))
     print("report written: %s" % report_path)
     print("report sha256: %s" % report["report_sha256"])
-    print("milestone: %s (%s)" % (milestone["state"], milestone["reason"]))
+    print("terminal outcome: %s" % decision["outcome"])
+    print("group-complete: %d / keys: %d / actionable gc: %d"
+          % (data.get("group_complete", 0), data.get("keys", 0),
+             data.get("actionable_group_complete", 0)))
+    print("tau state: %s" % {k: v["state"] for k, v in tau_status.items()})
     return 0
 
 

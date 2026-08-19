@@ -14,9 +14,14 @@ selection event in strict HLC total order under the exact oracle (#59):
 - Target labels always exclude retracted events; retracted events remain
   visible as history to queries before their retraction HLC.
 - ``explicit_current`` and ``explicit_indexed`` are both primary targets.
-- ``competition_complete=false`` events still provide positive historical
-  evidence, but never enter the top-1 / MRR / mispromotion / event-count
-  gates.
+- **Group-complete** (Habit130/squirrel#76/#77 rewrite, AC-77-v1 seam 3):
+  an event enters the top-1 / MRR / mispromotion / safety / pollution /
+  event-count gates iff its saved same-group competition size is ``< N``
+  (``N = 32``).  The persisted ``competition_complete`` bit is NOT that
+  gate: it is reported as a diagnostic only (a window may be marked
+  complete yet hold a full size-32 group, and an unmarked window may still
+  be a complete size-10 group).  Events that are not group-complete still
+  provide positive historical evidence.
 - Actionability, the cross-scheme actionable union, complete-competition
   coverage and the confirmation-source x confirmation-rank strata are all
   computed here; metric aggregation and bootstrap live in ``metrics.py`` /
@@ -73,7 +78,7 @@ except ImportError:  # pragma: no cover - numpy is required for the grid
 from oracle import (OracleError, OracleParams, match_text)
 
 # Engine constants (pre-declared, versioned).
-ENGINE_VERSION = "hlc-walkforward-eval-v1"
+ENGINE_VERSION = "hlc-walkforward-eval-v2"
 DEV_PREFIX_RATIO = 0.7   # tau calibration uses the earliest 70% of targets
 MIN_HARD_NEGATIVE_QUERIES = 200
 TAU_QUANTILES = (0.95, 0.975, 0.99, 0.995)
@@ -81,6 +86,9 @@ BOOTSTRAP_REPLICATES = 10000
 BOOTSTRAP_SEED = 20260817
 CI_LEVEL = 0.95
 DELTA_ONE_CAP = 0.5
+# Group-complete gate (spec #43 / #76 / #77): saved same-group competition
+# size < GROUP_COMPLETE_N.  NOT the persisted competition_complete bit.
+GROUP_COMPLETE_N = 32
 
 
 class EngineError(Exception):
@@ -113,6 +121,18 @@ class SelectionEvent:
     @property
     def key(self):
         return (self.schema_id, self.category, self.canonical_segment_input)
+
+    @property
+    def group_complete(self):
+        """Group-complete = saved same-group competition size < N (N=32).
+
+        The #76/#77 rank-gate denominator.  The persisted
+        ``competition_complete`` bit is a separate, diagnostic-only flag:
+        it is not the group-complete gate (a full size-32 window may be
+        marked complete; an unmarked window may still hold a complete
+        size-10 group).
+        """
+        return len(self.competition) < GROUP_COMPLETE_N
 
 
 class FrozenFacts:
@@ -429,6 +449,7 @@ class EventOutcome:
     key: Tuple[str, str, str]
     confirmation_source: str
     competition_complete: bool
+    group_complete: bool
     baseline_rank: int
     scheme_rank: Optional[int]
     actionable: bool
@@ -548,6 +569,7 @@ class WalkForwardReplay:
                 key=target.key,
                 confirmation_source=target.confirmation_source,
                 competition_complete=target.competition_complete,
+                group_complete=target.group_complete,
                 baseline_rank=baseline_rank,
                 scheme_rank=scheme_rank,
                 actionable=actionable,
@@ -707,9 +729,10 @@ class WalkForwardReplay:
 
     def _summarize(self, outcomes, gamma):
         replayable = len(outcomes)
-        complete = [o for o in outcomes if o.competition_complete]
+        group_complete = [o for o in outcomes if o.group_complete]
+        bit_complete = [o for o in outcomes if o.competition_complete]
         actionable = [o for o in outcomes if o.actionable]
-        coverage = (len(complete) / replayable) if replayable else 0.0
+        coverage = (len(group_complete) / replayable) if replayable else 0.0
         strata = {}
         for o in outcomes:
             if not o.actionable:
@@ -735,7 +758,9 @@ class WalkForwardReplay:
         return {
             "replayable_targets": replayable,
             "unrepresentable_targets": len(self.unrepresentable_targets()),
-            "complete_competition": len(complete),
+            "group_complete": len(group_complete),
+            "competition_complete_bit": len(bit_complete),
+            "group_complete_n": GROUP_COMPLETE_N,
             "actionable": len(actionable),
             "coverage": coverage,
             "strata": strata,
