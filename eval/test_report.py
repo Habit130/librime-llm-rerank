@@ -42,11 +42,18 @@ def _base_report():
     return build_report(
         ENGINE_VERSION,
         DummySnapshot(),
-        {"replayable_targets": 10, "complete_competition": 2,
-         "actionable": 3, "coverage": 0.2, "gamma": 0.0},
+        {"replayable_targets": 10, "group_complete": 2,
+         "competition_complete_bit": 1, "actionable": 3, "coverage": 0.2,
+         "gamma": 0.0},
         {"repr": {"state": "not_calibratable", "queries": 5}},
         [{"representation": "repr", "tau": {"state": "not_calibratable"}}],
-        {"state": "diagnostic", "reason": "diagnostic"},
+        {"outcome": "无合格方案", "lift_claimable": False,
+         "lift_reason": "thin", "data": {"group_complete": 10,
+                                          "keys": 5},
+         "per_representation": [], "total_eligible_cells": 0,
+         "any_evaluated": False, "rerun_milestones": [1500, 2000, 3000,
+                                                       5000],
+         "live_gamma": 0.0},
         {"benchmark": "quoted #69 gate state"},
         ["D1 test decision", "D2 test decision"],
         seed=42)
@@ -72,7 +79,9 @@ class ReportTest(unittest.TestCase):
         self.assertIn("seed", report)
         self.assertEqual(report["seed"], 42)
         self.assertIn("decisions", report)
-        self.assertEqual(report["contract"], "AC-70-v1")
+        self.assertEqual(report["contract"], "AC-77-v1")
+        self.assertIn("decision", report)
+        self.assertEqual(report["decision"]["outcome"], "无合格方案")
 
     def test_report_digest_is_deterministic(self):
         first = _base_report()["report_sha256"]
@@ -83,13 +92,14 @@ class ReportTest(unittest.TestCase):
         markdown = render_markdown(_base_report())
         self.assertIn("# Walk-Forward Evaluation Report", markdown)
         self.assertIn("Snapshot SHA-256", markdown)
-        self.assertIn("Milestone", markdown)
+        self.assertIn("Terminal outcome", markdown)
         self.assertIn("#69", markdown)
         self.assertIn("Decision record", markdown)
+        self.assertIn("Decision", markdown)
 
     def test_milestone_diagnostic_stated(self):
         markdown = render_markdown(_base_report())
-        self.assertIn("diagnostic", markdown)
+        self.assertIn("无合格方案", markdown)
         self.assertIn("not_run", markdown)
 
 

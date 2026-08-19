@@ -298,32 +298,92 @@ class WalkForwardCausalityTest(unittest.TestCase):
             facts.close()
 
     def test_incomplete_competition_positive_evidence_only(self):
-        """competition_complete=false: positive historical evidence yes,
-        top-1/MRR/mispromotion gates no (SCN-70-2)."""
+        """Not-group-complete (saved competition size >= 32): positive
+        historical evidence yes, top-1/MRR/mispromotion gates no
+        (AC-77-v1 seam 3; the persisted competition_complete bit is NOT the
+        gate)."""
         facts = SyntheticFacts()
         try:
-            facts.add_event("e1", "wo", "ctx1", "我", ("我", "握"), (100, 0),
-                            competition_complete=False)
-            facts.add_event("e2", "wo", "ctx2", "握", ("我", "握"), (200, 0),
-                            competition_complete=False)
+            # 34 candidates: size >= 32 -> NOT group-complete.
+            big = tuple("c%d" % i for i in range(34))
+            facts.add_event("e1", "wo", "ctx1", "c0", big, (100, 0),
+                            competition_complete=True)
+            facts.add_event("e2", "wo", "ctx2", "c1", big, (200, 0),
+                            competition_complete=True)
             replay, (outcomes, _) = replay_for(facts, {
                 "ctx1": (1.0, 0.0, 0.0, 0.0),
                 "ctx2": (0.9, 0.436, 0.0, 0.0),
             }, {
-                ("luna_pinyin", "wo", "我"): (1.0, 0.0, 0.0, 0.0),
-                ("luna_pinyin", "wo", "握"): (0.0, 1.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "c0"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "c1"): (0.0, 1.0, 0.0, 0.0),
             })
             by_id = {o.event_id: o for o in outcomes}
-            # e1 (incomplete) provides positive evidence to e2.
+            # e1 (size 34, even with bit=true) provides positive evidence
+            # to e2 (kept), but neither event is group-complete.
             self.assertIn("e1", by_id["e2"].kept_ids)
-            # e2 itself is actionable but incomplete -> not in rank gates:
-            # scheme_rank is still computed for diagnosis, but the gate
-            # eligibility lives in metrics (complete_only), pinned below.
+            self.assertFalse(by_id["e1"].group_complete)
+            self.assertFalse(by_id["e2"].group_complete)
             from metrics import (mispromotion_events, top1)
-            eligible = [o for o in outcomes if o.competition_complete]
+            eligible = [o for o in outcomes if o.group_complete]
             self.assertEqual(eligible, [])
             self.assertIsNone(top1(outcomes, complete_only=True))
             self.assertEqual(mispromotion_events(outcomes), ([], []))
+        finally:
+            facts.close()
+
+    def test_group_complete_uses_size_not_bit(self):
+        """AC-77-v1 seam 3 pin: the rank-gate denominator is the saved
+        same-group competition size < 32, NOT the persisted
+        competition_complete bit.
+
+        An event with bit=true and size=32 is OUT; an event with
+        bit=false and size=10 is IN.
+        """
+        facts = SyntheticFacts()
+        try:
+            size32 = tuple("c%d" % i for i in range(32))
+            size10 = tuple("d%d" % i for i in range(10))
+            # e1: bit=true, size=32 -> out of gates (historical positive
+            # evidence only).
+            facts.add_event("e1", "wo", "ctx1", "c0", size32, (100, 0),
+                            competition_complete=True)
+            # e2: bit=false, size=10 -> in the gates.
+            facts.add_event("e2", "wo", "ctx2", "d0", size10, (200, 0),
+                            competition_complete=False)
+            # e3: also size=10, bit=false -> in, and e2 is its same-key
+            # history (positive evidence).
+            facts.add_event("e3", "wo", "ctx3", "d1", size10, (300, 0),
+                            competition_complete=False)
+            replay, (outcomes, summary) = replay_for(facts, {
+                "ctx1": (1.0, 0.0, 0.0, 0.0),
+                "ctx2": (1.0, 0.0, 0.0, 0.0),
+                "ctx3": (1.0, 0.0, 0.0, 0.0),
+            }, {
+                ("luna_pinyin", "wo", "c0"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "d0"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "d1"): (0.0, 1.0, 0.0, 0.0),
+            })
+            by_id = {o.event_id: o for o in outcomes}
+            # bit=true + size=32 -> not group-complete.
+            self.assertTrue(by_id["e1"].competition_complete)
+            self.assertFalse(by_id["e1"].group_complete)
+            # bit=false + size=10 -> group-complete.
+            self.assertFalse(by_id["e2"].competition_complete)
+            self.assertTrue(by_id["e2"].group_complete)
+            self.assertTrue(by_id["e3"].group_complete)
+            # e1 (size 32) still provides positive evidence to e2 (same
+            # key, c0 vs d0 mismatch -> kept but no candidate match).
+            self.assertIn("e1", by_id["e2"].kept_ids)
+            # Summary: group-complete counts the size-based set, and the
+            # bit count is reported separately (diagnostic).
+            self.assertEqual(summary["group_complete"], 2)
+            self.assertEqual(summary["competition_complete_bit"], 1)
+            # Rank gates use group-complete only: e2, e3 are in.
+            from metrics import top1
+            self.assertIsNotNone(top1(outcomes, complete_only=True))
+            self.assertEqual(
+                [o.event_id for o in outcomes if o.group_complete],
+                ["e2", "e3"])
         finally:
             facts.close()
 
@@ -349,8 +409,12 @@ class WalkForwardCausalityTest(unittest.TestCase):
                 ("luna_pinyin", "de", "得"): (0.0, 1.0, 0.0, 0.0),
             })
             self.assertEqual(summary["replayable_targets"], 12)
-            self.assertEqual(summary["complete_competition"], 2)
-            self.assertAlmostEqual(summary["coverage"], 2 / 12)
+            # group-complete is size-based: all these events have 2
+            # candidates, so all 12 are group-complete (bit values differ
+            # but do not gate).
+            self.assertEqual(summary["group_complete"], 12)
+            self.assertEqual(summary["competition_complete_bit"], 2)
+            self.assertAlmostEqual(summary["coverage"], 1.0)
             # actionable: all events with prior same-key history.
             actionable = {o.event_id for o in outcomes if o.actionable}
             self.assertIn("a1", actionable)

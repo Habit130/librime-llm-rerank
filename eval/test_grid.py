@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for the pre-declared grid, Δ₁ gate and milestones (SCN-70-5).
+"""Tests for the pre-declared grid, Δ₁ gate, data state and hard gates
+(SCN-70-5 / AC-77-v1).
 
 Pins: the frozen candidate space (representations x H x K x gamma x k), the
 Δ₁ single-event safety boundary with the unavailable-margin handling, the
-replicate/seed floor, elimination of Δ₁-violating cells, and the diagnostic
-milestone ("诊断报告,不选方案") at small sample sizes.
+replicate/seed floor, elimination of Δ₁-violating cells, the #76 start gate
+(group-complete >= 1000, keys >= 100 — #70 D7 superseded), and the AC-77
+hard gates (safety / mispromotion / majority pollution on the
+group-complete denominator).
 """
 
 import os
@@ -20,9 +23,9 @@ for path in (_DAEMON, _ROOT):
 from walkforward import DELTA_ONE_CAP, delta_one  # noqa: E402
 
 from grid import (GAMMAS, HALF_LIVES, K_EVIDENCE,  # noqa: E402
-                  MILESTONE_DIAGNOSTIC, MILESTONE_SELECT, SATURATION_KS,
-                  delta_one_ok, finite_h_gate, milestone_state,
-                  predeclared_cells, run_representation)
+                  SATURATION_KS, data_counts, delta_one_ok, finite_h_gate,
+                  predeclared_cells, run_representation, start_gate_passed)
+from shortlist import assemble_shortlist  # noqa: E402
 
 
 class GridDeltaOneMilestoneTest(unittest.TestCase):
@@ -63,37 +66,47 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
         self.assertFalse(delta_one_ok(4.0, 3, margin_base=0.75))
         # Δ₁=1.0 > min(0.5, 0.75)=0.5
 
-    def test_milestone_diagnostic_below_selection(self):
-        state, reason = milestone_state(999, 100, 200, 200)
-        self.assertEqual(state, "diagnostic")
-        self.assertIn("诊断报告,不选方案", reason)
-
-    def test_milestone_requires_all_four(self):
-        self.assertEqual(milestone_state(
-            MILESTONE_SELECT, 99, 200, 200)[0], "diagnostic")
-        self.assertEqual(milestone_state(
-            MILESTONE_SELECT, 100, 199, 200)[0], "diagnostic")
-        self.assertEqual(milestone_state(
-            MILESTONE_SELECT, 100, 200, 199)[0], "diagnostic")
-        self.assertEqual(milestone_state(
-            MILESTONE_SELECT, 99, 200, 199)[0], "diagnostic")
-
-    def test_milestone_selectable_only_when_all_met(self):
-        state, _ = milestone_state(MILESTONE_SELECT, 200, 300, 250)
-        self.assertEqual(state, "selectable")
-
-    def test_diagnostic_threshold_constant(self):
-        self.assertEqual(
-            MILESTONE_DIAGNOSTIC, 250, "250 milestone per spec #43")
+    def test_start_gate_and_data_counts(self):
+        """The #76 start gate (AC-77 seam 10): group-complete replayable >=
+        1000 and >= 100 keys.  #70 D7 strata are report-only."""
+        counts = data_counts([])
+        self.assertEqual(counts["replayable"], 0)
+        self.assertEqual(counts["group_complete"], 0)
+        self.assertFalse(start_gate_passed(counts))
+        ok_counts = {
+            "replayable": 1500, "group_complete": 1200, "keys": 150,
+            "explicit_indexed": 50, "rank_gt1": 60,
+            "actionable_group_complete": 900, "actionable_keys": 80,
+            "coverage": 0.8,
+        }
+        self.assertTrue(start_gate_passed(ok_counts))
+        # Even with thin strata the start gate passes (strata are
+        # report-only, never start gates).
+        self.assertTrue(start_gate_passed({
+            "replayable": 1500, "group_complete": 1200, "keys": 150,
+            "explicit_indexed": 5, "rank_gt1": 3,
+            "actionable_group_complete": 50, "actionable_keys": 10,
+            "coverage": 0.8}))
+        # Below the group-complete or key floor the gate fails.
+        self.assertFalse(start_gate_passed({
+            "replayable": 1500, "group_complete": 999, "keys": 150,
+            "explicit_indexed": 5, "rank_gt1": 3,
+            "actionable_group_complete": 50, "actionable_keys": 10,
+            "coverage": 0.8}))
+        self.assertFalse(start_gate_passed({
+            "replayable": 1500, "group_complete": 1200, "keys": 99,
+            "explicit_indexed": 5, "rank_gt1": 3,
+            "actionable_group_complete": 50, "actionable_keys": 10,
+            "coverage": 0.8}))
 
     def test_delta_one_cap_constant(self):
         self.assertEqual(DELTA_ONE_CAP, 0.5)
 
     def test_not_calibratable_reports_delta_one_eliminations(self):
         """When τ is not calibratable, every pre-declared cell is reported
-        as eliminated (Δ₁ boundary first, then τ-dependence) and the
-        milestone still carries the reference-replay counts — no invented
-        τ, no silent skip."""
+        as eliminated (Δ₁ boundary first, then τ-dependence) and the data
+        state still carries the reference-replay counts — no invented τ, no
+        silent skip."""
         from calibration import calibrate_tau
         from fixture_facts import SyntheticFacts, fixture_provider
         from walkforward import FrozenFacts, VectorTable, WalkForwardReplay
@@ -130,8 +143,15 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
                 eliminated = {c["eliminated"] for c in result["cells"]}
                 self.assertIn("delta_one", eliminated)
                 self.assertIn("tau_not_calibratable", eliminated)
-                self.assertEqual(result["milestone"]["state"],
-                                 "diagnostic")
+                self.assertIn("data", result)
+                self.assertEqual(result["data"]["group_complete"], 30)
+                self.assertEqual(result["data"]["keys"], 3)
+                # The start gate needs >=1000 / >=100.
+                self.assertFalse(start_gate_passed(result["data"]))
+                decision = assemble_shortlist(
+                    [result], result["data"],
+                    benchmark_fail_reprs=set())
+                self.assertEqual(decision["outcome"], "无合格方案")
             finally:
                 frozen.close()
         finally:
@@ -148,7 +168,8 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
                 event_id=event_id, hlc=(1000, 0),
                 key=("s", "word", "k"),
                 confirmation_source="explicit_current",
-                competition_complete=True, baseline_rank=1,
+                competition_complete=True, group_complete=True,
+                baseline_rank=1,
                 scheme_rank=1, actionable=True, total_mass=1.0,
                 candidate_count=2, selection_index=0,
                 kept_ids=("h1",), kept_weights=(1.0,),
@@ -175,7 +196,8 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
                 event_id=event_id, hlc=(1000, 0),
                 key=("s", "word", "k%d" % (i % 2)),
                 confirmation_source="explicit_current",
-                competition_complete=True, baseline_rank=1,
+                competition_complete=True, group_complete=True,
+                baseline_rank=1,
                 scheme_rank=scheme_rank, actionable=True, total_mass=1.0,
                 candidate_count=2, selection_index=0,
                 kept_ids=("h1",), kept_weights=(1.0,),
@@ -188,7 +210,8 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
         finite_outcomes[0] = EventOutcome(
             event_id="e0", hlc=(1000, 0), key=("s", "word", "k0"),
             confirmation_source="explicit_current",
-            competition_complete=True, baseline_rank=1, scheme_rank=1,
+            competition_complete=True, group_complete=True,
+            baseline_rank=1, scheme_rank=1,
             actionable=True, total_mass=1.0, candidate_count=2,
             selection_index=0, kept_ids=("h1",), kept_weights=(1.0,),
             kept_matches=(0,))
@@ -220,7 +243,8 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
                     event_id=event_id, hlc=(1000 + i, 0),
                     key=("s", "word", "k%d" % (i % 4)),
                     confirmation_source="explicit_current",
-                    competition_complete=True, baseline_rank=1,
+                    competition_complete=True, group_complete=True,
+                    baseline_rank=1,
                     scheme_rank=1, actionable=True, total_mass=2.0,
                     candidate_count=3, selection_index=0,
                     kept_ids=("h1", "h2"), kept_weights=(1.0, 1.0),
@@ -291,9 +315,10 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
             facts.close()
 
     def test_stratum_gate_applies_at_200_events(self):
-        """A stratum with >=200 actionable complete-competition events is
+        """A stratum with >=200 actionable group-complete events is
         gated (top-1 non-inferiority + mispromotion <=2%/<=3% CI); below
-        200 it is reported as not applicable."""
+        200 it is reported as not applicable (AC-77 claim rules: thin
+        strata are reported, never claimed)."""
         from grid import _stratum_gates
         from walkforward import EventOutcome
 
@@ -303,6 +328,7 @@ class GridDeltaOneMilestoneTest(unittest.TestCase):
                 key=("s", "word", "k%d" % (i % 10)),
                 confirmation_source=source,
                 competition_complete=True,
+                group_complete=True,
                 baseline_rank=rank,
                 scheme_rank=scheme_rank,
                 actionable=True, total_mass=1.0, candidate_count=2,

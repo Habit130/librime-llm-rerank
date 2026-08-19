@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-declared grid scan with safety gates (Habit130/squirrel#70).
+"""Pre-declared grid scan with safety gates (Habit130/squirrel#70/#77).
 
 Candidate space (spec #43, frozen verbatim):
 
@@ -12,10 +12,16 @@ Candidate space (spec #43, frozen verbatim):
   prefix, ≥200 hard-negative queries, Q95/Q97.5/Q99/Q99.5); a
   representation without a calibratable τ is reported as such and its
   τ-dependent cells are skipped — no invented τ.
+- α is frozen at 0 (AC-106-v2).  Grid cells do not vary α.
 - No continuous optimizer is used anywhere: the scan is a flat pre-declared
   product grid.
 
-Gates applied per configuration (spec #43):
+Rank / safety denominator (AC-77-v1 seam 3): an event enters the top-1 /
+MRR / mispromotion / safety / pollution / event-count gates iff it is
+**group-complete** (saved same-group competition size < N, N=32).  The
+persisted ``competition_complete`` bit is a diagnostic only.
+
+Gates applied per configuration (spec #43, AC-77-v1 seams 7-10):
 
 1. **Δ₁ single-event safety boundary**: Δ₁ = γ/(1+k) must satisfy
    Δ₁ <= min(0.5, P10(margin_base)).  On real snapshots margin_base is
@@ -26,13 +32,24 @@ Gates applied per configuration (spec #43):
 2. **Finite-H gates**: each finite H vs H=inf must simultaneously satisfy
    top-1 paired-difference 95% CI lower bound >= -1pp, mispromotion-rate
    difference CI upper bound <= +1pp and majority-pollution-rate difference
-   CI upper bound <= +1pp, all on the common actionable union.  When no
-   finite H passes, γ=0 stays (nothing is shipped).
-3. **Milestones**: 250/500 actionable complete-competition events produce a
-   diagnostic report only; the earliest scheme selection additionally needs
-   >=1000 such events, >=100 choice-problem keys, >=200 explicit_indexed
-   and >=200 confirmation-rank >1 events.  Below the thresholds the report
-   states "诊断报告,不选方案" and no scheme is chosen.
+   CI upper bound <= +1pp, all on the common actionable group-complete
+   union.  When no finite H passes, H=inf alone cannot be a production
+   stand-in (it is reported, never shortlisted on its own).
+3. **Overall safety** on all group-complete targets: top-1 paired CI lower
+   bound >= -0.5pp and MRR paired CI lower bound >= -0.005.
+4. **Mispromotion**: denominator = actionable group-complete events where
+   the shadow baseline already ranked the selection first; point <= 2% and
+   95% CI upper <= 3%.
+5. **Majority pollution**: point <= 5% and 95% CI upper <= 7.5%.
+6. **#69 fixed-benchmark elimination** (quoted F1, not re-adjudicated):
+   a representation that failed the fixed benchmark cannot enter the exact
+   quality shortlist.  Its walk-forward still runs and is reported.
+
+The #70 D7 selection-milestone gates are **superseded** (AC-77-v1): the
+start gate is #76's group-complete replayable >= 1000 and keys >= 100, and
+the milestone gates (1000 actionable-complete / 200 explicit_indexed / 200
+rank>1) are claim/stratum rules, not start gates.  `+3pp` is a claim
+condition, not a ticket-fail.
 
 No raw text is produced: results carry representation ids, parameter
 values, numbers and event counts.
@@ -40,13 +57,13 @@ values, numbers and event counts.
 
 import math
 
-from bootstrap import paired_difference
+from bootstrap import bootstrap_rate, paired_difference
 from calibration import MIN_HARD_NEGATIVE_QUERIES, calibrate_tau
 from metrics import (majority_pollution_rate, mispromotion_events,
                      mispromotion_rate, pollution_distribution,
                      pollution_mass, top1, mrr)
-from walkforward import (DELTA_ONE_CAP, OracleParams, delta_one,
-                         margin_base_unavailable)
+from walkforward import (DELTA_ONE_CAP, GROUP_COMPLETE_N, OracleParams,
+                         delta_one, margin_base_unavailable)
 
 
 class GridError(Exception):
@@ -59,13 +76,25 @@ K_EVIDENCE = (8, 16, 32, 64)
 GAMMAS = (0.5, 1.0, 2.0, 4.0)
 SATURATION_KS = (1, 3, 7)
 
-# Selection milestones (spec #43, verbatim).
-MILESTONE_DIAGNOSTIC = 250
-MILESTONE_500 = 500
-MILESTONE_SELECT = 1000
-MILESTONE_KEYS = 100
-MILESTONE_EXPLICIT_INDEXED = 200
-MILESTONE_RANK_GT1 = 200
+# AC-77 hard-gate constants (spec #43, frozen).
+# Finite-H vs H=inf paired gates on the common actionable union.
+FINITE_H_TOP1_LOWER = -0.01      # top-1 CI lower >= -1pp
+FINITE_H_MISPROMOTION_UPPER = 0.01   # mispromotion CI upper <= +1pp
+FINITE_H_POLLUTION_UPPER = 0.01      # majority-pollution CI upper <= +1pp
+# Overall safety on all group-complete targets.
+SAFETY_TOP1_LOWER = -0.005       # top-1 CI lower >= -0.5pp
+SAFETY_MRR_LOWER = -0.005        # MRR CI lower >= -0.005
+# Mispromotion hard gates.
+MISPROMOTION_POINT = 0.02        # point <= 2%
+MISPROMOTION_CI_UPPER = 0.03     # 95% CI upper <= 3%
+# Majority-pollution hard gates.
+POLLUTION_POINT = 0.05           # point <= 5%
+POLLUTION_CI_UPPER = 0.075       # 95% CI upper <= 7.5%
+# +3pp own-actionable lift claim condition.
+LIFT_PP = 0.03
+# Rerun milestones (可作用组完整) when no shortlist forms.
+RERUN_MILESTONES = (1500, 2000, 3000, 5000)
+RERUN_STEP = 2500
 
 
 def predeclared_cells(representation_id):
@@ -105,50 +134,58 @@ def delta_one_ok(gamma, saturation_k, margin_base=None):
     return d1 <= min(DELTA_ONE_CAP, margin_base)
 
 
-def milestone_counts(outcomes):
-    """(actionable_complete, keys, explicit_indexed, rank_gt1).
+def data_counts(outcomes):
+    """Data-state counts over the replayable outcomes (AC-77 seam 10).
 
-    The milestone counts are **scheme-independent**: they count the
-    replayable events that are complete-competition and actionable under
-    the scheme-agnostic actionable union (any evidence at all, i.e. any
-    same-key active history above threshold under a reference parameter
-    set), so the milestone reflects the data, not one cell's parameters.
+    Returns the group-complete counts and the report-only strata
+    (explicit_indexed / rank>1 / coverage / hard-negative pool) that are
+    never start gates and never claim layers when thin.
     """
-    keys = set()
-    explicit_indexed = 0
-    rank_gt1 = 0
-    actionable_complete = 0
-    for o in outcomes:
-        if not o.actionable or not o.competition_complete:
-            continue
-        actionable_complete += 1
-        keys.add(o.key)
-        if o.confirmation_source == "explicit_indexed":
-            explicit_indexed += 1
-        if o.baseline_rank != 1:
-            rank_gt1 += 1
-    return actionable_complete, len(keys), explicit_indexed, rank_gt1
+    group_complete = [o for o in outcomes if o.group_complete]
+    keys = set(o.key for o in group_complete)
+    explicit_indexed = sum(1 for o in group_complete
+                           if o.confirmation_source == "explicit_indexed")
+    rank_gt1 = sum(1 for o in group_complete
+                   if o.baseline_rank != 1)
+    actionable = [o for o in group_complete if o.actionable]
+    actionable_keys = set(o.key for o in actionable)
+    return {
+        "replayable": len(outcomes),
+        "group_complete": len(group_complete),
+        "keys": len(keys),
+        "explicit_indexed": explicit_indexed,
+        "rank_gt1": rank_gt1,
+        "actionable_group_complete": len(actionable),
+        "actionable_keys": len(actionable_keys),
+        "coverage": (len(group_complete) / len(outcomes)
+                     if outcomes else 0.0),
+    }
 
 
-def milestone_state(actionable_complete, key_count, explicit_indexed,
-                    rank_gt1):
-    """The spec's milestone state for the current sample size.
+def start_gate_passed(counts, min_group_complete=1000, min_keys=100):
+    """The #76 start gate (AC-77 seam 10, #70 D7 superseded).
 
-    Returns ("diagnostic", reason) — no scheme may be selected below the
-    selection milestone; 250/500 only upgrade the diagnostic depth.
+    Group-complete replayable events >= 1000 and >= 100 choice-problem
+    keys.  The strata (explicit_indexed / rank>1 / coverage / hard-neg /
+    actionable) are report-only and never block the milestone run.
     """
-    if actionable_complete >= MILESTONE_SELECT and \
-            key_count >= MILESTONE_KEYS and \
-            explicit_indexed >= MILESTONE_EXPLICIT_INDEXED and \
-            rank_gt1 >= MILESTONE_RANK_GT1:
-        return ("selectable", "all selection milestones met")
-    return ("diagnostic",
-            "诊断报告,不选方案: actionable complete=%d (need >=%d), "
-            "keys=%d (need >=%d), explicit_indexed=%d (need >=%d), "
-            "rank>1=%d (need >=%d)"
-            % (actionable_complete, MILESTONE_SELECT, key_count,
-               MILESTONE_KEYS, explicit_indexed, MILESTONE_EXPLICIT_INDEXED,
-               rank_gt1, MILESTONE_RANK_GT1))
+    return (counts["group_complete"] >= min_group_complete
+            and counts["keys"] >= min_keys)
+
+
+def rerun_milestones(actionable_group_complete):
+    """Next rerun milestones at 可作用组完整 counts (spec #43).
+
+    1500 / 2000 / 3000 / 5000, then every +2500.  Used when no legal
+    shortlist forms and live γ stays 0.
+    """
+    milestones = list(RERUN_MILESTONES)
+    if actionable_group_complete > RERUN_MILESTONES[-1]:
+        next_milestone = RERUN_MILESTONES[-1] + RERUN_STEP
+        while next_milestone <= actionable_group_complete:
+            next_milestone += RERUN_STEP
+        milestones.append(next_milestone)
+    return milestones
 
 
 def _cell_outcomes(replay, cell, gamma=None):
@@ -177,20 +214,21 @@ def _rate_fn(metric):
 
 
 def _stratum_gates(outcomes, seed, replicates=10000):
-    """Per-stratum quality gates (spec #43).
+    """Per-stratum quality gates (spec #43 / #77 claim rules).
 
     Any stratum (confirmation source x confirmation rank) reaching >=200
-    actionable complete-competition events must satisfy, on that stratum's
+    actionable **group-complete** events must satisfy, on that stratum's
     own events:
 
     - top-1 non-inferiority vs the shadow baseline: the key-clustered
       paired-difference 95% CI lower bound >= -1pp;
     - mispromotion: point estimate <= 2% and 95% CI upper bound <= 3%
-      (denominator = actionable complete events where the baseline ranked
-      the selection first).
+      (denominator = actionable group-complete events where the baseline
+      ranked the selection first).
 
     Strata below 200 events are reported with ``applicable: false`` and
-    no gate result.  Returns a list of per-stratum gate dicts.
+    no gate result — a thin stratum is reported, never claimed, and never
+    fails the whole run (AC-77 seam 10).
     """
     from metrics import strata_of
 
@@ -220,7 +258,6 @@ def _stratum_gates(outcomes, seed, replicates=10000):
         mp_den, mp_num = mispromotion_events(actionable_complete,
                                              complete_only=True)
         mp_point = (len(mp_num) / len(mp_den)) if mp_den else None
-
         # Mispromotion CI: bootstrap the rate on the denominator events.
         mp_ci = (None, None)
         if mp_den:
@@ -248,12 +285,16 @@ def run_cell(replay, cell, seed, replicates=10000):
     """Run one grid cell and its per-cell metrics + bootstrap CIs.
 
     Returns a dict with point estimates and the bootstrap CI (95%,
-    key-clustered, fixed seed, >=10000 replicates) for top-1 and
-    mispromotion on the cell's own actionable complete-competition events.
+    key-clustered, fixed seed, >=10000 replicates) for top-1, MRR,
+    mispromotion and majority pollution on the cell's own actionable
+    **group-complete** events (AC-77 seam 3; the persisted
+    ``competition_complete`` bit is diagnostic only).  The hard-gate
+    results (safety / mispromotion / pollution) are attached as
+    ``hard_gates`` so the shortlist assembler can apply them.
     """
     outcomes, summary = _cell_outcomes(replay, cell)
     actionable_complete = [o for o in outcomes
-                           if o.actionable and o.competition_complete]
+                           if o.actionable and o.group_complete]
     top1_point = top1(outcomes, complete_only=True, actionable_only=True)
     mrr_point = mrr(outcomes, complete_only=True, actionable_only=True)
     mp_den, mp_num = mispromotion_events(outcomes, complete_only=True)
@@ -269,8 +310,51 @@ def run_cell(replay, cell, seed, replicates=10000):
     def baseline_fn(o):
         return 1.0 if o.baseline_rank == 1 else 0.0
 
+    def mrr_fn(o):
+        if o.scheme_rank is None:
+            return None
+        return 1.0 / o.scheme_rank
+
+    def baseline_mrr_fn(o):
+        return 1.0 / o.baseline_rank
+
     top1_diff = paired_difference(actionable_complete, top1_fn, baseline_fn,
                                   replicates=replicates, seed=seed)
+    mrr_diff = paired_difference(actionable_complete, mrr_fn,
+                                 baseline_mrr_fn, replicates=replicates,
+                                 seed=seed)
+    # Overall safety on ALL group-complete targets (spec #43 总体安全).
+    all_complete = [o for o in outcomes if o.group_complete]
+    safety_top1 = paired_difference(all_complete, top1_fn, baseline_fn,
+                                    replicates=replicates, seed=seed)
+    safety_mrr = paired_difference(all_complete, mrr_fn, baseline_mrr_fn,
+                                   replicates=replicates, seed=seed)
+
+    # Mispromotion CI: bootstrap the rate on the denominator events.
+    mp_ci = (None, None)
+    if mp_den:
+        _, mp_ci = bootstrap_rate(
+            mp_den, lambda o: 0.0 if o.scheme_rank == 1 else 1.0,
+            replicates=replicates, seed=seed)
+
+    # Majority-pollution rate CI (spec #43 证据污染门槛).
+    poll_ci = (None, None)
+    if poll and poll["count"]:
+        _, poll_ci = bootstrap_rate(
+            actionable_complete,
+            lambda o: 1.0 if (pollution_mass(o) or 0.0) >= 0.5 else 0.0,
+            replicates=replicates, seed=seed)
+
+    safety_top1_ok = (safety_top1[1][0] is None
+                      or safety_top1[1][0] >= SAFETY_TOP1_LOWER)
+    safety_mrr_ok = (safety_mrr[1][0] is None
+                     or safety_mrr[1][0] >= SAFETY_MRR_LOWER)
+    mp_point_ok = mp_rate is None or mp_rate <= MISPROMOTION_POINT
+    mp_ci_ok = mp_ci[1] is None or mp_ci[1] <= MISPROMOTION_CI_UPPER
+    poll_point_ok = majority is None or majority <= POLLUTION_POINT
+    poll_ci_ok = poll_ci[1] is None or poll_ci[1] <= POLLUTION_CI_UPPER
+    hard_pass = (safety_top1_ok and safety_mrr_ok and mp_point_ok
+                 and mp_ci_ok and poll_point_ok and poll_ci_ok)
     return {
         "cell": cell,
         "outcomes": outcomes,  # internal: used by the finite-H gate only
@@ -283,15 +367,30 @@ def run_cell(replay, cell, seed, replicates=10000):
             "mispromotion_numerator": len(mp_num),
             "pollution": poll,
             "majority_pollution_rate": majority,
-            "actionable_complete": len(actionable_complete),
+            "actionable_group_complete": len(actionable_complete),
+            "group_complete": len(all_complete),
         },
         "ci": {
             "top1_vs_baseline": top1_diff,
+            "mrr_vs_baseline": mrr_diff,
+            "safety_top1_vs_baseline": safety_top1,
+            "safety_mrr_vs_baseline": safety_mrr,
+            "mispromotion": mp_ci,
+            "majority_pollution": poll_ci,
         },
         "stratum_gates": _stratum_gates(outcomes, seed, replicates),
         "delta_one": delta_one(cell["gamma"], cell["saturation_k"]),
         "delta_one_ok": delta_one_ok(cell["gamma"], cell["saturation_k"],
                                      margin_base=None),
+        "hard_gates": {
+            "pass": hard_pass,
+            "safety_top1_ok": safety_top1_ok,
+            "safety_mrr_ok": safety_mrr_ok,
+            "mispromotion_point_ok": mp_point_ok,
+            "mispromotion_ci_ok": mp_ci_ok,
+            "pollution_point_ok": poll_point_ok,
+            "pollution_ci_ok": poll_ci_ok,
+        },
     }
 
 
@@ -299,22 +398,35 @@ def run_representation(replay, name, seed, replicates=10000,
                        max_cells=None):
     """Run the whole grid for one representation (all τ candidates).
 
-    Returns the per-cell results, the τ calibration state and the milestone
-    state.  The replay is re-walked per cell — deterministic and pure, so
-    cells are independent and reproducible.  The milestone counts come from
-    a scheme-independent reference replay (τ = 0, K = 8, H = inf, k = 1,
-    γ = 0), which measures the data's actionable union without depending on
-    any candidate's parameters.  ``max_cells`` limits evaluated cells
-    (driver smoke / test use only; the report then carries a
-    ``partial_scan`` marker).
+    Returns the per-cell results, the τ calibration state and the data
+    state (group-complete counts / keys / strata).  The replay is re-walked
+    per cell — deterministic and pure, so cells are independent and
+    reproducible.  The data counts come from a scheme-independent reference
+    replay (τ = 0, K = 8, H = inf, k = 1, γ = 0), which measures the
+    data's group-complete / actionable union without depending on any
+    candidate's parameters.  ``max_cells`` limits evaluated cells (driver
+    smoke / test use only; the report then carries a ``partial_scan``
+    marker).
+
+    #70 D7 milestone gates are superseded (AC-77-v1): the start gate is
+    #76's group-complete replayable >= 1000 and keys >= 100; the strata
+    (explicit_indexed / rank>1 / actionable / hard-neg) are report-only.
+    The terminal shortlist decision is assembled by ``shortlist.py``.
     """
     status = calibrate_tau(replay)
     cells = []
+    reference_outcomes, _ = _cell_outcomes(replay, {
+        "tau": 0.0,
+        "k_evidence": K_EVIDENCE[0],
+        "half_life": HALF_LIVES[-1],
+        "saturation_k": SATURATION_KS[0],
+    }, gamma=0.0)
+    counts = data_counts(reference_outcomes)
     if status["state"] != "calibratable":
         # τ not calibratable: the τ-dependent evaluation cells cannot run
         # (no invented τ).  The Δ₁ single-event safety boundary is a pure
         # parameter function, so it is still reported over the whole
-        # pre-declared space; the milestone comes from the reference
+        # pre-declared space; the data state comes from the reference
         # replay so the diagnostic always carries the data-readiness state.
         for cell in predeclared_cells(name):
             cell = dict(cell, tau=None, tau_quantile=None)
@@ -322,31 +434,16 @@ def run_representation(replay, name, seed, replicates=10000,
                 cells.append({"cell": cell, "eliminated": "delta_one"})
             else:
                 cells.append({"cell": cell, "eliminated": "tau_not_calibratable"})
-        reference_outcomes, _ = _cell_outcomes(replay, {
-            "tau": 0.0,
-            "k_evidence": K_EVIDENCE[0],
-            "half_life": HALF_LIVES[-1],
-            "saturation_k": SATURATION_KS[0],
-        }, gamma=0.0)
-        counts = milestone_counts(reference_outcomes)
-        milestone_state_name, milestone_reason = milestone_state(*counts)
-        return {
+        result = {
             "representation": name,
             "tau": status,
             "cells": cells,
-            "milestone": {"state": milestone_state_name,
-                          "reason": "%s (τ not calibratable: %d hard-negative "
-                                    "queries < %d)"
-                                    % (milestone_reason, status["queries"],
-                                       MIN_HARD_NEGATIVE_QUERIES),
-                          "counts": {
-                              "actionable_complete": counts[0],
-                              "keys": counts[1],
-                              "explicit_indexed": counts[2],
-                              "rank_gt1": counts[3],
-                          }},
+            "data": counts,
             "selection": "not_run",
         }
+        if max_cells is not None:
+            result["partial_scan"] = True
+        return result
     for quantile, tau_value in sorted(
             status["quantiles"].items(),
             key=lambda item: float(item[0])):
@@ -376,7 +473,8 @@ def run_representation(replay, name, seed, replicates=10000,
     # result is attached to the finite-H cell as ``finite_h_gate`` and the
     # H=inf cell as ``finite_h_reference``; a failed gate means the finite-H
     # cell is not acceptable relative to H=inf (spec: no finite H passes ->
-    # keep γ=0, never ship H=inf either).
+    # H=inf alone cannot be a production stand-in; it is reported, never
+    # shortlisted on its own).
     finite_h = {}
     for cell_record in cells:
         if "eliminated" in cell_record:
@@ -411,25 +509,11 @@ def run_representation(replay, name, seed, replicates=10000,
                 "majority_pollution_diff": gate["majority_pollution_diff"],
             }
         inf_record["finite_h_reference"] = True
-    reference_outcomes, _ = _cell_outcomes(replay, {
-        "tau": 0.0,
-        "k_evidence": K_EVIDENCE[0],
-        "half_life": HALF_LIVES[-1],
-        "saturation_k": SATURATION_KS[0],
-    }, gamma=0.0)
-    counts = milestone_counts(reference_outcomes)
     result = {
         "representation": name,
         "tau": status,
         "cells": cells,
-        "milestone": {"state": milestone_state(*counts)[0],
-                      "reason": milestone_state(*counts)[1],
-                      "counts": {
-                          "actionable_complete": counts[0],
-                          "keys": counts[1],
-                          "explicit_indexed": counts[2],
-                          "rank_gt1": counts[3],
-                      }},
+        "data": counts,
         "selection": "not_run",
     }
     if max_cells is not None:
@@ -445,9 +529,9 @@ def finite_h_gate(inf_cell, finite_cell, seed, replicates=10000,
     top-1 lower bound >= -1pp, mispromotion upper bound <= +1pp,
     majority-pollution upper bound <= +1pp.  Both cells' outcomes must
     cover the same event set (the driver passes union outcomes aligned by
-    event id).  top-1 is only computed over complete-competition events;
-    mispromotion over the spec's denominator (actionable complete events
-    where the baseline ranked the selection first); pollution over
+    event id).  top-1 is only computed over group-complete events;
+    mispromotion over the spec's denominator (actionable group-complete
+    events where the baseline ranked the selection first); pollution over
     actionable events.
     """
     from collections import defaultdict
@@ -457,14 +541,14 @@ def finite_h_gate(inf_cell, finite_cell, seed, replicates=10000,
     union_ids = sorted(set(inf_by_id) & set(finite_by_id))
 
     def top1_fn(outcome):
-        if not outcome.competition_complete or not outcome.actionable:
+        if not outcome.group_complete or not outcome.actionable:
             return None
         if outcome.scheme_rank is None:
             return None  # non-reconstructable: excluded, never a miss
         return 1.0 if outcome.scheme_rank == 1 else 0.0
 
     def mispromotion_fn(outcome):
-        if not outcome.competition_complete or not outcome.actionable:
+        if not outcome.group_complete or not outcome.actionable:
             return None
         if outcome.baseline_rank != 1:
             return None

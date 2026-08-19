@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Desensitized diagnostic report for the #70 walk-forward evaluation.
+"""Desensitized diagnostic report for the #70/#77 walk-forward evaluation.
 
-Spec #43 "可复验报告与隐私": every milestone and final acceptance run
-produces a versioned local report package containing:
+Spec #43 "可复验报告与隐私" and AC-77-v1: every milestone and final
+acceptance run produces a versioned local report package containing:
 
 - code commit(s) (plugin + squirrel),
 - model and tokenizer summaries and all representation fingerprints,
 - the fact-snapshot SHA-256, history_id, store_epoch and the HLC range,
 - the random seed and hardware/dependency versions,
-- sample inclusion/exclusion counts,
+- sample inclusion/exclusion counts (including the group-complete size<32
+  count and the persisted competition_complete bit count),
 - complete-competition coverage,
 - all stratified metrics and confidence intervals,
-- milestone state (diagnostic vs selectable),
+- the terminal outcome (exact quality shortlist / 收窄声称 shortlist /
+  仅安全、涨幅未测准 / 无合格方案),
 - the reference to the #69 fixed-benchmark gate state (quoted, not
   re-adjudicated),
 - and the evaluation-program decision record.
@@ -58,13 +60,14 @@ def model_summary(identity):
 
 
 def build_report(engine_version, snapshot, replay_summary, tau_status,
-                 grid_results, milestone, benchmark69, decisions,
+                 grid_results, decision, benchmark69, decisions,
                  seed, extra=None):
     """Assemble the desensitized report dict.
 
     ``snapshot`` is the ``take_snapshot`` record; ``grid_results`` the
-    ``run_representation`` records; ``benchmark69`` a summary of the #69
-    gate state (quoted from the #69 record, not re-adjudicated).
+    ``run_representation`` records; ``decision`` the ``assemble_shortlist``
+    terminal decision; ``benchmark69`` a summary of the #69 gate state
+    (quoted from the #69 record, not re-adjudicated).
     """
     if not snapshot or not snapshot.get("sha256"):
         raise ReportError("snapshot record is required")
@@ -79,11 +82,11 @@ def build_report(engine_version, snapshot, replay_summary, tau_status,
     for grid_result in grid_results or []:
         representation_ids.append(grid_result.get("representation"))
     report = {
-        "contract": "AC-70-v1",
+        "contract": "AC-77-v1",
         "engine": {
             "version": engine_version,
             "program": "eval/walkforward.py + metrics/bootstrap/calibration/"
-                       "grid/snapshot/report",
+                       "grid/shortlist/snapshot/report",
         },
         "snapshot": {
             "sha256": snapshot["sha256"],
@@ -98,7 +101,7 @@ def build_report(engine_version, snapshot, replay_summary, tau_status,
         "replay": replay_summary,
         "tau_calibration": tau_status,
         "grid": grid_results,
-        "milestone": milestone,
+        "decision": decision,
         "benchmark_69": benchmark69,
         "margin_base": margin_base_unavailable(),
         "decisions": decisions,
@@ -115,16 +118,19 @@ def build_report(engine_version, snapshot, replay_summary, tau_status,
 def render_markdown(report):
     """A human-readable desensitized summary (no raw text)."""
     lines = [
-        "# Walk-Forward Evaluation Report (AC-70-v1)",
+        "# Walk-Forward Evaluation Report (AC-77-v1)",
         "",
         "- Engine: %s" % report["engine"]["version"],
         "- Snapshot SHA-256: `%s`" % report["snapshot"]["sha256"],
         "- history_id: %s" % report["snapshot"]["history_id"],
         "- store_epoch: %s" % report["snapshot"]["store_epoch"],
         "- Seed: %s" % report["seed"],
-        "- Milestone: **%s** (%s)" % (report["milestone"]["state"],
-                                      report["milestone"]["reason"]),
-        "- Selection: %s" % report["selection"],
+        "- Terminal outcome: **%s**" % report["decision"]["outcome"],
+        "- Lift claimable: %s (%s)" % (
+            report["decision"].get("lift_claimable"),
+            report["decision"].get("lift_reason")),
+        "- Live γ: %s" % report["decision"].get("live_gamma"),
+        "- Selection: %s" % report.get("selection", "not_run"),
         "- Representations: %s" % ", ".join(
             report.get("representations") or []),
         "",
@@ -147,6 +153,12 @@ def render_markdown(report):
         "",
         "```json",
         json.dumps(report["tau_calibration"], ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## Decision",
+        "",
+        "```json",
+        json.dumps(report["decision"], ensure_ascii=False, indent=2),
         "```",
         "",
         "## Grid",
