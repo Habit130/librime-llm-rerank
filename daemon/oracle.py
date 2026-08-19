@@ -59,6 +59,7 @@ import os
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
+from functools import cached_property
 from typing import (Callable, Dict, FrozenSet, List, Mapping, Optional,
                     Sequence, Tuple)
 
@@ -292,8 +293,14 @@ class StoredEvent:
     # the event's representation vector from facts.
     preceding_text: str = ""
 
-    @property
+    @cached_property
     def key(self):
+        # Cached (not a plain property): the evidence loop compares every
+        # same-key candidate's key, and with 100k active events the
+        # recomputation of the choice-problem tuple per event dominated the
+        # per-query cost even after the cosine moved to Accelerate (#72).
+        # The value is a pure function of the frozen fields, so caching it
+        # changes nothing observable (spec: oracle semantics unchanged).
         return choice_problem_key(self.schema_id, self.category,
                                   self.canonical_segment_input)
 
@@ -442,12 +449,38 @@ def _age_factor(usage_age, half_life):
     return 2.0 ** (-usage_age / half_life)
 
 
-def compute_evidence(reader, params, query, vector_for):
+class CosineEngine:
+    """Batch-cosine seam for exact retrieval backends (#72).
+
+    The canonical oracle computes one Python-scalar cosine per event.  An
+    exact backend (Apple vecLib ``cblas_sgemv``) must produce the SAME
+    evidence as the oracle on the same query / facts / vectors, so the
+    engine's only job is to compute cosines -- the oracle's aggregation
+    (threshold, usage age, final weight, top-K, m_c / M / s_c) stays in
+    ``compute_evidence`` and is never duplicated (SCN-72-1/2).
+
+    ``batch_cosines(query_vector, event_ids, vector_for)`` returns a mapping
+    event_id -> cosine (float).  Any event it cannot serve must raise
+    OracleError (fail closed, never a silent zero or a fallback to a weaker
+    result); a missing cosine for a same-key event is an OracleError.
+    """
+
+    def batch_cosines(self, query_vector, event_ids, vector_for):
+        raise NotImplementedError
+
+
+def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
     """Exact retrieval evidence for one query (the canonical oracle).
 
     vector_for is a callable mapping event_id to the event's deterministic
     vector (a sequence of floats); a missing vector, a dimension mismatch or
     a non-finite value is a true fault (OracleError), never silent evidence.
+
+    cosine_engine (#72) is an optional batch-cosine backend.  When None the
+    oracle computes each cosine with Python scalar math (the stdlib oracle);
+    when provided, ``batch_cosines`` supplies every same-key event's cosine
+    and the aggregation below is byte-for-byte identical.  Both paths must
+    agree within the documented float tolerance (SCN-72-2).
 
     Order of operations (spec #43 "精确 oracle"):
       1. same choice-problem key, active as of the query point
@@ -460,46 +493,83 @@ def compute_evidence(reader, params, query, vector_for):
         raise OracleError("params must be an OracleParams")
     if not isinstance(query, OracleQuery):
         raise OracleError("query must be an OracleQuery")
+    if cosine_engine is not None and not isinstance(
+            cosine_engine, CosineEngine):
+        raise OracleError("cosine_engine must be a CosineEngine or None")
     as_of = query.as_of if query.as_of is not None else reader.default_as_of()
     query_vector = _as_float_vector(query.query_vector, "query_vector")
     candidates = tuple(match_text(candidate) for candidate in query.candidates)
 
     same_key = []
+    query_key = query.key
+    exclude = query.exclude_event_ids
     for event in reader.read_active_events(as_of):
-        if event.event_id in query.exclude_event_ids:
+        if event.event_id in exclude:
             continue
-        if event.key == query.key:
+        if event.key == query_key:
             same_key.append(event)
     same_key.sort(key=lambda event: (event.hlc, event.event_id))
 
+    batch = None
+    if cosine_engine is not None:
+        try:
+            batch = cosine_engine.batch_cosines(
+                query_vector,
+                tuple(event.event_id for event in same_key),
+                vector_for)
+        except OracleError:
+            raise
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise OracleError(
+                "cosine engine failed: %s" % error) from error
+        if not isinstance(batch, dict):
+            raise OracleError("cosine engine must return a mapping")
+
     contributions = []
     for index, event in enumerate(same_key):
-        try:
-            vector = vector_for(event.event_id)
-        except Exception as error:
-            raise OracleError(
-                "vector lookup failed for event %s" % event.event_id
-            ) from error
-        vector = _as_float_vector(
-            vector, "vector for event %s" % event.event_id)
-        if len(vector) != len(query_vector):
-            raise OracleError(
-                "vector dimension mismatch for event %s: %d vs query %d"
-                % (event.event_id, len(vector), len(query_vector)))
-        cosine = _cosine(query_vector, vector)
+        if batch is not None:
+            cosine = batch.get(event.event_id)
+            if cosine is None:
+                raise OracleError(
+                    "cosine engine returned no cosine for event %s"
+                    % event.event_id)
+            try:
+                cosine = float(cosine)
+            except (TypeError, ValueError) as error:
+                raise OracleError(
+                    "cosine engine returned a non-numeric cosine for event "
+                    "%s" % event.event_id) from error
+            if not math.isfinite(cosine):
+                raise OracleError(
+                    "cosine engine returned a non-finite cosine for event %s"
+                    % event.event_id)
+        else:
+            try:
+                vector = vector_for(event.event_id)
+            except Exception as error:
+                raise OracleError(
+                    "vector lookup failed for event %s" % event.event_id
+                ) from error
+            vector = _as_float_vector(
+                vector, "vector for event %s" % event.event_id)
+            if len(vector) != len(query_vector):
+                raise OracleError(
+                    "vector dimension mismatch for event %s: %d vs query %d"
+                    % (event.event_id, len(vector), len(query_vector)))
+            cosine = _cosine(query_vector, vector)
         relevance = min(max((cosine - params.tau) / (1.0 - params.tau), 0.0),
                         1.0)
         usage_age = len(same_key) - 1 - index
         age_factor = _age_factor(usage_age, params.half_life)
         weight = relevance * age_factor
-        normalized_selection = match_text(event.final_selection_text)
-        matched = -1
-        for candidate_index, candidate in enumerate(candidates):
-            if normalized_selection == candidate:
-                matched = candidate_index
-                break
-        contributions.append((event, cosine, relevance, usage_age,
-                              age_factor, weight, matched))
+        # Candidate text matching is deferred to the kept set (below): with
+        # 100k same-key events the OpenCC simplification per event dominated
+        # the loop even though only the kept entries ever need it.  The
+        # threshold filter and the top-K order depend only on the weight, so
+        # deferring the match changes nothing observable (spec: oracle
+        # semantics unchanged).
+        contributions.append([event, cosine, relevance, usage_age,
+                              age_factor, weight, None])
 
     # Threshold filter (r_i > 0, i.e. a_i > 0), then at most K_evidence by
     # final event weight a_i; deterministic tie-break by HLC order.
@@ -507,6 +577,16 @@ def compute_evidence(reader, params, query, vector_for):
     kept = sorted(passed, key=lambda entry:
                   (-entry[5], entry[0].hlc, entry[0].event_id))
     kept = kept[:params.k_evidence]
+
+    # Candidate matching for the kept events only (deferred above).
+    for entry in kept:
+        normalized_selection = match_text(entry[0].final_selection_text)
+        matched = -1
+        for candidate_index, candidate in enumerate(candidates):
+            if normalized_selection == candidate:
+                matched = candidate_index
+                break
+        entry[6] = matched
 
     m = [0.0] * len(candidates)
     for entry in kept:

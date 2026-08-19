@@ -437,6 +437,7 @@ class DeltaSnapshot:
         self._delta_vectors = dict(delta_vectors)
         self._change_seq = change_seq
         self._query_provider = query_provider
+        self._accelerate_engine = None  # #72 lazy Accelerate cosine engine
 
     @property
     def store_epoch(self):
@@ -469,6 +470,17 @@ class DeltaSnapshot:
     def event_ids(self):
         return [event.event_id for event in self._events]
 
+    def retrieval_backend(self):
+        """The base generation's exact retrieval backend (#72).
+
+        The snapshot's matrix (and therefore the served cosine path) is
+        bound to the generation's backend.  The evidence service uses this
+        to fail closed when the configured backend disagrees with the
+        generation the snapshot serves (SCN-72-5: never silently serve a
+        different backend than the fingerprint declares).
+        """
+        return self._generation.retrieval_backend
+
     def vector_for(self, event_id):
         source = self._row_source.get(event_id)
         if source == "base":
@@ -499,6 +511,30 @@ class DeltaSnapshot:
         if self._query_provider is None:
             raise DeltaError("snapshot has no query provider")
         return self._query_provider.query_vector(preceding_text)
+
+    def accelerate_engine(self, row_index=None):
+        """The Accelerate cosine engine over this snapshot's matrix (#72).
+
+        Builds a zero-copy ``AccelerateCosineEngine`` over the base
+        generation's immutable FP32 buffer; delta-only events fall back to
+        this snapshot's own ``vector_for`` (same representation, same
+        oracle exactness).  Raises ``AccelerateError`` when vecLib is
+        unavailable (fail closed: never a silent Python fallback presented
+        as Accelerate).  The engine is cached per snapshot; the returned
+        engine is only valid while this snapshot (and its generation) live.
+        """
+        if self._accelerate_engine is None:
+            from accelerate import build_cosine_engine
+            buffer = self._generation.vector_buffer()
+            if buffer is None:
+                raise DeltaError("snapshot base generation has no vector "
+                                 "buffer")
+            row_index = (self._generation.event_rows()
+                         if row_index is None else row_index)
+            self._accelerate_engine = build_cosine_engine(
+                buffer, self._generation.row_count,
+                self._generation.vector_dimension, row_index)
+        return self._accelerate_engine
 
 
 class DeltaSnapshotReader:

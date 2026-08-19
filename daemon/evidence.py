@@ -52,6 +52,15 @@ from typing import (Dict, List, Mapping, Optional, Sequence, Tuple)
 from oracle import (FactReader, OracleError, OracleParams, OracleQuery,
                     compute_evidence)
 
+# #72: the exact retrieval backend the daemon serves evidence with.  Both
+# backends compute the same exact evidence over the same facts/vectors; the
+# Accelerate backend uses Apple vecLib for the per-event cosine while the
+# oracle backend uses Python scalar math.  The configured backend is bound
+# into the index fingerprint (see compat.compose_backend_fingerprint); the
+# config seam never silently switches backends.
+BACKEND_ORACLE = "exact"
+BACKEND_ACCELERATE = "accelerate-cblas-sgemv"
+
 EVIDENCE_KIND = "evidence"
 EVIDENCE_PROTOCOL_VERSION = 2
 EVIDENCE_CONFIG_ID_VERSION = "evidence-v1"
@@ -263,7 +272,8 @@ class EvidenceService:
     store is missing, the missing-store semantics below apply unchanged.
     """
 
-    def __init__(self, facts_root, params, provider, gamma, machine=None):
+    def __init__(self, facts_root, params, provider, gamma, machine=None,
+                 retrieval_backend=BACKEND_ORACLE):
         if not facts_root:
             raise EvidenceError("evidence_unavailable", "facts root missing")
         if not isinstance(params, OracleParams):
@@ -274,11 +284,16 @@ class EvidenceService:
                                 "provider must be a RepresentationProvider")
         if not isinstance(gamma, (int, float)) or not math.isfinite(gamma):
             raise EvidenceError("evidence_unavailable", "gamma must be finite")
+        if retrieval_backend not in (BACKEND_ORACLE, BACKEND_ACCELERATE):
+            raise EvidenceError(
+                "evidence_unavailable",
+                "unsupported retrieval_backend %r" % (retrieval_backend,))
         self._facts_root = facts_root
         self._params = params
         self._provider = provider
         self._gamma = gamma
         self._machine = machine
+        self._retrieval_backend = retrieval_backend
         self._config_identity = compose_config_identity(
             provider.representation_id(), params, gamma)
 
@@ -300,6 +315,42 @@ class EvidenceService:
 
     def _db_path(self):
         return os.path.join(self._facts_root, "facts.sqlite3")
+
+    def _cosine_engine(self, snapshot):
+        """The CosineEngine for this request, per the configured backend.
+
+        The oracle backend returns None (the canonical Python scalar path in
+        ``compute_evidence``).  The Accelerate backend builds the vecLib
+        engine over the snapshot's matrix; any Accelerate fault raises
+        EvidenceError (fail closed -- never a silent Python fallback
+        presented as Accelerate, SCN-72-5).
+
+        The configured backend must AGREE with the snapshot's generation
+        backend: a generation built for ``accelerate-cblas-sgemv`` must never
+        be silently served with the oracle Python path (and vice versa),
+        because the served backend is bound into ``index_fingerprint``
+        (SCN-72-4).  A mismatch is a true fault, never a silent switch.
+        """
+        try:
+            generation_backend = snapshot.retrieval_backend()
+        except Exception:  # noqa: BLE001 - snapshot without a backend
+            generation_backend = None
+        if generation_backend != self._retrieval_backend:
+            raise EvidenceError(
+                "backend_mismatch",
+                "configured retrieval backend %r does not match the "
+                "served generation backend %r"
+                % (self._retrieval_backend, generation_backend))
+        if self._retrieval_backend == BACKEND_ACCELERATE:
+            try:
+                return snapshot.accelerate_engine()
+            except EvidenceError:
+                raise
+            except Exception as error:  # noqa: BLE001 - fail closed
+                raise EvidenceError(
+                    "accelerate_fault",
+                    "Accelerate backend unavailable: %s" % error) from error
+        return None
 
     def _serve_via_snapshot(self, request):
         """Serve one request from the machine's caught-up query snapshot.
@@ -342,10 +393,14 @@ class EvidenceService:
         )
         reader = snapshot.reader()
         try:
+            engine = self._cosine_engine(snapshot)
             result = compute_evidence(reader, self._params, query,
-                                      snapshot.vector_for)
+                                      snapshot.vector_for,
+                                      cosine_engine=engine)
         except OracleError as error:
             raise EvidenceError("oracle_fault", str(error)) from error
+        except EvidenceError:
+            raise
         finally:
             reader.close()
 
@@ -551,7 +606,9 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
         representation_id, tau, k_evidence, half_life, saturation_k, gamma,
         query_vectors (exact preceding text -> vector),
         event_vectors (schema_id|canonical_segment_input|final_selection -> vector),
-        default_query, default_event
+        default_query, default_event,
+        retrieval_backend ("exact" or "accelerate-cblas-sgemv"; default
+        "exact" -- the #71 oracle path)
 
     ``machine`` (#63) is an optional prebuilt delta state machine; when
     present, every served request is gated through its published query
@@ -568,6 +625,7 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
         saturation_k = float(
             config.get("saturation_k", DEFAULT_SATURATION_K))
         gamma = float(config["gamma"])
+        retrieval_backend = config.get("retrieval_backend", BACKEND_ORACLE)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}
         default_query = config.get("default_query")
@@ -579,7 +637,8 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
                           half_life=half_life, saturation_k=saturation_k)
     provider = _provider_from_config(config, representation_id)
     return EvidenceService(facts_root, params, provider, gamma,
-                           machine=machine)
+                           machine=machine,
+                           retrieval_backend=retrieval_backend)
 
 
 def _provider_from_config(config, representation_id):
