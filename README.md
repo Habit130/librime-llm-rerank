@@ -634,8 +634,12 @@ fsync) and swaps the in-memory query pointer through the delta machine's
 - A store epoch change mid-publish aborts with the old active intact
   (SCN-65-7). Deterministic delta-embed faults mark the staging `blocked`
   with the event named; `retry()` re-arms it.
-- The retired active generation and its checkpoint are retained — physical
-  retention/compaction/rollback belong to #67.
+- The retired healthy active becomes the rollback pointer
+  (`rollback_manifest.json`), and the retention sweep keeps at most
+  {active, rollback, current staging}: generations outside the set are
+  deleted, a space-short build keeps the current active (never the only
+  rollback), and a damaged active is isolated under `derived_root/isolated/`
+  (SCN-67-2/3).
 - Old generations are never updated in place, and the desired
   configuration never reinterprets the active generation.
 
@@ -679,6 +683,53 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 # pointer swap, restart-from-manifest, epoch-abort, fact writes during
 # the publish window (24 synthetic events)
 daemon/.venv/bin/python daemon/integration_publish.py --events 24
+```
+
+## Retention, rollback and damage recovery (Squirrel#67)
+
+`daemon/retention.py` owns the derived-state lifecycle: at most one active,
+one **healthy** rollback and one staging; an explicit rollback pointer
+(`rollback_manifest.json` next to `active_manifest.json`); damage isolation;
+and the pre-build space estimate.
+
+- **Rollback pointer** — after a successful publish the just-retired healthy
+  active is registered as the rollback (before the manifest swap, so a crash
+  mid-publish still keeps a rollback).  A damaged active is isolated, never
+  registered.  The pointer is the ONLY recovery source — nothing scans
+  `generations/` to pick a "newest" (SCN-67-7).
+- **Retention sweep** — after a successful publish (or once at startup)
+  deletes generations outside {active, rollback, current staging}; the only
+  rollback is never deleted (SCN-67-2/3).
+- **Space** — before a build the peak of active + rollback + staging + delta
+  is estimated against `derived_disk_budget_bytes` (default 3 GiB, spec #43
+  disk gate); a short budget keeps the current active and reports the error,
+  never deleting the only rollback (SCN-67-3).
+- **Damage** — base / metadata / manifest / checksum damage isolates the bad
+  generation under `derived_root/isolated/` and serves only after the
+  rollback is re-verified (identity + checksums + probes) and its delta
+  catches up to the current facts watermark; catch-up failure is NOT a
+  semantic success (AC67-5).  Delta-checkpoint damage drops the checkpoint
+  and replays from the base watermark (AC67-4).  A missing ANN sidecar is
+  never active-generation death (`no_ann_sidecar` pin, RISK-67-1).
+- **No healthy rollback** — the semantic path fails closed (pass-through)
+  and a background rebuild from facts is queued; fact recording / IME commit
+  keep working (SCN-67-6).  The public `rebuild` CLI stays reserved (#68).
+- **Dirty scheduling** — the delta machine counts new vectors + tombstones
+  against the base active row count (soft-dirty at `max(2048, 5% of base
+  rows)` compacted when idle; hard-dirty at 20,000 changes or 128 MiB
+  compacted even under input) and hands the compaction to the single staging
+  builder (`request_compaction`) — one builder at a time (AC67-1).  A
+  compaction/rebuild that reached `ready` survives a restart (the machine
+  re-verifies it for the publisher instead of discarding it under the
+  desired==active noop gate).
+- `clear` deletes `isolated/` and `rollback_manifest.json` along with the
+  other app-controlled derived state (SCN-67-8).
+
+Evidence commands:
+
+```sh
+# model-free fault injection (SCN-67-1..9)
+python3 -m unittest daemon.test_retention
 ```
 
 ## Frozen baseline policy identity

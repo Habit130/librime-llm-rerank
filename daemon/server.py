@@ -1108,20 +1108,73 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             facts_root, recovery=machine, auto_open_fact_handle=True)
         if machine is not None:
             coordinator.register_builder(machine)
+        # #67: when the delta machine's recovery found no healthy rollback it
+        # recorded ``force_rebuild_requested`` -- the staging machine must
+        # rebuild from facts regardless of desired == active (AC67-6).  The
+        # machine-level refusal is authoritative (the delta machine may have
+        # recovered via rollback even when the manifest-level resolve refused,
+        # in which case the recovered active manifest is valid and the
+        # staging machine must NOT idle on the stale manifest-level refusal).
+        force_rebuild = (machine is not None
+                         and machine.force_rebuild_requested())
+        machine_refuse = (machine.refuse_reason()
+                          if machine is not None else None)
+        staging_refuse_reason = (None
+                                 if force_rebuild or machine_refuse is None
+                                 else machine_refuse)
+        # #67: the delta machine's rollback recovery rewrote the active
+        # manifest -- the staging machine must gate against the RECOVERED
+        # active (id + representation), never the pre-recovery one, and the
+        # compatibility report must reflect the recovered active identity.
+        staging_active_generation_id = active_generation_id
+        staging_active_representation_id = active_representation_id
+        report_active_identity = active_identity
+        if derived_root and machine is not None and not force_rebuild:
+            try:
+                from publish import (active_identity_from_manifest,
+                                     read_active_manifest)
+                manifest, manifest_reason = read_active_manifest(derived_root)
+                if manifest is not None and manifest_reason is None:
+                    staging_active_generation_id = manifest["generation_id"]
+                    staging_active_representation_id = manifest[
+                        "representation_id"]
+                    report_active_identity = active_identity_from_manifest(
+                        manifest)
+            except Exception:  # noqa: BLE001 - best effort; keep the config
+                pass
         staging_machine = build_staging_machine_from_config(
             facts_root, evidence_config, builder_lock=builder_lock,
-            active_generation_id=active_generation_id,
-            active_representation_id=active_representation_id,
+            active_generation_id=staging_active_generation_id,
+            active_representation_id=staging_active_representation_id,
             publish_lock=publish_lock, active_identity=active_identity,
-            refuse_reason=refuse_reason)
+            refuse_reason=staging_refuse_reason,
+            force_rebuild=force_rebuild)
         publisher = build_publisher_from_config(
             facts_root, evidence_config, staging_machine, machine,
             publish_lock)
         state.evidence_service = build_evidence_service_from_config(
             facts_root, evidence_config, machine=machine)
+        # #67 wiring: the dirty scheduler asks the single staging builder to
+        # compact; a successful publish clears the forced-build flags so the
+        # compaction terminates (the delta absorbed, no second builder).
+        if machine is not None and staging_machine is not None:
+            machine.set_compaction_trigger(
+                staging_machine.request_compaction)
+            if publisher is not None:
+                publisher.add_publish_success_hook(
+                    staging_machine.notify_publish_success)
         state.compatibility_report = build_compat_report(
-            evidence_config, facts_root, active_identity, refuse_reason,
+            evidence_config, facts_root, report_active_identity,
+            machine_refuse if machine is not None else refuse_reason,
             staging_machine, machine)
+        # #67 retention pass at startup (never mid-publish): sweep any
+        # leftovers outside {active, rollback, live staging} left by a crash.
+        if derived_root:
+            try:
+                from retention import sweep_from_manifests
+                sweep_from_manifests(derived_root)
+            except Exception:  # noqa: BLE001 - best effort; never block start
+                pass
     else:
         machine = None
         staging_machine = None

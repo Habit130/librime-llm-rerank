@@ -106,13 +106,35 @@ The matrix is proven in-process by raising at the exact seam and asserting
 the durable state (identical to a real crash at that point), plus the
 fsync-order instrumentation test and the restart tests.
 
-## Old-generation retention
+## Old-generation retention (#67)
 
-The publish never deletes: the retired active generation directory, its
-delta checkpoint, or any orphaned published container stay on disk.
-Rollback registration, compaction and retention are #67. `clear`'s
-derived-state allowlist already covers the `delta/` directory namespace
-(prefix `delta`).
+Retention, rollback and damage isolation are delivered in `daemon/retention.py`
+(contract AC-67-v1):
+
+- The publish registers the just-retired **healthy** active as the rollback
+  pointer (`<derived_root>/rollback_manifest.json`, next to the active
+  manifest — `clear` already allowlists that name) BEFORE the manifest swap,
+  so a crash after the swap still keeps the complete new generation AND a
+  healthy rollback.  A damaged retired active is never registered.
+- The retention sweep (after a successful publish, or once at startup)
+  deletes generations outside {active, rollback, current staging} — never
+  the active, never the only rollback.  A space-short build keeps the
+  current active and reports the error.
+- Damage recovery (active manifest / base / metadata / checksum) isolates
+  the bad generation under `derived_root/isolated/` and serves ONLY from the
+  explicit rollback pointer after re-verify + catch-up to the current facts
+  watermark; no directory scan ever elects a rollback or active.  With no
+  healthy rollback the semantic path fails closed (pass-through) and a
+  background rebuild from facts is queued — fact recording / IME commit
+  keep working.
+- Dirty scheduling: the delta machine counts new vectors + tombstones
+  against the base active row count (soft-dirty at
+  `max(2048, 5% of base rows)` when idle; hard-dirty at 20,000 changes or
+  128 MiB even under input) and hands the compaction to the single staging
+  builder (`request_compaction`), preserving the one-builder-at-a-time rule.
+- `clear`'s derived-state allowlist now includes `isolated/` (the damaged
+  generations are app-controlled derived state, deleted by clear too).
+
 
 ## Pointer swap and the EvidenceService query path (SCN-65-5, AC65-7)
 

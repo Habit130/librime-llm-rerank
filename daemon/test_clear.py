@@ -665,6 +665,31 @@ class ClearStepTests(ClearEnv):
         live2, _empty = self.live_identity()
         self.assertEqual(live["store_epoch"], live2["store_epoch"])
 
+    def test_derived_isolation_and_rollback_pointer_are_clear_owned(self):
+        """#67 SCN-67-8: ``isolated/`` (damaged generations) and
+        ``rollback_manifest.json`` are app-controlled derived state that
+        ``clear`` deletes along with the other derived leftovers."""
+        from clear_operation import _derived_leftovers
+        identity = self.helper.create_empty(self.root)
+        os.makedirs(os.path.join(self.root, "isolated",
+                                 "shadow-gen-v1:bad-00000000000000000000000000"))
+        with open(os.path.join(self.root, "rollback_manifest.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump({"generation_id": "shadow-gen-v1:rb-0000"}, stream)
+        os.chmod(os.path.join(self.root, "rollback_manifest.json"), 0o600)
+        leftovers = _derived_leftovers(self.root, "op-1", os.getuid())
+        self.assertIn("isolated", leftovers)
+        self.assertIn("rollback_manifest.json", leftovers)
+        # A full clear removes them.
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, identity["store_epoch"])
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("succeeded", record["state"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, "isolated")))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, "rollback_manifest.json")))
+
     # -- SCN-54-10 ----------------------------------------------------------
 
     def test_cancel_before_publish_reopens_old_state(self):
