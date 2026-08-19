@@ -277,12 +277,17 @@ class FactHandle:
 
 def run_maintenance(preflight, root, replacement, control_socket, operation_id,
                     timeout_s=5.0, now=time.monotonic, sleep=time.sleep,
-                    control_client_factory=None):
+                    control_client_factory=None, expect_unreadable=False):
     """Run the production control lease around one exclusive replacement.
 
     The replacement itself remains an operation-specific concern for later
     tickets. This seam owns the non-negotiable ordering and keeps prepare and
     reopen on one authenticated control connection.
+
+    `expect_unreadable=True` is the #57 unreadable-current restore: the
+    daemon quiesces WITHOUT verifying the current identity (the store is
+    present-but-unreadable by design; the content fingerprint at publish
+    time is the CAS). The healthy path keeps the identity read.
     """
     if control_client_factory is None:
         from control import MaintenanceControlClient
@@ -292,7 +297,7 @@ def run_maintenance(preflight, root, replacement, control_socket, operation_id,
     # exclusive fact lock until all validation has passed.
     preflight()
     with control_client_factory(control_socket, operation_id) as control:
-        prepared = control.prepare()
+        prepared = control.prepare(expect_unreadable=expect_unreadable)
         if not prepared.get("ok"):
             return prepared
         lease = None
@@ -318,7 +323,7 @@ def run_maintenance(preflight, root, replacement, control_socket, operation_id,
 def replace_fact_database(root, replacement_path, _lease=None,
                           _connect=sqlite3.connect, _unlink=os.unlink,
                           _replace=os.replace, _fsync=os.fsync,
-                          _after_checkpoint=None):
+                          _after_checkpoint=None, checkpoint_old_store=True):
     """Replace only the fact database under an already-held exclusive lease.
 
     Publication is staged so a failure or crash can only ever expose the
@@ -336,6 +341,15 @@ def replace_fact_database(root, replacement_path, _lease=None,
     sidecar removal aborts before the main file is touched, so the old store
     stays complete; after the rename the new store is complete and no old
     sidecar can be paired with it.
+
+    `checkpoint_old_store=False` is the #57 unreadable-current path: the caller has
+    already quarantined the as-is DB/WAL/SHM bytes (so the old scene is
+    preserved verbatim) and the old database may be corrupt or have an
+    unreadable permission state that would make the checkpoint itself fail.
+    In that mode the old-store validation/checkpoint/fsync block is skipped,
+    but the old WAL/SHM sidecars are still unlinked before the rename so they
+    can never be paired with the new database. The replacement file is still
+    validated, fsynced and atomically renamed, and the root is fsynced.
 
     Destructive command policy, backup validation and operation persistence
     remain caller-owned by later maintenance operations. Underscore
@@ -363,13 +377,15 @@ def replace_fact_database(root, replacement_path, _lease=None,
         # mode and file type are proven on the very fd that was opened, which
         # matches the safety seam of every other fact-store opener in this
         # module.
-        try:
-            main_fd = os.open("facts.sqlite3", os.O_RDONLY | os.O_NOFOLLOW,
-                              dir_fd=root_fd)
-        except FileNotFoundError:
-            main_fd = None
-        except OSError as error:
-            raise MaintenanceError("replacement_failed") from error
+        main_fd = None
+        if checkpoint_old_store:
+            try:
+                main_fd = os.open("facts.sqlite3", os.O_RDONLY | os.O_NOFOLLOW,
+                                  dir_fd=root_fd)
+            except FileNotFoundError:
+                main_fd = None
+            except OSError as error:
+                raise MaintenanceError("replacement_failed") from error
         if main_fd is not None:
             try:
                 main_stat = os.fstat(main_fd)

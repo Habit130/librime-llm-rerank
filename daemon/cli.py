@@ -35,15 +35,22 @@ The single supported public entry point for semantic-memory maintenance
                     RESTORE <backup_id> OVER <epoch> or non-interactive
                     --yes + --expect-store-epoch CAS); --backup-current runs
                     after quiesce and before the replace and a failure
-                    leaves the live store unchanged.
-  rebuild, quarantine list|purge
-                    RESERVED command surface (approved by spec #43): fully
-                    parsed but dispatch to a stable `not_implemented` error;
-                    they never fake success and never execute destructive
-                    behavior (#57/#68 implement them).
-  restore --accept-unreadable-current / --expect-current-fingerprint /
-                    --expect-no-store: #57 stays RESERVED; these flags are
-                    parsed but dispatch to `not_implemented`.
+                    leaves the live store unchanged. An unreadable current
+                    store is restored only with the flag pair
+                    --accept-unreadable-current +
+                    --expect-current-fingerprint <hash>, which quarantines
+                    the as-is DB/WAL/SHM (verified + fsynced) before the
+                    replace; a truly missing store uses --expect-no-store
+                    (never satisfied by an unreadable file).
+  quarantine list|purge
+                    list quarantined stores (identity only: operation id,
+                    fingerprint, size, timestamp — never any private text)
+                    and purge one store only with the exact operation id +
+                    content fingerprint. The daemon never scans, repairs,
+                    merges or auto-restores quarantine.
+  rebuild           RESERVED command surface (approved by spec #43): fully
+                    parsed but dispatches to a stable `not_implemented`
+                    error; it never fakes success (#68 implements it).
 
 Output contracts (deterministic):
   - human text and --json carry stable version fields inside the document
@@ -86,6 +93,7 @@ from operations import (  # noqa: E402
     ERROR_VERSION,
     EVENT_VERSION,
     OPERATION_VERSION,
+    OperationBlocked,
     OperationError,
     OperationStore,
     cancel_operation,
@@ -242,15 +250,26 @@ def build_parser():
                         help="replace without keeping the current store; "
                              "restore never secretly saves it")
     restore.add_argument("--yes", action="store_true",
-                         help="non-interactive confirmation; requires "
-                              "--expect-store-epoch")
+                         help="non-interactive confirmation; for a healthy "
+                              "store requires --expect-store-epoch; for the "
+                              "unreadable/no-store paths it substitutes the "
+                              "flag pair as the confirmation")
     restore.add_argument("--expect-store-epoch", metavar="UUID",
                          help="expected current store epoch (epoch CAS)")
-    # #57 stays reserved: unreadable-current handling, quarantine and
-    # --expect-no-store are not implemented in this build.
-    restore.add_argument("--accept-unreadable-current", action="store_true")
-    restore.add_argument("--expect-current-fingerprint", metavar="HASH")
-    restore.add_argument("--expect-no-store", action="store_true")
+    # #57: unreadable-current handling, quarantine and --expect-no-store.
+    # --accept-unreadable-current requires --expect-current-fingerprint
+    # (atomic pair); both are exclusive with --expect-no-store.
+    restore.add_argument("--accept-unreadable-current", action="store_true",
+                         help="accept a present-but-unreadable current store "
+                              "and quarantine it as-is before the replace "
+                              "(requires --expect-current-fingerprint)")
+    restore.add_argument("--expect-current-fingerprint", metavar="HASH",
+                         help="expected sha256 fingerprint over the as-is "
+                              "current DB+WAL+SHM bytes (the unreadable-path "
+                              "CAS)")
+    restore.add_argument("--expect-no-store", action="store_true",
+                         help="restore over a truly missing store (no "
+                              "quarantine, no epoch CAS)")
     restore.add_argument("--json", action="store_true")
     restore.set_defaults(handler=_cmd_restore)
 
@@ -281,20 +300,20 @@ def build_parser():
     rebuild.set_defaults(handler=_cmd_reserved)
 
     quarantine = sub.add_parser("quarantine",
-                                help="reserved: quarantine management")
+                                help="list or purge quarantined stores")
     q_sub = quarantine.add_subparsers(dest="quarantine_command")
 
-    q_list = q_sub.add_parser("list", help="reserved: list quarantined "
-                                           "stores")
+    q_list = q_sub.add_parser("list", help="list quarantined stores "
+                                           "(identity only)")
     q_list.add_argument("--json", action="store_true")
-    q_list.set_defaults(handler=_cmd_reserved)
+    q_list.set_defaults(handler=_cmd_quarantine_list)
 
-    q_purge = q_sub.add_parser("purge", help="reserved: purge a "
-                                             "quarantined store")
+    q_purge = q_sub.add_parser("purge", help="purge one quarantined store "
+                                             "with exact id + fingerprint")
     q_purge.add_argument("operation_id")
     q_purge.add_argument("content_fingerprint")
     q_purge.add_argument("--json", action="store_true")
-    q_purge.set_defaults(handler=_cmd_reserved)
+    q_purge.set_defaults(handler=_cmd_quarantine_purge)
 
     return parser
 
@@ -1106,31 +1125,73 @@ def _cmd_migrate(args, paths):
 # restore
 # ---------------------------------------------------------------------------
 
-def _read_restore_plan(paths, from_path):
+def _read_restore_plan(paths, from_path, *, accept_unreadable=False,
+                       expect_no_store=False):
     """Read-only plan for the restore confirmation: the live current
     identity/stats and the backup manifest. Raises OperationError on a
-    fail-closed condition."""
+    fail-closed condition.
+
+    The #57 modes change what "current" means:
+    - healthy: the live identity and stats (existing #56 behavior).
+    - unreadable: the live store is present but the identity seam cannot
+      read it; there is no identity/stats to display, only the expected
+      fingerprint.
+    - no-store: no facts database exists at all; nothing to display.
+    """
     from backup_operation import BackupError, read_backup_manifest
     from clear_operation import FactStoreHelper, live_identity
+    from quarantine import classify_current_store
     from restore_operation import _verify_restore_backup
     helper = FactStoreHelper()
-    identity_empty = live_identity(helper, paths["semantic_memory_root"])
-    if identity_empty is None:
-        raise OperationError(
-            "store_missing", phase="cli",
-            remediation="no facts database exists; there is nothing to "
-                        "restore over (restore never creates a store)",
-            cause=None)
-    identity, _empty = identity_empty
-    try:
-        live_stats = helper.stats(paths["semantic_memory_root"])
-    except Exception as error:
-        fault = getattr(error, "code", None) or getattr(error, "status", None)
-        raise OperationError(
-            "fact_store_unverifiable", phase="cli",
-            remediation="the live fact store failed closed validation; "
-                        "inspect and fix it before restoring",
-            cause={"fault_code": fault})
+    facts_path = os.path.join(paths["semantic_memory_root"], "facts.sqlite3")
+    if expect_no_store:
+        if os.path.lexists(facts_path):
+            raise OperationError(
+                "store_present", phase="cli",
+                remediation="a facts database exists; --expect-no-store "
+                            "requires the store to be absent",
+                cause=None)
+        identity = None
+        live_stats = None
+    elif accept_unreadable:
+        disposition, _detail = classify_current_store(
+            paths["semantic_memory_root"], helper, os.geteuid())
+        if disposition == "missing":
+            raise OperationError(
+                "store_missing", phase="cli",
+                remediation="no facts database exists; the unreadable-"
+                            "current path requires a present store. Use "
+                            "--expect-no-store for a truly missing store",
+                cause=None)
+        if disposition == "readable":
+            raise OperationError(
+                "store_readable", phase="cli",
+                remediation="the current store is readable through the "
+                            "fact-store seam; the unreadable-current path "
+                            "requires an unreadable store",
+                cause={"disposition": _detail})
+        identity = None
+        live_stats = None
+    else:
+        identity_empty = live_identity(
+            helper, paths["semantic_memory_root"])
+        if identity_empty is None:
+            raise OperationError(
+                "store_missing", phase="cli",
+                remediation="no facts database exists; there is nothing to "
+                            "restore over (restore never creates a store)",
+                cause=None)
+        identity, _empty = identity_empty
+        try:
+            live_stats = helper.stats(paths["semantic_memory_root"])
+        except Exception as error:
+            fault = getattr(error, "code", None) or getattr(error, "status",
+                                                            None)
+            raise OperationError(
+                "fact_store_unverifiable", phase="cli",
+                remediation="the live fact store failed closed validation; "
+                            "inspect and fix it before restoring",
+                cause={"fault_code": fault})
     try:
         # Full offline validation of the backup (container, manifest,
         # checksum, integrity, version). This re-uses the restore preflight
@@ -1179,6 +1240,12 @@ def _print_restore_result(record, args):
               % result["backup_current_destination"])
     elif result.get("discarded_current"):
         print("  current store discarded (explicit choice)")
+    if result.get("quarantine_operation_id"):
+        print("  quarantined current store: %s (fingerprint %s)"
+              % (result["quarantine_operation_id"],
+                 result.get("quarantine_fingerprint") or "unknown"))
+    if result.get("no_store"):
+        print("  no-store: yes (no current store existed)")
     if result.get("backup_event_count") is not None:
         print("  backup facts: %s events" % result["backup_event_count"])
     print("  %s" % result.get(
@@ -1194,41 +1261,89 @@ def _cmd_restore(args, paths):
     except OperationError as error:
         return _store_operation_error(error, mode)
 
-    # #57 flags stay reserved: unreadable-current handling, quarantine and
-    # --expect-no-store are not implemented in this build.
-    if (args.accept_unreadable_current or args.expect_current_fingerprint
-            or args.expect_no_store):
-        command = "restore"
-        error = _not_implemented_error(command)
-        _render_error(error, mode)
-        return 2
-
-    if args.yes != (args.expect_store_epoch is not None):
-        # Non-interactive restore requires both confirmation and epoch CAS;
-        # there is deliberately no --force (spec #43).
+    accept_unreadable = bool(args.accept_unreadable_current)
+    fingerprint = (args.expect_current_fingerprint or "").strip().lower()
+    expect_no_store = bool(args.expect_no_store)
+    if bool(accept_unreadable) != bool(fingerprint):
+        # The #57 flag pair is atomic (spec #57 seam 2): either flag alone
+        # is a usage error.
         error = make_error(
-            "confirmation_required", phase="cli",
-            remediation="provide both --yes and --expect-store-epoch, or run "
-                        "interactively and type the exact confirmation string",
+            "unreadable_flags_required", phase="cli",
+            remediation="provide both --accept-unreadable-current and "
+                        "--expect-current-fingerprint <sha256 hex>, or "
+                        "neither",
             cause=None)
         _render_error(error, mode)
         return 2
+    if expect_no_store and (accept_unreadable or fingerprint):
+        error = make_error(
+            "conflicting_store_flags", phase="cli",
+            remediation="--expect-no-store is exclusive with the "
+                        "unreadable-current flags",
+            cause=None)
+        _render_error(error, mode)
+        return 2
+    if (accept_unreadable or expect_no_store) and args.backup_current:
+        error = make_error(
+            "retention_conflict", phase="cli",
+            remediation="--backup-current needs a readable current store; "
+                        "use --discard-current for an unreadable or missing "
+                        "store",
+            cause=None)
+        _render_error(error, mode)
+        return 2
+    if (accept_unreadable or expect_no_store) \
+            and args.expect_store_epoch is not None:
+        error = make_error(
+            "epoch_cas_unavailable", phase="cli",
+            remediation="no current store epoch is readable for the "
+                        "unreadable/no-store restore; the fingerprint (or "
+                        "absence) is the expectation, not an epoch",
+            cause=None)
+        _render_error(error, mode)
+        return 2
+    if not (accept_unreadable or expect_no_store):
+        if args.yes != (args.expect_store_epoch is not None):
+            # Non-interactive restore requires both confirmation and epoch
+            # CAS; there is deliberately no --force (spec #43).
+            error = make_error(
+                "confirmation_required", phase="cli",
+                remediation="provide both --yes and --expect-store-epoch, or "
+                            "run interactively and type the exact "
+                            "confirmation string",
+                cause=None)
+            _render_error(error, mode)
+            return 2
+    # For the #57 paths, --yes is OPTIONAL: without it the exact-string
+    # interactive confirmation is required (the flag pair alone is never a
+    # silent bypass); with it the non-interactive confirmation applies.
 
     from_path = os.path.abspath(args.from_path)
     try:
-        identity, live_stats, manifest = _read_restore_plan(paths, from_path)
+        identity, live_stats, manifest = _read_restore_plan(
+            paths, from_path, accept_unreadable=accept_unreadable,
+            expect_no_store=expect_no_store)
     except OperationError as error:
         return _store_operation_error(error, mode)
 
-    expected_epoch = identity["store_epoch"]
-    confirmation = "RESTORE %s OVER %s" % (manifest["backup_id"],
-                                           expected_epoch)
+    if expect_no_store:
+        expected_epoch = ""
+        confirmation = "RESTORE %s OVER NO-STORE" % manifest["backup_id"]
+    elif accept_unreadable:
+        expected_epoch = ""
+        confirmation = "RESTORE %s OVER UNREADABLE %s" % (
+            manifest["backup_id"], fingerprint)
+    else:
+        expected_epoch = identity["store_epoch"]
+        confirmation = "RESTORE %s OVER %s" % (manifest["backup_id"],
+                                               expected_epoch)
     backup_watermark = manifest["hlc_high_water"]
     description = (
         "this replaces the whole local semantic memory with the backup, "
         "keeping the backup's history and HLC but minting a new store epoch")
     if args.yes:
-        if args.expect_store_epoch != expected_epoch:
+        if not (accept_unreadable or expect_no_store) \
+                and args.expect_store_epoch != expected_epoch:
             error = make_error(
                 "store_epoch_mismatch", phase="cli",
                 remediation="re-run restore with --expect-store-epoch %s"
@@ -1238,11 +1353,21 @@ def _cmd_restore(args, paths):
             _render_error(error, mode)
             return 2
     else:
-        print("current:")
-        print("  history: %s" % identity["history_id"])
-        print("  epoch: %s" % identity["store_epoch"])
-        print("  events: %s"
-              % (live_stats.get("event_count") if live_stats else "unknown"))
+        if accept_unreadable:
+            print("current:")
+            print("  state: unreadable (present but cannot be read)")
+            print("  expected fingerprint: %s" % fingerprint)
+            print("  note: the current DB/WAL/SHM will be quarantined "
+                  "as-is before the replace")
+        elif expect_no_store:
+            print("current: none (no facts database exists)")
+        else:
+            print("current:")
+            print("  history: %s" % identity["history_id"])
+            print("  epoch: %s" % identity["store_epoch"])
+            print("  events: %s"
+                  % (live_stats.get("event_count") if live_stats
+                     else "unknown"))
         print("backup:")
         print("  id: %s" % manifest["backup_id"])
         print("  history: %s" % manifest["history_id"])
@@ -1273,6 +1398,9 @@ def _cmd_restore(args, paths):
         if args.backup_current else None,
         "discard_current": args.discard_current,
         "expect_store_epoch": expected_epoch,
+        "accept_unreadable_current": accept_unreadable,
+        "expect_current_fingerprint": fingerprint,
+        "expect_no_store": expect_no_store,
     }
     try:
         record = create_operation(store, args.registry, "restore", parameters)
@@ -1379,6 +1507,80 @@ def _cmd_backup_verify(args, paths):
 # reserved maintenance commands
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# quarantine list / purge
+# ---------------------------------------------------------------------------
+
+def _cmd_quarantine_list(args, paths):
+    from quarantine import (
+        QUARANTINE_VERSION,
+        list_quarantine,
+    )
+    mode = "json" if args.json else "human"
+    try:
+        entries = list_quarantine(paths["semantic_memory_root"],
+                                  os.geteuid())
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    payload = {
+        "quarantine_version": QUARANTINE_VERSION,
+        "count": len(entries),
+        "entries": entries,
+    }
+    if args.json:
+        print(_json_dump(payload), flush=True)
+        return 0
+    if not entries:
+        print("quarantine: none")
+        return 0
+    for entry in entries:
+        fingerprint = entry.get("fingerprint")
+        created = entry.get("created_at_utc")
+        total = entry.get("total_bytes")
+        if not entry.get("valid"):
+            print("quarantine %s (metadata unreadable)"
+                  % entry["operation_id"])
+            continue
+        print("quarantine %s" % entry["operation_id"])
+        print("  fingerprint: %s" % (fingerprint or "unknown"))
+        print("  created: %s" % (created or "unknown"))
+        if total is not None:
+            print("  bytes: %s" % total)
+        else:
+            print("  bytes: unknown")
+    return 0
+
+
+def _cmd_quarantine_purge(args, paths):
+    from quarantine import (
+        QUARANTINE_VERSION,
+        purge_quarantine,
+    )
+    mode = "json" if args.json else "human"
+    try:
+        removed = purge_quarantine(paths["semantic_memory_root"],
+                                   args.operation_id,
+                                   args.content_fingerprint, os.geteuid())
+    except OperationError as error:
+        # Usage-level (invalid id) exits 2; a refused purge (not found /
+        # fingerprint mismatch) is a non-success outcome, exit 1.
+        if error.code == "invalid_operation_id":
+            return _store_operation_error(error, mode)
+        _render_error(error.to_error_object(), mode)
+        return 1
+    payload = {
+        "quarantine_version": QUARANTINE_VERSION,
+        "purged": args.operation_id,
+        "removed_bytes": removed,
+    }
+    if args.json:
+        print(_json_dump(payload), flush=True)
+    else:
+        print("purged quarantine %s (%s bytes removed)"
+              % (args.operation_id, removed))
+    return 0
+
+
 def _cmd_reserved(args, paths):
     command = _reserved_command_name(args)
     error = _not_implemented_error(command)
@@ -1387,8 +1589,6 @@ def _cmd_reserved(args, paths):
 
 
 def _reserved_command_name(args):
-    if args.command == "quarantine":
-        return "quarantine %s" % args.quarantine_command
     return args.command
 
 
@@ -1400,8 +1600,8 @@ def main(argv=None, registry=None):
     """Run the CLI. `registry` is the operation-type registry used by the
     internal `operation run` executor; production code passes None, which
     loads the production registry (`clear`, `backup.create`, `migrate`,
-    `restore`; rebuild/quarantine arrive with their own tickets). Returns
-    the process exit code.
+    `restore`; rebuild arrives with its own ticket). Returns the process
+    exit code.
     """
     if os.geteuid() == 0:
         error = make_error(

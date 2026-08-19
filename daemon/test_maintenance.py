@@ -37,7 +37,7 @@ class _FakeControlClient:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def prepare(self):
+    def prepare(self, expect_unreadable=False):
         self.steps.append("prepare")
         return {"ok": True}
 
