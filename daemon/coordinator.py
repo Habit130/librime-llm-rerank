@@ -219,7 +219,8 @@ class MaintenanceCoordinator:
             self._condition.notify_all()
         return self._block(code)
 
-    def prepare(self, operation_id, lease_id=None, lease_alive=None):
+    def prepare(self, operation_id, lease_id=None, lease_alive=None,
+                expect_unreadable=False):
         with self._condition:
             if self._closed or self._state != "serving":
                 return {"ok": False, "code": "maintenance_in_progress"}
@@ -279,10 +280,22 @@ class MaintenanceCoordinator:
                         return self._prepare_failure("control_lease_lost")
                     self._condition.wait(0.05 if lease_alive is not None else None)
             try:
-                identity = self._identity_reader(self._facts_root)
+                if expect_unreadable:
+                    # #57 unreadable-current restore: the current store is
+                    # PRESENT but cannot be read (that is the whole point of
+                    # the quarantine path). The daemon must quiesce WITHOUT
+                    # verifying an identity; the content fingerprint at
+                    # publish time is the CAS. A missing store still fails
+                    # closed (that is --expect-no-store).
+                    if not self._facts_database_exists():
+                        return self._prepare_failure("epoch_unverifiable")
+                    identity = None
+                else:
+                    identity = self._identity_reader(self._facts_root)
             except Exception:
                 identity = None
-            if identity is None and self._facts_database_exists():
+            if identity is None and self._facts_database_exists() \
+                    and not expect_unreadable:
                 return self._prepare_failure("epoch_unverifiable")
             if identity is not None and not self._valid_identity(identity):
                 return self._prepare_failure("epoch_unverifiable")

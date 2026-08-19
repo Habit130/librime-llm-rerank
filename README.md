@@ -231,6 +231,10 @@ squirrel-semantic-memory restore --from <backup> \
     (--backup-current <new-path> | --discard-current)
 squirrel-semantic-memory restore --from <backup> --yes \
     --expect-store-epoch <epoch> (--backup-current <new-path> | --discard-current)
+squirrel-semantic-memory restore --from <backup> --discard-current \
+    --accept-unreadable-current --expect-current-fingerprint <hash>
+squirrel-semantic-memory restore --from <backup> --discard-current \
+    --expect-no-store
 ```
 
 Preflight validates the container (exact member set, names, attributes,
@@ -255,9 +259,40 @@ requires typing `RESTORE <backup_id> OVER <current_store_epoch>` verbatim.
 Non-interactive use requires both `--yes` and `--expect-store-epoch`, which
 must match the current live epoch (a stale expectation is a zero-side-effect
 failure). Only a healthy current store can be restored over: an unreadable
-current store fails closed, and a missing store fails closed
-(`--accept-unreadable-current` / `--expect-current-fingerprint` /
-`--expect-no-store` are #57 and stay reserved).
+current store fails closed, and a missing store fails closed.
+
+**Unreadable current store (#57).** When the current `facts.sqlite3` is
+present but the identity seam cannot read it (corrupt header, clock-invalid
+meta, open/permission failure), restore is allowed ONLY with the atomic flag
+pair `--accept-unreadable-current` + `--expect-current-fingerprint <sha256
+hex>`. Classification runs the C++ `schema` seam on a throwaway copy of the
+store (never the live file, so the as-is bytes stay untouched): a store the
+seam reads is refused — healthy (not a bypass of the epoch CAS),
+supported-old needs-migration, or too-new (migrate stays the only upgrade
+path per RISK-57-2). The fingerprint is defined over the as-is DB+WAL+SHM
+bytes that will be quarantined (documented in `daemon/quarantine.py`; tests
+and manual probes compute the same value). After quiesce the fingerprint is
+computed from the ALREADY-OPENED descriptors and compared with the
+expectation; on a match the as-is bytes are copied into
+`quarantine/<operation_id>/` (0700 dir, 0600 files), byte-identity-verified
+and fsynced BEFORE the atomic replace. Any fingerprint mismatch,
+copy/verify failure or space shortfall aborts with the current bytes
+untouched and no successful-looking quarantine. `--backup-current` is
+refused (an unreadable store cannot be snapshotted).
+
+**Missing store (#57).** A truly absent `facts.sqlite3` uses the distinct
+`--expect-no-store` branch: the backup's history is restored as a new epoch
+with no quarantine and no current-epoch CAS (there is none). A present file
+— even an unreadable one — never satisfies `--expect-no-store`.
+
+**Quarantine.** The daemon never scans, repairs, merges or auto-restores
+quarantine. `squirrel-semantic-memory quarantine list` reports only identity
+(operation id, fingerprint, sizes, timestamp — never any private text);
+`squirrel-semantic-memory quarantine purge <operation_id>
+<content_fingerprint>` deletes exactly one operation's copy and only when
+BOTH identifiers match exactly (a wrong fingerprint refuses the delete).
+`clear` deletes all app-controlled quarantine; external backups are
+untouched.
 
 Crash recovery is phase-persistent. A crash before the atomic replace
 leaves the complete old store observable; after the replace the durable

@@ -90,15 +90,18 @@ class MaintenanceControlClient:
             self.connection.close()
             self.connection = None
 
-    def _request(self, action):
+    def _request(self, action, extra=None):
         if self.connection is None or self._reader is None:
             raise MaintenanceError("control_unavailable")
+        payload = {
+            "version": CONTROL_VERSION,
+            "action": action,
+            "operation_id": self.operation_id,
+        }
+        if extra:
+            payload.update(extra)
         try:
-            _send(self.connection, {
-                "version": CONTROL_VERSION,
-                "action": action,
-                "operation_id": self.operation_id,
-            })
+            _send(self.connection, payload)
             line = self._reader.readline()
         except (OSError, ValueError) as error:
             raise MaintenanceError("control_unavailable") from error
@@ -114,8 +117,9 @@ class MaintenanceControlClient:
             raise MaintenanceError("control_protocol_invalid")
         return response
 
-    def prepare(self):
-        return self._request("prepare")
+    def prepare(self, expect_unreadable=False):
+        extra = {"expect_unreadable": True} if expect_unreadable else None
+        return self._request("prepare", extra)
 
     def reopen(self):
         return self._request("reopen")
@@ -183,7 +187,8 @@ def _serve_connection(connection, coordinator):
                 # and strand the live lease of the first, successful prepare.
                 response = coordinator.prepare(
                     request["operation_id"], lease_id,
-                    lease_alive=lambda: not lease_lost.is_set())
+                    lease_alive=lambda: not lease_lost.is_set(),
+                    expect_unreadable=bool(request.get("expect_unreadable")))
                 if response.get("ok"):
                     operation_id = request["operation_id"]
             elif action == "lease":

@@ -206,7 +206,7 @@ class FakeControlClient:
     def __exit__(self, exc_type, exc, traceback):
         self.steps.append("close")
 
-    def prepare(self):
+    def prepare(self, expect_unreadable=False):
         self.steps.append("prepare")
         if not self.prepare_ok:
             return {"ok": False, "code": self.prepare_code

@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import uuid
 import zipfile
 
@@ -39,6 +40,7 @@ sys.path.insert(0, DAEMON_DIR)
 import backup_operation  # noqa: E402
 import cli  # noqa: E402
 import operations as operations_module  # noqa: E402
+import quarantine  # noqa: E402
 import restore_operation  # noqa: E402
 from backup_operation import (  # noqa: E402
     FACTS_MEMBER,
@@ -237,14 +239,19 @@ class RestoreEnv(unittest.TestCase):
         return registry
 
     def create_op(self, spec, from_path, epoch, operation_id=None,
-                  backup_current=None, discard_current=True):
+                  backup_current=None, discard_current=True,
+                  accept_unreadable_current=False,
+                  expect_current_fingerprint="", expect_no_store=False):
         store = OperationStore(self.root)
         return create_operation(
             store, self.registry(spec), "restore",
             {"from_path": from_path,
              "backup_current": backup_current,
              "discard_current": discard_current,
-             "expect_store_epoch": epoch},
+             "expect_store_epoch": epoch,
+             "accept_unreadable_current": accept_unreadable_current,
+             "expect_current_fingerprint": expect_current_fingerprint,
+             "expect_no_store": expect_no_store},
             operation_id=operation_id)
 
     def store(self):
@@ -282,8 +289,10 @@ class FakeControlClient:
     def __exit__(self, exc_type, exc, traceback):
         self.steps.append("close")
 
-    def prepare(self):
+    def prepare(self, expect_unreadable=False):
         self.steps.append("prepare")
+        if expect_unreadable:
+            self.steps.append("prepare:unreadable")
         if not self.prepare_ok:
             return {"ok": False, "code": self.prepare_code
                     or "maintenance_in_progress"}
@@ -1048,6 +1057,524 @@ class RestoreStepTests(RestoreEnv):
         self.assertEqual("fact_store_unverifiable",
                          record["error"]["code"])
 
+    # -- #57 unreadable / no-store paths -------------------------------------
+
+    def _make_unreadable_store(self, seed=True):
+        """Create a live store, then corrupt its main DB header so the
+        identity seam cannot read it. Returns (identity_before, fingerprint)
+        where the fingerprint is over the as-is DB+WAL+SHM bytes. Uses the
+        C++-seam-on-copy classifier to prove unreadability (any sqlite open
+        of the live store would rewrite its WAL/SHM sidecars and change the
+        fingerprint)."""
+        live = self.make_live_store(seed=seed)
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        with open(db_path, "rb+") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff\xff\xff\xff")
+        # Prove the seam now fails closed (unreadable) WITHOUT mutating the
+        # store: classify_current_store runs the C++ schema seam on a copy.
+        disposition, detail = quarantine.classify_current_store(
+            self.root, self.helper, os.geteuid())
+        self.assertEqual("unreadable", disposition, detail)
+        members = {}
+        for member in quarantine.QUARANTINE_MEMBERS:
+            path = os.path.join(self.root, member)
+            if os.path.exists(path):
+                with open(path, "rb") as stream:
+                    members[member] = stream.read()
+        fingerprint = quarantine.fingerprint_bytes(members)
+        return live, fingerprint
+
+    def _quarantine_bytes(self, operation_id):
+        import quarantine
+        path = os.path.join(self.root, quarantine.QUARANTINE_DIRNAME,
+                            operation_id, "facts.sqlite3")
+        with open(path, "rb") as stream:
+            return stream.read()
+
+    def test_unreadable_restore_flag_pair_required(self):
+        # Either #57 flag alone is a usage error before any mutation.
+        live, fingerprint = self._make_unreadable_store()
+        backup_root = os.path.join(self._tmp, "BackupMachine57a")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        # accept without fingerprint
+        with self.assertRaises(ValueError):
+            self.create_op(spec, backup, "", accept_unreadable_current=True)
+        # fingerprint without accept
+        with self.assertRaises(ValueError):
+            self.create_op(spec, backup, "",
+                           expect_current_fingerprint=fingerprint)
+
+    def test_unreadable_current_accepted_with_fingerprint_and_quarantine(
+            self):
+        # SCN-57-1: unreadable current + correct accept/fingerprint ->
+        # quarantine (as-is bytes, verified) then replace.
+        live, fingerprint = self._make_unreadable_store()
+        db_bytes = self._read_db_bytes()
+        backup_root = os.path.join(self._tmp, "BackupMachine57b")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, backup_result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",
+                                accept_unreadable_current=True,
+                                expect_current_fingerprint=fingerprint)
+        operation_id = record["operation_id"]
+        record = self.run_to_terminal(spec, operation_id)
+        self.assertEqual("succeeded", record["state"], record["error"])
+        result = record["result"]
+        self.assertEqual("restored", result["outcome"])
+        self.assertTrue(result["fact_operation_succeeded"])
+        self.assertEqual(operation_id, result["quarantine_operation_id"])
+        self.assertEqual(fingerprint, result["quarantine_fingerprint"])
+        # The old (unreadable) store was replaced by the backup's history.
+        new_identity, _empty = self.live_identity()
+        self.assertEqual(backup_identity["history_id"],
+                         new_identity["history_id"])
+        self.assertNotEqual(live["store_epoch"], new_identity["store_epoch"])
+        # The quarantine copy preserves the as-is main DB bytes verbatim.
+        self.assertEqual(db_bytes, self._quarantine_bytes(operation_id))
+        # The quarantine metadata is identity-only (no private text).
+        import quarantine
+        metadata_path = os.path.join(
+            self.root, quarantine.QUARANTINE_DIRNAME, operation_id,
+            quarantine.METADATA_FILE)
+        metadata = json.load(open(metadata_path))
+        self.assertEqual(fingerprint, metadata["fingerprint"])
+        self.assertNotIn(SECRET_PRECEDING, json.dumps(metadata))
+        self.assertNotIn(SECRET_CANDIDATE, json.dumps(metadata))
+
+    def _read_db_bytes(self):
+        with open(os.path.join(self.root, "facts.sqlite3"), "rb") as stream:
+            return stream.read()
+
+    def test_unreadable_fingerprint_mismatch_no_replace(self):
+        # SCN-57-2: fingerprint mismatch aborts with no replace and no
+        # successful-looking quarantine.
+        live, _fingerprint = self._make_unreadable_store()
+        db_bytes = self._read_db_bytes()
+        backup_root = os.path.join(self._tmp, "BackupMachine57c")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",
+                                accept_unreadable_current=True,
+                                expect_current_fingerprint="b" * 64)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("fingerprint_mismatch", record["error"]["code"])
+        # The current bytes are untouched.
+        self.assertEqual(db_bytes, self._read_db_bytes())
+        # No quarantine was published (a partial dir must not look
+        # successful).
+        import quarantine
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, quarantine.QUARANTINE_DIRNAME)))
+
+    def test_unreadable_path_rejects_healthy_store(self):
+        # The unreadable path is not a bypass of the epoch CAS: a healthy
+        # readable current store is refused.
+        live = self.make_live_store(seed=True)
+        backup_root = os.path.join(self._tmp, "BackupMachine57d")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",
+                                accept_unreadable_current=True,
+                                expect_current_fingerprint="d" * 64)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("store_present_unexpected",
+                         record["error"]["code"])
+        # The healthy store is unchanged.
+        self.assertEqual(live["store_epoch"],
+                         _meta_value(os.path.join(self.root, "facts.sqlite3"),
+                                     "store_epoch"))
+
+    def test_unreadable_path_rejects_too_new_and_migrate_eligible(self):
+        # RISK-57-2 pinning: a too-new or supported-old store is classified
+        # "readable" by the C++ seam (migrate / #58 stays the only upgrade
+        # path); it is never forced through quarantine-restore.
+        for bump in (999, 0):
+            with self.subTest(schema_version=bump):
+                if os.path.isdir(self.root):
+                    shutil.rmtree(self.root)
+                live = self.make_live_store(seed=True)
+                connection = sqlite3.connect(
+                    os.path.join(self.root, "facts.sqlite3"))
+                connection.execute(
+                    "UPDATE meta SET value=? WHERE key='fact_schema_version'",
+                    (str(bump),))
+                connection.commit()
+                connection.close()
+                backup_root = os.path.join(
+                    self._tmp, "BackupMachine57r%d" % bump)
+                backup_identity = self.helper.create_empty(backup_root)
+                self.seed_backup(backup_root,
+                                 backup_identity["store_epoch"])
+                backup, _result = self.make_backup_from_store(
+                    backup_root,
+                    output=os.path.join(
+                        self.dest_dir, "backup57r%d.squirrel-memory-backup"
+                        % bump))
+                spec = self.build_spec(
+                    control_client_factory=self.control_factory())
+                record = self.create_op(
+                    spec, backup, "",
+                    accept_unreadable_current=True,
+                    expect_current_fingerprint="d" * 64)
+                record = self.run_to_terminal(spec, record["operation_id"])
+                self.assertEqual("blocked", record["state"])
+                self.assertEqual("store_present_unexpected",
+                                 record["error"]["code"])
+                self.assertFalse(os.path.exists(
+                    os.path.join(self.root, quarantine.QUARANTINE_DIRNAME)))
+
+    def test_unreadable_path_rejects_missing_store(self):
+        # A missing store is the --expect-no-store territory, never the
+        # unreadable path.
+        backup_root = os.path.join(self._tmp, "BackupMachine57e")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",                                accept_unreadable_current=True,
+                                expect_current_fingerprint="d" * 64)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("store_missing", record["error"]["code"])
+
+    def test_expect_no_store_restores_without_quarantine(self):
+        # SCN-57-3: missing store + --expect-no-store -> restore without
+        # quarantine; no epoch CAS.
+        backup_root = os.path.join(self._tmp, "BackupMachine57f")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, backup_result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "", expect_no_store=True)
+        operation_id = record["operation_id"]
+        record = self.run_to_terminal(spec, operation_id)
+        self.assertEqual("succeeded", record["state"], record["error"])
+        result = record["result"]
+        self.assertEqual("restored", result["outcome"])
+        self.assertTrue(result["no_store"])
+        self.assertIsNone(result["old"])
+        new_identity, _empty = self.live_identity()
+        self.assertEqual(backup_identity["history_id"],
+                         new_identity["history_id"])
+        # No quarantine was created.
+        import quarantine
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, quarantine.QUARANTINE_DIRNAME)))
+
+    def test_expect_no_store_rejects_unreadable_file(self):
+        # An unreadable present file does NOT satisfy --expect-no-store (the
+        # gate is raw presence: the path must be absent, never merely
+        # unreadable).
+        live, _fingerprint = self._make_unreadable_store()
+        backup_root = os.path.join(self._tmp, "BackupMachine57g")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "", expect_no_store=True)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("store_present_unexpected",
+                         record["error"]["code"])
+
+    def test_expect_no_store_rejects_healthy_store(self):
+        live = self.make_live_store(seed=True)
+        backup_root = os.path.join(self._tmp, "BackupMachine57h")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "", expect_no_store=True)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("store_present_unexpected",
+                         record["error"]["code"])
+
+    def test_expect_no_store_rejects_empty_present_file(self):
+        # Seam 5 pinning: #56 treats a present (even empty) facts file as a
+        # store — `verify` on a 0-byte file CREATES an empty store, so the
+        # path exists and is NOT "missing". --expect-no-store therefore
+        # refuses a 0-byte present file (the gate is raw presence).
+        root = self.root
+        os.makedirs(root, mode=0o700)
+        os.chmod(root, 0o700)
+        with open(os.path.join(root, "facts.sqlite3"), "wb"):
+            pass
+        os.chmod(os.path.join(root, "facts.sqlite3"), 0o600)
+        backup_root = os.path.join(self._tmp, "BackupMachine57m")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "", expect_no_store=True)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("store_present_unexpected",
+                         record["error"]["code"])
+        # The 0-byte file was not touched (no restore, no quarantine).
+        self.assertEqual(0, os.path.getsize(
+            os.path.join(root, "facts.sqlite3")))
+        self.assertFalse(os.path.exists(
+            os.path.join(root, quarantine.QUARANTINE_DIRNAME)))
+
+    def test_unreadable_no_store_conflict_at_normalize(self):
+        live = self.make_live_store(seed=True)
+        backup_root = os.path.join(self._tmp, "BackupMachine57i")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        with self.assertRaises(ValueError):
+            self.create_op(spec, backup, "",
+                           accept_unreadable_current=True,
+                           expect_current_fingerprint="d" * 64,
+                           expect_no_store=True)
+
+    def test_restore_then_clear_removes_quarantine(self):
+        # SCN-57-7: after a successful unreadable restore the quarantine
+        # still verifies; a later clear removes the app-controlled
+        # quarantine (external backups untouched).
+        live, fingerprint = self._make_unreadable_store()
+        backup_root = os.path.join(self._tmp, "BackupMachine57j")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",
+                                accept_unreadable_current=True,
+                                expect_current_fingerprint=fingerprint)
+        operation_id = record["operation_id"]
+        record = self.run_to_terminal(spec, operation_id)
+        self.assertEqual("succeeded", record["state"], record["error"])
+        import quarantine
+        qdir = os.path.join(self.root, quarantine.QUARANTINE_DIRNAME,
+                            operation_id)
+        self.assertTrue(os.path.isdir(qdir))
+        # External backup (a user file outside the root) stays untouched.
+        external = os.path.join(self.dest_dir, "external-backup.bin")
+        with open(external, "wb") as stream:
+            stream.write(b"external")
+        # Now clear; the clear deletes app-controlled quarantine.
+        import clear_operation
+        from clear_operation import ClearSpec
+        original_probe = clear_operation._probe_control_socket
+        clear_operation._probe_control_socket = lambda path: True
+        try:
+            clear_spec = ClearSpec(
+                self.root, helper=self.helper, euid=os.geteuid(),
+                control_socket=self.control_socket,
+                scoring_socket=self.scoring_socket,
+                control_client_factory=self.control_factory()).build()
+            clear_record = create_operation(
+                self.store(), self.registry(clear_spec), "clear",
+                {"expect_store_epoch":
+                 record["result"]["new"]["store_epoch"]})
+            clear_record = self.run_to_terminal(clear_spec,
+                                                clear_record["operation_id"])
+        finally:
+            clear_operation._probe_control_socket = original_probe
+        self.assertEqual("succeeded", clear_record["state"],
+                         clear_record["error"])
+        self.assertEqual("cleared", clear_record["result"]["outcome"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, quarantine.QUARANTINE_DIRNAME)))
+        self.assertTrue(os.path.exists(external))
+
+    def test_healthy_restore_still_fail_closed_without_57_flags(self):
+        # SCN-57-4: the #56 healthy path is preserved — an unreadable or
+        # missing store still fails closed without the #57 flags.
+        live, _fingerprint = self._make_unreadable_store()
+        backup_root = os.path.join(self._tmp, "BackupMachine57k")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, live["store_epoch"])
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("fact_store_unverifiable",
+                         record["error"]["code"])
+
+    # -- #57 fault injection -------------------------------------------------
+
+    def test_quarantine_copy_failure_no_replace_no_partial_dir(self):
+        # SCN-57-2: a copy/disk-full failure during quarantine aborts with
+        # no replace and no successful-looking quarantine.
+        original_open = os.open
+        original_publish = restore_operation.publish_quarantine
+
+        def faulty_open(*args, **kwargs):
+            if args and isinstance(args[0], str) \
+                    and args[0] == "facts.sqlite3" \
+                    and len(args) > 1 and (args[1] & os.O_WRONLY):
+                raise OSError(28, "No space left on device")
+            return original_open(*args, **kwargs)
+
+        def fault_publish(root, operation_id, fds, expected, euid,
+                          now=None, disposition="unreadable"):
+            with unittest.mock.patch("quarantine.os.open", faulty_open):
+                return quarantine.publish_quarantine(
+                    root, operation_id, fds, expected, euid, now=now,
+                    disposition=disposition)
+        restore_operation.publish_quarantine = fault_publish
+        try:
+            live, fingerprint = self._make_unreadable_store()
+            db_bytes = self._read_db_bytes()
+            backup_root = os.path.join(self._tmp, "BackupMachine57fault1")
+            backup_identity = self.helper.create_empty(backup_root)
+            self.seed_backup(backup_root, backup_identity["store_epoch"])
+            backup, _result = self.make_backup_from_store(backup_root)
+            spec = self.build_spec(
+                control_client_factory=self.control_factory())
+            record = self.create_op(spec, backup, "",
+                                    accept_unreadable_current=True,
+                                    expect_current_fingerprint=fingerprint)
+            record = self.run_to_terminal(spec, record["operation_id"])
+        finally:
+            restore_operation.publish_quarantine = original_publish
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("quarantine_failed", record["error"]["code"])
+        # The current bytes are untouched.
+        self.assertEqual(db_bytes, self._read_db_bytes())
+        # No partial quarantine op dir looks successful (the parent
+        # `quarantine/` may remain, but never the operation's copy).
+        self.assertFalse(os.path.exists(os.path.join(
+            self.root, quarantine.QUARANTINE_DIRNAME, record["operation_id"])))
+
+    def test_quarantine_verify_failure_no_replace(self):
+        # SCN-57-2: a quarantine verification (byte-identity check of the
+        # copies) failure aborts with no replace and removes the partial
+        # quarantine.
+        original_open = os.open
+        original_publish = restore_operation.publish_quarantine
+        state = {"db_reads": 0}
+
+        def faulty_open(*args, **kwargs):
+            # The verification step re-opens the copied `facts.sqlite3`
+            # read-only (O_RDONLY == 0); fail that open so byte-identity
+            # verification cannot complete. The write open (O_WRONLY set)
+            # and the source fd from open_current_files (which predates the
+            # patch) are not affected.
+            if args and isinstance(args[0], str) \
+                    and args[0] == "facts.sqlite3" \
+                    and not (args[1] & os.O_WRONLY):
+                raise OSError(5, "Input/output error")
+            return original_open(*args, **kwargs)
+
+        def fault_publish(root, operation_id, fds, expected, euid,
+                          now=None, disposition="unreadable"):
+            with unittest.mock.patch("quarantine.os.open", faulty_open):
+                return quarantine.publish_quarantine(
+                    root, operation_id, fds, expected, euid, now=now,
+                    disposition=disposition)
+        restore_operation.publish_quarantine = fault_publish
+        try:
+            live, fingerprint = self._make_unreadable_store()
+            db_bytes = self._read_db_bytes()
+            backup_root = os.path.join(self._tmp, "BackupMachine57fault2")
+            backup_identity = self.helper.create_empty(backup_root)
+            self.seed_backup(backup_root, backup_identity["store_epoch"])
+            backup, _result = self.make_backup_from_store(backup_root)
+            spec = self.build_spec(
+                control_client_factory=self.control_factory())
+            record = self.create_op(spec, backup, "",
+                                    accept_unreadable_current=True,
+                                    expect_current_fingerprint=fingerprint)
+            record = self.run_to_terminal(spec, record["operation_id"])
+        finally:
+            restore_operation.publish_quarantine = original_publish
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("quarantine_failed", record["error"]["code"])
+        # The current bytes are untouched (no replace happened).
+        self.assertEqual(db_bytes, self._read_db_bytes())
+        # The partial quarantine op dir was removed.
+        self.assertFalse(os.path.exists(os.path.join(
+            self.root, quarantine.QUARANTINE_DIRNAME, record["operation_id"])))
+
+    def test_fingerprint_change_between_plan_and_copy_no_replace(self):
+        # SCN-57-2: the fingerprint is recomputed from the opened fds at
+        # publish time; a change between plan and copy aborts with no
+        # quarantine and no replace.
+        live, _fingerprint = self._make_unreadable_store()
+        db_bytes = self._read_db_bytes()
+        backup_root = os.path.join(self._tmp, "BackupMachine57fault3")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        # Use a DIFFERENT fingerprint than the store's actual bytes.
+        wrong = "a" * 64
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",
+                                accept_unreadable_current=True,
+                                expect_current_fingerprint=wrong)
+        record = self.run_to_terminal(spec, record["operation_id"])
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("fingerprint_mismatch", record["error"]["code"])
+        self.assertEqual(db_bytes, self._read_db_bytes())
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, quarantine.QUARANTINE_DIRNAME)))
+
+    def test_unreadable_space_short_fails_preflight_no_replace(self):
+        # SCN-57-2: space short for the quarantine copy fails in preflight
+        # with the current state untouched (spec #57: 空间不足时不发布恢复库).
+        live, fingerprint = self._make_unreadable_store()
+        db_bytes = self._read_db_bytes()
+        backup_root = os.path.join(self._tmp, "BackupMachine57fault4")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        original_space = restore_operation._space_available
+        restore_operation._space_available = lambda root: 0
+        try:
+            spec = self.build_spec(
+                control_client_factory=self.control_factory())
+            record = self.create_op(spec, backup, "",
+                                    accept_unreadable_current=True,
+                                    expect_current_fingerprint=fingerprint)
+            record = self.run_to_terminal(spec, record["operation_id"])
+        finally:
+            restore_operation._space_available = original_space
+        self.assertEqual("blocked", record["state"])
+        self.assertEqual("insufficient_space", record["error"]["code"])
+        self.assertEqual(db_bytes, self._read_db_bytes())
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, quarantine.QUARANTINE_DIRNAME)))
+
+    def test_quarantine_list_has_no_raw_text_after_restore(self):
+        # SCN-57-5 / BASE-SAFETY: after an unreadable restore, `quarantine
+        # list` output contains only identity (no private text).
+        live, fingerprint = self._make_unreadable_store()
+        backup_root = os.path.join(self._tmp, "BackupMachine57l")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        spec = self.build_spec(control_client_factory=self.control_factory())
+        record = self.create_op(spec, backup, "",
+                                accept_unreadable_current=True,
+                                expect_current_fingerprint=fingerprint)
+        operation_id = record["operation_id"]
+        record = self.run_to_terminal(spec, operation_id)
+        self.assertEqual("succeeded", record["state"], record["error"])
+        from quarantine import list_quarantine
+        entries = list_quarantine(self.root, os.geteuid())
+        self.assertEqual(1, len(entries))
+        self.assertEqual(operation_id, entries[0]["operation_id"])
+        text = json.dumps(entries)
+        self.assertNotIn(SECRET_PRECEDING, text)
+        self.assertNotIn(SECRET_CANDIDATE, text)
+
     # -- idempotency --------------------------------------------------------
 
     def test_same_operation_id_same_parameters_idempotent(self):
@@ -1245,6 +1772,153 @@ class RestoreCliTests(RestoreEnv):
         self.assertNotIn(SECRET_CANDIDATE, stdout)
         self.assertNotIn(SECRET_PRECEDING, stderr)
         self.assertNotIn(SECRET_CANDIDATE, stderr)
+
+    # -- #57 CLI end-to-end -------------------------------------------------
+
+    def test_cli_unreadable_restore_end_to_end_with_quarantine(self):
+        # SCN-57-1 end to end through the real CLI + control server: the
+        # unreadable store is quarantined (as-is, verified) then replaced.
+        # The daemon starts on the healthy store and the store is corrupted
+        # afterwards (the realistic crash-scene flow).
+        live = self.make_live_store(seed=True)
+        self.start_control_server()
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        with open(db_path, "rb+") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff\xff\xff\xff")
+        fingerprint = quarantine.fingerprint_bytes({
+            member: open(os.path.join(self.root, member), "rb").read()
+            for member in quarantine.QUARANTINE_MEMBERS
+            if os.path.exists(os.path.join(self.root, member))})
+        backup_root = os.path.join(self._tmp, "BackupMachineCli57a")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        code, stdout, stderr = self.run_cli(
+            "restore", "--from", backup, "--discard-current",
+            "--yes", "--accept-unreadable-current",
+            "--expect-current-fingerprint", fingerprint, "--json",
+            timeout=120)
+        self.assertEqual(0, code, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual("succeeded", payload["state"])
+        result = payload["result"]
+        self.assertEqual("restored", result["outcome"])
+        self.assertTrue(result["fact_operation_succeeded"])
+        self.assertEqual(fingerprint, result["quarantine_fingerprint"])
+        new_identity, _empty = self.live_identity()
+        self.assertEqual(backup_identity["history_id"],
+                         new_identity["history_id"])
+        # The quarantine copy exists and is identity-listed.
+        rc, out, err = self.run_cli("quarantine", "list", "--json")
+        self.assertEqual(0, rc, err)
+        listed = json.loads(out)
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(fingerprint,
+                         listed["entries"][0]["fingerprint"])
+        # list carries no private text.
+        self.assertNotIn(SECRET_PRECEDING, out)
+        self.assertNotIn(SECRET_CANDIDATE, out)
+
+    def test_cli_unreadable_fingerprint_mismatch_no_replace(self):
+        # SCN-57-2 end to end: a wrong fingerprint aborts with no replace
+        # and no quarantine.
+        live = self.make_live_store(seed=True)
+        self.start_control_server()
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        with open(db_path, "rb+") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff\xff\xff\xff")
+        db_bytes = open(db_path, "rb").read()
+        backup_root = os.path.join(self._tmp, "BackupMachineCli57b")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        code, stdout, stderr = self.run_cli(
+            "restore", "--from", backup, "--discard-current",
+            "--yes", "--accept-unreadable-current",
+            "--expect-current-fingerprint", "b" * 64, "--json",
+            timeout=120)
+        self.assertEqual(1, code)
+        self.assertIn("fingerprint_mismatch", stdout + stderr)
+        # The current bytes are untouched.
+        self.assertEqual(db_bytes, open(db_path, "rb").read())
+        rc, out, err = self.run_cli("quarantine", "list", "--json")
+        self.assertEqual(0, rc, err)
+        self.assertEqual(0, json.loads(out)["count"])
+
+    def test_cli_expect_no_store_end_to_end(self):
+        # SCN-57-3 end to end: missing store + --expect-no-store restores
+        # without quarantine.
+        backup_root = os.path.join(self._tmp, "BackupMachineCli57c")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        self.start_control_server()
+        code, stdout, stderr = self.run_cli(
+            "restore", "--from", backup, "--discard-current",
+            "--yes", "--expect-no-store", "--json",
+            timeout=120)
+        self.assertEqual(0, code, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual("succeeded", payload["state"])
+        result = payload["result"]
+        self.assertEqual("restored", result["outcome"])
+        self.assertTrue(result["no_store"])
+        new_identity, _empty = self.live_identity()
+        self.assertEqual(backup_identity["history_id"],
+                         new_identity["history_id"])
+        rc, out, err = self.run_cli("quarantine", "list", "--json")
+        self.assertEqual(0, rc, err)
+        self.assertEqual(0, json.loads(out)["count"])
+
+    def test_cli_expect_no_store_with_present_unreadable_file_refused(self):
+        # SCN-57-3: an unreadable present file never satisfies
+        # --expect-no-store (end to end).
+        live = self.make_live_store(seed=True)
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        with open(db_path, "rb+") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff\xff\xff\xff")
+        db_bytes = open(db_path, "rb").read()
+        backup_root = os.path.join(self._tmp, "BackupMachineCli57d")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        code, stdout, stderr = self.run_cli(
+            "restore", "--from", backup, "--discard-current",
+            "--yes", "--expect-no-store", "--json",
+            timeout=120)
+        self.assertEqual(2, code)
+        self.assertIn("store_present", stdout + stderr)
+        # No store was touched.
+        self.assertEqual(db_bytes, open(db_path, "rb").read())
+
+    def test_cli_unreadable_interactive_exact_confirmation(self):
+        live = self.make_live_store(seed=True)
+        self.start_control_server()
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        with open(db_path, "rb+") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff\xff\xff\xff")
+        fingerprint = quarantine.fingerprint_bytes({
+            member: open(os.path.join(self.root, member), "rb").read()
+            for member in quarantine.QUARANTINE_MEMBERS
+            if os.path.exists(os.path.join(self.root, member))})
+        backup_root = os.path.join(self._tmp, "BackupMachineCli57e")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, result = self.make_backup_from_store(backup_root)
+        confirmation = "RESTORE %s OVER UNREADABLE %s" % (
+            result["backup_id"], fingerprint)
+        code, stdout, stderr = self.run_cli(
+            "restore", "--from", backup, "--discard-current",
+            "--accept-unreadable-current",
+            "--expect-current-fingerprint", fingerprint,
+            input_text=confirmation + "\n", timeout=120)
+        self.assertEqual(0, code, stderr)
+        self.assertIn("restore restored", stdout)
+        self.assertIn("quarantined current store", stdout)
 
 
 if __name__ == "__main__":

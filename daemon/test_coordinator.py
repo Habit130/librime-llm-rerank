@@ -307,6 +307,81 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual("blocked", self.coordinator.health()["maintenance_state"])
         self.assertIsNone(self.coordinator.begin_request())
 
+    def test_prepare_expect_unreadable_quiesces_without_identity_read(self):
+        # #57: the unreadable-current restore quiesces WITHOUT reading the
+        # current identity (the fingerprint at publish is the CAS). A present
+        # store prepares; a missing store still fails closed.
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            write_facts(root, epoch="disk-epoch")
+            coordinator = MaintenanceCoordinator(root)
+            handle = coordinator.open_fact_handle()
+            self.assertTrue(handle.lease_held)
+
+            def unreadable(_root):
+                raise MaintenanceError("epoch_unverifiable")
+
+            coordinator._identity_reader = unreadable
+            prepared = coordinator.prepare("op-unreadable",
+                                           expect_unreadable=True)
+            self.assertTrue(prepared["ok"])
+            self.assertIsNone(prepared["store_epoch"])
+            self.assertEqual(0, prepared["open_handles"])
+            self.assertTrue(handle.is_closed)
+            # The exclusive lease is now acquirable (daemon quiesced).
+            exclusive = MaintenanceLock(root, exclusive=True,
+                                        nonblocking=True).acquire()
+            exclusive.release()
+
+    def test_prepare_expect_unreadable_missing_store_fails_closed(self):
+        # A missing store is --expect-no-store territory; even with
+        # expect_unreadable the daemon refuses to quiesce an absent store.
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            os.mkdir(root, 0o700)
+            coordinator = MaintenanceCoordinator(root)
+            prepared = coordinator.prepare("op-missing",
+                                           expect_unreadable=True)
+            self.assertFalse(prepared["ok"])
+            self.assertEqual("epoch_unverifiable", prepared["code"])
+            self.assertEqual("blocked",
+                             coordinator.health()["maintenance_state"])
+
+    def test_daemon_never_scans_or_touches_quarantine(self):
+        # SCN-57-6 / AC57-5: daemon prepare/reopen/status never scan,
+        # repair, merge or auto-restore quarantine. A populated quarantine
+        # directory is byte-for-byte untouched across a full quiesce.
+        with tempfile.TemporaryDirectory() as temp:
+            root = os.path.join(temp, "facts")
+            write_facts(root, epoch="disk-epoch")
+            qdir = os.path.join(root, "quarantine", "op-evidence")
+            os.makedirs(qdir, 0o700)
+            os.chmod(os.path.join(root, "quarantine"), 0o700)
+            payload = b"as-is-evidence-bytes"
+            with open(os.path.join(qdir, "facts.sqlite3"), "wb") as f:
+                f.write(payload)
+            os.chmod(os.path.join(qdir, "facts.sqlite3"), 0o600)
+            import json as json_module
+            with open(os.path.join(qdir, "metadata.json"), "w") as f:
+                json_module.dump({"fingerprint": "d" * 64}, f)
+            os.chmod(os.path.join(qdir, "metadata.json"), 0o600)
+
+            coordinator = MaintenanceCoordinator(root,
+                                                 auto_open_fact_handle=True)
+            # status-like health read
+            health = coordinator.health()
+            self.assertEqual("serving", health["maintenance_state"])
+            prepared = coordinator.prepare("op-evidence")
+            self.assertTrue(prepared["ok"])
+            result = coordinator.reopen("op-evidence")
+            self.assertTrue(result["ok"])
+
+            # The quarantine evidence is untouched.
+            with open(os.path.join(qdir, "facts.sqlite3"), "rb") as f:
+                self.assertEqual(payload, f.read())
+            self.assertTrue(os.path.exists(
+                os.path.join(qdir, "metadata.json")))
+
     def test_pristine_no_database_reopen_returns_to_serving(self):
         with tempfile.TemporaryDirectory() as temp:
             root = os.path.join(temp, "facts")

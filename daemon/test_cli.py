@@ -468,37 +468,147 @@ class CliTest(unittest.TestCase):
     # -- reserved maintenance commands --------------------------------------
 
     def test_reserved_commands_return_not_implemented(self):
-        # backup create/verify, migrate and restore are implemented since
-        # #55/#58/#56; rebuild, quarantine and the #57 restore flags remain
-        # reserved.
-        cases = [
-            ("rebuild",),
-            ("quarantine", "list"),
-            ("quarantine", "purge", "op-1", "deadbeef"),
-        ]
-        for args in cases:
-            with self.subTest(command=args):
-                rc, out, err = self.run_cli(*args)
-                self.assertEqual(2, rc, args)
-                self.assertIn("not_implemented", out + err)
+        # backup create/verify, migrate, restore and quarantine are
+        # implemented since #55/#58/#56/#57; rebuild remains reserved.
+        rc, out, err = self.run_cli("rebuild")
+        self.assertEqual(2, rc)
+        self.assertIn("not_implemented", out + err)
 
-    def test_restore_reserved_flags_return_not_implemented(self):
-        # The #57 flags (unreadable-current handling, quarantine,
-        # --expect-no-store) stay reserved even though the healthy restore
-        # path is implemented.
+    def test_restore_57_flags_single_usage_error(self):
+        # Either #57 restore flag alone is a usage error (spec #57 seam 2).
         cases = [
             ("restore", "--from", "x.squirrel-memory-backup",
              "--discard-current", "--accept-unreadable-current"),
             ("restore", "--from", "x.squirrel-memory-backup",
              "--discard-current", "--expect-current-fingerprint", "deadbeef"),
-            ("restore", "--from", "x.squirrel-memory-backup",
-             "--discard-current", "--expect-no-store"),
         ]
         for args in cases:
             with self.subTest(command=args):
                 rc, out, err = self.run_cli(*args)
                 self.assertEqual(2, rc, args)
-                self.assertIn("not_implemented", out + err)
+                self.assertIn("unreadable_flags_required", out + err)
+
+    def test_restore_expect_no_store_conflicts_with_unreadable_flags(self):
+        rc, out, err = self.run_cli(
+            "restore", "--from", "x.squirrel-memory-backup",
+            "--discard-current", "--expect-no-store",
+            "--accept-unreadable-current",
+            "--expect-current-fingerprint", "d" * 64)
+        self.assertEqual(2, rc)
+        self.assertIn("conflicting_store_flags", out + err)
+
+    def test_restore_unreadable_without_yes_goes_interactive(self):
+        # The flag pair alone is not a silent bypass: without --yes the
+        # exact-string interactive confirmation is required. (With no store
+        # present the plan itself fails closed first.)
+        rc, out, err = self.run_cli(
+            "restore", "--from", "x.squirrel-memory-backup",
+            "--discard-current", "--accept-unreadable-current",
+            "--expect-current-fingerprint", "d" * 64)
+        self.assertEqual(2, rc)
+        self.assertIn("store_missing", out + err)
+
+    def test_restore_unreadable_rejects_epoch_cas_and_backup_current(self):
+        rc, out, err = self.run_cli(
+            "restore", "--from", "x.squirrel-memory-backup",
+            "--discard-current", "--yes",
+            "--accept-unreadable-current",
+            "--expect-current-fingerprint", "d" * 64,
+            "--expect-store-epoch", "a" * 32)
+        self.assertEqual(2, rc)
+        self.assertIn("epoch_cas_unavailable", out + err)
+        rc, out, err = self.run_cli(
+            "restore", "--from", "x.squirrel-memory-backup",
+            "--backup-current", "/tmp/out-backup",
+            "--yes", "--accept-unreadable-current",
+            "--expect-current-fingerprint", "d" * 64)
+        self.assertEqual(2, rc)
+        self.assertIn("retention_conflict", out + err)
+
+    # -- quarantine ----------------------------------------------------------
+
+    def _write_quarantine(self, operation_id, fingerprint="d" * 64,
+                          marker="quarantined-bytes"):
+        """Create a quarantined store fixture (identity-only metadata + as-is
+        bytes) and return its fingerprint."""
+        from quarantine import (
+            METADATA_FILE,
+            QUARANTINE_DIRNAME,
+        )
+        if not os.path.isdir(self.root):
+            os.makedirs(self.root, mode=0o700)
+        os.chmod(self.root, 0o700)
+        qparent = os.path.join(self.root, QUARANTINE_DIRNAME)
+        if not os.path.isdir(qparent):
+            os.makedirs(qparent, mode=0o700)
+        os.chmod(qparent, 0o700)
+        qdir = os.path.join(qparent, operation_id)
+        os.makedirs(qdir, mode=0o700)
+        with open(os.path.join(qdir, "facts.sqlite3"), "wb") as stream:
+            stream.write(marker.encode("utf-8"))
+        os.chmod(os.path.join(qdir, "facts.sqlite3"), 0o600)
+        import json as json_module
+        with open(os.path.join(qdir, METADATA_FILE), "w",
+                  encoding="utf-8") as stream:
+            json_module.dump({
+                "quarantine_version": 1,
+                "operation_id": operation_id,
+                "fingerprint_algorithm": "sha256",
+                "fingerprint": fingerprint,
+                "disposition": "unreadable",
+                "created_at_utc": "2026-08-19T00:00:00+00:00",
+                "members": {"facts.sqlite3": {"present": True, "size": 18,
+                                              "sha256": ""}},
+            }, stream)
+        os.chmod(os.path.join(qdir, METADATA_FILE), 0o600)
+        return fingerprint
+
+    def test_quarantine_list_identity_only(self):
+        fingerprint = self._write_quarantine("op-q1")
+        rc, out, err = self.run_cli("quarantine", "list", "--json")
+        self.assertEqual(0, rc, err)
+        payload = json.loads(out)
+        self.assertEqual(1, payload["count"])
+        entry = payload["entries"][0]
+        self.assertEqual("op-q1", entry["operation_id"])
+        self.assertEqual(fingerprint, entry["fingerprint"])
+        self.assertTrue(entry["valid"])
+        # Identity only: no private content ever appears.
+        self.assertNotIn("quarantined-bytes", out)
+        rc, out, err = self.run_cli("quarantine", "list")
+        self.assertEqual(0, rc, err)
+        self.assertIn("op-q1", out)
+        self.assertIn(fingerprint, out)
+        self.assertNotIn("quarantined-bytes", out)
+
+    def test_quarantine_purge_requires_exact_fingerprint(self):
+        self._write_quarantine("op-q2", fingerprint="d" * 64)
+        # Wrong fingerprint refuses the delete (exit 1) and leaves the copy.
+        rc, out, err = self.run_cli(
+            "quarantine", "purge", "op-q2", "e" * 64, "--json")
+        self.assertEqual(1, rc)
+        self.assertIn("fingerprint_mismatch", out + err)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.root, "quarantine", "op-q2")))
+        # Exact fingerprint deletes it.
+        rc, out, err = self.run_cli(
+            "quarantine", "purge", "op-q2", "d" * 64, "--json")
+        self.assertEqual(0, rc, err)
+        payload = json.loads(out)
+        self.assertEqual("op-q2", payload["purged"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, "quarantine", "op-q2")))
+        # A second purge of a missing operation refuses.
+        rc, out, err = self.run_cli(
+            "quarantine", "purge", "op-q2", "d" * 64, "--json")
+        self.assertEqual(1, rc)
+        self.assertIn("quarantine_not_found", out + err)
+
+    def test_quarantine_purge_invalid_operation_id_is_usage_error(self):
+        rc, out, err = self.run_cli(
+            "quarantine", "purge", "../escape", "d" * 64)
+        self.assertEqual(2, rc)
+        self.assertIn("invalid_operation_id", out + err)
 
     def test_backup_create_without_store_fails_closed(self):
         output_path = os.path.join(self._tmp, "backup.squirrel-memory-backup")

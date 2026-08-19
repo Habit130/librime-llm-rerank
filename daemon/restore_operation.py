@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The `restore` production operation type (Habit130/squirrel#56).
+"""The `restore` production operation type (Habit130/squirrel#56, #57).
 
 `squirrel-semantic-memory restore` atomically replaces the whole live fact
 store with a verified backup, preserving the backup's logical history
@@ -33,9 +33,21 @@ and BEFORE the replace, using the existing backup.create / snapshot path to
 `<path>` (destination_exists and owner-only-medium checks still apply); if
 that backup fails, the live store is unchanged.
 
-Health contract: only a healthy current store can be restored over. An
-unreadable current store fails closed; a missing current store fails closed
-(`--expect-no-store` is #57 and stays reserved).
+Health contract (spec #43 / #57):
+
+- A healthy current store is restored over with the epoch CAS
+  (`--expect-store-epoch`) and `--backup-current` / `--discard-current`;
+  an unreadable or missing store fails closed without the #57 flags.
+- An unreadable (present-but-unreadable) current store is restored over
+  ONLY with the flag pair `--accept-unreadable-current` +
+  `--expect-current-fingerprint <hash>`. After quiesce the fingerprint is
+  computed from the already-opened DB/WAL/SHM descriptors and the as-is
+  bytes are copied into `quarantine/<operation_id>/`, verified and fsynced
+  BEFORE the replace; any fingerprint mismatch or quarantine failure aborts
+  with no replace and no successful-looking quarantine.
+- A truly missing store is restored over ONLY with `--expect-no-store` (a
+  distinct branch that never quarantines and never satisfies an unreadable
+  file).
 
 Fact semantics live in C++ (`fact_store_tool`): Python never creates,
 verifies, migrates or epoch-mints a fact store itself; it only moves files
@@ -44,6 +56,7 @@ contains 上文, candidate text or embeddings.
 """
 
 import os
+import re
 import stat
 
 from backup_operation import (
@@ -84,6 +97,13 @@ from operations import (
     OperationFailed,
     OperationTypeSpec,
 )
+from quarantine import (
+    classify_current_store,
+    current_store_bytes,
+    open_current_files,
+    probe_current_epoch,
+    publish_quarantine,
+)
 
 RESTORE_DIRNAME = ".restore"
 FACTS_DB = "facts.sqlite3"
@@ -101,6 +121,17 @@ _PRISTINE_EPOCH = ""
 
 def _staging_root(root, operation_id):
     return os.path.join(root, RESTORE_DIRNAME, operation_id)
+
+
+def _restore_mode(parameters):
+    """The normalized restore disposition mode: "healthy" (default),
+    "unreadable" (`--accept-unreadable-current` + fingerprint), or
+    "no-store" (`--expect-no-store`). The mode drives every phase gate."""
+    if parameters.get("expect_no_store"):
+        return "no-store"
+    if parameters.get("accept_unreadable_current"):
+        return "unreadable"
+    return "healthy"
 
 
 def _staging_store_dir(root, operation_id):
@@ -416,11 +447,47 @@ class RestoreSpec:
         epoch = parameters.get("expect_store_epoch", _PRISTINE_EPOCH)
         if epoch != _PRISTINE_EPOCH and not _valid_identity_token(epoch):
             raise ValueError("expect_store_epoch must be a store epoch")
+        # #57 unreadable-current / no-store flags (reserved in #56, now
+        # implemented). The flag pair is atomic and mutually exclusive with
+        # --expect-no-store; a present-but-unreadable current store is the
+        # only scene the pair accepts, and an absent store is the only scene
+        # --expect-no-store accepts.
+        accept_unreadable = bool(parameters.get("accept_unreadable_current"))
+        fingerprint = parameters.get("expect_current_fingerprint")
+        if not isinstance(fingerprint, str):
+            fingerprint = ""
+        fingerprint = fingerprint.strip().lower()
+        if fingerprint and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError("expect_current_fingerprint must be a sha256 "
+                             "hex digest (64 hex characters)")
+        expect_no_store = bool(parameters.get("expect_no_store"))
+        if bool(accept_unreadable) != bool(fingerprint):
+            raise ValueError("--accept-unreadable-current and "
+                             "--expect-current-fingerprint must be provided "
+                             "together")
+        if expect_no_store and (accept_unreadable or fingerprint):
+            raise ValueError("--expect-no-store is exclusive with the "
+                             "unreadable-current flags")
+        if expect_no_store and backup_current is not None:
+            raise ValueError("--expect-no-store cannot be combined with "
+                             "--backup-current (there is no current store to "
+                             "back up)")
+        if accept_unreadable and backup_current is not None:
+            raise ValueError("--accept-unreadable-current cannot be combined "
+                             "with --backup-current (an unreadable current "
+                             "store cannot be snapshotted)")
+        if (accept_unreadable or expect_no_store) and epoch != _PRISTINE_EPOCH:
+            raise ValueError("no current store epoch is readable for an "
+                             "unreadable or no-store restore; do not pass "
+                             "expect_store_epoch")
         return {
             "from_path": from_path,
             "backup_current": backup_current,
             "discard_current": bool(discard_current),
             "expect_store_epoch": epoch,
+            "accept_unreadable_current": accept_unreadable,
+            "expect_current_fingerprint": fingerprint,
+            "expect_no_store": expect_no_store,
         }
 
     # -- steps --------------------------------------------------------------
@@ -428,14 +495,81 @@ class RestoreSpec:
     def _current_disposition(self, record, phase):
         """Read the live store through the C++ seam and verify the CAS.
 
-        Restore requires a healthy current store: unreadable -> fail closed,
-        missing -> fail closed (--expect-no-store is #57 and stays
-        reserved). Returns the live identity (store_epoch == the expected
-        one), or raises OperationBlocked. Every phase prelude uses this one
-        gate so the CAS semantics stay identical across the machine.
+        Three modes (spec #43 / #57), selected by the normalized parameters:
+
+        - healthy (default): requires a readable current store whose
+          store_epoch == the expected one; unreadable -> fail closed,
+          missing -> fail closed (#56 preserved).
+        - unreadable: requires BOTH `--accept-unreadable-current` and
+          `--expect-current-fingerprint`; the store must be PRESENT but the
+          identity seam must fail to read it. A healthy readable store is
+          refused (this path is not a bypass of the epoch CAS) and a missing
+          store is refused (that is `--expect-no-store`).
+        - no-store: requires `--expect-no-store`; the store must be ABSENT.
+          An unreadable present file does not satisfy it, and a healthy
+          present store does not either.
+
+        Returns ("healthy", identity) | ("unreadable", None) |
+        ("no-store", None). Every phase prelude uses this one gate so the
+        disposition semantics stay identical across the machine.
         """
-        expected = record["parameters"]["expect_store_epoch"]
-        identity_empty = live_identity(self.helper, self.root)
+        parameters = record["parameters"]
+        mode = _restore_mode(parameters)
+        expected = parameters["expect_store_epoch"]
+        if mode == "no-store":
+            # The no-store gate is RAW presence: --expect-no-store requires
+            # the facts path to be absent, never satisfied by an unreadable
+            # file that happens to exist.
+            if os.path.lexists(os.path.join(self.root, FACTS_DB)):
+                raise OperationBlocked(
+                    "store_present_unexpected", phase=phase,
+                    remediation="a facts database exists (or an unreadable "
+                                "file occupies the path); --expect-no-store "
+                                "requires the store to be absent",
+                    cause=None)
+            return ("no-store", None)
+        if mode == "unreadable":
+            # The unreadable gate runs the C++ `schema` seam on a THROWAWAY
+            # COPY of the current store (never the live file, so the as-is
+            # bytes the operator's fingerprint covers stay untouched): a
+            # store the seam cannot read (corrupt, clock-invalid, open or
+            # permission failure) is the unreadable scene this path
+            # quarantines; a store the seam reads (healthy, supported-old,
+            # too-new) is refused — the path is not a bypass of the epoch
+            # CAS and migrate stays the only upgrade path (RISK-57-2).
+            disposition, _detail = classify_current_store(
+                self.root, self.helper, self.euid)
+            if disposition == "missing":
+                raise OperationBlocked(
+                    "store_missing", phase=phase,
+                    remediation="no facts database exists; the unreadable-"
+                                "current path requires a present (but "
+                                "unreadable) store; use --expect-no-store "
+                                "for a truly missing store",
+                    cause=None)
+            if disposition == "readable":
+                raise OperationBlocked(
+                    "store_present_unexpected", phase=phase,
+                    remediation="the current store is readable through the "
+                                "fact-store seam; the unreadable-current path "
+                                "is for a store the identity seam cannot "
+                                "read, not a bypass of the epoch CAS",
+                    cause={"disposition": _detail})
+            return ("unreadable", None)
+        try:
+            identity_empty = live_identity(self.helper, self.root)
+        except OperationBlocked as error:
+            if error.code != "fact_store_unverifiable":
+                raise
+            # The identity seam could not read a PRESENT store.
+            raise OperationBlocked(
+                "fact_store_unverifiable", phase=phase,
+                remediation="the fact store failed closed validation; inspect "
+                            "and fix it before restoring, or re-run restore "
+                            "with --accept-unreadable-current and "
+                            "--expect-current-fingerprint",
+                cause={"fault_code": error.cause.get("fault_code")
+                       if isinstance(error.cause, dict) else None})
         if identity_empty is None:
             raise OperationBlocked(
                 "store_missing", phase=phase,
@@ -449,13 +583,13 @@ class RestoreSpec:
                 remediation="re-run restore with the current store epoch",
                 cause={"expected": expected,
                        "actual": identity["store_epoch"]})
-        return identity
+        return ("healthy", identity)
 
     def _step_preflight(self, record):
-        self._current_disposition(record, "preflight")
+        disposition, _identity = self._current_disposition(record, "preflight")
         from_path = record["parameters"]["from_path"]
         try:
-            manifest, stats, disposition = _verify_restore_backup(
+            manifest, stats, backup_disposition = _verify_restore_backup(
                 from_path, self.helper, phase="preflight")
         except BackupError as error:
             raise OperationBlocked(
@@ -465,15 +599,21 @@ class RestoreSpec:
                 cause=error.cause)
         # Best-effort space check (spec #43 "版本和空间"; RISK-56-4): the
         # replace is atomic, but an obvious no-space condition must fail in
-        # preflight with the current state untouched.
-        db_size = manifest.get("database_size")
+        # preflight with the current state untouched. The unreadable path
+        # also needs space for the as-is quarantine copy of the current
+        # store (spec #57: 空间不足时不发布恢复库).
+        required = manifest.get("database_size")
+        if disposition == "unreadable":
+            current_bytes = current_store_bytes(self.root)
+            if current_bytes is not None:
+                required = (required or 0) + current_bytes
         available = _space_available(self.root)
-        if (db_size is not None and available is not None
-                and db_size > available):
+        if (required is not None and available is not None
+                and required > available):
             raise OperationBlocked(
                 "insufficient_space", phase="preflight",
                 remediation="free space in the facts root and retry",
-                cause={"required_bytes": db_size,
+                cause={"required_bytes": required,
                        "available_bytes": available})
         # Preflight is read-only: it never creates staging (a preflight
         # failure must leave the current state untouched). The durable plan
@@ -613,7 +753,8 @@ class RestoreSpec:
                 remediation="the restore staging file could not be prepared; "
                             "the backup original is unchanged",
                 cause={"fault_code": error.status})
-        live = self._current_disposition(record, "staging")
+        _live_disposition, _live_identity = self._current_disposition(
+            record, "staging")
         old_epoch = record["parameters"]["expect_store_epoch"]
         backup_epoch = staged_manifest["backup_manifest"]["store_epoch"]
         if (prepared["store_epoch"] == backup_epoch
@@ -729,51 +870,58 @@ class RestoreSpec:
         backup_current = record["parameters"]["backup_current"]
 
         def replacement(lease):
-            # Re-verify the expected epoch under the exclusive lease, before
-            # any fact mutation (the CAS gate closes again here).
-            if os.path.lexists(os.path.join(self.root, FACTS_DB)):
-                live = read_identity_under_exclusive(self.root)
-                disk_epoch = live["store_epoch"]
+            parameters = record["parameters"]
+            mode = _restore_mode(parameters)
+            if mode == "healthy":
+                # -- healthy path (unchanged #56): the epoch CAS closes again
+                # under the exclusive lease, before any fact mutation.
+                self._healthy_replacement(
+                    lease, record, staged_identity, expected_epoch,
+                    backup_current)
             else:
+                # -- #57 paths ---------------------------------------------------
+                marker_exists = _read_json(
+                    _published_marker_path(self.root, operation_id),
+                    self.euid) is not None
+                present = os.path.lexists(os.path.join(self.root, FACTS_DB))
                 disk_epoch = None
-            marker_exists = _read_json(
-                _published_marker_path(self.root, operation_id),
-                self.euid) is not None
-            if disk_epoch == staged_identity["store_epoch"]:
-                # A previous attempt already published (crash between the
-                # atomic replace and the record write): re-persist the
-                # marker and continue; never regenerate identity.
-                pass
-            elif marker_exists:
-                raise MaintenanceError("publish_state_inconsistent")
-            elif disk_epoch is None:
-                raise MaintenanceError("epoch_mismatch")
-            elif disk_epoch != expected_epoch:
-                raise MaintenanceError("epoch_mismatch")
-            else:
-                # The staged store must still be the prepared identity.
-                try:
-                    identity, _empty = self.helper.verify(
-                        _staging_store_dir(self.root, operation_id))
-                except _HelperFailed:
-                    raise MaintenanceError("staging_invalid")
-                if identity != staged_identity:
-                    raise MaintenanceError("staging_invalid")
-                if backup_current is not None:
-                    # --backup-current runs AFTER quiesce and BEFORE the
-                    # replace; any failure aborts here with the live store
-                    # unchanged.
+                if present:
                     try:
-                        self._backup_current(operation_id, backup_current)
+                        disk_epoch = probe_current_epoch(self.root, self.euid)
                     except OperationBlocked:
-                        raise
-                    except OperationFailed:
-                        raise
-                    except BackupError as error:
-                        raise MaintenanceError(
-                            "backup_current_failed") from error
-                replace_fact_database(self.root, _staging_db_path(
-                    self.root, operation_id), lease)
+                        # Still unreadable (corrupt / clock-invalid): the
+                        # fingerprint gate below decides.
+                        disk_epoch = None
+                if disk_epoch == staged_identity["store_epoch"]:
+                    # A previous attempt already published (crash between the
+                    # atomic replace and the record write): re-persist the
+                    # marker and continue; never regenerate identity.
+                    pass
+                elif marker_exists:
+                    raise MaintenanceError("publish_state_inconsistent")
+                elif disk_epoch is not None:
+                    # A readable store with a different epoch appeared: the
+                    # scene changed and this path's fingerprint/no-store
+                    # expectation no longer holds.
+                    raise MaintenanceError("epoch_mismatch")
+                elif mode == "no-store":
+                    if present:
+                        # A store appeared (or an unreadable file now exists):
+                        # --expect-no-store requires absence.
+                        raise MaintenanceError("store_present_unexpected")
+                    self._verify_staged_identity(operation_id, staged_identity)
+                    replace_fact_database(self.root, _staging_db_path(
+                        self.root, operation_id), lease)
+                else:
+                    # Unreadable path: the store must still be present and
+                    # unreadable. Quarantine FIRST (fingerprint check + as-is
+                    # copy + verify + fsync), then replace; any failure aborts
+                    # with the current bytes untouched.
+                    if not present:
+                        raise MaintenanceError("store_missing")
+                    self._verify_staged_identity(operation_id, staged_identity)
+                    self._quarantine_and_replace(
+                        lease, operation_id, staged_identity, parameters)
             _write_json_atomic(
                 _published_marker_path(self.root, operation_id),
                 {"store_epoch": staged_identity["store_epoch"],
@@ -805,7 +953,9 @@ class RestoreSpec:
         try:
             recovery = run_maintenance(
                 lambda: None, self.root, replacement, self.control_socket,
-                operation_id, **maintenance_kwargs)
+                operation_id, **maintenance_kwargs,
+                expect_unreadable=(_restore_mode(
+                    record["parameters"]) == "unreadable"))
         except MaintenanceError as error:
             code = error.code
             if code == "epoch_mismatch":
@@ -824,6 +974,20 @@ class RestoreSpec:
                     remediation="the staged publication marker disagrees "
                                 "with the store on disk; inspect before "
                                 "retrying")
+            if code == "store_present_unexpected":
+                raise OperationBlocked(
+                    "store_present_unexpected", phase="publishing",
+                    remediation="a store now exists where none was expected; "
+                                "inspect the current store before retrying",
+                    cause=None)
+            if code == "store_missing":
+                raise OperationBlocked(
+                    "store_missing", phase="publishing",
+                    remediation="the current store is missing; the "
+                                "unreadable-current path cannot quarantine "
+                                "it. Use --expect-no-store for a missing "
+                                "store",
+                    cause=None)
             if code == "backup_current_failed":
                 raise OperationBlocked(
                     "backup_current_failed", phase="publishing",
@@ -890,6 +1054,87 @@ class RestoreSpec:
                 staged_manifest, self.euid)
         return {"advance": True}
 
+    def _healthy_replacement(self, lease, record, staged_identity,
+                             expected_epoch, backup_current):
+        """The unchanged #56 healthy-current replacement inside the lease:
+        epoch CAS, staged identity check, --backup-current, atomic replace."""
+        operation_id = record["operation_id"]
+        if os.path.lexists(os.path.join(self.root, FACTS_DB)):
+            live = read_identity_under_exclusive(self.root)
+            disk_epoch = live["store_epoch"]
+        else:
+            disk_epoch = None
+        marker_exists = _read_json(
+            _published_marker_path(self.root, operation_id),
+            self.euid) is not None
+        if disk_epoch == staged_identity["store_epoch"]:
+            # A previous attempt already published (crash between the atomic
+            # replace and the record write): re-persist the marker and
+            # continue; never regenerate identity.
+            return
+        if marker_exists:
+            raise MaintenanceError("publish_state_inconsistent")
+        if disk_epoch is None:
+            raise MaintenanceError("epoch_mismatch")
+        if disk_epoch != expected_epoch:
+            raise MaintenanceError("epoch_mismatch")
+        self._verify_staged_identity(operation_id, staged_identity)
+        if backup_current is not None:
+            # --backup-current runs AFTER quiesce and BEFORE the replace;
+            # any failure aborts here with the live store unchanged.
+            try:
+                self._backup_current(operation_id, backup_current)
+            except OperationBlocked:
+                raise
+            except OperationFailed:
+                raise
+            except BackupError as error:
+                raise MaintenanceError("backup_current_failed") from error
+        replace_fact_database(self.root, _staging_db_path(
+            self.root, operation_id), lease)
+
+    def _verify_staged_identity(self, operation_id, staged_identity):
+        """The staged store must still be the prepared identity before the
+        replace."""
+        try:
+            identity, _empty = self.helper.verify(
+                _staging_store_dir(self.root, operation_id))
+        except _HelperFailed:
+            raise MaintenanceError("staging_invalid")
+        if identity != staged_identity:
+            raise MaintenanceError("staging_invalid")
+
+    def _quarantine_and_replace(self, lease, operation_id, staged_identity,
+                                parameters):
+        """The #57 unreadable-current replacement inside the exclusive lease:
+        open the as-is DB/WAL/SHM after quiesce, compute the fingerprint from
+        THOSE opened descriptors, verify it against
+        --expect-current-fingerprint, copy the bytes into
+        quarantine/<operation_id>/ (verified + fsynced), and only then
+        replace. Any fingerprint mismatch or quarantine failure raises before
+        the replace; the current bytes stay untouched and no partial
+        quarantine is left looking successful."""
+        fds = None
+        try:
+            fds = open_current_files(self.root, self.euid)
+            publish_quarantine(
+                self.root, operation_id, fds,
+                parameters["expect_current_fingerprint"], self.euid,
+                now=self.now, disposition="unreadable")
+        finally:
+            if fds is not None:
+                for fd in fds.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        # Only after the quarantine is verified and durable: replace without
+        # the old-store checkpoint. The as-is old bytes (including any WAL/
+        # SHM) are preserved in quarantine; the old DB may be corrupt or have
+        # an unreadable permission state, so the checkpoint must not run.
+        replace_fact_database(self.root, _staging_db_path(
+            self.root, operation_id), lease, checkpoint_old_store=False)
+
     def _step_reopening(self, record):
         operation_id = record["operation_id"]
         staged_identity = _load_staged_identity(
@@ -898,7 +1143,19 @@ class RestoreSpec:
             # Pre-publish compensation (cancel_phase == reopening). The
             # irreversible replacement only ever runs in the publishing
             # phase, so the disk must still hold the complete old store.
-            identity_empty = live_identity(self.helper, self.root)
+            try:
+                identity_empty = live_identity(self.helper, self.root)
+            except OperationBlocked:
+                # The current store is still unreadable (a #57 cancel before
+                # publish): we cannot prove the old store is untouched, so the
+                # cancel fails closed instead of pretending to reopen an
+                # unverifiable state.
+                raise OperationBlocked(
+                    "cancel_unverifiable", phase="reopening",
+                    remediation="the current store is unreadable; the cancel "
+                                "cannot verify the old state. Re-run restore "
+                                "to completion or purge the operation",
+                    cause=None)
             if (identity_empty is not None and staged_identity is not None
                     and identity_empty[0]["store_epoch"]
                     == staged_identity["store_epoch"]):
@@ -917,7 +1174,14 @@ class RestoreSpec:
                 remediation="restore or re-create the staging directory for "
                             "this operation, then retry")
         # Success path: the disk must now hold the staged identity.
-        identity_empty = live_identity(self.helper, self.root)
+        try:
+            identity_empty = live_identity(self.helper, self.root)
+        except OperationBlocked:
+            # The freshly published store must be readable; an unreadable
+            # post-publish store is a broken publication.
+            raise OperationFailed(
+                "reopen_unverifiable", phase="reopening", retryable=True,
+                cause=None)
         if identity_empty is None:
             raise OperationFailed(
                 "reopen_unverifiable", phase="reopening", retryable=True,
@@ -948,16 +1212,27 @@ class RestoreSpec:
             return {"advance": True}
         # The outcome is derived from durable disk state AFTER the sweep, so
         # a crash at any point of cleanup retries into the identical result.
-        identity_empty = live_identity(self.helper, self.root)
+        try:
+            identity_empty = live_identity(self.helper, self.root)
+        except OperationBlocked:
+            identity_empty = None
         if (identity_empty is not None
                 and staged_identity is not None
                 and identity_empty[0]["store_epoch"]
                 == staged_identity["store_epoch"]):
             outcome = "restored"
-            old_identity = {
-                "store_epoch": record["parameters"]["expect_store_epoch"],
-                "history_id": None,
-            }
+            if _restore_mode(record["parameters"]) == "unreadable":
+                # The old store was unreadable; its identity was never
+                # readable, so the old identity is explicitly unknown.
+                old_identity = {"store_epoch": None, "history_id": None,
+                                "unreadable": True}
+            elif _restore_mode(record["parameters"]) == "no-store":
+                old_identity = None
+            else:
+                old_identity = {
+                    "store_epoch": record["parameters"]["expect_store_epoch"],
+                    "history_id": None,
+                }
             new_identity = identity_empty[0]
         else:
             outcome = "not_restored"
@@ -1020,6 +1295,13 @@ class RestoreSpec:
                 "backup_current"]
         if record["parameters"]["discard_current"]:
             result["discarded_current"] = True
+        if _restore_mode(record["parameters"]) == "unreadable":
+            # Identity-only quarantine evidence reference; never any content.
+            result["quarantine_operation_id"] = operation_id
+            result["quarantine_fingerprint"] = record["parameters"][
+                "expect_current_fingerprint"]
+        if _restore_mode(record["parameters"]) == "no-store":
+            result["no_store"] = True
         result["plaintext_sensitive_declaration"] = SENSITIVE_DECLARATION
         return {"progress": {"bytes": removed_bytes, "chunks": 1},
                 "advance": True, "result": result}
