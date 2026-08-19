@@ -133,7 +133,7 @@ class StagingBuildMachine:
                  active_identity=None, projection_version=PROJECTION_VERSION,
                  index_fingerprint=None, vector_format_version=VECTOR_FORMAT,
                  refuse_reason=None, force_rebuild=False,
-                 disk_budget_bytes=None):
+                 disk_budget_bytes=None, rebuild_tag=None):
         if not facts_root:
             raise StagingError("facts root missing")
         if not derived_root:
@@ -184,6 +184,16 @@ class StagingBuildMachine:
         self._probe_params = probe_params
         self._poll_interval = float(poll_interval)
         self._builder_lock = builder_lock
+        # #68: the explicit-rebuild nonce.  When set, every target this
+        # machine computes carries the tag in its generation identity, so an
+        # explicit `--full` rebuild of the SAME fingerprint mints a NEW
+        # generation id (spec: 只有显式 full 为同一 fingerprint 创建新代).
+        # The tag is not a compatibility layer, so the matrix still compares
+        # the tagged generation against the active layer by layer.
+        if rebuild_tag is not None and (
+                not isinstance(rebuild_tag, str) or not rebuild_tag):
+            raise StagingError("rebuild_tag must be a non-empty string or None")
+        self._rebuild_tag = rebuild_tag
         # #66 refuse-load: a present-but-invalid / unknown active manifest
         # refuses the load of derived state.  The staging machine idles and
         # reports the refusal (never builds against an unknown active);
@@ -625,7 +635,8 @@ class StagingBuildMachine:
         return _prepare_target(events, self._provider, store_epoch,
                                source_hlc,
                                projection_version=self._projection_version,
-                               index_fingerprint=self._index_fingerprint)
+                               index_fingerprint=self._index_fingerprint,
+                               rebuild_tag=self._rebuild_tag)
 
     def _desired_identity(self, facts_epoch, fact_schema_version):
         """The daemon's desired layered identity (spec "分层兼容身份").
@@ -701,7 +712,8 @@ class StagingBuildMachine:
             pinned = _prepare_target(events, self._provider, store_epoch,
                                      source_hlc,
                                      projection_version=self._projection_version,
-                                     index_fingerprint=self._index_fingerprint)
+                                     index_fingerprint=self._index_fingerprint,
+                                     rebuild_tag=self._rebuild_tag)
         except BuildBlockedError as error:
             raise _ResumeGateError(
                 "pinned events no longer validate: %s" % error.message)

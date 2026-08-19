@@ -468,11 +468,37 @@ class CliTest(unittest.TestCase):
     # -- reserved maintenance commands --------------------------------------
 
     def test_reserved_commands_return_not_implemented(self):
-        # backup create/verify, migrate, restore and quarantine are
-        # implemented since #55/#58/#56/#57; rebuild remains reserved.
-        rc, out, err = self.run_cli("rebuild")
+        # backup create/verify, migrate, restore, quarantine and rebuild
+        # are implemented since #55/#58/#56/#57/#68; no reserved command
+        # surface remains.
+        rc, out, err = self.run_cli("rebuild", "--json")
+        # A rebuild without any configured derived state refuses with a
+        # stable precondition error -- never a fake success and never a
+        # not_implemented.
+        self.assertEqual(1, rc)
+        self.assertIn("derived_root_unconfigured", out + err)
+
+    # -- rebuild CLI surface (Habit130/squirrel#68) --------------------------
+
+    def test_rebuild_full_and_index_only_conflict_is_usage_error(self):
+        rc, out, err = self.run_cli("rebuild", "--full", "--index-only",
+                                    "--json")
         self.assertEqual(2, rc)
-        self.assertIn("not_implemented", out + err)
+        self.assertIn("rebuild_mode_conflict", out + err)
+
+    def test_rebuild_retry_and_restart_conflict_is_usage_error(self):
+        rc, out, err = self.run_cli("rebuild", "--retry",
+                                    "shadow-gen-v1:x-0000000000000000000000000000",
+                                    "--restart", "--json")
+        self.assertEqual(2, rc)
+        self.assertIn("rebuild_retry_restart_conflict", out + err)
+
+    def test_rebuild_retry_unknown_build_refuses(self):
+        rc, out, err = self.run_cli(
+            "rebuild", "--retry",
+            "shadow-gen-v1:missing-0000000000000000000000000000", "--json")
+        self.assertEqual(1, rc)
+        self.assertIn("rebuild_not_found", out + err)
 
     def test_restore_57_flags_single_usage_error(self):
         # Either #57 restore flag alone is a usage error (spec #57 seam 2).

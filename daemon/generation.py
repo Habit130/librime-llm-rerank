@@ -649,7 +649,7 @@ def _read_snapshot(facts_root, as_of=None):
 
 def _prepare_target(events, provider, store_epoch, source_hlc,
                     projection_version=PROJECTION_VERSION,
-                    index_fingerprint=None):
+                    index_fingerprint=None, rebuild_tag=None):
     """The deterministic build target over one frozen snapshot.
 
     Validates every event (a violation blocks with the event named), derives
@@ -666,6 +666,15 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
     values are the daemon's current projection semantics and the composed
     exact-only index fingerprint; the staging machine passes the desired
     values from its config seam.
+
+    ``rebuild_tag`` (Squirrel#68) is the explicit-rebuild nonce: ``None``
+    keeps the fully content-addressed target, while an explicit ``--full``
+    rebuild passes a fresh tag so the SAME fingerprint mints a NEW
+    generation id (spec: 只有显式 full 为同一 fingerprint 创建新代).  The
+    tag is part of the generation identity but NOT one of the compatibility
+    matrix's orthogonal layers, so a tagged full rebuild of an identical
+    active is still an explicit build -- never a matrix no-op -- and the
+    resulting generation remains fully compatible with the active layers.
     """
     rows = []
     for stored in events:
@@ -695,6 +704,8 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
         "retrieval_backend": RETRIEVAL_BACKEND,
         "retrieval_params": RETRIEVAL_PARAMS,
     }
+    if rebuild_tag is not None:
+        identity["rebuild_tag"] = rebuild_tag
     generation_id = _compose_generation_id(identity, fingerprint)
     return {
         "rows": rows,

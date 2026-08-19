@@ -48,9 +48,22 @@ The single supported public entry point for semantic-memory maintenance
                     and purge one store only with the exact operation id +
                     content fingerprint. The daemon never scans, repairs,
                     merges or auto-restores quarantine.
-  rebuild           RESERVED command surface (approved by spec #43): fully
-                    parsed but dispatches to a stable `not_implemented`
-                    error; it never fakes success (#68 implements it).
+  rebuild           explicitly trigger a manual rebuild of the derived
+                    state (spec #43 手动重建, #68): auto (compatibility
+                    matrix minimum scope; healthy matching active ->
+                    already_current), --full (rebuild FP32/projection/
+                    delta/index from facts even when the fingerprint is
+                    unchanged; only --full mints a new generation for the
+                    same fingerprint), --index-only (only with a healthy
+                    compatible base AND a real ANN sidecar; otherwise an
+                    explicit refusal, never a silent upgrade to full),
+                    --retry <build_id> (continue a blocked/incomplete
+                    staging; blocked never auto-retries), --restart
+                    (discard the staging, then rebuild), --wait (observe
+                    only; Ctrl-C detaches, never cancels).  Rebuild never
+                    modifies facts, history_id, store_epoch or the three
+                    schema switches, never quiesces the plugin, and never
+                    starts a second builder (#68).
 
 Output contracts (deterministic):
   - human text and --json carry stable version fields inside the document
@@ -105,6 +118,11 @@ from operations import (  # noqa: E402
     try_run_pending_steps,
     wait_for_terminal,
 )
+from rebuild_operation import (  # noqa: E402
+    MODE_AUTO,
+    MODE_FULL,
+    MODE_INDEX_ONLY,
+)
 
 PROGRAM_NAME = "squirrel-semantic-memory"
 PROGRAM_VERSION = "0.1.0"
@@ -133,8 +151,7 @@ def default_paths():
 
 def default_registry(paths=None):
     """The production operation registry (`clear`, `backup.create`,
-    `migrate`, `restore`; later tickets add the remaining maintenance
-    types)."""
+    `migrate`, `restore`, `rebuild`)."""
     from clear_operation import production_registry as clear_registry
     from backup_operation import production_registry as backup_registry
     from migrate_operation import production_registry as migrate_registry
@@ -155,7 +172,41 @@ def default_registry(paths=None):
             control_socket=paths["control_socket"],
             scoring_socket=paths["daemon_socket"])._specs.values():
         registry.register(spec)
+    rebuild_spec = _rebuild_spec(paths).build()
+    registry.register(rebuild_spec)
     return registry
+
+
+def _rebuild_derived_root(paths):
+    """The rebuild operation's derived root.
+
+    The daemon owns the live derived root (its ``evidence_config`` is a
+    daemon-private JSON); a manual rebuild must target the SAME derived
+    root, so the CLI resolves it from ``SQUIRREL_SEMANTIC_MEMORY_DERIVED_ROOT``
+    when set, else the conventional sibling ``derived`` next to the facts
+    store.  The single-builder constraint is the caller's contract: a
+    rebuild must not run against a derived root a daemon staging worker is
+    concurrently building (throwaway roots in this ticket's envelope).
+    """
+    explicit = os.environ.get("SQUIRREL_SEMANTIC_MEMORY_DERIVED_ROOT")
+    if explicit:
+        return os.path.abspath(explicit)
+    return os.path.join(paths["semantic_memory_root"], "derived")
+
+
+def _rebuild_spec(paths):
+    """The production RebuildSpec for one semantic root.
+
+    The preview (CLI resolves build_id / already_current before creating
+    the operation) and the executor steps (registry) must share ONE spec
+    instance so their seams (provider / machine builder / publish) can
+    never disagree.  The production seams default to the throwaway
+    envelope (deterministic fixture provider, standard staging machine,
+    no publish); a host that wires real seams passes its own registry.
+    """
+    from rebuild_operation import RebuildSpec
+    return RebuildSpec(paths["semantic_memory_root"],
+                       derived_root=_rebuild_derived_root(paths))
 
 
 def build_parser():
@@ -289,15 +340,29 @@ def build_parser():
     migrate.add_argument("--json", action="store_true")
     migrate.set_defaults(handler=_cmd_migrate)
 
-    rebuild = sub.add_parser("rebuild", help="reserved: rebuild derived "
-                                             "state")
-    rebuild.add_argument("--full", action="store_true")
-    rebuild.add_argument("--index-only", action="store_true")
-    rebuild.add_argument("--retry", metavar="BUILD_ID")
-    rebuild.add_argument("--restart", action="store_true")
-    rebuild.add_argument("--wait", action="store_true")
+    rebuild = sub.add_parser("rebuild", help="explicitly trigger a manual "
+                                             "rebuild of the derived state")
+    rebuild.add_argument("--full", action="store_true",
+                         help="rebuild FP32 / projection / delta / index "
+                              "from facts even when the fingerprint is "
+                              "unchanged; only --full mints a new "
+                              "generation for the same fingerprint")
+    rebuild.add_argument("--index-only", action="store_true",
+                         help="rebuild only the ANN index from a healthy "
+                              "compatible base; refuses when no healthy "
+                              "base or ANN sidecar exists (never upgrades "
+                              "to full)")
+    rebuild.add_argument("--retry", metavar="BUILD_ID",
+                         help="continue an existing blocked/incomplete "
+                              "staging build")
+    rebuild.add_argument("--restart", action="store_true",
+                         help="discard the current staging, then rebuild "
+                              "from scratch (distinct from --retry)")
+    rebuild.add_argument("--wait", action="store_true",
+                         help="observe the rebuild until terminal; "
+                              "interrupting only detaches, never cancels")
     rebuild.add_argument("--json", action="store_true")
-    rebuild.set_defaults(handler=_cmd_reserved)
+    rebuild.set_defaults(handler=_cmd_rebuild)
 
     quarantine = sub.add_parser("quarantine",
                                 help="list or purge quarantined stores")
@@ -868,11 +933,16 @@ def _cmd_clear(args, paths):
 # backup create / verify
 # ---------------------------------------------------------------------------
 
-def _watch_detached_operation(store, operation_id, emit, mode, noun):
+def _watch_detached_operation(store, operation_id, emit, mode, noun,
+                              extra_argv=()):
     """Spawn the detached executor and observe the persistent record until
     it reaches a terminal state or `blocked`. Ctrl-C only detaches (exit
     130); the executor keeps running. Returns (record, None) on a terminal
-    observation or (None, exit_code) on early failure or detach."""
+    observation or (None, exit_code) on early failure or detach.
+
+    ``extra_argv`` appends executor arguments before the operation id
+    (e.g. ``("--retry",)`` for an explicit retry of a blocked rebuild).
+    """
     import time as time_module
     entry = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          "squirrel-semantic-memory")
@@ -881,7 +951,8 @@ def _watch_detached_operation(store, operation_id, emit, mode, noun):
     executor = None
     try:
         executor = subprocess.Popen(
-            [sys.executable, entry, "operation", "run", operation_id],
+            [sys.executable, entry, "operation", "run"]
+            + list(extra_argv) + [operation_id],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
         while True:
@@ -896,11 +967,14 @@ def _watch_detached_operation(store, operation_id, emit, mode, noun):
                 if alive_grace is None:
                     alive_grace = time_module.monotonic()
                 elif time_module.monotonic() - alive_grace > 3.0:
+                    resume_args = " ".join(
+                        ["operation", "run"] + list(extra_argv)
+                        + [operation_id])
                     error = make_error(
                         "executor_exited", phase="runner", retryable=True,
                         remediation="the executor process exited without a "
-                                    "terminal record; run `operation run %s` "
-                                    "to resume" % operation_id,
+                                    "terminal record; run `%s` to resume"
+                                    % resume_args,
                         cause={"state": current["state"],
                                "phase": current["phase"]})
                     _render_error(error, mode)
@@ -1593,6 +1667,329 @@ def _reserved_command_name(args):
 
 
 # ---------------------------------------------------------------------------
+# rebuild
+# ---------------------------------------------------------------------------
+
+def _rebuild_parameters(args, paths):
+    """Normalize the CLI rebuild flags into the operation parameters.
+
+    ``--full`` and ``--index-only`` are mutually exclusive (usage error);
+    ``--retry`` and ``--restart`` are mutually exclusive (a retry continues
+    the staging, a restart discards it).  The derived root and the build
+    target are resolved by the rebuild operation preview.
+    """
+    if args.full and args.index_only:
+        error = make_error(
+            "rebuild_mode_conflict", phase="cli",
+            remediation="choose exactly one of --full or --index-only (or "
+                        "neither for auto); they cannot be combined",
+            cause=None)
+        _render_error(error, "json" if args.json else "human")
+        return None, 2
+    if args.retry and args.restart:
+        error = make_error(
+            "rebuild_retry_restart_conflict", phase="cli",
+            remediation="--retry continues an existing staging; --restart "
+                        "discards it. Choose one",
+            cause=None)
+        _render_error(error, "json" if args.json else "human")
+        return None, 2
+    mode = MODE_FULL if args.full else (
+        MODE_INDEX_ONLY if args.index_only else MODE_AUTO)
+    if mode == MODE_FULL:
+        # `--full` mints a NEW generation even when the fingerprint is
+        # unchanged (spec #43).  The generation id is content-addressed, so
+        # the mint needs a fresh rebuild tag -- one per explicit request.
+        # The tag is part of the operation parameters (fixed before
+        # creation), so a retry of the same operation reuses the identical
+        # build target (idempotency key unchanged).
+        import uuid as uuid_module
+        rebuild_tag = "rebuild-full-%s" % uuid_module.uuid4().hex[:16]
+    else:
+        rebuild_tag = None
+    return {
+        "mode": mode,
+        "derived_root": _rebuild_derived_root(paths),
+        "retry_build_id": args.retry,
+        "restart": bool(args.restart),
+        "rebuild_tag": rebuild_tag,
+    }, None
+
+def _print_rebuild_result(record, args):
+    if args.json:
+        print(_json_dump(public_record(record)), flush=True)
+        return
+    result = record.get("result") or {}
+    print("rebuild %s" % result.get("outcome", "completed"))
+    print("  build: %s" % (result.get("build_id") or "unknown"))
+    if result.get("generation_id"):
+        print("  generation: %s" % result["generation_id"])
+    print("  published: %s" % ("yes" if result.get("published") else "no"))
+    if result.get("outcome") == "already_current":
+        print("  the active generation already matches the desired "
+              "identity; nothing was rebuilt")
+
+
+def _find_rebuild_operation(store, build_id):
+    """The operation id of a rebuild operation persisted with `build_id`,
+    or None.  Scans only the operation records (never derives state)."""
+    try:
+        operation_ids = store.list_ids()
+    except OperationError:
+        return None
+    for operation_id in operation_ids:
+        try:
+            record = store.load(operation_id)
+        except OperationError:
+            continue
+        if record.get("type") != "rebuild":
+            continue
+        if record["parameters"].get("build_id") == build_id:
+            return operation_id
+    return None
+
+
+def _resume_operation(store, args, mode, operation_id):
+    """Resume an existing rebuild operation in explicit retry mode.
+
+    ``--wait`` observes the persistent record until terminal (Ctrl-C only
+    detaches, exit 130, never cancels); without it the retry executor is
+    spawned and the CLI returns once the build job is durable (spec #43:
+    默认在 build job 持久化后返回).
+    """
+    entry = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "squirrel-semantic-memory")
+    if not args.wait:
+        try:
+            subprocess.Popen(
+                [sys.executable, entry, "operation", "run", "--retry",
+                 operation_id],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            return _store_operation_error(
+                OperationError("executor_start_failed", phase="cli",
+                               retryable=True,
+                               cause={"error": error.strerror}), mode)
+        if args.json:
+            print(_json_dump({
+                "operation_version": OPERATION_VERSION,
+                "operation_id": operation_id,
+                "type": "rebuild",
+                "state": "running",
+                "retry": True,
+                "observed": False,
+            }), flush=True)
+        return 0
+
+    def emit(entry):
+        if not args.json:
+            print(_human_event_line(entry), flush=True)
+
+    # Explicit retry: `operation run --retry` clears the block (blocked
+    # never auto-retries).
+    current, failure_code = _watch_detached_operation(
+        store, operation_id, emit, mode, "rebuild",
+        extra_argv=("--retry",))
+    if failure_code is not None:
+        return failure_code
+
+    if current["state"] in ("succeeded", "cancelled"):
+        _print_rebuild_result(current, args)
+        return 0
+    if args.json:
+        print(_json_dump(public_record(current)), flush=True)
+    else:
+        print("rebuild did not complete: state %s (phase %s)"
+              % (current["state"], current["phase"]))
+        if current.get("error") is not None:
+            print("  error: %s" % current["error"]["code"])
+            print("  remediation: %s"
+                  % current["error"].get("remediation", ""))
+    return 1
+
+
+def _cmd_rebuild(args, paths):
+    """Explicit manual rebuild (Habit130/squirrel#68).
+
+    Creates (or idempotently returns) a `rebuild` operation whose
+    ``build_id`` is fixed before creation, spawns the detached executor and
+    returns once the build job is durable (spec #43: 默认在 build job 持久
+    化后返回).  ``--wait`` observes the persistent record until terminal;
+    Ctrl-C only detaches (exit 130), never cancels -- the durable build
+    continues (AC68-6).
+    """
+    store = _operation_store(paths)
+    mode = "json" if args.json else "human"
+    try:
+        store.open(create=False)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+
+    parameters, failure = _rebuild_parameters(args, paths)
+    if failure is not None:
+        return failure
+
+    if args.retry:
+        # `--retry <build_id>` continues an EXISTING rebuild operation for
+        # that build: locate the operation whose persisted build_id matches
+        # and resume it (the operation record is the durable build job;
+        # blocked never auto-retries -- the executor must run in explicit
+        # retry mode, `operation run --retry`).  A retry never creates a
+        # new operation and never changes the idempotency key.
+        operation_id = _find_rebuild_operation(store, args.retry)
+        if operation_id is None:
+            error = make_error(
+                "rebuild_not_found", phase="cli",
+                remediation="the build_id does not match any persisted "
+                            "rebuild operation; run rebuild first",
+                cause={"build_id": args.retry})
+            _render_error(error, mode)
+            return 1
+        current = store.load(operation_id)
+        if current["state"] in ("succeeded", "cancelled", "failed"):
+            # A terminal rebuild has nothing to retry: --retry continues a
+            # blocked/incomplete staging, never a finished one (AC68-5).
+            error = make_error(
+                "rebuild_already_terminal", phase="cli",
+                remediation="start a new rebuild for a fresh build; "
+                            "--retry only continues a blocked or "
+                            "incomplete staging",
+                cause={"build_id": args.retry,
+                       "state": current["state"]})
+            _render_error(error, mode)
+            return 1
+        operation_id = _resume_operation(store, args, mode, operation_id)
+        return operation_id
+
+    # The build_id is resolved (read-only) before the operation exists so
+    # the same target returns the same build_id and an auto already-current
+    # request never creates an operation at all.  The same gates re-run in
+    # the operation's preflight step.  The preview spec is the RebuildSpec
+    # the registry's steps were built from (its seams and the executor
+    # steps' seams can never disagree).
+    from rebuild_operation import RebuildSpec
+    registered = args.registry.get("rebuild")
+    preview_spec = getattr(registered, "rebuild_spec", None)
+    if not isinstance(preview_spec, RebuildSpec):
+        # A host registry registered the bare OperationTypeSpec (no seam
+        # wiring): fall back to the production RebuildSpec so the CLI
+        # still resolves the build_id deterministically.
+        preview_spec = _rebuild_spec(paths)
+    preview = preview_spec.preview(parameters)
+    if preview["refuse"] is not None:
+        error = make_error(
+            preview["refuse"]["code"], phase="cli", retryable=False,
+            remediation=preview["refuse"]["remediation"],
+            cause=preview["refuse"].get("cause"))
+        _render_error(error, mode)
+        return 1
+
+    parameters["build_id"] = preview["build_id"]
+    if preview["already_current"]:
+        # auto + healthy matching active: succeeded immediately with
+        # already_current; no operation record, no staging, no generation,
+        # no rollback rotation (AC68-1).  The CLI reports the outcome
+        # directly (nothing durable to wait on).
+        if args.json:
+            print(_json_dump({
+                "rebuild_version": 1,
+                "outcome": "already_current",
+                "build_id": preview["build_id"],
+                "active_generation_id": preview["active_generation_id"],
+                "refuse": None,
+            }), flush=True)
+        else:
+            print("rebuild already_current")
+            print("  build: %s" % preview["build_id"])
+            print("  the active generation already matches the desired "
+                  "identity; nothing was rebuilt")
+        return 0
+
+    try:
+        record = create_operation(store, args.registry, "rebuild",
+                                  parameters)
+    except OperationError as error:
+        return _store_operation_error(error, mode)
+    except ValueError as error:
+        return _store_operation_error(
+            OperationError("invalid_parameters", phase="cli",
+                           retryable=False, cause={
+                               "error": str(error)}), mode)
+
+    operation_id = record["operation_id"]
+    if args.json:
+        # The operation id + build id must be observable before any build
+        # work, but stdout must stay exactly one versioned terminal
+        # document so a single json.loads(stdout) parses the whole run.
+        # The compact started envelope therefore goes to stderr, a
+        # separate channel that never pollutes the JSON stdout contract.
+        print(_json_line({
+            "operation_version": OPERATION_VERSION,
+            "operation_id": operation_id,
+            "type": "rebuild",
+            "state": "running",
+            "build_id": parameters["build_id"],
+            "mode": parameters["mode"],
+        }), flush=True, file=sys.stderr)
+    else:
+        print("rebuild started: operation %s (build %s)"
+              % (operation_id, parameters["build_id"]))
+
+    # Spec #43: 默认在 build job 持久化后返回 -- spawn the detached
+    # executor and return immediately; only `--wait` observes the progress
+    # (interrupting the wait detaches, never cancels -- the durable build
+    # continues).
+    entry = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "squirrel-semantic-memory")
+    try:
+        subprocess.Popen(
+            [sys.executable, entry, "operation", "run", operation_id],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as error:
+        return _store_operation_error(
+            OperationError("executor_start_failed", phase="cli",
+                           retryable=True, cause={"error": error.strerror}),
+            mode)
+    if not args.wait:
+        if args.json:
+            print(_json_dump({
+                "operation_version": OPERATION_VERSION,
+                "operation_id": operation_id,
+                "type": "rebuild",
+                "state": "running",
+                "build_id": parameters["build_id"],
+                "mode": parameters["mode"],
+                "observed": False,
+            }), flush=True)
+        return 0
+
+    def emit(entry):
+        if not args.json:
+            print(_human_event_line(entry), flush=True)
+
+    current, failure_code = _watch_detached_operation(
+        store, operation_id, emit, mode, "rebuild")
+    if failure_code is not None:
+        return failure_code
+
+    if current["state"] in ("succeeded", "cancelled"):
+        _print_rebuild_result(current, args)
+        return 0
+    if args.json:
+        print(_json_dump(public_record(current)), flush=True)
+    else:
+        print("rebuild did not complete: state %s (phase %s)"
+              % (current["state"], current["phase"]))
+        if current.get("error") is not None:
+            print("  error: %s" % current["error"]["code"])
+            print("  remediation: %s"
+                  % current["error"].get("remediation", ""))
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -1600,8 +1997,7 @@ def main(argv=None, registry=None):
     """Run the CLI. `registry` is the operation-type registry used by the
     internal `operation run` executor; production code passes None, which
     loads the production registry (`clear`, `backup.create`, `migrate`,
-    `restore`; rebuild arrives with its own ticket). Returns the process
-    exit code.
+    `restore`, `rebuild`). Returns the process exit code.
     """
     if os.geteuid() == 0:
         error = make_error(
