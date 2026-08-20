@@ -314,28 +314,60 @@ def main():
         "start": env_snapshot(), "latencies_ms": s_lat,
         "percentiles": percentiles(s_lat), "faults": s_faults}
 
-    # C: concurrent (interleaved evidence + scoring).
+    # C: concurrent (TRUE overlap: evidence and scoring issued simultaneously
+    # from two threads so the MLX matmul and the LM forward genuinely overlap
+    # on the same Metal device in the same daemon process).
     print("[C] concurrent %s" % env_snapshot(), flush=True)
+    import threading
+
     c_ev = []
     c_sc = []
     c_faults = 0
-    for i in range(args.concurrent_rounds):
-        dt, resp = send_json(scoring_sock,
-                             evidence_payload("cc-ev-%d" % i,
-                                              config_identity,
-                                              fact_high_water))
-        if "error" in resp or resp.get("status") != "ok":
-            c_faults += 1
-        c_ev.append(dt)
-        dt, resp = send_json(scoring_sock, scoring_payload("cc-sc-%d" % i))
-        if "error" in resp:
-            c_faults += 1
-        c_sc.append(dt)
+    c_lock = threading.Lock()
+
+    def evidence_worker(rounds):
+        nonlocal c_faults
+        local = []
+        for i in range(rounds):
+            dt, resp = send_json(scoring_sock,
+                                 evidence_payload("cc-ev-%d" % i,
+                                                  config_identity,
+                                                  fact_high_water))
+            if "error" in resp or resp.get("status") != "ok":
+                with c_lock:
+                    c_faults += 1
+            local.append(dt)
+        with c_lock:
+            c_ev.extend(local)
+
+    def scoring_worker(rounds):
+        nonlocal c_faults
+        local = []
+        for i in range(rounds):
+            dt, resp = send_json(scoring_sock, scoring_payload("cc-sc-%d" % i))
+            if "error" in resp:
+                with c_lock:
+                    c_faults += 1
+            local.append(dt)
+        with c_lock:
+            c_sc.extend(local)
+
+    workers = [
+        threading.Thread(target=evidence_worker,
+                         args=(args.concurrent_rounds,)),
+        threading.Thread(target=scoring_worker,
+                         args=(args.concurrent_rounds,)),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
     record["windows"]["concurrent"] = {
         "start": env_snapshot(),
-        "evidence_latencies_ms": c_ev,
+        "mode": "true-overlap-two-threads",
+        "evidence_latencies_ms": sorted(c_ev),
         "evidence_percentiles": percentiles(c_ev),
-        "scoring_latencies_ms": c_sc,
+        "scoring_latencies_ms": sorted(c_sc),
         "scoring_percentiles": percentiles(c_sc),
         "faults": c_faults,
     }

@@ -137,7 +137,10 @@ def main():
             # synthetic and its result is discarded; nothing here touches
             # live data.  The batch must exceed the engine's Python path
             # threshold to force the batched branch.
-            from accelerate import PYTHON_PATH_THRESHOLD
+            if args.backend == "mlx-exact-matmul":
+                from mlx_engine import PYTHON_PATH_THRESHOLD
+            else:
+                from accelerate import PYTHON_PATH_THRESHOLD
             if len(snapshot.active_events) >= PYTHON_PATH_THRESHOLD:
                 probe_ids = tuple(
                     event.event_id

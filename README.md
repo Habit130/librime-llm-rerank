@@ -404,9 +404,9 @@ canonical FP32 file.
   `oracle.compute_evidence` through the `CosineEngine` seam
   (`batch_cosines`); the oracle's aggregation (threshold, usage age, final
   weight, top-K, `m_c` / `M` / `s_c`) is untouched and never duplicated
-  (SCN-73-1/2).  Small same-key sets use the oracle's own Python float64
-  scalar cosine (bit-identical by construction); large sets use one batched
-  `mx.matmul`.
+  (SCN-73-1/2).  Small same-key sets (≤256) use the oracle's own Python
+  float64 scalar cosine — bit-identical by construction, the #72 small-set
+  contract; large sets use one batched `mx.matmul`.
 - **No second resident model.**  The engine is a dense FP32 matrix-vector
   product over the already-built vector file; it never loads a model and
   never spawns a second daemon.  It shares the daemon process with the

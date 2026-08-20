@@ -146,6 +146,50 @@ class _FixtureMatrix:
         shutil.rmtree(os.path.dirname(self.path), ignore_errors=True)
 
 
+def assert_equivalent(testcase, oracle, engine):
+    """Query-by-query equivalence shared by the #72/#73 backend suites.
+
+    Compares the oracle and a backend-engine result: same-key active count,
+    kept set (same events, same order), per-event cosine/weight deviation
+    within COSINE_TOLERANCE, per-candidate evidence ``s_c`` deviation and
+    the final emit order.  ``testcase`` is the unittest.TestCase providing
+    the assert methods.
+    """
+    testcase.assertEqual(oracle.same_key_active, engine.same_key_active,
+                         "same-key active count must match")
+    oracle_kept = [(c.event_id, c.cosine, c.weight, c.matched_candidate)
+                   for c in oracle.kept]
+    engine_kept = [(c.event_id, c.cosine, c.weight, c.matched_candidate)
+                   for c in engine.kept]
+    # SCN-72-2 / SCN-73-2: identical kept-set (same events, same order).
+    testcase.assertEqual(
+        [item[0] for item in oracle_kept],
+        [item[0] for item in engine_kept],
+        "kept event set / order must match the oracle")
+    for o_entry, e_entry in zip(oracle_kept, engine_kept):
+        testcase.assertLessEqual(
+            abs(o_entry[1] - e_entry[1]), COSINE_TOLERANCE,
+            "cosine deviation exceeds the pinned tolerance")
+        testcase.assertLessEqual(
+            abs(o_entry[2] - e_entry[2]), COSINE_TOLERANCE,
+            "weight deviation exceeds the pinned tolerance")
+        testcase.assertEqual(o_entry[3], e_entry[3],
+                             "matched candidate must match")
+    # s_c per candidate + final emit order (by descending s, then index).
+    oracle_sc = {c.index: c.s for c in oracle.candidates}
+    engine_sc = {c.index: c.s for c in engine.candidates}
+    for index in oracle_sc:
+        testcase.assertLessEqual(
+            abs(oracle_sc[index] - engine_sc[index]), COSINE_TOLERANCE,
+            "candidate evidence s_c deviation exceeds tolerance")
+    oracle_order = sorted(range(len(oracle_sc)),
+                          key=lambda i: (-oracle_sc[i], i))
+    engine_order = sorted(range(len(engine_sc)),
+                          key=lambda i: (-engine_sc[i], i))
+    testcase.assertEqual(oracle_order, engine_order,
+                         "final emit order must match the oracle")
+
+
 @unittest.skipUnless(VECLIB_AVAILABLE,
                      "Apple vecLib not available; skipping Accelerate suite")
 class AccelerateEquivalenceTests(unittest.TestCase):
@@ -195,39 +239,7 @@ class AccelerateEquivalenceTests(unittest.TestCase):
 
     def assert_equivalent(self, oracle, engine):
         """Query-by-query equivalence: kept set, weights, s_c, emit order."""
-        self.assertEqual(oracle.same_key_active, engine.same_key_active,
-                         "same-key active count must match")
-        oracle_kept = [(c.event_id, c.cosine, c.weight, c.matched_candidate)
-                       for c in oracle.kept]
-        engine_kept = [(c.event_id, c.cosine, c.weight, c.matched_candidate)
-                       for c in engine.kept]
-        # SCN-72-2: identical kept-set (same events, same order) and weights.
-        self.assertEqual(
-            [item[0] for item in oracle_kept],
-            [item[0] for item in engine_kept],
-            "kept event set / order must match the oracle")
-        for o_entry, e_entry in zip(oracle_kept, engine_kept):
-            self.assertLessEqual(
-                abs(o_entry[1] - e_entry[1]), COSINE_TOLERANCE,
-                "cosine deviation exceeds the pinned tolerance")
-            self.assertLessEqual(
-                abs(o_entry[2] - e_entry[2]), COSINE_TOLERANCE,
-                "weight deviation exceeds the pinned tolerance")
-            self.assertEqual(o_entry[3], e_entry[3],
-                             "matched candidate must match")
-        # s_c per candidate + final emit order (by descending s, then index).
-        oracle_sc = {c.index: c.s for c in oracle.candidates}
-        engine_sc = {c.index: c.s for c in engine.candidates}
-        for index in oracle_sc:
-            self.assertLessEqual(
-                abs(oracle_sc[index] - engine_sc[index]), COSINE_TOLERANCE,
-                "candidate evidence s_c deviation exceeds tolerance")
-        oracle_order = sorted(range(len(oracle_sc)),
-                              key=lambda i: (-oracle_sc[i], i))
-        engine_order = sorted(range(len(engine_sc)),
-                              key=lambda i: (-engine_sc[i], i))
-        self.assertEqual(oracle_order, engine_order,
-                         "final emit order must match the oracle")
+        assert_equivalent(self, oracle, engine)
 
     # -- SCN-72-1/72-2: large same-key sets use the sgemv batched path ------
 

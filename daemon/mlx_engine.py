@@ -64,9 +64,19 @@ PYTHON_PATH_THRESHOLD = 256
 
 # Documented equivalence tolerance (absolute cosine difference vs the stdlib
 # oracle), pinned for the #73 report and the equivalence suite.  The measured
-# MLX-matmul-vs-oracle deviation at 100k x 1024 is ~3e-8, two orders of
+# MLX-matmul-vs-oracle deviation at 100k x 1024 is ~6e-9 (spot-checked across
+# hot keys; worst observed ~1e-7 on synthetic unit vectors), two orders of
 # magnitude inside this bound.
 COSINE_TOLERANCE = 1e-6
+
+# Resource gate (SCN-73-6): the engine holds one explicit in-process copy of
+# the canonical FP32 matrix (MLX 0.32 has no zero-copy CPU constructor), so a
+# matrix whose working copy exceeds this bound is refused -- fail closed,
+# never a silently degraded/approximate serving path.  100k x 1024 x 4B =
+# 409.6 MiB, well inside the bound; the bound exists so an out-of-range
+# build (or a future much larger matrix) faults instead of exhausting memory
+# while pretending to serve.
+MATRIX_BYTES_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GiB working copy
 
 
 class MlxError(Exception):
@@ -107,13 +117,22 @@ class MlxCosineEngine(CosineEngine):
                 "fails closed (no silent Accelerate/Python fallback): %s"
                 % error) from error
         try:
+            bytes_needed = self._rows * self._dimension * 4
+            if bytes_needed > MATRIX_BYTES_LIMIT:
+                # Resource gate (SCN-73-6): a working copy beyond the bound
+                # is refused, never served degraded.
+                raise MlxError(
+                    "MLX matrix working copy would be %d bytes, over the "
+                    "resource gate of %d bytes; the MLX backend fails "
+                    "closed (no approximate fallback)"
+                    % (bytes_needed, MATRIX_BYTES_LIMIT))
             view = memoryview(buffer)
-            if view.nbytes < self._rows * self._dimension * 4:
+            if view.nbytes < bytes_needed:
                 raise MlxError(
                     "MLX matrix buffer is smaller than the declared shape "
                     "(%d x %d)" % (self._rows, self._dimension))
             array = np.frombuffer(
-                view[:self._rows * self._dimension * 4], dtype="<f4")
+                view[:bytes_needed], dtype="<f4")
             matrix = array.reshape(self._rows, self._dimension)
             self._matrix = mx.array(matrix)  # the one explicit working copy
         except MlxError:

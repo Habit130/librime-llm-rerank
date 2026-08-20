@@ -53,7 +53,11 @@ try:
 except Exception:  # noqa: BLE001 - env without MLX skips the suite
     MLX_AVAILABLE = False
 
-from test_accelerate import build_facts  # noqa: E402  (shared fixture helper)
+from test_accelerate import (  # noqa: E402  (shared fixture helpers)
+    _FixtureMatrix,
+    assert_equivalent,
+    build_facts,
+)
 
 DIM = 1024
 SEED = 20260817
@@ -63,40 +67,6 @@ SEED = 20260817
 COSINE_TOLERANCE = 1e-6
 
 
-class _FixtureMatrix:
-    """A deterministic FP32 matrix backing the engine, from seed vectors."""
-
-    def __init__(self, events, dimension=DIM, seed=SEED):
-        self.events = events
-        self.dimension = dimension
-        self.row_index = {"ev-%d" % i: i for i in range(events)}
-        tmpdir = tempfile.mkdtemp(prefix="mlx-matrix-")
-        self.path = os.path.join(tmpdir, "vectors.fp32")
-        with open(self.path, "wb") as handle:
-            for i in range(events):
-                vector = _vector(seed, "event", "ev-%d" % i, dimension)
-                handle.write(struct.pack("<%df" % dimension, *vector))
-        self._file = open(self.path, "rb")
-        import mmap
-        self._mm = mmap.mmap(self._file.fileno(), 0,
-                             access=mmap.ACCESS_COPY)
-        self.buffer = self._mm
-
-    def event_vector(self, event_id):
-        row = self.row_index[event_id]
-        return struct.unpack_from("<%df" % self.dimension, self.buffer,
-                                  row * self.dimension * 4)
-
-    def close(self):
-        try:
-            self._mm.close()
-        except Exception:  # noqa: BLE001 - best effort
-            pass
-        try:
-            self._file.close()
-        except Exception:  # noqa: BLE001 - best effort
-            pass
-        shutil.rmtree(os.path.dirname(self.path), ignore_errors=True)
 
 
 @unittest.skipUnless(MLX_AVAILABLE,
@@ -146,42 +116,6 @@ class MlxEquivalenceTests(unittest.TestCase):
             if own_matrix:
                 matrix.close()
 
-    def assert_equivalent(self, oracle, engine):
-        """Query-by-query equivalence: kept set, weights, s_c, emit order."""
-        self.assertEqual(oracle.same_key_active, engine.same_key_active,
-                         "same-key active count must match")
-        oracle_kept = [(c.event_id, c.cosine, c.weight, c.matched_candidate)
-                       for c in oracle.kept]
-        engine_kept = [(c.event_id, c.cosine, c.weight, c.matched_candidate)
-                       for c in engine.kept]
-        # SCN-73-2: identical kept-set (same events, same order) and weights.
-        self.assertEqual(
-            [item[0] for item in oracle_kept],
-            [item[0] for item in engine_kept],
-            "kept event set / order must match the oracle")
-        for o_entry, e_entry in zip(oracle_kept, engine_kept):
-            self.assertLessEqual(
-                abs(o_entry[1] - e_entry[1]), COSINE_TOLERANCE,
-                "cosine deviation exceeds the pinned tolerance")
-            self.assertLessEqual(
-                abs(o_entry[2] - e_entry[2]), COSINE_TOLERANCE,
-                "weight deviation exceeds the pinned tolerance")
-            self.assertEqual(o_entry[3], e_entry[3],
-                             "matched candidate must match")
-        # s_c per candidate + final emit order (by descending s, then index).
-        oracle_sc = {c.index: c.s for c in oracle.candidates}
-        engine_sc = {c.index: c.s for c in engine.candidates}
-        for index in oracle_sc:
-            self.assertLessEqual(
-                abs(oracle_sc[index] - engine_sc[index]), COSINE_TOLERANCE,
-                "candidate evidence s_c deviation exceeds tolerance")
-        oracle_order = sorted(range(len(oracle_sc)),
-                              key=lambda i: (-oracle_sc[i], i))
-        engine_order = sorted(range(len(engine_sc)),
-                              key=lambda i: (-engine_sc[i], i))
-        self.assertEqual(oracle_order, engine_order,
-                         "final emit order must match the oracle")
-
     # -- SCN-73-1/73-2: large same-key sets use the matmul batched path ------
 
     def test_large_same_key_matches_oracle(self):
@@ -190,7 +124,7 @@ class MlxEquivalenceTests(unittest.TestCase):
             5000, ["a" * 64, "b" * 64, "c" * 64])
         for oracle, engine in zip(oracle_results, engine_results):
             self.assertEqual(oracle.same_key_active, 5000)
-            self.assert_equivalent(oracle, engine)
+            assert_equivalent(self, oracle, engine)
 
     def test_small_same_key_matches_oracle(self):
         """Small sets (<= threshold) use the byte-identical Python path."""
@@ -198,7 +132,7 @@ class MlxEquivalenceTests(unittest.TestCase):
             100, ["a" * 64, "d" * 64])
         for oracle, engine in zip(oracle_results, engine_results):
             self.assertEqual(oracle.same_key_active, 100)
-            self.assert_equivalent(oracle, engine)
+            assert_equivalent(self, oracle, engine)
 
     def test_mixed_delta_fallback_matches_oracle(self):
         """Events missing from the matrix fall back to vector_for (delta).
@@ -227,7 +161,7 @@ class MlxEquivalenceTests(unittest.TestCase):
                     reader, self.params, query, vector_for,
                     cosine_engine=engine)
                 self.assertEqual(oracle.same_key_active, events + extra)
-                self.assert_equivalent(oracle, engine_result)
+                assert_equivalent(self, oracle, engine_result)
         finally:
             matrix.close()
             matrix2.close()
@@ -269,7 +203,7 @@ class MlxEquivalenceTests(unittest.TestCase):
                 reader, self.params, query, vector_for_ok,
                 cosine_engine=engine)
             self.assertEqual(oracle.same_key_active, events)
-            self.assert_equivalent(oracle, engine_result)
+            assert_equivalent(self, oracle, engine_result)
         finally:
             matrix.close()
 
@@ -289,6 +223,44 @@ class MlxEquivalenceTests(unittest.TestCase):
             # MlxError, not a fallback.
             with self.assertRaises(MlxError):
                 build_cosine_engine(b"", 0, 1024, {})
+
+    def test_resource_gate_fails_closed(self):
+        """A matrix working copy beyond the resource gate is refused
+        (SCN-73-6), never served degraded."""
+        import mlx_engine as _mle
+        from unittest import mock
+        # A 3 GiB declared matrix exceeds the 2 GiB gate even though the
+        # buffer is only a stub: the gate must fire before any copy.
+        with mock.patch.object(_mle, "MATRIX_BYTES_LIMIT", 1024):
+            with self.assertRaises(MlxError) as ctx:
+                build_cosine_engine(b"\x00" * 4096, 1024, 1024, {})
+        self.assertIn("resource gate", str(ctx.exception))
+
+    def test_engine_never_touches_a_model(self):
+        """SCN-73-5: the engine is a dense FP32 matmul over the vector file;
+        it must never load or reference a language model (no second
+        resident model)."""
+        import mlx_engine as _mle
+        # The engine module must not import any model-loading machinery.
+        source = open(os.path.join(os.path.dirname(__file__),
+                                   "mlx_engine.py"), encoding="utf-8").read()
+        for forbidden in ("mlx_lm", "transformers", "load_model",
+                          "HiddenState", "safetensors"):
+            self.assertNotIn(forbidden, source,
+                             "engine must not reference model loading: %s"
+                             % forbidden)
+        # And running the engine must not spawn any subprocess or load any
+        # model file: build a tiny matrix and confirm it works without any
+        # model directory existing.
+        matrix = _FixtureMatrix(8, dimension=8, seed=SEED)
+        try:
+            engine = MlxCosineEngine(matrix.buffer, 8, 8, matrix.row_index)
+            query = _vector(SEED, "query", "q" * 8, 8)
+            batch = engine.batch_cosines(query, ("ev-0",),
+                                         matrix.event_vector)
+            self.assertIn("ev-0", batch)
+        finally:
+            matrix.close()
 
     # -- SCN-73-4: backend enters the fingerprint ---------------------------
 

@@ -599,6 +599,7 @@ def protocol_error(
         "fact_identity_mismatch": "fact store epoch does not match the request",
         "not_caught_up": "daemon fact snapshot is behind the request watermark",
         "fact_store_fault": "fact store is missing or unreadable",
+        "oracle_fault": "retrieval-evidence oracle failed",
         "accelerate_fault": "Accelerate retrieval backend failed",
         "mlx_fault": "MLX retrieval backend failed",
         "representation_fault": "representation generation failed",
