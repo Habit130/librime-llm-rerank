@@ -357,6 +357,40 @@ python3 -m unittest discover -s daemon -p 'test_*.py'
 including the fixed counterexample for the top-K order and the retraction
 timing scenarios.
 
+## Accelerate exact retrieval backend (#72)
+
+`daemon/accelerate.py` implements the #72 exact backend challenge: the same
+exact evidence semantics as the oracle, with the per-event cosine computed by
+Apple vecLib (`cblas_sgemv`) over the generation's canonical row-major
+little-endian FP32 vector file — zero copy, no second resident copy.  It is
+the #71 baseline's challenge object: the pure-Python oracle measured ~7.5 s
+per query on the 100k single-hot-key fixture; the Accelerate path measures
+single-digit milliseconds for the same query.
+
+- **Same evidence, same aggregation.**  The engine plugs into
+  `oracle.compute_evidence` through the `CosineEngine` seam
+  (`batch_cosines`); the oracle's aggregation (threshold, usage age, final
+  weight, top-K, `m_c` / `M` / `s_c`) is untouched and never duplicated
+  (SCN-72-1/2).  Small same-key sets use the oracle's own Python float64
+  scalar cosine (bit-identical by construction); large sets use one batched
+  `cblas_sgemv`.
+- **Backend identity.**  The backend is bound into `index_fingerprint`
+  (`compose_backend_fingerprint(backend="accelerate-cblas-sgemv")`, library
+  version `accelerate-vecLib-cblas-sgemv-v1`); serving Accelerate under the
+  old `oracle-exact-v1` fingerprint is a contract failure (SCN-72-4).  The
+  FP32 vector file itself is identical across backends.
+- **Fail closed.**  If vecLib is unavailable at runtime the daemon raises a
+  fault (`accelerate_fault`) — never a silent Python fallback presented as
+  Accelerate (SCN-72-5).
+- **Equivalence.**  `daemon/test_accelerate.py` (model-free) compares the
+  engine against the oracle query-by-query: kept neighbors, event weights,
+  candidate evidence `s_c` and final emit order, within a pinned 1e-6
+  absolute cosine tolerance (measured deviation ~1e-8 at 100k x 1024).
+
+Select the backend on the daemon config seam (`retrieval_backend`:
+`"exact"` or `"accelerate-cblas-sgemv"`); the bench driver accepts
+`--backend accelerate-cblas-sgemv` (see `daemon/bench_100k.py`).
+
 ## Retrieval-evidence protocol (Squirrel#61)
 
 The plugin asks the daemon for the oracle's candidate-level evidence of one

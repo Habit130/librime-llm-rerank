@@ -59,7 +59,7 @@ def run(cmd, cwd=None, timeout=1800):
 
 
 def start_server(sock_dir, facts_root, derived_root, seed, repr_id,
-                 log_path, staging_config=None, timeout_s=90):
+                 log_path, staging_config=None, timeout_s=90, backend="exact"):
     os.makedirs(sock_dir, mode=0o700, exist_ok=True)
     for name in ("evidence.sock",):
         path = os.path.join(sock_dir, name)
@@ -71,7 +71,8 @@ def start_server(sock_dir, facts_root, derived_root, seed, repr_id,
            "--socket", os.path.join(sock_dir, "evidence.sock"),
            "--representation-id", repr_id,
            "--seed", str(seed),
-           "--dimension", str(DIM)]
+           "--dimension", str(DIM),
+           "--backend", backend]
     if staging_config:
         cmd += ["--staging-config", staging_config]
     log = open(log_path, "w", encoding="utf-8")
@@ -144,6 +145,30 @@ def stop_server(proc, log):
     log.close()
 
 
+def sample_peak_rss_kb(proc, tracker):
+    """Sample the daemon's current RSS and fold it into a peak tracker."""
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(proc.pid)],
+                             capture_output=True, text=True, timeout=10)
+        rss_kb = int(out.stdout.strip())
+    except Exception:  # noqa: BLE001 - best effort; never fail the window
+        return tracker
+    return max(tracker, rss_kb)
+
+
+def record_peak_rss(record_path, rss_kb):
+    """Attach the window's peak RSS to an existing measurement record."""
+    try:
+        with open(record_path, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except Exception:  # noqa: BLE001 - best effort
+        return
+    record["peak_rss_kib"] = rss_kb
+    with open(record_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, ensure_ascii=False, sort_keys=True,
+                  indent=2)
+
+
 def _active_generation_id(derived_root):
     sys.path.insert(0, _DAEMON)
     from publish import read_active_manifest
@@ -151,7 +176,8 @@ def _active_generation_id(derived_root):
     return manifest["generation_id"]
 
 
-def _build_generation_script(derived_root, facts_root, repr_id, seed):
+def _build_generation_script(derived_root, facts_root, repr_id, seed,
+                             backend="exact"):
     return ("import sys; sys.path.insert(0, 'daemon')\n"
             "from seed_vectors import SeedVectorProvider\n"
             "from generation import build_generation\n"
@@ -161,14 +187,14 @@ def _build_generation_script(derived_root, facts_root, repr_id, seed):
             "import shutil\n"
             "shutil.rmtree(%r, ignore_errors=True)\n"
             "p = SeedVectorProvider(%r, %d, %d)\n"
-            "g = build_generation(%r, p, %r)\n"
+            "g = build_generation(%r, p, %r, retrieval_backend=%r)\n"
             "m = _compose_active_manifest(g, 'delta/%%s/%%s' %% "
             "(g.generation_id, DELTA_FILENAME), "
             "_read_fact_schema_version(%r))\n"
             "write_active_manifest(%r, m)\n"
             "g.close()\n" % (
                 derived_root, repr_id, seed, DIM, facts_root, derived_root,
-                facts_root, derived_root))
+                backend, facts_root, derived_root))
 
 
 def _run_client(sock_dir, kind, facts_root, replay_count,
@@ -188,12 +214,17 @@ def _run_client(sock_dir, kind, facts_root, replay_count,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-root", required=True)
+    parser.add_argument("--backend", default="exact",
+                        choices=("exact", "accelerate-cblas-sgemv"),
+                        help="exact retrieval backend (default: the #71 "
+                             "python oracle)")
     parser.add_argument("--replay-count", type=int, default=10000)
     parser.add_argument("--hotkey-replay-count", type=int, default=30)
     parser.add_argument("--client-deadline-ms", type=float, default=200.0)
     parser.add_argument("--skip-build", action="store_true",
                         help="reuse existing fixtures/derived roots")
     args = parser.parse_args()
+    backend = args.backend
 
     work = args.work_root
     os.makedirs(work, mode=0o700, exist_ok=True)
@@ -220,7 +251,7 @@ def main():
         with open(os.path.join(work, "build_gen.py"), "w") as handle:
             handle.write(_build_generation_script(
                 derived_freq, os.path.join(fixtures, "freq"),
-                REPR_ID, SEED))
+                REPR_ID, SEED, backend))
         rc, out = run([_PYTHON, os.path.join(work, "build_gen.py")],
                       cwd=_REPO, timeout=1200)
         if rc != 0:
@@ -232,12 +263,15 @@ def main():
     sock_dir = os.path.join(work, "sock-freq")
     proc, log = start_server(
         sock_dir, os.path.join(fixtures, "freq"), derived_freq,
-        SEED, REPR_ID, os.path.join(records, "freq-server.log"))
+        SEED, REPR_ID, os.path.join(records, "freq-server.log"),
+        backend=backend)
     time.sleep(5)
     record_s13 = os.path.join(records, "freq-s1s3.json")
     rc, out = _run_client(
         sock_dir, "freq", os.path.join(fixtures, "freq"),
         args.replay_count, args.client_deadline_ms, record_s13, _REPO)
+    peak = sample_peak_rss_kb(proc, 0)
+    record_peak_rss(record_s13, peak)
     stop_server(proc, log)
     if rc != 0:
         print(out[-3000:])
@@ -256,12 +290,14 @@ def main():
     sock_dir = os.path.join(work, "sock-s2")
     proc, log = start_server(
         sock_dir, s2_facts, derived_s2, SEED, REPR_ID,
-        os.path.join(records, "s2-server.log"))
+        os.path.join(records, "s2-server.log"), backend=backend)
     time.sleep(5)
     record_s2 = os.path.join(records, "freq-s2.json")
     rc, out = _run_client(
         sock_dir, "freq", s2_facts, 50, args.client_deadline_ms,
         record_s2, _REPO)
+    peak = sample_peak_rss_kb(proc, 0)
+    record_peak_rss(record_s2, peak)
     stop_server(proc, log)
     if rc != 0:
         print(out[-3000:])
@@ -277,7 +313,7 @@ def main():
         with open(os.path.join(work, "build_gen_hotkey.py"), "w") as handle:
             handle.write(_build_generation_script(
                 derived_hotkey, os.path.join(fixtures, "hotkey"),
-                REPR_ID, SEED))
+                REPR_ID, SEED, backend))
         rc, out = run([_PYTHON, os.path.join(work, "build_gen_hotkey.py")],
                       cwd=_REPO, timeout=1200)
         if rc != 0:
@@ -286,12 +322,15 @@ def main():
     sock_dir = os.path.join(work, "sock-hotkey")
     proc, log = start_server(
         sock_dir, os.path.join(fixtures, "hotkey"), derived_hotkey,
-        SEED, REPR_ID, os.path.join(records, "hotkey-server.log"))
+        SEED, REPR_ID, os.path.join(records, "hotkey-server.log"),
+        backend=backend)
     time.sleep(5)
     record_h = os.path.join(records, "hotkey-s1s3.json")
     rc, out = _run_client(
         sock_dir, "hotkey", os.path.join(fixtures, "hotkey"),
         args.hotkey_replay_count, args.client_deadline_ms, record_h, _REPO)
+    peak = sample_peak_rss_kb(proc, 0)
+    record_peak_rss(record_h, peak)
     stop_server(proc, log)
     if rc != 0:
         print(out[-3000:])
@@ -322,7 +361,7 @@ def main():
     proc, log = start_server(
         sock_dir, s4_facts, derived_s4, SEED, REPR_ID,
         os.path.join(records, "s4-server.log"),
-        staging_config=staging_config, timeout_s=90)
+        staging_config=staging_config, timeout_s=90, backend=backend)
     time.sleep(5)
     staging_dir = os.path.join(derived_s4, "staging")
     for _ in range(120):
@@ -333,6 +372,8 @@ def main():
     rc, out = _run_client(
         sock_dir, "freq", s4_facts, args.replay_count,
         args.client_deadline_ms, record_s4, _REPO)
+    peak = sample_peak_rss_kb(proc, 0)
+    record_peak_rss(record_s4, peak)
     stop_server(proc, log)
     if rc != 0:
         print(out[-3000:])
@@ -342,7 +383,8 @@ def main():
 
     # -- aggregate --------------------------------------------------------
     aggregate = {
-        "contract": "AC-71-v1",
+        "contract": "AC-72-v1" if backend != "exact" else "AC-71-v1",
+        "retrieval_backend": backend,
         "fixtures": fixture_summary,
         "records": {
             "freq_s1s3": record_s13,

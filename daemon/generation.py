@@ -80,6 +80,8 @@ import tempfile
 from compat import (  # noqa: E402
     EXACT_BACKEND,
     FP32_ROW_MAJOR_LE,
+    SUPPORTED_BACKENDS,
+    compose_backend_fingerprint,
     compose_index_fingerprint,
 )
 from evidence import (EvidenceError, RepresentationProvider)
@@ -368,8 +370,12 @@ class _VectorFile:
                     "vectors file size %d does not match %d rows x %d dims"
                     % (size, rows, dimension))
             with open(path, "rb") as handle:
+                # ACCESS_COPY: the Accelerate backend (#72) reads the file
+                # through a ctypes writable-buffer view (copy-on-write) so it
+                # can hand the matrix address to vecLib without ever writing
+                # back; physical pages stay shared read-only until written.
                 self._mm = mmap.mmap(handle.fileno(), 0,
-                                     access=mmap.ACCESS_READ)
+                                     access=mmap.ACCESS_COPY)
 
     def vector(self, row):
         if not (0 <= row < self._rows):
@@ -379,6 +385,10 @@ class _VectorFile:
             return ()
         return struct.unpack_from("<%df" % self._dimension,
                                   self._mm, row * self._row_bytes)
+
+    def buffer(self):
+        """The raw read-only mmap buffer (None for a zero-row file)."""
+        return self._mm
 
     def close(self):
         if self._mm is not None:
@@ -649,7 +659,9 @@ def _read_snapshot(facts_root, as_of=None):
 
 def _prepare_target(events, provider, store_epoch, source_hlc,
                     projection_version=PROJECTION_VERSION,
-                    index_fingerprint=None, rebuild_tag=None):
+                    index_fingerprint=None, rebuild_tag=None,
+                    retrieval_backend=RETRIEVAL_BACKEND,
+                    retrieval_params=RETRIEVAL_PARAMS):
     """The deterministic build target over one frozen snapshot.
 
     Validates every event (a violation blocks with the event named), derives
@@ -667,6 +679,12 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
     exact-only index fingerprint; the staging machine passes the desired
     values from its config seam.
 
+    ``retrieval_backend`` / ``retrieval_params`` (#72) name the exact
+    retrieval implementation that interprets the canonical FP32 file
+    (``exact`` oracle or ``accelerate-cblas-sgemv``).  They are bound into the
+    identity AND the index fingerprint (SCN-72-4), so an Accelerate build
+    mints a different generation id than the oracle build of the same facts.
+
     ``rebuild_tag`` (Squirrel#68) is the explicit-rebuild nonce: ``None``
     keeps the fully content-addressed target, while an explicit ``--full``
     rebuild passes a fresh tag so the SAME fingerprint mints a NEW
@@ -676,6 +694,9 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
     active is still an explicit build -- never a matrix no-op -- and the
     resulting generation remains fully compatible with the active layers.
     """
+    if retrieval_backend not in SUPPORTED_BACKENDS:
+        raise BuildError("unsupported retrieval backend %r"
+                         % (retrieval_backend,))
     rows = []
     for stored in events:
         problem = _validate_event(stored)
@@ -690,8 +711,14 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
                                   stored.final_selection_text, stored.hlc))
     fingerprint = _rows_fingerprint(rows)
     if index_fingerprint is None:
-        index_fingerprint = compose_index_fingerprint(
-            backend=RETRIEVAL_BACKEND, params=RETRIEVAL_PARAMS)
+        # The backend's library/ABI version is bound here (SCN-72-4): an
+        # Accelerate build must never carry the oracle's ``oracle-exact-v1``
+        # library version, even though the backend token already differs.
+        # ``compose_backend_fingerprint`` binds the per-backend library
+        # version; ``compose_index_fingerprint`` with the default version
+        # would be a fingerprint forgery for the Accelerate backend.
+        index_fingerprint = compose_backend_fingerprint(
+            backend=retrieval_backend, params=retrieval_params)
     identity = {
         "store_epoch": store_epoch,
         "source_hlc": [source_hlc[0], source_hlc[1]],
@@ -701,8 +728,8 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
         "projection_version": projection_version,
         "index_fingerprint": index_fingerprint,
         "builder_version": BUILD_VERSION,
-        "retrieval_backend": RETRIEVAL_BACKEND,
-        "retrieval_params": RETRIEVAL_PARAMS,
+        "retrieval_backend": retrieval_backend,
+        "retrieval_params": retrieval_params,
     }
     if rebuild_tag is not None:
         identity["rebuild_tag"] = rebuild_tag
@@ -949,7 +976,9 @@ def _compose_manifest(identity, generation_id, rows_fingerprint, row_count,
 
 
 def build_generation(facts_root, provider, output_root,
-                     chunk_rows=CHUNK_ROWS, probe_params=PROBE_PARAMS):
+                     chunk_rows=CHUNK_ROWS, probe_params=PROBE_PARAMS,
+                     retrieval_backend=RETRIEVAL_BACKEND,
+                     retrieval_params=RETRIEVAL_PARAMS):
     """Build and publish one immutable generation over a facts snapshot.
 
     ``provider`` must be a ``RepresentationProvider`` (the #61 seam) whose
@@ -957,6 +986,12 @@ def build_generation(facts_root, provider, output_root,
     from the stored event (including its raw ``preceding_text``) and whose
     ``query_vector`` does the same for probe query text.  The build runs on
     the caller's facts_root read-only; the caller owns the root layout.
+
+    ``retrieval_backend`` (#72) selects the exact retrieval implementation
+    that interprets the generated FP32 file (``exact`` or
+    ``accelerate-cblas-sgemv``); it is bound into the generation identity and
+    index fingerprint (SCN-72-4).  The FP32 file itself is identical for both
+    backends (same canonical format, dimension and row order).
 
     Raises ``BuildBlockedError`` (with the blocking events) on any
     deterministic parse/representation error, ``BuildEpochChangedError`` if
@@ -978,9 +1013,14 @@ def build_generation(facts_root, provider, output_root,
     if not isinstance(dimension, int) or dimension < 1:
         raise BuildError("provider vector_dimension must be a positive "
                          "integer")
+    if retrieval_backend not in SUPPORTED_BACKENDS:
+        raise BuildError("unsupported retrieval backend %r"
+                         % (retrieval_backend,))
 
     store_epoch, source_hlc, events = _read_snapshot(facts_root)
-    target = _prepare_target(events, provider, store_epoch, source_hlc)
+    target = _prepare_target(events, provider, store_epoch, source_hlc,
+                             retrieval_backend=retrieval_backend,
+                             retrieval_params=retrieval_params)
     rows = target["rows"]
     fingerprint = target["rows_fingerprint"]
     identity = target["identity"]
@@ -1090,7 +1130,7 @@ def _verify_identity(manifest):
         if not isinstance(value, str) or not value:
             raise GenerationRejected(
                 "manifest: identity %s missing or empty" % label)
-    if identity.get("retrieval_backend") != RETRIEVAL_BACKEND:
+    if identity.get("retrieval_backend") not in SUPPORTED_BACKENDS:
         raise GenerationRejected(
             "manifest: unsupported retrieval backend %r"
             % identity.get("retrieval_backend"))
@@ -1432,12 +1472,27 @@ class Generation:
             raise GenerationError("no row for event %s" % event_id)
         return row
 
+    def event_rows(self):
+        """A copy of the event_id -> row mapping (read-only by value)."""
+        return dict(self._row_index)
+
     def vector(self, row):
         """The FP32 row vector as a tuple of floats (via mmap)."""
         return self._vfile.vector(row)
 
     def event_vector(self, event_id):
         return self._vfile.vector(self.event_row(event_id))
+
+    def vector_buffer(self):
+        """The raw read-only FP32 buffer (mmap) for zero-copy backends.
+
+        #72: the Accelerate exact backend (``accelerate-cblas-sgemv``) reads
+        the same canonical row-major little-endian FP32 file through a
+        ctypes/numpy view of this buffer; no second resident copy.  The
+        buffer is immutable; callers must not hold it past the generation's
+        lifetime (the generation owns the mmap).
+        """
+        return self._vfile.buffer()
 
     def close(self):
         self._vfile.close()
