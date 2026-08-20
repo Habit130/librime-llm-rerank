@@ -121,36 +121,41 @@ REFUSE_CHECKSUM_FAILURE = "checksum_failure"
 REFUSE_UNKNOWN_IDENTITY = "unknown_identity"
 
 # Exact-only envelope constants (the only supported backends / format /
-# metric).  The #71 pure-Python oracle and the #72 Accelerate exact backend
-# are the two supported exact retrieval implementations; both interpret the
-# same canonical FP32 file, and both must match the oracle's evidence
-# semantics (spec: 检索后端进入 index fingerprint).
+# metric).  The #71 pure-Python oracle, the #72 Accelerate exact backend and
+# the #73 MLX exact backend are the supported exact retrieval
+# implementations; all interpret the same canonical FP32 file, and all must
+# match the oracle's evidence semantics (spec: 检索后端进入 index
+# fingerprint).
 EXACT_BACKEND = "exact"
 ACCELERATE_BACKEND = "accelerate-cblas-sgemv"
+MLX_BACKEND = "mlx-exact-matmul"
 EXACT_METRIC = "cosine"
 # The exact-only envelope has no ANN library; the "library version" is the
 # version of the in-tree exact retrieval implementation that interprets the
 # FP32 file.  A second production backend / format would change this constant
 # (and thus every fingerprint) -- the seam ANN lands on in #78/#79.
-# The Accelerate backend binds Apple vecLib (cblas_sgemv) as its library/ABI;
-# serving Accelerate under the old ``oracle-exact-v1`` fingerprint is a
-# contract failure (SCN-72-4).
+# The Accelerate backend binds Apple vecLib (cblas_sgemv) and the MLX backend
+# binds mlx.core (mx.matmul) as their library/ABI; serving either under the
+# old ``oracle-exact-v1`` fingerprint is a contract failure (SCN-72-4 /
+# SCN-73-4).
 EXACT_LIBRARY_VERSION = "oracle-exact-v1"
 ACCELERATE_LIBRARY_VERSION = "accelerate-vecLib-cblas-sgemv-v1"
+MLX_LIBRARY_VERSION = "mlx-core-matmul-v1"
 # The serialization ABI of the canonical vector file: row-major little-endian
 # FP32, no header (dimension/rows live in the manifest).
 FP32_ROW_MAJOR_LE = "fp32-row-major-little-endian"
 INDEX_FINGERPRINT_PREFIX = "index-fingerprint-v1"
 
-# The supported retrieval backends the daemon can load (both exact, both
+# The supported retrieval backends the daemon can load (all exact, all
 # cosine over the same canonical FP32 file).  A generation whose manifest
 # names anything else is refused on reopen (SCN-66-12).
-SUPPORTED_BACKENDS = (EXACT_BACKEND, ACCELERATE_BACKEND)
+SUPPORTED_BACKENDS = (EXACT_BACKEND, ACCELERATE_BACKEND, MLX_BACKEND)
 
 # Library/ABI versions per backend, for the index fingerprint payload.
 _LIBRARY_VERSION_BY_BACKEND = {
     EXACT_BACKEND: EXACT_LIBRARY_VERSION,
     ACCELERATE_BACKEND: ACCELERATE_LIBRARY_VERSION,
+    MLX_BACKEND: MLX_LIBRARY_VERSION,
 }
 
 # ---------------------------------------------------------------------------
@@ -193,10 +198,11 @@ def compose_index_fingerprint(backend=EXACT_BACKEND, metric=EXACT_METRIC,
 def compose_backend_fingerprint(backend=EXACT_BACKEND, params=None):
     """Compose the index fingerprint for a supported exact backend.
 
-    The library/ABI version is bound per backend (SCN-72-4: serving
-    Accelerate under the old ``oracle-exact-v1`` fingerprint is a contract
-    failure); both backends share the canonical FP32 serialization ABI and the
-    cosine metric.  An unknown backend raises ValueError (fail closed).
+    The library/ABI version is bound per backend (SCN-72-4 / SCN-73-4:
+    serving Accelerate under the old ``oracle-exact-v1`` fingerprint -- or
+    MLX under either of the older ones -- is a contract failure); all
+    backends share the canonical FP32 serialization ABI and the cosine
+    metric.  An unknown backend raises ValueError (fail closed).
     """
     if backend not in _LIBRARY_VERSION_BY_BACKEND:
         raise ValueError("unsupported retrieval backend %r" % (backend,))

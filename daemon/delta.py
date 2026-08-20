@@ -438,6 +438,7 @@ class DeltaSnapshot:
         self._change_seq = change_seq
         self._query_provider = query_provider
         self._accelerate_engine = None  # #72 lazy Accelerate cosine engine
+        self._mlx_engine = None  # #73 lazy MLX cosine engine
 
     @property
     def store_epoch(self):
@@ -471,13 +472,13 @@ class DeltaSnapshot:
         return [event.event_id for event in self._events]
 
     def retrieval_backend(self):
-        """The base generation's exact retrieval backend (#72).
+        """The base generation's exact retrieval backend (#72/#73).
 
         The snapshot's matrix (and therefore the served cosine path) is
         bound to the generation's backend.  The evidence service uses this
         to fail closed when the configured backend disagrees with the
-        generation the snapshot serves (SCN-72-5: never silently serve a
-        different backend than the fingerprint declares).
+        generation the snapshot serves (SCN-72-5 / SCN-73-6: never silently
+        serve a different backend than the fingerprint declares).
         """
         return self._generation.retrieval_backend
 
@@ -535,6 +536,32 @@ class DeltaSnapshot:
                 buffer, self._generation.row_count,
                 self._generation.vector_dimension, row_index)
         return self._accelerate_engine
+
+    def mlx_engine(self, row_index=None):
+        """The MLX cosine engine over this snapshot's matrix (#73).
+
+        Builds an ``MlxCosineEngine`` over the base generation's canonical
+        FP32 buffer (one explicit in-process MLX copy of the matrix, since
+        MLX 0.32 has no zero-copy CPU constructor -- see mlx_engine.py);
+        delta-only events fall back to this snapshot's own ``vector_for``
+        (same representation, same oracle exactness).  Raises ``MlxError``
+        when MLX is unavailable or the matrix cannot be built (fail closed:
+        never a silent Accelerate/Python fallback presented as MLX,
+        SCN-73-6).  The engine is cached per snapshot; the returned engine
+        is only valid while this snapshot (and its generation) live.
+        """
+        if self._mlx_engine is None:
+            from mlx_engine import build_cosine_engine
+            buffer = self._generation.vector_buffer()
+            if buffer is None:
+                raise DeltaError("snapshot base generation has no vector "
+                                 "buffer")
+            row_index = (self._generation.event_rows()
+                         if row_index is None else row_index)
+            self._mlx_engine = build_cosine_engine(
+                buffer, self._generation.row_count,
+                self._generation.vector_dimension, row_index)
+        return self._mlx_engine
 
 
 class DeltaSnapshotReader:

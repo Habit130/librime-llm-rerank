@@ -679,11 +679,12 @@ def _prepare_target(events, provider, store_epoch, source_hlc,
     exact-only index fingerprint; the staging machine passes the desired
     values from its config seam.
 
-    ``retrieval_backend`` / ``retrieval_params`` (#72) name the exact
+    ``retrieval_backend`` / ``retrieval_params`` (#72/#73) name the exact
     retrieval implementation that interprets the canonical FP32 file
-    (``exact`` oracle or ``accelerate-cblas-sgemv``).  They are bound into the
-    identity AND the index fingerprint (SCN-72-4), so an Accelerate build
-    mints a different generation id than the oracle build of the same facts.
+    (``exact`` oracle, ``accelerate-cblas-sgemv`` or ``mlx-exact-matmul``).
+    They are bound into the identity AND the index fingerprint
+    (SCN-72-4 / SCN-73-4), so an Accelerate or MLX build mints a different
+    generation id than the oracle build of the same facts.
 
     ``rebuild_tag`` (Squirrel#68) is the explicit-rebuild nonce: ``None``
     keeps the fully content-addressed target, while an explicit ``--full``
@@ -987,11 +988,12 @@ def build_generation(facts_root, provider, output_root,
     ``query_vector`` does the same for probe query text.  The build runs on
     the caller's facts_root read-only; the caller owns the root layout.
 
-    ``retrieval_backend`` (#72) selects the exact retrieval implementation
-    that interprets the generated FP32 file (``exact`` or
-    ``accelerate-cblas-sgemv``); it is bound into the generation identity and
-    index fingerprint (SCN-72-4).  The FP32 file itself is identical for both
-    backends (same canonical format, dimension and row order).
+    ``retrieval_backend`` (#72/#73) selects the exact retrieval implementation
+    that interprets the generated FP32 file (``exact``, ``accelerate-cblas-sgemv``
+    or ``mlx-exact-matmul``); it is bound into the generation identity and
+    index fingerprint (SCN-72-4 / SCN-73-4).  The FP32 file itself is
+    identical for all backends (same canonical format, dimension and row
+    order).
 
     Raises ``BuildBlockedError`` (with the blocking events) on any
     deterministic parse/representation error, ``BuildEpochChangedError`` if

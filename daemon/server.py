@@ -599,7 +599,8 @@ def protocol_error(
         "fact_identity_mismatch": "fact store epoch does not match the request",
         "not_caught_up": "daemon fact snapshot is behind the request watermark",
         "fact_store_fault": "fact store is missing or unreadable",
-        "oracle_fault": "retrieval-evidence oracle failed",
+        "accelerate_fault": "Accelerate retrieval backend failed",
+        "mlx_fault": "MLX retrieval backend failed",
         "representation_fault": "representation generation failed",
     }
     response = {
@@ -834,6 +835,8 @@ _EVIDENCE_FAULT_CODES = frozenset((
     "not_caught_up",
     "fact_store_fault",
     "oracle_fault",
+    "accelerate_fault",
+    "mlx_fault",
     "representation_fault",
     "invalid_request",
 ))
@@ -1131,8 +1134,7 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
         report_active_identity = active_identity
         if derived_root and machine is not None and not force_rebuild:
             try:
-                from publish import (active_identity_from_manifest,
-                                     read_active_manifest)
+                from publish import active_identity_from_manifest
                 manifest, manifest_reason = read_active_manifest(derived_root)
                 if manifest is not None and manifest_reason is None:
                     staging_active_generation_id = manifest["generation_id"]
