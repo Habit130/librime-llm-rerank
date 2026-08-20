@@ -159,6 +159,8 @@ def main():
         "seed": args.seed,
         "dimension": args.dimension,
         "representation_id": args.representation_id,
+        "retrieval_backend": os.environ.get("LLM_RERANK_BENCH_BACKEND",
+                                            "exact"),
         "params": {
             "tau": args.tau, "k_evidence": args.k_evidence,
             "half_life": args.half_life, "saturation_k": args.saturation_k,

@@ -69,9 +69,11 @@ def main():
     parser.add_argument("--seed", type=int, default=20260817)
     parser.add_argument("--dimension", type=int, default=1024)
     parser.add_argument("--backend", default="exact",
-                        choices=("exact", "accelerate-cblas-sgemv"),
-                        help="exact retrieval backend: the #71 python oracle "
-                             "or the #72 Apple vecLib Accelerate path")
+                        choices=("exact", "accelerate-cblas-sgemv",
+                                 "mlx-exact-matmul"),
+                        help="exact retrieval backend: the #71 python oracle, "
+                             "the #72 Apple vecLib Accelerate path, or the "
+                             "#73 MLX matmul path")
     parser.add_argument("--staging-config", default=None,
                         help="JSON file with desired_representation_id / "
                              "desired_seed for the S4 rebuild scenario")
@@ -119,22 +121,26 @@ def main():
     os.chmod(args.socket, 0o600)
     srv.listen(8)
     srv.settimeout(1.0)
-    # #72 warm-up: when serving the Accelerate backend, construct the cosine
-    # engine once BEFORE the measurement window so the one-time per-row norm
-    # precomputation (~40 ms at 100k rows) never lands inside a measured
-    # request (spec: model-warm windows; the bench client's first S1 request
-    # must not pay the engine's construction cost).
+    # #72/#73 warm-up: when serving the Accelerate or MLX backend, construct
+    # the cosine engine once BEFORE the measurement window so the one-time
+    # engine construction (per-row norm precomputation / matrix copy) never
+    # lands inside a measured request (spec: model-warm windows; the bench
+    # client's first S1 request must not pay the engine's construction cost).
     if args.backend != "exact" and machine is not None:
         try:
             snapshot = machine.ensure_caught_up()
-            engine = snapshot.accelerate_engine()
-            # Touch the matrix once (one real sgemv over a >threshold batch)
-            # so the first measured request never pays the one-time cold-
-            # matrix / vecLib warm cost (~150 ms at 100k x 1024).  The probe
-            # vector is synthetic and its result is discarded; nothing here
-            # touches live data.  The batch must exceed the engine's Python
-            # path threshold to force the sgemv branch.
-            from accelerate import PYTHON_PATH_THRESHOLD
+            engine = (snapshot.mlx_engine() if args.backend == "mlx-exact-matmul"
+                      else snapshot.accelerate_engine())
+            # Touch the matrix once (one real matmul/sgemv over a >threshold
+            # batch) so the first measured request never pays the one-time
+            # cold-matrix / MLX-allocator warm cost.  The probe vector is
+            # synthetic and its result is discarded; nothing here touches
+            # live data.  The batch must exceed the engine's Python path
+            # threshold to force the batched branch.
+            if args.backend == "mlx-exact-matmul":
+                from mlx_engine import PYTHON_PATH_THRESHOLD
+            else:
+                from accelerate import PYTHON_PATH_THRESHOLD
             if len(snapshot.active_events) >= PYTHON_PATH_THRESHOLD:
                 probe_ids = tuple(
                     event.event_id
@@ -143,7 +149,7 @@ def main():
                     [1.0] * snapshot.vector_dimension, probe_ids,
                     snapshot.vector_for)
         except Exception as error:  # noqa: BLE001 - fail closed at startup
-            print("FAIL: Accelerate engine warm-up: %s" % error,
+            print("FAIL: %s engine warm-up: %s" % (args.backend, error),
                   file=sys.stderr)
             machine.close()
             srv.close()

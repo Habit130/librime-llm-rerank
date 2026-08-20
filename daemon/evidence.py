@@ -52,14 +52,16 @@ from typing import (Dict, List, Mapping, Optional, Sequence, Tuple)
 from oracle import (FactReader, OracleError, OracleParams, OracleQuery,
                     compute_evidence)
 
-# #72: the exact retrieval backend the daemon serves evidence with.  Both
+# #72/#73: the exact retrieval backend the daemon serves evidence with.  All
 # backends compute the same exact evidence over the same facts/vectors; the
-# Accelerate backend uses Apple vecLib for the per-event cosine while the
-# oracle backend uses Python scalar math.  The configured backend is bound
-# into the index fingerprint (see compat.compose_backend_fingerprint); the
-# config seam never silently switches backends.
+# Accelerate backend uses Apple vecLib and the MLX backend uses mlx.core for
+# the per-event cosine while the oracle backend uses Python scalar math.
+# The configured backend is bound into the index fingerprint (see
+# compat.compose_backend_fingerprint); the config seam never silently
+# switches backends.
 BACKEND_ORACLE = "exact"
 BACKEND_ACCELERATE = "accelerate-cblas-sgemv"
+BACKEND_MLX = "mlx-exact-matmul"
 
 EVIDENCE_KIND = "evidence"
 EVIDENCE_PROTOCOL_VERSION = 2
@@ -284,7 +286,8 @@ class EvidenceService:
                                 "provider must be a RepresentationProvider")
         if not isinstance(gamma, (int, float)) or not math.isfinite(gamma):
             raise EvidenceError("evidence_unavailable", "gamma must be finite")
-        if retrieval_backend not in (BACKEND_ORACLE, BACKEND_ACCELERATE):
+        if retrieval_backend not in (BACKEND_ORACLE, BACKEND_ACCELERATE,
+                                     BACKEND_MLX):
             raise EvidenceError(
                 "evidence_unavailable",
                 "unsupported retrieval_backend %r" % (retrieval_backend,))
@@ -320,16 +323,17 @@ class EvidenceService:
         """The CosineEngine for this request, per the configured backend.
 
         The oracle backend returns None (the canonical Python scalar path in
-        ``compute_evidence``).  The Accelerate backend builds the vecLib
-        engine over the snapshot's matrix; any Accelerate fault raises
+        ``compute_evidence``).  The Accelerate and MLX backends build their
+        engine over the snapshot's matrix; any engine fault raises
         EvidenceError (fail closed -- never a silent Python fallback
-        presented as Accelerate, SCN-72-5).
+        presented as the configured backend, SCN-72-5 / SCN-73-6).
 
         The configured backend must AGREE with the snapshot's generation
-        backend: a generation built for ``accelerate-cblas-sgemv`` must never
-        be silently served with the oracle Python path (and vice versa),
-        because the served backend is bound into ``index_fingerprint``
-        (SCN-72-4).  A mismatch is a true fault, never a silent switch.
+        backend: a generation built for ``accelerate-cblas-sgemv`` or
+        ``mlx-exact-matmul`` must never be silently served with the oracle
+        Python path (and vice versa), because the served backend is bound
+        into ``index_fingerprint`` (SCN-72-4 / SCN-73-4).  A mismatch is a
+        true fault, never a silent switch.
         """
         try:
             generation_backend = snapshot.retrieval_backend()
@@ -350,6 +354,15 @@ class EvidenceService:
                 raise EvidenceError(
                     "accelerate_fault",
                     "Accelerate backend unavailable: %s" % error) from error
+        if self._retrieval_backend == BACKEND_MLX:
+            try:
+                return snapshot.mlx_engine()
+            except EvidenceError:
+                raise
+            except Exception as error:  # noqa: BLE001 - fail closed
+                raise EvidenceError(
+                    "mlx_fault",
+                    "MLX backend unavailable: %s" % error) from error
         return None
 
     def _serve_via_snapshot(self, request):
@@ -607,8 +620,8 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
         query_vectors (exact preceding text -> vector),
         event_vectors (schema_id|canonical_segment_input|final_selection -> vector),
         default_query, default_event,
-        retrieval_backend ("exact" or "accelerate-cblas-sgemv"; default
-        "exact" -- the #71 oracle path)
+        retrieval_backend ("exact", "accelerate-cblas-sgemv" or
+        "mlx-exact-matmul"; default "exact" -- the #71 oracle path)
 
     ``machine`` (#63) is an optional prebuilt delta state machine; when
     present, every served request is gated through its published query

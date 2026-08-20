@@ -49,10 +49,12 @@ def env_snapshot():
     }
 
 
-def run(cmd, cwd=None, timeout=1800):
+def run(cmd, cwd=None, timeout=1800, env=None):
     """Run a command, returning (returncode, stdout+stderr)."""
     full_env = dict(os.environ)
     full_env["PYTHONPATH"] = _DAEMON
+    if env:
+        full_env.update(env)
     proc = subprocess.run(cmd, cwd=cwd, env=full_env,
                           capture_output=True, text=True, timeout=timeout)
     return proc.returncode, proc.stdout + proc.stderr
@@ -198,7 +200,9 @@ def _build_generation_script(derived_root, facts_root, repr_id, seed,
 
 
 def _run_client(sock_dir, kind, facts_root, replay_count,
-                client_deadline_ms, record_path, cwd):
+                client_deadline_ms, record_path, cwd, backend="exact"):
+    full_env = dict(os.environ)
+    full_env["LLM_RERANK_BENCH_BACKEND"] = backend
     return run([
         _PYTHON, CLIENT, "--socket",
         os.path.join(sock_dir, "evidence.sock"),
@@ -208,16 +212,17 @@ def _run_client(sock_dir, kind, facts_root, replay_count,
         "--client-deadline-ms", str(client_deadline_ms),
         "--output", record_path,
         "--facts-root", facts_root,
-    ], cwd=cwd)
+    ], cwd=cwd, env=full_env)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-root", required=True)
     parser.add_argument("--backend", default="exact",
-                        choices=("exact", "accelerate-cblas-sgemv"),
+                        choices=("exact", "accelerate-cblas-sgemv",
+                                 "mlx-exact-matmul"),
                         help="exact retrieval backend (default: the #71 "
-                             "python oracle)")
+                             "python oracle; #72 vecLib; #73 MLX)")
     parser.add_argument("--replay-count", type=int, default=10000)
     parser.add_argument("--hotkey-replay-count", type=int, default=30)
     parser.add_argument("--client-deadline-ms", type=float, default=200.0)
@@ -269,7 +274,8 @@ def main():
     record_s13 = os.path.join(records, "freq-s1s3.json")
     rc, out = _run_client(
         sock_dir, "freq", os.path.join(fixtures, "freq"),
-        args.replay_count, args.client_deadline_ms, record_s13, _REPO)
+        args.replay_count, args.client_deadline_ms, record_s13, _REPO,
+        backend=backend)
     peak = sample_peak_rss_kb(proc, 0)
     record_peak_rss(record_s13, peak)
     stop_server(proc, log)
@@ -295,7 +301,7 @@ def main():
     record_s2 = os.path.join(records, "freq-s2.json")
     rc, out = _run_client(
         sock_dir, "freq", s2_facts, 50, args.client_deadline_ms,
-        record_s2, _REPO)
+        record_s2, _REPO, backend=backend)
     peak = sample_peak_rss_kb(proc, 0)
     record_peak_rss(record_s2, peak)
     stop_server(proc, log)
@@ -328,7 +334,8 @@ def main():
     record_h = os.path.join(records, "hotkey-s1s3.json")
     rc, out = _run_client(
         sock_dir, "hotkey", os.path.join(fixtures, "hotkey"),
-        args.hotkey_replay_count, args.client_deadline_ms, record_h, _REPO)
+        args.hotkey_replay_count, args.client_deadline_ms, record_h, _REPO,
+        backend=backend)
     peak = sample_peak_rss_kb(proc, 0)
     record_peak_rss(record_h, peak)
     stop_server(proc, log)
@@ -371,7 +378,7 @@ def main():
     record_s4 = os.path.join(records, "freq-s4.json")
     rc, out = _run_client(
         sock_dir, "freq", s4_facts, args.replay_count,
-        args.client_deadline_ms, record_s4, _REPO)
+        args.client_deadline_ms, record_s4, _REPO, backend=backend)
     peak = sample_peak_rss_kb(proc, 0)
     record_peak_rss(record_s4, peak)
     stop_server(proc, log)
@@ -382,8 +389,10 @@ def main():
         print(line)
 
     # -- aggregate --------------------------------------------------------
+    contract = "AC-72-v1" if backend == "accelerate-cblas-sgemv" else (
+        "AC-73-v1" if backend == "mlx-exact-matmul" else "AC-71-v1")
     aggregate = {
-        "contract": "AC-72-v1" if backend != "exact" else "AC-71-v1",
+        "contract": contract,
         "retrieval_backend": backend,
         "fixtures": fixture_summary,
         "records": {

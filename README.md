@@ -391,6 +391,53 @@ Select the backend on the daemon config seam (`retrieval_backend`:
 `"exact"` or `"accelerate-cblas-sgemv"`); the bench driver accepts
 `--backend accelerate-cblas-sgemv` (see `daemon/bench_100k.py`).
 
+## MLX exact retrieval backend (#73)
+
+`daemon/mlx_engine.py` implements the #73 exact backend challenge: the same
+exact evidence semantics as the oracle, with the per-event cosine computed by
+MLX (`mx.matmul` over the generation's canonical row-major little-endian
+FP32 vector matrix, plus per-row squared norms).  It is the #72
+Accelerate-path challenger and the second exact backend over the same
+canonical FP32 file.
+
+- **Same evidence, same aggregation.**  The engine plugs into
+  `oracle.compute_evidence` through the `CosineEngine` seam
+  (`batch_cosines`); the oracle's aggregation (threshold, usage age, final
+  weight, top-K, `m_c` / `M` / `s_c`) is untouched and never duplicated
+  (SCN-73-1/2).  Small same-key sets (≤256) use the oracle's own Python
+  float64 scalar cosine — bit-identical by construction, the #72 small-set
+  contract; large sets use one batched `mx.matmul`.
+- **No second resident model.**  The engine is a dense FP32 matrix-vector
+  product over the already-built vector file; it never loads a model and
+  never spawns a second daemon.  It shares the daemon process with the
+  mean-token LM candidate scorer — the #73 contention measurement
+  (`daemon/bench_contention.py`) exercises exactly that shared-process
+  configuration (SCN-73-5).
+- **Backend identity.**  The backend is bound into `index_fingerprint`
+  (`compose_backend_fingerprint(backend="mlx-exact-matmul")`, library
+  version `mlx-core-matmul-v1`); serving MLX under the oracle or the
+  Accelerate fingerprint is a contract failure (SCN-73-4).  The FP32 vector
+  file itself is identical across all backends.
+- **Fail closed.**  If MLX is unavailable at runtime the daemon raises a
+  fault (`mlx_fault`) — never a silent Accelerate/Python fallback presented
+  as MLX (SCN-73-6).
+- **Equivalence.**  `daemon/test_mlx.py` (model-free) compares the engine
+  against the oracle query-by-query: kept neighbors, event weights,
+  candidate evidence `s_c` and final emit order, within a pinned 1e-6
+  absolute cosine tolerance (measured deviation ~3e-8 at 100k x 1024).
+- **Memory.**  MLX 0.32 has no zero-copy CPU array constructor, so the
+  engine holds one explicit in-process working copy of the canonical FP32
+  matrix (~400 MiB at 100k x 1024) instead of #72's zero-copy mmap view;
+  the file-backed generation stays the durable source of truth and the
+  working copy is released with the snapshot.  The RSS cost is reported
+  explicitly in the #73 memory/contention record (RISK-73-4).
+
+Select the backend on the daemon config seam (`retrieval_backend`:
+`"exact"`, `"accelerate-cblas-sgemv"` or `"mlx-exact-matmul"`); the bench
+drivers accept `--backend mlx-exact-matmul` (`daemon/bench_100k.py`,
+`daemon/bench_evidence_daemon.py`) and `daemon/bench_contention.py` measures
+the shared-process contention window.
+
 ## Retrieval-evidence protocol (Squirrel#61)
 
 The plugin asks the daemon for the oracle's candidate-level evidence of one
