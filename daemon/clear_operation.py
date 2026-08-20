@@ -64,8 +64,11 @@ HELPER_ENV = "SQUIRREL_FACT_STORE_HELPER"
 # already_clear check) deletes only these, nothing else under the root.
 # ``isolated`` (#67) holds damaged active/rollback generations moved out of
 # serving; it is app-controlled derived state and is deleted by clear too.
+# ``traces`` (#74) is the app-controlled trial trace store (identity-only
+# order-change/fault traces, aggregates, annotations, alarms); clear deletes
+# it like any other app-controlled copy (SCN-74-9).
 DERIVED_DIR_NAMES = ("generations", "staging", "quarantine", "isolated",
-                     CLEAR_DIRNAME)
+                     "traces", CLEAR_DIRNAME)
 DERIVED_FILE_NAMES = (
     "active_manifest.json", "rollback_manifest.json", "derived_manifest.json",
 )

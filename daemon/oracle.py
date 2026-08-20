@@ -57,6 +57,7 @@ carry event ids, numeric decompositions and candidate indexes only.
 import math
 import os
 import sqlite3
+import time
 import unicodedata
 from dataclasses import dataclass
 from functools import cached_property
@@ -500,6 +501,7 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
     query_vector = _as_float_vector(query.query_vector, "query_vector")
     candidates = tuple(match_text(candidate) for candidate in query.candidates)
 
+    _t0 = time.monotonic()
     same_key = []
     query_key = query.key
     exclude = query.exclude_event_ids
@@ -509,6 +511,7 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
         if event.key == query_key:
             same_key.append(event)
     same_key.sort(key=lambda event: (event.hlc, event.event_id))
+    _t1 = time.monotonic()
 
     batch = None
     if cosine_engine is not None:
@@ -524,6 +527,7 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
                 "cosine engine failed: %s" % error) from error
         if not isinstance(batch, dict):
             raise OracleError("cosine engine must return a mapping")
+    _t2 = time.monotonic()
 
     contributions = []
     for index, event in enumerate(same_key):
@@ -570,6 +574,7 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
         # semantics unchanged).
         contributions.append([event, cosine, relevance, usage_age,
                               age_factor, weight, None])
+    _t3 = time.monotonic()
 
     # Threshold filter (r_i > 0, i.e. a_i > 0), then at most K_evidence by
     # final event weight a_i; deterministic tie-break by HLC order.
@@ -604,8 +609,9 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
         else:
             s = 0.0
         candidate_evidence.append((candidate_index, candidate_mass, s))
+    _t4 = time.monotonic()
 
-    return OracleResult(
+    result = OracleResult(
         query_point=as_of,
         same_key_active=len(same_key),
         kept=tuple(EventContribution(
@@ -623,6 +629,14 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
             for index, mass, s in candidate_evidence),
         total_mass=total_mass,
         derived_key=query.key)
+    object.__setattr__(result, "latency_ms", {
+        "same_key_scan_ms": (_t1 - _t0) * 1000.0,
+        "cosine_ms": (_t2 - _t1) * 1000.0,
+        "contribution_ms": (_t3 - _t2) * 1000.0,
+        "aggregate_ms": (_t4 - _t3) * 1000.0,
+        "oracle_total_ms": (_t4 - _t0) * 1000.0,
+    })
+    return result
 
 
 @dataclass(frozen=True)
@@ -659,6 +673,11 @@ class OracleResult:
     candidates: Tuple[CandidateEvidence, ...]
     total_mass: float  # M
     derived_key: Tuple[str, str, str]
+
+    def __post_init__(self):
+        # Segmented latency (ms) collected by callers for tracing (#74).
+        # Frozen dataclass: store in a plain attribute via object.__setattr__.
+        object.__setattr__(self, "latency_ms", {})
 
     def s_for(self, candidate_index):
         for candidate in self.candidates:

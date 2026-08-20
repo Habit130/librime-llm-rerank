@@ -989,6 +989,80 @@ TEST(EvidenceProtocolTest, RequestCarriesFullContractFields) {
   EXPECT_EQ((vector<string>{"乙", "甲"}), CollectProtocolTexts(filtered));
 }
 
+TEST(EvidenceProtocolTest, TrialEnvelopeSerializedIdentityOnly) {
+  // Squirrel#74: the plugin declares the group actionable and its γ=0 base
+  // scores as identity-only JSON (numbers only, never raw text).
+  FakeDaemon daemon([&](const string& request) -> std::optional<string> {
+    EXPECT_NE(string::npos, request.find("\"trial\":{\"actionable\":true,"
+                                         "\"base_scores\":[1,4]"));
+    return EvidenceResponse(request,
+                            "[{\"index\":0,\"s\":0.5},"
+                            "{\"index\":1,\"s\":0.0}]");
+  }, 1);
+  auto evidence = New<EvidenceScorer>(
+      daemon.path(), "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=10",
+      200);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(New<WeightScorer>(1.0, 1.0));
+  filter.set_evidence_scorer(evidence);
+  filter.set_evidence_active(true);
+  filter.set_evidence_config_identity(
+      "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=10");
+  filter.set_facts_root(path("/tmp/nonexistent-evidence-facts-root"));
+  filter.set_gamma(10.0);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+  filter.set_preceding_text("敏感测试上文");
+  vector<an<Candidate>> cands{
+      MakeProtocolPhrase("table", 0, 2, "甲", 1.0),
+      MakeProtocolPhrase("table", 0, 2, "乙", 4.0),
+  };
+  CandidateList candidates;
+  auto filtered = filter.Apply(New<ProtocolTranslation>(cands), &candidates);
+  // 甲 = 1 + 10*0.5 = 6 > 乙 = 4: evidence changed the order.
+  EXPECT_EQ((vector<string>{"甲", "乙"}), CollectProtocolTexts(filtered));
+}
+
+TEST(EvidenceProtocolTest, TrialEnvelopeDeclaresNoOrderChange) {
+  // Zero evidence: the trial still rides along with the base scores (the
+  // daemon then replays shadow == final and records aggregates only,
+  // SCN-74-3).
+  FakeDaemon daemon([&](const string& request) -> std::optional<string> {
+    EXPECT_NE(string::npos,
+              request.find("\"trial\":{\"actionable\":true,"
+                           "\"base_scores\":[1,4]"));
+    return EvidenceResponse(request,
+                            "[{\"index\":0,\"s\":0.0},"
+                            "{\"index\":1,\"s\":0.0}]");
+  }, 1);
+  auto evidence = New<EvidenceScorer>(
+      daemon.path(), "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4",
+      200);
+  Ticket ticket;
+  ticket.name_space = "llm_rerank";
+  LlmRerankFilter filter(ticket);
+  filter.set_scorer(New<WeightScorer>(1.0, 1.0));
+  filter.set_evidence_scorer(evidence);
+  filter.set_evidence_active(true);
+  filter.set_evidence_config_identity(
+      "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4");
+  filter.set_facts_root(path("/tmp/nonexistent-evidence-facts-root"));
+  filter.set_gamma(4.0);
+  filter.set_schema_id("test");
+  filter.set_input("abcdef");
+  filter.set_preceding_text("敏感测试上文");
+  vector<an<Candidate>> cands{
+      MakeProtocolPhrase("table", 0, 2, "甲", 1.0),
+      MakeProtocolPhrase("table", 0, 2, "乙", 4.0),
+  };
+  CandidateList candidates;
+  auto filtered = filter.Apply(New<ProtocolTranslation>(cands), &candidates);
+  // Zero evidence -> base order.
+  EXPECT_EQ((vector<string>{"乙", "甲"}), CollectProtocolTexts(filtered));
+}
+
 TEST(EvidenceProtocolTest, HitChangesWithinGroupOrder) {
   // SCN-61-1: 乙 (weight 4) beats 甲 (weight 1) on base; evidence s=0.5 for
   // 甲 with gamma=4 gives 甲 = 1 + 2 = 3 < 乙... use gamma 10 so 甲 wins.

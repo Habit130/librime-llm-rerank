@@ -364,6 +364,28 @@ class EvidenceProtocolTest(unittest.TestCase):
         self.assert_error(self.call(request=evidence_request(extra=True)),
                           "invalid_request")
 
+    def test_trial_envelope_is_validated(self):
+        # The additive trial envelope (#74) must carry exactly actionable +
+        # base_scores aligned with the candidates; anything else is a fault.
+        good = {"actionable": True, "base_scores": [1.0, 2.0]}
+        self.assertEqual("ok", self.call(
+            request=evidence_request(trial=good))["status"])
+        bad_trials = [
+            {"actionable": True, "base_scores": [1.0]},       # length
+            {"actionable": True, "base_scores": [1.0, "x"]},  # non-numeric
+            {"actionable": True, "base_scores": [1.0, float("inf")]},
+            {"actionable": "yes", "base_scores": [1.0, 2.0]},  # type
+            {"actionable": True},                              # missing scores
+            {"actionable": True, "base_scores": [1.0, 2.0],
+             "order_changed": False},                          # extra field
+            "not-a-dict",
+        ]
+        for trial in bad_trials:
+            with self.subTest(trial=trial):
+                self.assert_error(self.call(
+                    request=evidence_request(trial=trial)),
+                    "invalid_request")
+
     def test_empty_candidates_are_rejected(self):
         for damaged in (evidence_request(candidates=[]),
                         evidence_request(candidates=["", "时界"])):

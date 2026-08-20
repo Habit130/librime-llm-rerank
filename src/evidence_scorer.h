@@ -30,6 +30,17 @@ class EvidenceScorer {
     int64_t hlc_logical = 0;
   };
 
+  // Trial envelope (Habit130/squirrel#74): the plugin's γ=0 base scores for
+  // desensitized trace recording.  The daemon replays the same group with
+  // γ=0 (shadow) and with the served evidence (final) and compares the emit
+  // orders.  Identity/numbers only -- never 上文, candidate text or
+  // embeddings.
+  struct Trial {
+    bool actionable = false;       // request has a complete comparable group
+    vector<double> base_scores;    // γ=0 scores, one per group candidate
+    bool present = false;
+  };
+
   struct GroupRequest {
     string plan_identity;
     string schema_id;
@@ -39,6 +50,7 @@ class EvidenceScorer {
     string config_identity;
     FactHighWater fact_high_water;
     vector<string> candidate_texts;  // current group in merge order
+    Trial trial;                     // #74; absent when !trial.present
   };
 
   EvidenceScorer(const string& socket_path,
