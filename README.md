@@ -119,8 +119,9 @@ the semantic memory. It publishes a brand-new empty fact store with a fresh
 `history_id`, a fresh `store_epoch` and a reset HLC, then deletes every
 application-controlled copy of the old facts and derived state
 (generations, delta, staging, derived manifests, quarantine, internal
-snapshots and old operation records), while the three schema switches and
-any backup you copied outside the fact root stay untouched.
+snapshots, old operation records and the app-controlled trial `traces/`
+directory -- see "Desensitized trial traces"), while the three schema
+switches and any backup you copied outside the fact root stay untouched.
 
 Interactive use prints the exact confirmation string
 `CLEAR <history_id> AT <store_epoch>` (or `CLEAR PRISTINE` when no store
@@ -472,6 +473,51 @@ Run the evidence tests with the rest of the daemon and C++ suites:
 python3 -m unittest discover -s daemon -p 'test_*.py'
 ctest # llm_rerank_test (filter/protocol/recorder e2e)
 ```
+
+## Desensitized trial traces and exit alarms (Squirrel#74)
+
+The daemon records a local, app-controlled, owner-only `traces/` directory
+under the semantic-memory root (`daemon/tracing.py`) so the real-trial
+("真实试用") semantics of the evidence path stay explainable by identity
+only:
+
+- **Order changes** — when the semantic emit order of a complete rerank
+  group differs from the γ=0 shadow baseline (the same group replayed with
+  zero retrieval evidence), the daemon writes one structured trace with
+  config/generation fingerprints, facts/derived watermarks, base and final
+  ranks, the score decomposition (neighbor event IDs, cosine, `r_i`/`d_i`/
+  `a_i`, aggregated `s_c`), the retrieval backend and segmented latencies.
+- **True faults** — every fault records a stable error identity plus the
+  fail-closed pass-through result.
+- **Unchanged successes** — aggregates only: counts plus a segmented
+  latency histogram, never a per-request trace.
+
+The plugin declares its γ=0 base scores in the additive `trial` envelope of
+each evidence request; the daemon replays the shadow and final emit orders
+from those numbers.  Traces, errors, annotations and status never contain
+上文, candidate text or embeddings — event IDs, request IDs, hashes and
+numbers only (the store refuses non-ASCII identity bytes outright).
+
+CLI verbs (on `squirrel-semantic-memory`):
+
+```text
+squirrel-semantic-memory annotate mispromotion --request-id <ID> [--event-id <ID>]
+squirrel-semantic-memory alarm list [--json] [--all]
+squirrel-semantic-memory alarm dismiss <alarm_id> [--reason <text>]
+```
+
+`annotate` records a user-confirmed mispromotion by request/event ID only
+(never private facts) and refuses unknown IDs.  Exit **alarms** are advisory
+and only ever suggest rollback to `γ=0`; they never write config or any
+switch.  Sliding windows, pinned: 3 user-confirmed mispromotions in any
+consecutive 100 actionable events; true-fault rate > 1% in any consecutive
+300 semantic requests; two consecutive 300-request windows missing the
+p95/p99 full-request latency gates (50/75 ms, the spec #43 gates #71/#72/
+#73 measure against).  A user may dismiss an alarm (subjective veto);
+dismissal never erases traces or annotations.  `status` reports the trial
+dimension (trace count, aggregates, active alarms) and exits 1 while an
+alarm is active.  `clear` removes the whole app-controlled `traces/`
+directory (SCN-74-9); external copies you made are out of scope.
 
 ## Versioned hidden-state 上文 representations
 

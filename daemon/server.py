@@ -65,7 +65,8 @@ REQUEST_FIELDS = {
 # Evidence request kind (Squirrel#61, AC61-1): the plugin asks the daemon for
 # the canonical oracle's candidate-level retrieval evidence for one rerank
 # group.  The exact field set is part of the protocol; anything else is
-# invalid_request.
+# invalid_request.  ``trial`` (Squirrel#74) is the optional additive trial
+# envelope: the plugin's γ=0 shadow-order comparison for trace recording.
 EVIDENCE_FIELDS = {
     "version",
     "kind",
@@ -78,6 +79,11 @@ EVIDENCE_FIELDS = {
     "candidates",
     "config_identity",
     "fact_high_water",
+}
+EVIDENCE_OPTIONAL_FIELDS = {"trial"}
+TRIAL_FIELDS = {
+    "actionable",
+    "base_scores",
 }
 
 # Scoring strategies (see docs/token-attribution.md). The production strategy
@@ -697,6 +703,56 @@ def handle_health(state, request, coordinator=None):
     return response
 
 
+def _record_evidence_fault(state, req, code, phase="evidence"):
+    """Record a fail-closed evidence fault as a trace (AC74-2/SCN-74-2).
+
+    Covers the validation-layer faults (invalid_request / invalid_json /
+    config_identity_mismatch / evidence_unavailable) that never reach
+    ``EvidenceService.serve``: the input-correctness and fail-closed
+    violations spec #43 counts into the true-fault rate and must alarm.
+    Identity-only; advisory, never fatal.
+    """
+    store = getattr(state, "trace_store", None)
+    if store is None:
+        return
+    try:
+        if isinstance(req, dict):
+            request_meta = {
+                "schema_id": req.get("schema_id"),
+                "category": req.get("category"),
+                "canonical_segment_input": req.get(
+                    "canonical_segment_input"),
+                "request_id": req.get("request_id"),
+                "plan_identity": req.get("plan_identity"),
+                "config_identity": req.get("config_identity"),
+                "fact_high_water": req.get("fact_high_water"),
+                "actionable": False,
+                "candidate_count": len(req.get("candidates") or []),
+            }
+        else:
+            # Unparseable payload: no identity to extract; still counts as a
+            # semantic-request fault with an anonymous stable identity.
+            request_meta = {
+                "schema_id": None, "category": None,
+                "canonical_segment_input": None,
+                "request_id": "invalid-json",
+                "plan_identity": None, "config_identity": None,
+                "fact_high_water": None, "actionable": False,
+                "candidate_count": 0,
+            }
+        store.record_request(
+            request_meta, code,
+            trace_payload={
+                "kind": "fault",
+                "error_code": code,
+                "passthrough": True,  # AC61-2: every fault passes through
+                "fact_high_water": request_meta.get("fact_high_water"),
+                "phase": phase,
+            })
+    except Exception:  # noqa: BLE001 - tracing is advisory
+        pass
+
+
 def handle_evidence_request(state, data, coordinator=None,
                             completion_sink=None):
     """Serve one retrieval-evidence request (Squirrel#61, AC61-1/AC61-2).
@@ -714,11 +770,13 @@ def handle_evidence_request(state, data, coordinator=None,
         if parsed_end != len(data):
             raise ValueError("trailing request payload")
     except (json.JSONDecodeError, TypeError, ValueError):
+        _record_evidence_fault(state, None, "invalid_json")
         return protocol_error("invalid_json")
 
     if (
         not isinstance(req, dict)
-        or set(req) != EVIDENCE_FIELDS
+        or not EVIDENCE_FIELDS.issubset(set(req))
+        or not set(req).issubset(EVIDENCE_FIELDS | EVIDENCE_OPTIONAL_FIELDS)
         or type(req["version"]) is not int
         or req["version"] != PROTOCOL_VERSION
         or req.get("kind") != EVIDENCE_KIND
@@ -745,10 +803,34 @@ def handle_evidence_request(state, data, coordinator=None,
         or not isinstance(req["config_identity"], str)
         or not req["config_identity"]
     ):
+        _record_evidence_fault(state, req, "invalid_request",
+                               phase="validate")
         return protocol_error("invalid_request")
+
+    # Trial envelope validation (#74): identity-only, additive, never raw
+    # text.  When present it must be an object with exactly the allowed
+    # fields; a malformed trial is a fault, never a silent trace drop.
+    trial = req.get("trial")
+    if trial is not None:
+        if (
+            not isinstance(trial, dict)
+            or set(trial) != TRIAL_FIELDS
+            or not isinstance(trial.get("actionable"), bool)
+            or not isinstance(trial.get("base_scores"), list)
+            or len(trial["base_scores"]) != len(req["candidates"])
+            or any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in trial["base_scores"]
+            )
+        ):
+            _record_evidence_fault(state, req, "invalid_request",
+                                   phase="validate")
+            return protocol_error("invalid_request")
 
     service = getattr(state, "evidence_service", None)
     if service is None:
+        _record_evidence_fault(state, req, "evidence_unavailable")
         return protocol_error(
             "evidence_unavailable",
             phase="evidence",
@@ -760,6 +842,7 @@ def handle_evidence_request(state, data, coordinator=None,
     # configured with; a request declaring anything else is a true fault
     # (plugin passes through), never a silently different evidence algorithm.
     if req["config_identity"] != service.config_identity():
+        _record_evidence_fault(state, req, "config_identity_mismatch")
         return protocol_error(
             "config_identity_mismatch",
             phase="evidence",
@@ -1058,6 +1141,13 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
     state.started_at = datetime.now(timezone.utc).isoformat()
     facts_root = (facts_root or os.environ.get("SQUIRREL_SEMANTIC_MEMORY_ROOT")
                   or FACTS_ROOT)
+    # Trial tracing (#74): app-controlled owner-only traces/ under the
+    # semantic-memory root.  Advisory only; never gates the evidence path.
+    try:
+        from tracing import TraceStore
+        state.trace_store = TraceStore(facts_root)
+    except Exception:  # noqa: BLE001 - tracing disabled, never fatal
+        state.trace_store = None
     control_socket = control_socket or os.path.join(facts_root,
                                                      "llm-rerank-control.sock")
     if evidence_config is not None:
@@ -1156,7 +1246,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
             facts_root, evidence_config, staging_machine, machine,
             publish_lock)
         state.evidence_service = build_evidence_service_from_config(
-            facts_root, evidence_config, machine=machine)
+            facts_root, evidence_config, machine=machine,
+            trace_store=getattr(state, "trace_store", None))
         # #67 wiring: the dirty scheduler asks the single staging builder to
         # compact; a successful publish clears the forced-build flags so the
         # compaction terminates (the delta absorbed, no second builder).

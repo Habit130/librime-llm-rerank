@@ -46,6 +46,7 @@ provider behind the same interface.
 import math
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from typing import (Dict, List, Mapping, Optional, Sequence, Tuple)
 
@@ -275,7 +276,7 @@ class EvidenceService:
     """
 
     def __init__(self, facts_root, params, provider, gamma, machine=None,
-                 retrieval_backend=BACKEND_ORACLE):
+                 retrieval_backend=BACKEND_ORACLE, trace_store=None):
         if not facts_root:
             raise EvidenceError("evidence_unavailable", "facts root missing")
         if not isinstance(params, OracleParams):
@@ -297,6 +298,7 @@ class EvidenceService:
         self._gamma = gamma
         self._machine = machine
         self._retrieval_backend = retrieval_backend
+        self._trace_store = trace_store
         self._config_identity = compose_config_identity(
             provider.representation_id(), params, gamma)
 
@@ -433,6 +435,7 @@ class EvidenceService:
                 "hlc_physical_ms": result.query_point[0],
                 "hlc_logical": result.query_point[1],
             },
+            "_oracle_result": result,
         }
 
     def _read_identity(self, reader):
@@ -483,10 +486,220 @@ class EvidenceService:
 
         ``request`` is the already field-validated evidence request dict.
         Returns the success response dict (including ``zero_evidence``);
-        raises EvidenceError for every true fault.
+        raises EvidenceError for every true fault.  When a trace store is
+        configured, order changes and faults are recorded identity-only and
+        unchanged successes aggregate only, as side effects.
         """
-        if self._machine is not None and os.path.isfile(self._db_path()):
-            return self._serve_via_snapshot(request)
+        started = time.monotonic()
+        trial = request.get("trial")
+        try:
+            if self._machine is not None and os.path.isfile(self._db_path()):
+                response = self._serve_via_snapshot(request)
+            else:
+                response = self._serve_direct(request)
+        except EvidenceError as error:
+            self._record_fault(request, error, started)
+            raise
+        except Exception:  # noqa: BLE001 - any fault fails closed
+            self._record_fault(request, None, started)
+            raise
+        # The private oracle-result envelope feeds tracing only; it never
+        # reaches callers or the wire.
+        result = response.pop("_oracle_result", None)
+        if self._trace_store is not None:
+            self._attach_trace(request, response, result, trial, started)
+        return response
+
+    def _record_fault(self, request, error, started):
+        """Persist a stable fault trace (SCN-74-2) without raw text."""
+        store = self._trace_store
+        if store is None:
+            return
+        try:
+            code = error.code if isinstance(error, EvidenceError) \
+                else "oracle_fault"
+            store.record_request(
+                self._request_meta(request),
+                code,
+                trace_payload={
+                    "kind": "fault",
+                    "error_code": code,
+                    "passthrough": True,  # AC61-2: every fault passes through
+                    "config_identity": self.config_identity(),
+                    "retrieval_backend": self._retrieval_backend,
+                    "fact_high_water": request.get("fact_high_water"),
+                    "derived_watermark": self._derived_watermark(),
+                },
+                latency_segments=self._segments(request, started, None),
+            )
+        except Exception:  # noqa: BLE001 - tracing is advisory, never fatal
+            pass
+
+    def _attach_trace(self, request, response, result, trial, started):
+        """Write the identity-only order-change trace or aggregates.
+
+        The shadow emit order is the group replayed with γ=0 (base scores
+        only, stable sort descending -- exactly the plugin's
+        ``ReplayRerankPlan`` with zero retrieval evidence); the final order
+        adds ``gamma * s_c``.  Any permutation difference is an order
+        change (SCN-74-1); unchanged successes aggregate only (SCN-74-3).
+        """
+        store = self._trace_store
+        if store is None:
+            return
+        try:
+            outcome = "ok"
+            shadow, final = self._emit_orders(request, result, trial)
+            if shadow is None or final == shadow:
+                store.record_request(
+                    self._request_meta(request), outcome,
+                    latency_segments=self._segments(request, started, result))
+                return
+            payload = self._trace_payload(request, result, trial, shadow,
+                                          final)
+            store.record_request(
+                self._request_meta(request), outcome,
+                trace_payload=payload,
+                latency_segments=self._segments(request, started, result))
+        except Exception:  # noqa: BLE001 - tracing is advisory
+            pass
+
+    def _emit_orders(self, request, result, trial):
+        """(shadow_order, final_order) as candidate-index permutations.
+
+        Stable sort by comparison score descending, matching the plugin's
+        group replay semantics: ties keep the original (merge) order.  The
+        request's candidate list is the group in merge order.
+        """
+        if not trial or not isinstance(trial.get("base_scores"), list):
+            return None, None
+        base_scores = trial["base_scores"]
+        if len(base_scores) != len(request.get("candidates") or []):
+            return None, None
+        if result is None:
+            return None, None
+        s_by_index = {
+            candidate.index: candidate.s for candidate in result.candidates
+        }
+        gamma = self._gamma
+        indexes = list(range(len(base_scores)))
+        shadow = sorted(indexes,
+                        key=lambda i: base_scores[i], reverse=True)
+        final = sorted(
+            indexes,
+            key=lambda i: base_scores[i] + gamma * s_by_index.get(i, 0.0),
+            reverse=True)
+        # Python's sorted is stable: equal comparison scores keep merge
+        # order, exactly like std::stable_sort in ReplayRerankPlan.
+        return tuple(shadow), tuple(final)
+
+    def _request_meta(self, request):
+        return {
+            "schema_id": request.get("schema_id"),
+            "category": request.get("category"),
+            "canonical_segment_input": request.get(
+                "canonical_segment_input"),
+            "request_id": request.get("request_id"),
+            "plan_identity": request.get("plan_identity"),
+            "config_identity": request.get("config_identity"),
+            "fact_high_water": request.get("fact_high_water"),
+            "actionable": bool((request.get("trial") or {}).get(
+                "actionable")),
+            "candidate_count": len(request.get("candidates") or []),
+        }
+
+    def _segments(self, request, started, result):
+        """Segmented latency in ms (full_request + oracle stage timings)."""
+        segments = {"full_request_ms": (time.monotonic() - started) * 1000.0}
+        if result is not None and hasattr(result, "latency_ms"):
+            for key, value in result.latency_ms.items():
+                segments[key] = value
+        return segments
+
+    @staticmethod
+    def _ranks(order):
+        rank = {index: position for position, index in enumerate(order)}
+        return [rank.get(i, len(order)) for i in range(len(order))]
+
+    def _derived_watermark(self):
+        """The served generation identity (base generation + representation).
+
+        Privacy-clean: identity strings only, from the delta machine's
+        published snapshot when one exists (spec: trace carries the
+        generation fingerprint); None on the offline/calibration path.
+        """
+        machine = self._machine
+        if machine is None:
+            return None
+        try:
+            snapshot = machine.snapshot()
+        except Exception:  # noqa: BLE001 - advisory; never fatal
+            return None
+        if snapshot is None:
+            return None
+        watermark = {"representation_id": None, "generation_id": None}
+        try:
+            watermark["representation_id"] = snapshot.representation_id()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            watermark["generation_id"] = snapshot.base_generation_id()
+        except Exception:  # noqa: BLE001
+            pass
+        return watermark
+
+    def _trace_payload(self, request, result, trial, shadow, final):
+        """Assemble the identity-only full trace (AC74-1 fields)."""
+        payload = {
+            "kind": "order_change",
+            "schema_id": request.get("schema_id"),
+            "category": request.get("category"),
+            "canonical_segment_input": request.get(
+                "canonical_segment_input"),
+            "plan_identity": request.get("plan_identity"),
+            "config_identity": self.config_identity(),
+            "retrieval_backend": self._retrieval_backend,
+            "fact_high_water": request.get("fact_high_water"),
+            "request_id": request.get("request_id"),
+            "base_scores": list(trial.get("base_scores") or []),
+            "shadow_order": list(shadow),
+            "final_order": list(final),
+            "base_ranks": self._ranks(shadow),
+            "final_ranks": self._ranks(final),
+            "candidate_count": len(request.get("candidates") or []),
+            "facts_watermark": None,
+            "derived_watermark": self._derived_watermark(),
+            "neighbors": [],
+            "aggregate_s_c": None,
+        }
+        if result is not None:
+            payload["facts_watermark"] = {
+                "store_epoch": getattr(result, "store_epoch", None),
+                "hlc_physical_ms": result.query_point[0],
+                "hlc_logical": result.query_point[1],
+            }
+            payload["neighbors"] = [
+                {
+                    "event_id": contribution.event_id,
+                    "commit_id": contribution.commit_id,
+                    "cosine": contribution.cosine,
+                    "r_i": contribution.relevance,
+                    "d_i": contribution.age_factor,
+                    "a_i": contribution.weight,
+                    "usage_age": contribution.usage_age,
+                    "matched_candidate": contribution.matched_candidate,
+                }
+                for contribution in result.kept
+            ]
+            payload["aggregate_s_c"] = [
+                {"index": candidate.index, "s": candidate.s}
+                for candidate in result.candidates
+            ]
+        return payload
+
+    def _serve_direct(self, request):
+        """The direct (non-snapshot) serve path, returning the response with
+        the private ``_oracle_result`` envelope."""
         schema_id = request["schema_id"]
         category = request["category"]
         canonical_input = request["canonical_segment_input"]
@@ -563,8 +776,15 @@ class EvidenceService:
                         "event vector failed for %s: %s"
                         % (event_id, error)) from error
 
+            started = time.monotonic()
             result = compute_evidence(reader, self._params, query,
                                       vector_for)
+            # The oracle already filled result.latency_ms with its stage
+            # timings (#74 segmented latency); the wall-clock oracle_ms here
+            # would clobber them, so it stays local.
+            oracle_ms = (time.monotonic() - started) * 1000.0
+            object.__setattr__(result, "latency_ms", dict(
+                result.latency_ms, oracle_ms=oracle_ms))
         except OracleError as error:
             raise EvidenceError("oracle_fault", str(error)) from error
         finally:
@@ -586,6 +806,7 @@ class EvidenceService:
                 "hlc_physical_ms": result.query_point[0],
                 "hlc_logical": result.query_point[1],
             },
+            "_oracle_result": result,
         }
 
 
@@ -610,7 +831,8 @@ def make_evidence_request(schema_id, category, canonical_segment_input,
     }
 
 
-def build_evidence_service_from_config(facts_root, config, machine=None):
+def build_evidence_service_from_config(facts_root, config, machine=None,
+                                       trace_store=None):
     """Construct an EvidenceService from a JSON config dict.
 
     The config binds the oracle params, the plugin-side gamma and the
@@ -629,6 +851,10 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
     daemon tests inject a deterministic fixture; #62 plugs the real
     hidden-state provider behind the same config shape (query/event vectors
     produced by the generation instead).
+
+    ``trace_store`` (#74) is the optional app-controlled trial trace store
+    (daemon/tracing.py); when present, order changes and true faults are
+    recorded identity-only, unchanged successes aggregate only.
     """
     try:
         representation_id = config["representation_id"]
@@ -651,7 +877,8 @@ def build_evidence_service_from_config(facts_root, config, machine=None):
     provider = _provider_from_config(config, representation_id)
     return EvidenceService(facts_root, params, provider, gamma,
                            machine=machine,
-                           retrieval_backend=retrieval_backend)
+                           retrieval_backend=retrieval_backend,
+                           trace_store=trace_store)
 
 
 def _provider_from_config(config, representation_id):

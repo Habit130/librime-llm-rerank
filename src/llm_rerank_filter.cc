@@ -303,7 +303,10 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   // Retrieval evidence (#61): one evidence request per complete rerank group
   // (each group is one choice problem). The plugin applies gamma * s_c only
   // on a complete, identity-bound success; any fault passes the whole window
-  // through in original order.
+  // through in original order.  The trial envelope (#74) rides along: the
+  // plugin's γ=0 base scores for this group, so the daemon can replay the
+  // same group with γ=0 (shadow) and with the served evidence (final) and
+  // record an identity-only order-change trace (or aggregates only).
   if (evidence_active_) {
     if (!evidence_scorer_) {
       LogWindowFailure("evidence_unavailable", "evidence", buffer.size());
@@ -324,8 +327,12 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       evidence_request.preceding_text = *plan.preceding_text;
       evidence_request.config_identity = *scoring_policy_.retrieval_policy_id;
       evidence_request.fact_high_water = high_water;
-      for (size_t index : *group.candidate_indexes)
+      for (size_t index : *group.candidate_indexes) {
         evidence_request.candidate_texts.push_back(buffer[index]->text());
+        evidence_request.trial.present = true;
+        evidence_request.trial.actionable = true;
+        evidence_request.trial.base_scores.push_back(scores[index].base_score);
+      }
       vector<double> group_evidence;
       if (!evidence_scorer_->ScoreGroup(evidence_request, &group_evidence) ||
           group_evidence.size() != group.candidate_indexes->size()) {
@@ -355,6 +362,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     LogWindowFailure("replay_validation_failed", "replay", buffer.size());
     return false;
   }
+
   for (size_t index : emission_order)
     out->push_back(buffer[index]);
   return true;

@@ -33,6 +33,7 @@ from operations import (  # noqa: E402
     create_operation,
     run_pending_steps,
 )
+from tracing import TraceStore  # noqa: E402
 
 DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
 ENTRY = os.path.join(DAEMON_DIR, "squirrel-semantic-memory")
@@ -709,6 +710,187 @@ class CliTest(unittest.TestCase):
         def hook(phase, step_index, point):
             raise OperationFailed(code="transient_step_failure", phase=phase)
         return hook
+
+
+class TrialCliTest(unittest.TestCase):
+    """`annotate` / `alarm` / `status` trial dimension (Habit130/squirrel#74).
+
+    Uses throwaway trace stores under the temp semantic root; never touches
+    live facts or Rime.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="llm_rerank_trial_cli_")
+        self.root = os.path.join(self._tmp, "sm")
+        self.rime_dir = os.path.join(self._tmp, "rime")
+        os.makedirs(os.path.join(self.rime_dir, "build"))
+        self._old_env = dict(os.environ)
+        os.environ["SQUIRREL_SEMANTIC_MEMORY_ROOT"] = self.root
+        os.environ["SQUIRREL_RIME_DIR"] = self.rime_dir
+        os.environ["SQUIRREL_DAEMON_SOCKET"] = os.path.join(
+            self._tmp, "missing.sock")
+        self.store = TraceStore(self.root)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._old_env)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def run_cli(self, *args, timeout=30):
+        proc = subprocess.run(
+            [sys.executable, ENTRY] + list(args),
+            capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def write_schema(self):
+        with open(os.path.join(self.rime_dir, "default.yaml"), "w",
+                  encoding="utf-8") as f:
+            f.write("config_version: \"0.1\"\n")
+            f.write("schema_list:\n  - schema: alpha\n")
+        with open(os.path.join(self.rime_dir, "build",
+                               "alpha.schema.yaml"), "w",
+                  encoding="utf-8") as f:
+            json.dump(SCHEMA, f, ensure_ascii=False)
+
+    def seed_trace(self, request_id, kind="order_change"):
+        if kind == "order_change":
+            self.store.record_request(
+                {"schema_id": "luna_pinyin", "category": "word",
+                 "canonical_segment_input": "shijie",
+                 "request_id": request_id, "plan_identity": "p",
+                 "config_identity": "c",
+                 "fact_high_water": {"store_epoch": "e1"},
+                 "actionable": True, "candidate_count": 2},
+                "ok",
+                trace_payload={"kind": "order_change",
+                               "request_id": request_id,
+                               "schema_id": "luna_pinyin",
+                               "category": "word",
+                               "canonical_segment_input": "shijie",
+                               "plan_identity": "p",
+                               "config_identity": "c",
+                               "retrieval_backend": "exact",
+                               "base_scores": [1.0, 2.0],
+                               "shadow_order": [0, 1],
+                               "final_order": [1, 0],
+                               "base_ranks": [0, 1],
+                               "final_ranks": [1, 0],
+                               "candidate_count": 2})
+        else:
+            self.store.record_request(
+                {"schema_id": "luna_pinyin", "category": "word",
+                 "canonical_segment_input": "shijie",
+                 "request_id": request_id, "plan_identity": "p",
+                 "config_identity": "c",
+                 "fact_high_water": {"store_epoch": "e1"},
+                 "actionable": True, "candidate_count": 2},
+                "oracle_fault",
+                trace_payload={"kind": "fault",
+                               "error_code": "oracle_fault",
+                               "passthrough": True})
+
+    def test_annotate_mispromotion_human_and_json(self):
+        self.seed_trace("req-cli-1")
+        rc, out, err = self.run_cli(
+            "annotate", "mispromotion", "--request-id", "req-cli-1",
+            "--event-id", "evt-9")
+        self.assertEqual(0, rc, err)
+        self.assertIn("annotated mispromotion", out)
+        self.assertIn("req-cli-1", out)
+        rc, out, err = self.run_cli(
+            "annotate", "mispromotion", "--request-id", "req-cli-1", "--json")
+        self.assertEqual(0, rc, err)
+        payload = json.loads(out)
+        self.assertEqual("req-cli-1", payload["annotation"]["request_id"])
+        self.assertEqual("mispromotion", payload["annotation"]["kind"])
+        self.assertEqual([], payload["alarms_fired"])
+        # Never echoes private text.
+        self.assertNotIn(MARKER, out)
+        self.assertNotIn(MARKER, err)
+
+    def test_annotate_unknown_request_refuses(self):
+        rc, out, err = self.run_cli(
+            "annotate", "mispromotion", "--request-id", "req-unknown")
+        self.assertEqual(1, rc)
+        self.assertIn("unknown_request_id", err)
+        rc, out, err = self.run_cli(
+            "annotate", "mispromotion", "--request-id", "req-unknown",
+            "--json")
+        self.assertEqual(1, rc)
+        payload = json.loads(out)
+        self.assertEqual("unknown_request_id", payload["code"])
+
+    def test_annotate_refuses_raw_text_ids(self):
+        self.seed_trace("req-cli-2")
+        rc, out, err = self.run_cli(
+            "annotate", "mispromotion", "--request-id", "req-cli-2",
+            "--event-id", MARKER)
+        self.assertEqual(1, rc)
+        self.assertIn("unknown_request_id", err)
+
+    def test_alarm_list_and_dismiss(self):
+        self.seed_trace("req-cli-3")
+        self.store.record_annotation("req-cli-3")
+        # Force an alarm through the store directly (window logic is
+        # unit-tested in test_tracing.py); the CLI surface is what we test.
+        self.store._fire_alarm(
+            "mispromotion_rate",
+            {"window": 100, "confirmed": 3},
+            "2026-01-01T00:00:00+00:00",
+            "3 user-confirmed mispromotions in the last 100 actionable "
+            "events; suggest rollback to gamma=0")
+        rc, out, err = self.run_cli("alarm", "list")
+        self.assertEqual(0, rc, err)
+        self.assertIn("mispromotion_rate", out)
+        self.assertIn("rollback to gamma=0", out)
+        rc, out, err = self.run_cli("alarm", "list", "--json")
+        self.assertEqual(0, rc, err)
+        payload = json.loads(out)
+        self.assertEqual(1, payload["active_count"])
+        alarm_id = payload["alarms"][0]["alarm_id"]
+        rc, out, err = self.run_cli("alarm", "dismiss", alarm_id,
+                                    "--reason", "主观否决")
+        self.assertEqual(0, rc, err)
+        self.assertIn("dismissed alarm", out)
+        rc, out, err = self.run_cli("alarm", "list")
+        self.assertEqual(0, rc, err)
+        self.assertIn("no alarms", out)
+        # Traces remain after dismissal (SCN-74-7).
+        self.assertEqual(1, len(self.store.list_traces()))
+
+    def test_alarm_dismiss_unknown_refuses(self):
+        rc, out, err = self.run_cli("alarm", "dismiss", "alarm-nope")
+        self.assertEqual(1, rc)
+        self.assertIn("unknown_alarm_id", err)
+
+    def test_status_reports_trial_dimension(self):
+        self.write_schema()
+        self.seed_trace("req-cli-4")
+        rc, out, err = self.run_cli("status", "--json")
+        self.assertEqual(0, rc, err)
+        payload = json.loads(out)
+        self.assertIn("trial", payload)
+        self.assertEqual(1, payload["trial"]["trace_count"])
+        self.assertEqual(1, payload["trial"]["aggregates"]["semantic_requests"])
+        self.assertIn("trial", out)
+        # No raw text anywhere in status.
+        self.assertNotIn(MARKER, out)
+        self.assertNotIn(MARKER, err)
+
+    def test_status_trial_alarm_raises_exit_code(self):
+        self.write_schema()
+        self.seed_trace("req-cli-5")
+        self.store.record_annotation("req-cli-5")
+        self.store._fire_alarm(
+            "fault_rate",
+            {"window": 300, "faults": 4, "rate": 0.0133},
+            "2026-01-01T00:00:00+00:00",
+            "true-fault rate exceeds 1%; suggest rollback to gamma=0")
+        rc, out, err = self.run_cli("status", "--json")
+        self.assertEqual(1, rc, err)
+        payload = json.loads(out)
+        self.assertEqual(1, payload["exit_code"])
+        self.assertEqual(1, len(payload["trial"]["alarms"]))
 
 
 if __name__ == "__main__":

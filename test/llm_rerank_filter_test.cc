@@ -783,6 +783,16 @@ class FakeEvidenceScorer : public EvidenceScorer {
   vector<GroupRequest> requests;
 };
 
+static const EvidenceScorer::GroupRequest* FindGroupRequest(
+    const vector<EvidenceScorer::GroupRequest>& requests,
+    const string& canonical_input) {
+  for (const auto& request : requests) {
+    if (request.canonical_segment_input == canonical_input)
+      return &request;
+  }
+  return nullptr;
+}
+
 static path EvidenceFactsRoot() {
   static std::atomic<unsigned int> sequence{0};
   return std::filesystem::temp_directory_path() /
@@ -884,6 +894,56 @@ TEST(EvidenceRerankTest, SupporterMissingLeavesGroupUnchanged) {
                                           MakePhrase("table", 0, 2, "乙", 3.0),
                                       });
   EXPECT_EQ((vector<string>{"乙", "甲"}), CollectTexts(filtered));
+}
+
+// --- T6: trial envelope (Habit130/squirrel#74) ---
+
+TEST(EvidenceRerankTest, TrialEnvelopeCarriesBaseScores) {
+  // The trial rides on every complete-group evidence request: it declares
+  // the group actionable and carries the γ=0 base scores (identity-only,
+  // one per group candidate, in merge order).  The daemon replays shadow
+  // vs final emit order from these numbers.
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.0, 0.5};
+  auto filter = MakeEvidenceFilter(evidence, 10.0);
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲", 3.0),
+                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 0, 4, "丙", 0.0),
+                                      });
+  EXPECT_EQ((vector<string>{"乙", "甲", "丙"}), CollectTexts(filtered));
+  const auto* ab = FindGroupRequest(evidence->requests, "ab");
+  ASSERT_NE(nullptr, ab);
+  const auto& trial = ab->trial;
+  EXPECT_TRUE(trial.present);
+  EXPECT_TRUE(trial.actionable);
+  ASSERT_EQ(2u, trial.base_scores.size());
+  EXPECT_DOUBLE_EQ(3.0, trial.base_scores[0]);
+  EXPECT_DOUBLE_EQ(1.0, trial.base_scores[1]);
+}
+
+TEST(EvidenceRerankTest, TrialEnvelopeTracksEachGroup) {
+  // Each complete group gets its own trial with that group's base scores
+  // (never the whole window's).
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.0, 0.5};
+  evidence->scripted_["cd"] = {0.0, 0.0};
+  auto filter = MakeEvidenceFilter(evidence, 10.0);
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲", 3.0),
+                                          MakePhrase("table", 0, 2, "乙", 1.0),
+                                          MakePhrase("table", 2, 4, "丙", 5.0),
+                                          MakePhrase("table", 2, 4, "丁", 4.0),
+                                      });
+  // Consume the lazy translation so every group request is sent.
+  CollectTexts(filtered);
+  ASSERT_FALSE(evidence->requests.empty());
+  for (const auto& request : evidence->requests) {
+    EXPECT_TRUE(request.trial.present);
+    EXPECT_TRUE(request.trial.actionable);
+    EXPECT_EQ(request.candidate_texts.size(),
+              request.trial.base_scores.size());
+  }
 }
 
 TEST(EvidenceRerankTest, RequestCarriesGroupBinding) {

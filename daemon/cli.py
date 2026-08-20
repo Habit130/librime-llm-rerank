@@ -325,7 +325,9 @@ def build_parser():
     restore.set_defaults(handler=_cmd_restore)
 
     clear = sub.add_parser("clear", help="physically clear the semantic "
-                                         "memory and start a new history")
+                                         "memory and start a new history "
+                                         "(facts + derived state + trial "
+                                         "traces)")
     clear.add_argument("--yes", action="store_true",
                        help="non-interactive confirmation; requires "
                             "--expect-store-epoch")
@@ -333,6 +335,37 @@ def build_parser():
                        help="expected current store epoch (epoch CAS)")
     clear.add_argument("--json", action="store_true")
     clear.set_defaults(handler=_cmd_clear)
+
+    annotate = sub.add_parser(
+        "annotate",
+        help="record a user-confirmed mispromotion by request/event ID "
+             "(identity only; never copies private facts)")
+    annotate.add_argument(
+        "mispromotion", nargs="?", const="mispromotion",
+        help="the annotation kind (mispromotion)")
+    annotate.add_argument("--request-id", metavar="ID", required=True,
+                          help="the traced request ID")
+    annotate.add_argument("--event-id", metavar="ID",
+                          help="optional event ID inside the trace")
+    annotate.add_argument("--json", action="store_true")
+    annotate.set_defaults(handler=_cmd_annotate)
+
+    alarm = sub.add_parser("alarm",
+                           help="list or dismiss advisory trial alarms")
+    alarm_sub = alarm.add_subparsers(dest="alarm_command")
+    alarm_list = alarm_sub.add_parser(
+        "list", help="list active (non-dismissed) alarms")
+    alarm_list.add_argument("--json", action="store_true")
+    alarm_list.add_argument("--all", action="store_true",
+                            help="include dismissed alarms")
+    alarm_list.set_defaults(handler=_cmd_alarm_list)
+    alarm_dismiss = alarm_sub.add_parser(
+        "dismiss", help="subjectively dismiss one alarm (traces remain)")
+    alarm_dismiss.add_argument("alarm_id", metavar="ID")
+    alarm_dismiss.add_argument("--reason", metavar="TEXT",
+                               help="optional subjective veto reason")
+    alarm_dismiss.add_argument("--json", action="store_true")
+    alarm_dismiss.set_defaults(handler=_cmd_alarm_dismiss)
 
     migrate = sub.add_parser(
         "migrate", help="upgrade a supported-old fact store to the current "
@@ -500,6 +533,15 @@ def _cmd_status(args, paths):
             and (operation_section.get("state") in ("failed", "blocked")
                  or "error" in operation_section)):
         exit_code = max(exit_code, 1)
+
+    # Additive trial dimension (Squirrel#74): identity-only trace summaries,
+    # aggregates and active alarms.  Status never writes the trace store; a
+    # pristine machine has no traces/ directory and reports none.
+    report["trial"] = _trial_status_section(paths)
+    alarms = report["trial"].get("alarms") or []
+    if any(not a.get("dismissed") for a in alarms):
+        exit_code = max(exit_code, 1)
+
     report["exit_code"] = exit_code
     if args.json:
         print(_json_dump(report))
@@ -517,7 +559,64 @@ def _cmd_status(args, paths):
                          operation_section["type"],
                          operation_section["state"],
                          operation_section["phase"]))
+        _print_trial_human(report["trial"])
     return exit_code
+
+
+def _trial_status_section(paths):
+    """The identity-only trial status section (traces/aggregates/alarms).
+
+    Read-only: never creates or writes the trace store.
+    """
+    from tracing import TraceStore, TRACES_DIRNAME
+    section = {
+        "traces_dir": None,
+        "trace_count": 0,
+        "aggregates": None,
+        "alarms": [],
+        "annotations": 0,
+    }
+    root = paths["semantic_memory_root"]
+    if not os.path.isdir(os.path.join(root, TRACES_DIRNAME)):
+        return section
+    store = TraceStore(root)
+    try:
+        traces = store.list_traces()
+        section["traces_dir"] = os.path.join(root, TRACES_DIRNAME)
+        section["trace_count"] = len(traces)
+        section["aggregates"] = store.aggregates()
+        section["alarms"] = store.list_alarms(include_dismissed=True)
+        section["annotations"] = len(store.annotations())
+    except Exception:  # noqa: BLE001 - status never fails on trace store
+        section["traces_dir"] = os.path.join(root, TRACES_DIRNAME)
+    return section
+
+
+def _print_trial_human(section):
+    traces_dir = section.get("traces_dir")
+    if traces_dir is None:
+        print("trial: not started (no traces)")
+        return
+    print("trial: %d trace(s); %d annotation(s)"
+          % (section.get("trace_count", 0), section.get("annotations", 0)))
+    aggregates = section.get("aggregates")
+    if isinstance(aggregates, dict):
+        print("  semantic requests: %d; actionable events: %d; "
+              "order changes: %d; faults: %d; passthroughs: %d"
+              % (aggregates.get("semantic_requests", 0),
+                 aggregates.get("actionable_events", 0),
+                 aggregates.get("order_changes", 0),
+                 aggregates.get("faults", 0),
+                 aggregates.get("passthroughs", 0)))
+    alarms = section.get("alarms") or []
+    active = [a for a in alarms if not a.get("dismissed")]
+    if active:
+        print("  alarms: %d active" % len(active))
+        for alarm in active:
+            print("    %s: %s" % (alarm["alarm_id"], alarm["message"]))
+            print("      suggestion: %s" % alarm["suggestion"])
+    elif alarms:
+        print("  alarms: %d (all dismissed)" % len(alarms))
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +811,114 @@ def _cmd_operation_run(args, paths):
     if record["state"] in ("failed", "blocked"):
         return 1
     # running with --once: work was done, more remains; nothing is wrong.
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# annotate / alarm (Squirrel#74 trial instrumentation)
+# ---------------------------------------------------------------------------
+
+def _trace_store(paths):
+    """The app-controlled trial trace store under the semantic root."""
+    from tracing import TraceStore
+    return TraceStore(paths["semantic_memory_root"])
+
+
+def _cmd_annotate(args, paths):
+    """Record a user-confirmed mispromotion by request/event ID.
+
+    Identity only; refuses unknown IDs and never copies private facts.
+    """
+    store = _trace_store(paths)
+    try:
+        result = store.record_annotation(args.request_id, args.event_id)
+    except Exception as error:  # noqa: BLE001 - any store fault is a clean error
+        error_obj = make_error("annotate_failed", phase="cli",
+                               remediation="the trace store is unreadable",
+                               cause={"detail": str(error)})
+        _render_error(error_obj, "json" if args.json else "human")
+        return 2
+    if result is None:
+        error_obj = make_error(
+            "unknown_request_id", phase="cli",
+            remediation="annotate only requests with a recorded trace "
+                        "(order change or fault); list traces with "
+                        "`status --json`",
+            cause={"request_id": args.request_id})
+        _render_error(error_obj, "json" if args.json else "human")
+        return 1
+    if isinstance(result, tuple):
+        record, alarms = result
+    else:
+        record, alarms = result, []
+    payload = {
+        "annotation": record,
+        "alarms_fired": alarms or [],
+    }
+    if args.json:
+        print(_json_dump(payload), flush=True)
+    else:
+        print("annotated mispromotion: request %s (trace %s)"
+              % (record["request_id"], record["trace_id"]))
+        if record.get("event_id"):
+            print("  event: %s" % record["event_id"])
+        if alarms:
+            print("alarm fired: %s" % alarms[0]["message"])
+    return 0
+
+
+def _cmd_alarm_list(args, paths):
+    store = _trace_store(paths)
+    try:
+        alarms = store.list_alarms(include_dismissed=args.all)
+    except Exception as error:  # noqa: BLE001
+        error_obj = make_error("alarm_list_failed", phase="cli",
+                               remediation="the trace store is unreadable",
+                               cause={"detail": str(error)})
+        _render_error(error_obj, "json" if args.json else "human")
+        return 2
+    payload = {
+        "alarms": alarms,
+        "active_count": len([a for a in alarms if not a.get("dismissed")]),
+    }
+    if args.json:
+        print(_json_dump(payload), flush=True)
+    else:
+        if not alarms:
+            print("no alarms")
+        for alarm in alarms:
+            state = "dismissed" if alarm.get("dismissed") else "active"
+            print("%s: %s (%s, fired %s)"
+                  % (alarm["alarm_id"], alarm["kind"], state,
+                     alarm["fired_at"]))
+            print("  %s" % alarm["message"])
+            print("  suggestion: %s" % alarm["suggestion"])
+            if alarm.get("dismiss_reason"):
+                print("  dismissed: %s" % alarm["dismiss_reason"])
+    return 0
+
+
+def _cmd_alarm_dismiss(args, paths):
+    store = _trace_store(paths)
+    try:
+        alarm = store.dismiss_alarm(args.alarm_id, args.reason)
+    except Exception as error:  # noqa: BLE001
+        error_obj = make_error("alarm_dismiss_failed", phase="cli",
+                               remediation="the trace store is unreadable",
+                               cause={"detail": str(error)})
+        _render_error(error_obj, "json" if args.json else "human")
+        return 2
+    if alarm is None:
+        error_obj = make_error(
+            "unknown_alarm_id", phase="cli",
+            remediation="list alarms with `alarm list --all`",
+            cause={"alarm_id": args.alarm_id})
+        _render_error(error_obj, "json" if args.json else "human")
+        return 1
+    if args.json:
+        print(_json_dump(alarm), flush=True)
+    else:
+        print("dismissed alarm %s (%s)" % (alarm["alarm_id"], alarm["kind"]))
     return 0
 
 
