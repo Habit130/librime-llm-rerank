@@ -258,6 +258,46 @@ class TraceStoreTest(unittest.TestCase):
         self.assertEqual(MISPROMOTION_LIMIT,
                          alarms[0]["detail"]["confirmed"])
 
+    def test_scn74_6_mispromotion_delayed_confirmation_still_fires(self):
+        # A confirmation arriving long after the event (past the 100-event
+        # ring) must still count: the window is over the actionable-event
+        # stream, not the recent ring.
+        confirmed = (3, 50, 99)
+        for i in range(MISPROMOTION_WINDOW + 50):
+            rid = "req-dc-%d" % i
+            if i in confirmed:
+                self.store.record_request(
+                    request_meta(rid), "ok",
+                    trace_payload=order_change_trace(rid))
+            else:
+                self.store.record_request(request_meta(rid), "ok")
+        # No alarm yet: none of the confirmations have been recorded.
+        self.assertEqual([], self.store.list_alarms())
+        # The user confirms the three mispromotions much later.
+        for i in confirmed:
+            self.store.record_annotation("req-dc-%d" % i)
+        alarms = self.store.list_alarms()
+        self.assertEqual(1, len(alarms))
+        self.assertEqual("mispromotion_rate", alarms[0]["kind"])
+        self.assertEqual(3, alarms[0]["detail"]["confirmed"])
+        self.assertLessEqual(alarms[0]["detail"]["span_events"],
+                             MISPROMOTION_WINDOW)
+
+    def test_scn74_6_mispromotion_outside_window_does_not_fire(self):
+        # Three confirmations spanning more than 100 actionable events must
+        # not fire (no 100-event window contains all three).
+        confirmed = (1, 60, 150)
+        for i in range(200):
+            rid = "req-ow-%d" % i
+            if i in confirmed:
+                self.store.record_request(
+                    request_meta(rid), "ok",
+                    trace_payload=order_change_trace(rid))
+                self.store.record_annotation(rid)
+            else:
+                self.store.record_request(request_meta(rid), "ok")
+        self.assertEqual([], self.store.list_alarms())
+
     def test_scn74_6_fault_rate_alarm_gt_1_percent_in_300(self):
         # 4 faults in 300 semantic requests = 1.33% > 1%.
         for i in range(FAULT_WINDOW):

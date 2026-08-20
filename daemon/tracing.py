@@ -342,7 +342,7 @@ class TraceStore:
         result = []
         for request_id, entry in sorted(index.items()):
             if request_id in ("version", "updated_at") or not isinstance(
-                    entry, dict):
+                    entry, dict) or not entry.get("trace_id"):
                 continue
             summary = {
                 "request_id": request_id,
@@ -419,9 +419,32 @@ class TraceStore:
                 if _safe_name(request_meta[key]) is None:
                     raise TracingError("trace_identity_unsafe")
                 entry[key] = request_meta[key]
+        self._write_index_entry(index, request_meta, entry)
+
+    def _index_actionable(self, request_meta, outcome, seq, now_iso):
+        """Index one actionable request (trace or not) with its global
+        sequence, so a later mispromotion confirmation can locate the
+        event's position in the actionable stream."""
+        index = self._read_index()
+        existing = index.get(request_meta["request_id"])
+        entry = {
+            "recorded_at": now_iso,
+            "actionable_seq": seq,
+            "kind": existing.get("kind") if isinstance(existing, dict)
+            else ("ok" if outcome == "ok" else outcome),
+        }
+        for key in ("schema_id", "category", "canonical_segment_input",
+                    "trace_id"):
+            if existing and isinstance(existing, dict) and existing.get(key):
+                entry[key] = existing[key]
+            elif request_meta.get(key):
+                entry[key] = request_meta[key]
+        self._write_index_entry(index, request_meta, entry)
+
+    def _write_index_entry(self, index, request_meta, entry):
         index[request_meta["request_id"]] = entry
         index["version"] = INDEX_VERSION
-        index["updated_at"] = now_iso
+        index["updated_at"] = _now_iso()
         _write_owner_file(os.path.join(self._dir, "index.json"), index)
 
     def _read_aggregates(self):
@@ -433,6 +456,7 @@ class TraceStore:
                 "updated_at": None,
                 "semantic_requests": 0,
                 "actionable_events": 0,
+                "actionable_seq": 0,   # global seq over actionable events
                 "order_changes": 0,
                 "faults": 0,
                 "passthroughs": 0,
@@ -453,9 +477,15 @@ class TraceStore:
         aggregates["semantic_requests"] += 1
         if request_meta.get("actionable"):
             aggregates["actionable_events"] += 1
+            aggregates["actionable_seq"] += 1
+            seq = aggregates["actionable_seq"]
             ring = aggregates["recent_actionable"]
             ring.append(request_meta["request_id"])
             del ring[:-MISPROMOTION_WINDOW]
+            # Index every actionable request with its global sequence so a
+            # mispromotion confirmed much later still knows where the event
+            # sat in the actionable stream (SCN-74-6 "任意连续 100 条").
+            self._index_actionable(request_meta, outcome, seq, now_iso)
         if outcome != "ok":
             aggregates["faults"] += 1
             # A true fault makes the plugin pass the window through (protocol
@@ -538,33 +568,41 @@ class TraceStore:
 
     def _mispromotion_alarm(self, now_iso):
         """3 user-confirmed mispromotions in any consecutive 100 actionable
-        events (sliding window over the actionable-event stream)."""
-        if len(self._read_aggregates().get("recent_actionable", [])) \
-                < MISPROMOTION_WINDOW:
-            return None
-        confirmed = {
-            a.get("request_id") for a in self._read_annotations().get(
-                "annotations", [])
+        events.
+
+        Sliding-window semantics over the actionable-event stream: each
+        actionable request carries a global ``actionable_seq`` in the index,
+        so a confirmation that arrives long after the event still knows the
+        event's position.  Three confirmed events fall inside some 100-event
+        window iff their sequence span (max - min + 1) is at most 100.
+        """
+        index = self._read_index()
+        confirmed = [
+            index[a.get("request_id")].get("actionable_seq")
+            for a in self._read_annotations().get("annotations", [])
             if a.get("kind") == "mispromotion"
             and a.get("request_id") is not None
-        }
-        window = MISPROMOTION_WINDOW
-        ring = self._read_aggregates().get("recent_actionable", [])
-        if len(ring) < window:
+            and isinstance(index.get(a.get("request_id")), dict)
+        ]
+        confirmed = [seq for seq in confirmed
+                     if isinstance(seq, int) and seq > 0]
+        if len(confirmed) < MISPROMOTION_LIMIT:
             return None
-        for start in range(0, len(ring) - window + 1):
-            chunk = ring[start:start + window]
-            count = sum(1 for rid in chunk if rid in confirmed)
-            if count >= MISPROMOTION_LIMIT:
+        window = MISPROMOTION_WINDOW
+        # The 3 (or more) confirmed events span at most 100 actionable
+        # events: sort their sequences and check every consecutive triple.
+        ordered = sorted(confirmed)
+        for i in range(len(ordered) - MISPROMOTION_LIMIT + 1):
+            span = ordered[i + MISPROMOTION_LIMIT - 1] - ordered[i] + 1
+            if span <= window:
                 return self._fire_alarm(
                     "mispromotion_rate",
-                    {"window": window, "confirmed": count,
-                     "window_start_request": chunk[0],
-                     "window_end_request": chunk[-1]},
+                    {"window": window, "confirmed": MISPROMOTION_LIMIT,
+                     "span_events": span},
                     now_iso,
-                    "%d user-confirmed mispromotions in the last %d "
+                    "%d user-confirmed mispromotions within %d consecutive "
                     "actionable events; suggest rollback to gamma=0"
-                    % (count, window))
+                    % (MISPROMOTION_LIMIT, window))
         return None
 
     def _fault_rate_alarm(self, now_iso):
