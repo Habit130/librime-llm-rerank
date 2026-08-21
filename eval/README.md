@@ -100,6 +100,35 @@ byte-for-byte summary regeneration. Must pass on the committed artifacts.
   `daemon/integration_cache_limit.py`, and an isolated daemon plus
   `daemon/integration_memory.py --socket <sock> --pid <pid>`.
 
+## Candidate-conditioned benchmark v2 (AC-108-v1)
+
+`semantic_benchmark.py` is the unchanged #69 v1 development/regression set.
+`semantic_benchmark_v2.py` adds exactly 50 new synthetic Simplified-Chinese
+families and expands them into 100 positive and 100 hard-negative directions.
+Its payload represents the query as the last 64 characters of 上文 plus one
+candidate, and history as the historical last-64 上文 plus its selected
+candidate. Choice problems remain hard partitions and hard-negative evidence
+is never inferred from candidate identity alone.
+
+The v2 manifest must be frozen before a report is accepted. Each future route
+calibrates its own threshold from exactly the 100 v1 hard-negative cosines by
+nearest-rank Q95; evidence uses strict `cosine > tau`. The seven route
+descriptor binds payload, model/instruction, 64-character window, pooling,
+vector format, dimensions, and metric. It and the manifest digest are checked
+before metrics, and the one-shot
+artifact boundary rejects a second report for the same benchmark/route
+identity. The model-free fixture proves exact top-K, strict equality, positive
+and no-evidence decisions, manifest verification, and report identity without
+loading a model or producing v2 quality results:
+
+```sh
+python3 eval/semantic_benchmark_v2.py --fixture --artifact-dir <dir>
+```
+
+Real embedding routes, candidate-span extraction, projection training, and v2
+quality results are deferred to issues #109-#113. Live ranking remains
+`alpha=0`, `gamma=0`.
+
 ## Strict-HLC walk-forward evaluation (Habit130/squirrel#70/#77)
 
 `walkforward.py` + `metrics.py` / `bootstrap.py` / `calibration.py` /
