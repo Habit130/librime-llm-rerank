@@ -43,6 +43,7 @@ end-to-end gate; the #62 generation builder plugs a real hidden-state
 provider behind the same interface.
 """
 
+import json
 import math
 import os
 import sqlite3
@@ -160,6 +161,20 @@ class RepresentationProvider:
     def vector_dimension(self):
         raise NotImplementedError
 
+    def is_candidate_conditioned(self):
+        """Whether vectors require the current/selected candidate argument."""
+        return False
+
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        """Candidate-aware query seam; legacy providers use their old vector."""
+        del candidate
+        return self.query_vector(preceding_text)
+
+    def event_vector_for_candidate(self, event, candidate):
+        """Candidate-aware event seam; legacy providers use their old vector."""
+        del candidate
+        return self.event_vector(event)
+
 
 def _normalize(vector):
     values = tuple(float(value) for value in vector)
@@ -183,9 +198,9 @@ def _event_vector_key(schema_id, canonical_segment_input,
 def _parse_event_vector_keys(mapping):
     """Normalize config keys to the internal tuple form.
 
-    JSON configs use the flat "schema|canonical_input|selection" form; the
-    internal lookup uses the tuple form so text containing '|' can never
-    collide.
+    JSON configs use the flat "schema|canonical_input|selection" form or a
+    canonical JSON array for candidate-conditioned history keys; the internal
+    lookup uses the tuple form so text containing '|' can never collide.
     """
     result = {}
     for key, vector in mapping.items():
@@ -195,6 +210,14 @@ def _parse_event_vector_keys(mapping):
         if not isinstance(key, str):
             raise EvidenceError("representation_fault",
                                 "event vector key must be a string or tuple")
+        try:
+            decoded = json.loads(key)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, list) and len(decoded) in (3, 4) \
+                and all(isinstance(part, str) for part in decoded):
+            result[tuple(decoded)] = vector
+            continue
         parts = key.split("|")
         if len(parts) != 3:
             raise EvidenceError(
@@ -245,6 +268,96 @@ class FixtureRepresentationProvider(RepresentationProvider):
                                  event.canonical_segment_input,
                                  event.final_selection_text)
         return self._event_vectors.get(key, self._default_event)
+
+    def vector_dimension(self):
+        return len(self._default_query)
+
+
+class CandidateFixtureRepresentationProvider(RepresentationProvider):
+    """Model-free candidate-conditioned fixture provider.
+
+    Query keys are ``(preceding_text, candidate)``. Event vectors remain bound
+    to the immutable event's selected candidate and choice-problem identity.
+    """
+
+    def __init__(self, representation_id, query_vectors, event_vectors,
+                 default_query=(1.0, 0.0, 0.0, 0.0),
+                 default_event=(0.0, 1.0, 0.0, 0.0)):
+        if not representation_id or not isinstance(representation_id, str):
+            raise EvidenceError("representation_fault",
+                                "fixture needs a representation_id")
+        self._representation_id = representation_id
+        self._query_vectors = {
+            self._query_key(key): _normalize(vector)
+            for key, vector in query_vectors.items()
+        }
+        self._event_vectors = {
+            key: _normalize(vector)
+            for key, vector in _parse_event_vector_keys(event_vectors).items()
+        }
+        self._default_query = _normalize(default_query)
+        self._default_event = _normalize(default_event)
+
+    @staticmethod
+    def _query_key(key):
+        if isinstance(key, tuple) and len(key) == 2:
+            return key
+        if isinstance(key, str):
+            try:
+                decoded = json.loads(key)
+            except (TypeError, ValueError):
+                decoded = key.split("|", 1)
+            if isinstance(decoded, list) and len(decoded) == 2:
+                decoded = tuple(decoded)
+            if isinstance(decoded, (list, tuple)) and len(decoded) == 2 \
+                    and all(isinstance(part, str) for part in decoded):
+                return tuple(decoded)
+        raise EvidenceError(
+            "representation_fault",
+            "candidate query key must be (preceding_text, candidate)")
+
+    def representation_id(self):
+        return self._representation_id
+
+    def is_candidate_conditioned(self):
+        return True
+
+    def query_vector(self, preceding_text):
+        raise EvidenceError(
+            "representation_fault",
+            "candidate-conditioned query requires a candidate")
+
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        vector = self._query_vectors.get((preceding_text, candidate))
+        if vector is None:
+            from representations import candidate_conditioned_payload
+            serialized = candidate_conditioned_payload(
+                preceding_text, candidate)
+            vector = self._query_vectors.get((serialized, candidate))
+            if vector is None:
+                vector = self._query_vectors.get(serialized)
+        return vector if vector is not None else self._default_query
+
+    def event_vector(self, event):
+        return self.event_vector_for_candidate(
+            event, event.final_selection_text)
+
+    def event_vector_for_candidate(self, event, candidate):
+        if candidate != event.final_selection_text:
+            raise EvidenceError(
+                "representation_fault",
+                "event vector candidate does not match selection")
+        key = _event_vector_key(event.schema_id,
+                                event.canonical_segment_input,
+                                candidate)
+        vector = self._event_vectors.get(key)
+        if vector is None:
+            from representations import candidate_conditioned_payload
+            history_key = (
+                candidate_conditioned_payload(event.preceding_text, candidate),
+                event.schema_id, event.canonical_segment_input, candidate)
+            vector = self._event_vectors.get(history_key)
+        return vector if vector is not None else self._default_event
 
     def vector_dimension(self):
         return len(self._default_query)
@@ -367,6 +480,33 @@ class EvidenceService:
                     "MLX backend unavailable: %s" % error) from error
         return None
 
+    @staticmethod
+    def _oracle_query(source, request):
+        """Build one-vector or per-candidate query semantics."""
+        preceding_text = request["preceding_text"]
+        candidates = list(request["candidates"])
+        if source.is_candidate_conditioned():
+            vectors = [source.query_vector_for_candidate(
+                preceding_text, candidate) for candidate in candidates]
+            if not vectors:
+                raise EvidenceError("representation_fault",
+                                    "candidate query has no vectors")
+            return OracleQuery(
+                schema_id=request["schema_id"],
+                canonical_segment_input=request["canonical_segment_input"],
+                candidates=candidates,
+                query_vector=list(vectors[0]),
+                category=request["category"],
+                candidate_query_vectors=[list(vector) for vector in vectors],
+            )
+        return OracleQuery(
+            schema_id=request["schema_id"],
+            canonical_segment_input=request["canonical_segment_input"],
+            candidates=candidates,
+            query_vector=list(source.query_vector(preceding_text)),
+            category=request["category"],
+        )
+
     def _serve_via_snapshot(self, request):
         """Serve one request from the machine's caught-up query snapshot.
 
@@ -379,10 +519,6 @@ class EvidenceService:
         the old and the new representation/projection/index identity even
         while a publish switch is in flight (SCN-65-5).
         """
-        schema_id = request["schema_id"]
-        category = request["category"]
-        canonical_input = request["canonical_segment_input"]
-        preceding_text = request["preceding_text"]
         candidates = request["candidates"]
         request_watermark = request["fact_high_water"]
 
@@ -391,21 +527,13 @@ class EvidenceService:
                               snapshot.consumed[0], snapshot.consumed[1])
 
         try:
-            query_vector = snapshot.query_vector(preceding_text)
+            query = self._oracle_query(snapshot, request)
         except EvidenceError:
             raise
         except Exception as error:  # noqa: BLE001 - fail closed
             raise EvidenceError(
                 "representation_fault", "query vector failed: %s" % error
             ) from error
-
-        query = OracleQuery(
-            schema_id=schema_id,
-            canonical_segment_input=canonical_input,
-            candidates=list(candidates),
-            query_vector=list(query_vector),
-            category=category,
-        )
         reader = snapshot.reader()
         try:
             engine = self._cosine_engine(snapshot)
@@ -700,10 +828,6 @@ class EvidenceService:
     def _serve_direct(self, request):
         """The direct (non-snapshot) serve path, returning the response with
         the private ``_oracle_result`` envelope."""
-        schema_id = request["schema_id"]
-        category = request["category"]
-        canonical_input = request["canonical_segment_input"]
-        preceding_text = request["preceding_text"]
         candidates = request["candidates"]
         request_watermark = request["fact_high_water"]
 
@@ -736,21 +860,13 @@ class EvidenceService:
             raise EvidenceError("fact_store_fault", str(error)) from error
 
         try:
-            query_vector = self._provider.query_vector(preceding_text)
+            query = self._oracle_query(self._provider, request)
         except EvidenceError:
             raise
         except Exception as error:  # noqa: BLE001 - fail closed
             raise EvidenceError(
                 "representation_fault", "query vector failed: %s" % error
             ) from error
-
-        query = OracleQuery(
-            schema_id=schema_id,
-            canonical_segment_input=canonical_input,
-            candidates=list(candidates),
-            query_vector=list(query_vector),
-            category=category,
-        )
 
         # The oracle's vector_for is keyed by event id; resolve it through
         # the provider with the full event record (missing -> fault).
@@ -889,6 +1005,8 @@ def _provider_from_config(config, representation_id):
     - ``provider_kind: "fixture"`` (default): the existing
       FixtureRepresentationProvider with explicit query/event vector maps
       (tests and small e2e fixtures).
+    - ``provider_kind: "candidate_fixture"``: candidate-conditioned maps
+      keyed by ``(preceding_text, candidate)`` plus the existing event key.
     - ``provider_kind: "seed_vectors"``: the #71 capacity-fixture provider,
       deterministic fixed-seed vectors for the 100k-event fixtures (see
       seed_vectors.py).  The seed and dimension come from the config.
@@ -897,10 +1015,21 @@ def _provider_from_config(config, representation_id):
     if kind == "seed_vectors":
         from seed_vectors import build_seed_provider_from_config
         return build_seed_provider_from_config(config)
+    if kind == "candidate_fixture":
+        return CandidateFixtureRepresentationProvider(
+            representation_id,
+            config.get("candidate_query_vectors") or {},
+            config.get("candidate_event_vectors") or {},
+            default_query=config.get("default_query") or
+            (1.0, 0.0, 0.0, 0.0),
+            default_event=config.get("default_event") or
+            (0.0, 1.0, 0.0, 0.0),
+        )
     if kind != "fixture":
         raise EvidenceError(
             "evidence_unavailable",
-            "unknown provider_kind %r (expected fixture or seed_vectors)"
+            "unknown provider_kind %r (expected fixture, candidate_fixture "
+            "or seed_vectors)"
             % kind)
     query_vectors = config.get("query_vectors") or {}
     event_vectors = config.get("event_vectors") or {}

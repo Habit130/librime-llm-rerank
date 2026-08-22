@@ -36,7 +36,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from evidence import (EvidenceError, FixtureRepresentationProvider,  # noqa: E402
+from evidence import (CandidateFixtureRepresentationProvider, EvidenceError,
+                      FixtureRepresentationProvider,  # noqa: E402
                       RepresentationProvider)
 from generation import (  # noqa: E402
     BUILD_VERSION,
@@ -811,6 +812,46 @@ class SeamTest(unittest.TestCase):
             GenerationRepresentationProvider(
                 self.gen, make_provider("different-repr-v1"))
         self.assertEqual("representation_fault", ctx.exception.code)
+
+
+class CandidateGenerationTest(unittest.TestCase):
+    """Generation probes carry one query vector for every current candidate."""
+
+    def test_candidate_generation_does_not_accept_the_old_representation(self):
+        facts = make_facts()
+        root = tempfile.mkdtemp(prefix="gen_candidate_")
+        old_root = tempfile.mkdtemp(prefix="gen_context_only_")
+        try:
+            provider = CandidateFixtureRepresentationProvider(
+                "candidate-conditioned-fixture-v1", {}, {},
+                default_event=(0.0, 1.0, 0.0, 0.0))
+            generation = build_generation(
+                os.path.dirname(facts.db_path), provider, root)
+            try:
+                manifest = generation.manifest()
+                self.assertIn("candidate-conditioned", generation.representation_id)
+                self.assertTrue(all(
+                    len(item["query_vectors"]) == len(item["candidates"])
+                    for item in manifest["probes"]["items"]))
+                with self.assertRaises(EvidenceError) as ctx:
+                    GenerationRepresentationProvider(
+                        generation, make_provider(REPR_ID))
+                self.assertEqual("representation_fault", ctx.exception.code)
+            finally:
+                generation.close()
+            old_generation = build_generation(
+                os.path.dirname(facts.db_path), make_provider(REPR_ID),
+                old_root)
+            try:
+                with self.assertRaises(EvidenceError) as ctx:
+                    GenerationRepresentationProvider(old_generation, provider)
+                self.assertEqual("representation_fault", ctx.exception.code)
+            finally:
+                old_generation.close()
+        finally:
+            facts.close()
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.rmtree(old_root, ignore_errors=True)
 
 
 class EmptyContainerEdgeTest(unittest.TestCase):

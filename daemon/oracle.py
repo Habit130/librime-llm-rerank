@@ -249,6 +249,7 @@ class OracleQuery:
     category: str = "word"
     as_of: Optional[Tuple[int, int]] = None
     exclude_event_ids: FrozenSet[str] = frozenset()
+    candidate_query_vectors: Optional[Sequence[Sequence[float]]] = None
 
     def __post_init__(self):
         if not self.schema_id:
@@ -257,22 +258,41 @@ class OracleQuery:
             raise OracleError("category must not be empty")
         if not self.candidates:
             raise OracleError("query needs at least one candidate")
-        if not self.query_vector:
+        if not self.query_vector and self.candidate_query_vectors is None:
             raise OracleError("query_vector must not be empty")
         if self.as_of is not None:
             if (len(self.as_of) != 2 or self.as_of[0] < 0
                     or self.as_of[1] < 0):
                 raise OracleError(
                     "as_of must be (physical_ms >= 0, logical >= 0)")
-        for value in self.query_vector:
-            if not isinstance(value, (int, float)) or not math.isfinite(value):
+        if self.query_vector:
+            for value in self.query_vector:
+                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise OracleError(
+                        "query_vector must contain only finite numbers")
+        if self.candidate_query_vectors is not None:
+            if (not isinstance(self.candidate_query_vectors, (list, tuple))
+                    or len(self.candidate_query_vectors) != len(self.candidates)):
                 raise OracleError(
-                    "query_vector must contain only finite numbers")
+                    "candidate_query_vectors must align with candidates")
+            for vector in self.candidate_query_vectors:
+                if not vector:
+                    raise OracleError(
+                        "candidate query vectors must not be empty")
+                for value in vector:
+                    if (not isinstance(value, (int, float))
+                            or not math.isfinite(value)):
+                        raise OracleError(
+                            "candidate query vectors must be finite")
 
     @property
     def key(self):
         return choice_problem_key(self.schema_id, self.category,
                                   self.canonical_segment_input)
+
+    @property
+    def is_candidate_conditioned(self):
+        return self.candidate_query_vectors is not None
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +518,16 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
             cosine_engine, CosineEngine):
         raise OracleError("cosine_engine must be a CosineEngine or None")
     as_of = query.as_of if query.as_of is not None else reader.default_as_of()
-    query_vector = _as_float_vector(query.query_vector, "query_vector")
     candidates = tuple(match_text(candidate) for candidate in query.candidates)
+    candidate_vectors = None
+    if query.is_candidate_conditioned:
+        candidate_vectors = [
+            _as_float_vector(vector, "query vector for candidate %d" % index)
+            for index, vector in enumerate(query.candidate_query_vectors)
+        ]
+        query_vector = None
+    else:
+        query_vector = _as_float_vector(query.query_vector, "query_vector")
 
     _t0 = time.monotonic()
     same_key = []
@@ -513,69 +541,134 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
     same_key.sort(key=lambda event: (event.hlc, event.event_id))
     _t1 = time.monotonic()
 
-    batch = None
-    if cosine_engine is not None:
-        try:
-            batch = cosine_engine.batch_cosines(
-                query_vector,
-                tuple(event.event_id for event in same_key),
-                vector_for)
-        except OracleError:
-            raise
-        except Exception as error:  # noqa: BLE001 - fail closed
-            raise OracleError(
-                "cosine engine failed: %s" % error) from error
-        if not isinstance(batch, dict):
-            raise OracleError("cosine engine must return a mapping")
     _t2 = time.monotonic()
-
     contributions = []
-    for index, event in enumerate(same_key):
-        if batch is not None:
-            cosine = batch.get(event.event_id)
+    if candidate_vectors is not None:
+        # Each selected historical candidate is compared only with the query
+        # vector for that same current candidate.  Unmatched selections are
+        # still part of the same-key age clock but cannot provide evidence.
+        events_by_candidate = {}
+        for index, event in enumerate(same_key):
+            selected = match_text(event.final_selection_text)
+            matched = next((candidate_index for candidate_index, candidate
+                            in enumerate(candidates)
+                            if candidate == selected), None)
+            if matched is not None:
+                events_by_candidate.setdefault(matched, []).append(
+                    (index, event))
+        cosines = {}
+        for candidate_index, entries in events_by_candidate.items():
+            query_for_candidate = candidate_vectors[candidate_index]
+            event_ids = tuple(event.event_id for _index, event in entries)
+            if cosine_engine is not None:
+                try:
+                    batch = cosine_engine.batch_cosines(
+                        query_for_candidate, event_ids, vector_for)
+                except OracleError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - fail closed
+                    raise OracleError(
+                        "cosine engine failed: %s" % error) from error
+                if not isinstance(batch, dict):
+                    raise OracleError("cosine engine must return a mapping")
+                for event_id in event_ids:
+                    cosine = batch.get(event_id)
+                    try:
+                        cosine = float(cosine)
+                    except (TypeError, ValueError) as error:
+                        raise OracleError(
+                            "cosine engine returned a non-numeric cosine for "
+                            "event %s" % event_id) from error
+                    if not math.isfinite(cosine):
+                        raise OracleError(
+                            "cosine engine returned an invalid cosine for "
+                            "event %s" % event_id)
+                    cosines[event_id] = cosine
+            else:
+                for _index, event in entries:
+                    try:
+                        vector = _as_float_vector(
+                            vector_for(event.event_id),
+                            "vector for event %s" % event.event_id)
+                    except Exception as error:
+                        raise OracleError(
+                            "vector lookup failed for event %s"
+                            % event.event_id) from error
+                    if len(vector) != len(query_for_candidate):
+                        raise OracleError(
+                            "vector dimension mismatch for event %s: %d vs "
+                            "query %d" % (event.event_id, len(vector),
+                                           len(query_for_candidate)))
+                    cosines[event.event_id] = _cosine(
+                        query_for_candidate, vector)
+        for index, event in enumerate(same_key):
+            cosine = cosines.get(event.event_id)
             if cosine is None:
-                raise OracleError(
-                    "cosine engine returned no cosine for event %s"
-                    % event.event_id)
+                continue
+            relevance = min(
+                max((cosine - params.tau) / (1.0 - params.tau), 0.0), 1.0)
+            usage_age = len(same_key) - 1 - index
+            age_factor = _age_factor(usage_age, params.half_life)
+            weight = relevance * age_factor
+            selected = match_text(event.final_selection_text)
+            matched = next((candidate_index for candidate_index, candidate
+                            in enumerate(candidates)
+                            if candidate == selected), -1)
+            contributions.append([event, cosine, relevance, usage_age,
+                                  age_factor, weight, matched])
+    else:
+        batch = None
+        if cosine_engine is not None:
             try:
-                cosine = float(cosine)
-            except (TypeError, ValueError) as error:
+                batch = cosine_engine.batch_cosines(
+                    query_vector,
+                    tuple(event.event_id for event in same_key),
+                    vector_for)
+            except OracleError:
+                raise
+            except Exception as error:  # noqa: BLE001 - fail closed
                 raise OracleError(
-                    "cosine engine returned a non-numeric cosine for event "
-                    "%s" % event.event_id) from error
-            if not math.isfinite(cosine):
-                raise OracleError(
-                    "cosine engine returned a non-finite cosine for event %s"
-                    % event.event_id)
-        else:
-            try:
-                vector = vector_for(event.event_id)
-            except Exception as error:
-                raise OracleError(
-                    "vector lookup failed for event %s" % event.event_id
-                ) from error
-            vector = _as_float_vector(
-                vector, "vector for event %s" % event.event_id)
-            if len(vector) != len(query_vector):
-                raise OracleError(
-                    "vector dimension mismatch for event %s: %d vs query %d"
-                    % (event.event_id, len(vector), len(query_vector)))
-            cosine = _cosine(query_vector, vector)
-        relevance = min(max((cosine - params.tau) / (1.0 - params.tau), 0.0),
-                        1.0)
-        usage_age = len(same_key) - 1 - index
-        age_factor = _age_factor(usage_age, params.half_life)
-        weight = relevance * age_factor
-        # Candidate text matching is deferred to the kept set (below): with
-        # 100k same-key events the OpenCC simplification per event dominated
-        # the loop even though only the kept entries ever need it.  The
-        # threshold filter and the top-K order depend only on the weight, so
-        # deferring the match changes nothing observable (spec: oracle
-        # semantics unchanged).
-        contributions.append([event, cosine, relevance, usage_age,
-                              age_factor, weight, None])
-    _t3 = time.monotonic()
-
+                    "cosine engine failed: %s" % error) from error
+            if not isinstance(batch, dict):
+                raise OracleError("cosine engine must return a mapping")
+        for index, event in enumerate(same_key):
+            if batch is not None:
+                cosine = batch.get(event.event_id)
+                if cosine is None:
+                    raise OracleError(
+                        "cosine engine returned no cosine for event %s"
+                        % event.event_id)
+                try:
+                    cosine = float(cosine)
+                except (TypeError, ValueError) as error:
+                    raise OracleError(
+                        "cosine engine returned a non-numeric cosine for "
+                        "%s" % event.event_id) from error
+                if not math.isfinite(cosine):
+                    raise OracleError(
+                        "cosine engine returned a non-finite cosine for event "
+                        "%s" % event.event_id)
+            else:
+                try:
+                    vector = vector_for(event.event_id)
+                except Exception as error:
+                    raise OracleError(
+                        "vector lookup failed for event %s" % event.event_id
+                    ) from error
+                vector = _as_float_vector(
+                    vector, "vector for event %s" % event.event_id)
+                if len(vector) != len(query_vector):
+                    raise OracleError(
+                        "vector dimension mismatch for event %s: %d vs query %d"
+                        % (event.event_id, len(vector), len(query_vector)))
+                cosine = _cosine(query_vector, vector)
+            relevance = min(
+                max((cosine - params.tau) / (1.0 - params.tau), 0.0), 1.0)
+            usage_age = len(same_key) - 1 - index
+            age_factor = _age_factor(usage_age, params.half_life)
+            weight = relevance * age_factor
+            contributions.append([event, cosine, relevance, usage_age,
+                                  age_factor, weight, None])
     # Threshold filter (r_i > 0, i.e. a_i > 0), then at most K_evidence by
     # final event weight a_i; deterministic tie-break by HLC order.
     passed = [entry for entry in contributions if entry[5] > 0.0]
@@ -583,15 +676,18 @@ def compute_evidence(reader, params, query, vector_for, cosine_engine=None):
                   (-entry[5], entry[0].hlc, entry[0].event_id))
     kept = kept[:params.k_evidence]
 
-    # Candidate matching for the kept events only (deferred above).
-    for entry in kept:
-        normalized_selection = match_text(entry[0].final_selection_text)
-        matched = -1
-        for candidate_index, candidate in enumerate(candidates):
-            if normalized_selection == candidate:
-                matched = candidate_index
-                break
-        entry[6] = matched
+    # Candidate matching for the legacy context-only path is deferred here;
+    # candidate-conditioned contributions already carry their paired index.
+    if candidate_vectors is None:
+        for entry in kept:
+            normalized_selection = match_text(entry[0].final_selection_text)
+            matched = -1
+            for candidate_index, candidate in enumerate(candidates):
+                if normalized_selection == candidate:
+                    matched = candidate_index
+                    break
+            entry[6] = matched
+    _t3 = time.monotonic()
 
     m = [0.0] * len(candidates)
     for entry in kept:

@@ -88,8 +88,9 @@ class MlxEquivalenceTests(unittest.TestCase):
             query_vector=_vector(SEED, "query", text, DIM))
 
     def _run_both(self, events, query_texts, matrix=None,
-                  engine_cls=MlxCosineEngine):
+                  engine_cls=None):
         """Compute oracle and engine results for the same queries."""
+        engine_cls = engine_cls or MlxCosineEngine
         db = build_facts(os.path.join(self.root, "facts"), events)
         own_matrix = matrix is None
         if own_matrix:

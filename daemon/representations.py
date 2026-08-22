@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 REPRESENTATION_ID_VERSION = "hidden-state-repr-v1"
+CANDIDATE_REPRESENTATION_ID_VERSION = "candidate-conditioned-repr-v1"
 GRAPH_VERSION = "1"
 
 # ADR-0002 / spec #43: the model is conditioned on the last 64 chars of 上文.
@@ -57,6 +58,9 @@ POOLING = "last"
 NORM_TAG = "rmsnorm+l2"
 OUTPUT_DTYPE = "fp32"
 METRIC = "cosine"
+CANDIDATE_PAYLOAD_SCHEMA = "candidate-conditioned-concat-v1"
+CANDIDATE_SERIALIZATION = "last64-preceding-plus-candidate:no-separator:no-special"
+CANDIDATE_SPAN_RULE = "candidate-token-span-v1"
 
 # Files that make up the model identity digest and the tokenizer identity
 # digest, in this fixed order so the digest is canonical across environments.
@@ -159,6 +163,60 @@ class RepresentationSpec:
         if self.kind == "exact":
             return "exact_l%d_%s" % (self.layer, self.pooling)
         return "split_l%d_%s" % (self.layer, self.pooling)
+
+    def __str__(self):
+        return self.short_name
+
+
+@dataclass(frozen=True)
+class CandidateRepresentationSpec:
+    """One of the four frozen candidate-conditioned Qwen routes.
+
+    This remains separate from ``RepresentationSpec`` so the accepted
+    context-only #60/#69 regression artifact is not changed.
+    """
+
+    layer: int
+    pooling: str
+    window_chars: int = WINDOW_CHARS
+    payload_schema: str = CANDIDATE_PAYLOAD_SCHEMA
+    serialization: str = CANDIDATE_SERIALIZATION
+    span_rule: str = CANDIDATE_SPAN_RULE
+    norm: str = NORM_TAG
+    dtype: str = OUTPUT_DTYPE
+    metric: str = METRIC
+    id_version: str = field(default=CANDIDATE_REPRESENTATION_ID_VERSION)
+
+    def __post_init__(self):
+        if self.layer not in EXACT_LAYERS:
+            raise InvalidRepresentationSpec(
+                "candidate layer %d is not in the pre-declared set %r"
+                % (self.layer, EXACT_LAYERS))
+        if self.pooling not in ("candidate_span_mean", "last_candidate_token"):
+            raise InvalidRepresentationSpec(
+                "candidate pooling is not pre-declared: %r" % self.pooling)
+        if self.pooling == "last_candidate_token" and self.layer != 28:
+            raise InvalidRepresentationSpec(
+                "last_candidate_token control must use layer 28")
+        if self.window_chars != WINDOW_CHARS:
+            raise InvalidRepresentationSpec(
+                "candidate window_chars must be exactly %d" % WINDOW_CHARS)
+        if self.payload_schema != CANDIDATE_PAYLOAD_SCHEMA:
+            raise InvalidRepresentationSpec("unsupported candidate payload")
+        if self.serialization != CANDIDATE_SERIALIZATION:
+            raise InvalidRepresentationSpec("unsupported candidate serialization")
+        if self.span_rule != CANDIDATE_SPAN_RULE:
+            raise InvalidRepresentationSpec("unsupported candidate span rule")
+        if self.norm != NORM_TAG:
+            raise InvalidRepresentationSpec("only rmsnorm+l2 normalization is declared")
+        if self.dtype != OUTPUT_DTYPE:
+            raise InvalidRepresentationSpec("only fp32 output is declared")
+        if self.metric != METRIC:
+            raise InvalidRepresentationSpec("only cosine metric is declared")
+
+    @property
+    def short_name(self):
+        return "candidate_l%d_%s" % (self.layer, self.pooling)
 
     def __str__(self):
         return self.short_name
@@ -290,6 +348,8 @@ def representation_id(spec, identity):
     versioning contract: vectors computed under one id are incompatible with
     vectors under another (SCN-60-1).
     """
+    if isinstance(spec, CandidateRepresentationSpec):
+        return candidate_representation_id(spec, identity)
     if not isinstance(spec, RepresentationSpec):
         raise InvalidRepresentationSpec("spec must be a RepresentationSpec")
     if not isinstance(identity, ModelTokenIdentity):
@@ -308,6 +368,37 @@ def representation_id(spec, identity):
         identity.hidden_dim,
         spec.dtype,
         spec.metric,
+    )
+
+
+def candidate_representation_id(spec, identity):
+    """Bind the frozen candidate payload and pooling contract to an id."""
+    if not isinstance(spec, CandidateRepresentationSpec):
+        raise InvalidRepresentationSpec(
+            "spec must be a CandidateRepresentationSpec")
+    if not isinstance(identity, ModelTokenIdentity):
+        raise InvalidRepresentationSpec("identity must be a ModelTokenIdentity")
+    return (
+        "%s:payload=%s:serialization=%s:model=%s:tokenizer=%s:mlxlm=%s:"
+        "graph=%s:layer=%d:pool=%s:window=%d:span=%s:norm=%s:dim=%d:"
+        "dtype=%s:metric=%s"
+        % (
+            spec.id_version,
+            spec.payload_schema,
+            spec.serialization,
+            identity.model_digest[:16],
+            identity.tokenizer_digest[:16],
+            identity.mlxlm_version,
+            GRAPH_VERSION,
+            spec.layer,
+            spec.pooling,
+            spec.window_chars,
+            spec.span_rule,
+            spec.norm,
+            identity.hidden_dim,
+            spec.dtype,
+            spec.metric,
+        )
     )
 
 
@@ -387,6 +478,58 @@ def split_tokenization_for(tokenizer, context, window_chars=WINDOW_CHARS,
         raise EmptyContextRepresentationError(
             "tail tokenizes to no tokens")
     return prefix_text, prefix_ids, tail_text, tail_ids
+
+
+class EmptyCandidateRepresentationError(RepresentationError):
+    """An empty candidate has no token span and cannot be represented."""
+
+
+def candidate_conditioned_payload(preceding_text, candidate,
+                                  window_chars=WINDOW_CHARS):
+    """The frozen payload: ``last_64(preceding_text) + candidate``."""
+    if window_chars != WINDOW_CHARS:
+        raise InvalidRepresentationSpec(
+            "candidate window_chars must be exactly %d" % WINDOW_CHARS)
+    if not isinstance(candidate, str) or not candidate:
+        raise EmptyCandidateRepresentationError("empty candidate")
+    if not isinstance(preceding_text, str):
+        raise RepresentationError("preceding_text must be a string")
+    return window_text(preceding_text, window_chars) + candidate
+
+
+def candidate_tokenization_for(tokenizer, preceding_text, candidate,
+                               window_chars=WINDOW_CHARS, spec=None):
+    """Return payload token ids and the deterministic candidate token span.
+
+    Attribution uses the same decode/reconstruction rule as
+    ``candidate_scoring_plan``. A token crossing the context/candidate
+    boundary is not attributable and therefore fails closed.
+    """
+    if spec is not None and not isinstance(spec, CandidateRepresentationSpec):
+        raise InvalidRepresentationSpec(
+            "candidate_tokenization_for requires a candidate spec")
+    payload = candidate_conditioned_payload(
+        preceding_text, candidate, window_chars)
+    ids = tokenizer.encode(payload, add_special_tokens=False)
+    if not ids:
+        raise EmptyContextRepresentationError("payload tokenizes to no tokens")
+    if tokenizer.decode(ids) != payload:
+        raise RepresentationError("lossy candidate-conditioned tokenization")
+    context = window_text(preceding_text, window_chars)
+    if not context:
+        if tokenizer.decode(ids) != candidate:
+            raise RepresentationError("candidate suffix mismatch")
+        return payload, tuple(ids), 0, len(ids)
+    for boundary in range(1, len(ids) + 1):
+        if tokenizer.decode(ids[:boundary]) != context:
+            continue
+        if boundary == len(ids):
+            raise EmptyCandidateRepresentationError(
+                "candidate token span is empty")
+        if tokenizer.decode(ids[boundary:]) != candidate:
+            raise RepresentationError("candidate suffix mismatch")
+        return payload, tuple(ids), boundary, len(ids) - boundary
+    raise RepresentationError("token straddles context/candidate boundary")
 
 
 def seam_changed(prefix_text, prefix_ids, tail_text, tail_ids,
@@ -470,4 +613,14 @@ def first_round_specs():
         RepresentationSpec(kind="exact", layer=21),
         RepresentationSpec(kind="exact", layer=28),
         RepresentationSpec(kind="split_reuse", layer=SPLIT_REUSE_LAYER),
+    )
+
+
+def candidate_conditioned_specs():
+    """Exactly the four frozen Qwen3 candidate-conditioned routes."""
+    return (
+        CandidateRepresentationSpec(layer=14, pooling="candidate_span_mean"),
+        CandidateRepresentationSpec(layer=21, pooling="candidate_span_mean"),
+        CandidateRepresentationSpec(layer=28, pooling="candidate_span_mean"),
+        CandidateRepresentationSpec(layer=28, pooling="last_candidate_token"),
     )

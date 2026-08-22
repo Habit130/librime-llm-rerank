@@ -551,11 +551,36 @@ is incompatible with vectors under another (spec #43's "任何表示变化都会
 bit-identical across loads and processes; the `mlx_lm` forward graph is
 version-constrained to Qwen3.
 
-Fail-closed boundary rules: an empty window, a window that tokenizes to no
-tokens, a model-forward fault and a non-finite or zero-norm vector are all
-explicit `RepresentationError` faults — a dirty vector can never leave the
-generation path. An empty 上文 is a fault, not a phantom EOS-anchored vector,
-because a representation of void text could later contribute bogus evidence.
+### AC-109 candidate-conditioned routes
+
+The context-only routes above remain the accepted #69 v1 development/regression
+artifact. AC-109 adds a separate frozen matrix without changing that v1
+payload, route names, or digest:
+
+- `candidate_l14_candidate_span_mean`
+- `candidate_l21_candidate_span_mean`
+- `candidate_l28_candidate_span_mean`
+- `candidate_l28_last_candidate_token` (pooling control)
+
+Each query and historical event is serialized as the last 64 Unicode characters
+of 上文 followed immediately by one candidate, with no separator and
+`add_special_tokens=False`. Token attribution uses the existing reconstruction
+rule. Empty 上文 is valid; an empty candidate or an unprovable BPE boundary is
+a representation fault. The sequence is RMSNormed, then only the attributed
+candidate span is mean-pooled or last-token pooled and L2-normalized.
+
+Evidence creates one query vector per current candidate and compares it only
+with events whose selected candidate is that candidate inside the same choice
+problem. Evidence remains positive-only and zero evidence remains a successful
+result. `eval/candidate_conditioned_benchmark.py` is a model-free adapter over
+#69 v1; the deferred v2 benchmark is not imported or run by this delivery.
+
+The context-only #60 boundary rules remain unchanged: an empty window, a
+window that tokenizes to no tokens, a model-forward fault and a non-finite or
+zero-norm vector are explicit `RepresentationError` faults. For the AC-109
+candidate routes, empty 上文 is valid because the candidate supplies the whole
+payload; only an empty candidate, an unprovable span, or a dirty forward is a
+fault.
 
 Evidence commands (daemon venv required for the integration/latency run):
 
