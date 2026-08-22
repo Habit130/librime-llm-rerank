@@ -43,7 +43,6 @@ from semantic_benchmark import (  # noqa: E402
 CONTRACT_ID = "AC-110-v1"
 PAYLOAD_SCHEMA = "candidate-conditioned-concat-v1"
 V1_DIGEST = "69205442228a14b6942e2a4de999587e893125f24f3d91e3e218a0140e2df1ec"
-EMBEDDING_DIMENSION = 1024
 
 
 def payload(preceding_text, candidate):
@@ -52,7 +51,7 @@ def payload(preceding_text, candidate):
 
 
 def _axis_vector(axis):
-    return embedding_fixture_vector(axis, EMBEDDING_DIMENSION)
+    return embedding_fixture_vector(axis)
 
 
 def _near_axis(cosine):

@@ -589,11 +589,11 @@ class BGEM3RepresentationProvider(DedicatedEmbeddingRepresentationProvider):
         super().__init__(BGEM3EmbeddingAdapter(model_path, identity, loader))
 
 
-def embedding_fixture_vector(axis, dimension=EMBEDDING_OUTPUT_DIMENSION):
+def embedding_fixture_vector(axis):
     """Return a deterministic unit vector for model-free route fixtures."""
-    if not isinstance(axis, int) or not 0 <= axis < dimension:
+    if not isinstance(axis, int) or not 0 <= axis < EMBEDDING_OUTPUT_DIMENSION:
         raise EmbeddingError("fixture axis is outside the embedding dimension")
-    result = [0.0] * dimension
+    result = [0.0] * EMBEDDING_OUTPUT_DIMENSION
     result[axis] = 1.0
     return tuple(result)
 
