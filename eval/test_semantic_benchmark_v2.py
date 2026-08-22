@@ -218,7 +218,7 @@ class SemanticBenchmarkV2ShapeTest(unittest.TestCase):
         self.assertEqual("not_run", first["selection"])
         self.assertEqual("not_run", first["production_enablement"])
         self.assertEqual(
-            "6dc430557ba79fa2a214eee424c45bbb90b61c7bdb496f23a0bc9356ddce90b5",
+            "4d2ed16b607f127c125f1d5c4cd2bfaced0ad9829550bf3788e637727429e01c",
             first["benchmark_digest"],
         )
 
@@ -311,6 +311,101 @@ class SemanticBenchmarkV2ShapeTest(unittest.TestCase):
         with patch.object(module, "FAMILY_SPECS", (
                 replace(family, axes=("negation", "unknown_axis")),
                 *module.FAMILY_SPECS[1:])):
+            with self.assertRaises(BenchmarkProtocolError):
+                validate_v2_cases()
+
+    def test_v2_is_disjoint_from_v1_case_sentence_and_competition_sets(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        v1_families = module._v1_families()
+        v1_sentences = module._v1_source_sentences()
+        v1_triplets = module._v1_case_triplets()
+        v1_choice_problems = module._v1_choice_problems()
+        v1_candidate_sets = module._v1_candidate_sets()
+        v2_families = module.family_specs_v2()
+        v2_cases = module.benchmark_cases_v2()
+        self.assertFalse({family.family_id for family in v2_families}
+                         & {family["family_id"] for family in v1_families})
+        self.assertFalse({sentence for family in v2_families
+                          for relation in (family.positive, family.negative)
+                          for sentence in relation} & v1_sentences)
+        self.assertFalse({(case.query_preceding_text,
+                           case.recorded_preceding_text,
+                           case.query_candidate) for case in v2_cases}
+                         & v1_triplets)
+        self.assertFalse({family.choice_problem for family in v2_families}
+                         & v1_choice_problems)
+        self.assertFalse({frozenset(family.candidates) for family in v2_families}
+                         & v1_candidate_sets)
+
+    def test_previous_exact_leak_classes_are_rejected(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        v1_family = next(family for family in module._v1_families()
+                         if family["family_id"] == "preference-03")
+        current = next(family for family in module.FAMILY_SPECS
+                       if family.family_id == "v2-preference-03")
+
+        v1_case = next(case for case in module.v1_benchmark_cases()
+                       if case.case_id == "hard_negative-preference-03-02")
+        current_case = next(case for case in module.benchmark_cases_v2()
+                            if case.case_id ==
+                            "hard_negative-v2-preference-03-02")
+        exact_triplet_leak = replace(
+            current_case,
+            query_preceding_text=v1_case.query_preceding_text,
+            recorded_preceding_text=v1_case.recorded_preceding_text,
+            query_candidate=v1_case.expected_candidate,
+            historical_selected_candidate=v1_case.expected_candidate,
+            candidates=(v1_case.expected_candidate, current_case.candidates[-1]),
+            source_query_text="全新修订查询句",
+            source_recorded_text="全新修订历史句",
+        )
+        patched_cases = tuple(
+            exact_triplet_leak if case.case_id == current_case.case_id
+            else case for case in module.benchmark_cases_v2()
+        )
+        with patch.object(module, "benchmark_cases_v2",
+                          return_value=patched_cases):
+            with self.assertRaisesRegex(
+                    BenchmarkProtocolError, "expanded case overlaps v1"):
+                validate_v2_cases()
+
+        exact_case_leak = replace(
+            current,
+            choice_problem="repair_unique_case_leak",
+            candidates=("稳定", "新候选"),
+            target="稳定",
+            positive=tuple(v1_family["positive"]),
+            negative=tuple(v1_family["negative"]),
+        )
+        with patch.object(module, "FAMILY_SPECS", tuple(
+                exact_case_leak if family.family_id == current.family_id
+                else family for family in module.FAMILY_SPECS)):
+            with self.assertRaises(BenchmarkProtocolError):
+                validate_v2_cases()
+
+        source_sentence_leak = replace(
+            current,
+            choice_problem="repair_unique_sentence_leak",
+            candidates=("可靠", "新候选"),
+            positive=(v1_family["positive"][0], current.positive[1]),
+        )
+        with patch.object(module, "FAMILY_SPECS", tuple(
+                source_sentence_leak if family.family_id == current.family_id
+                else family for family in module.FAMILY_SPECS)):
+            with self.assertRaises(BenchmarkProtocolError):
+                validate_v2_cases()
+
+        candidate_set_leak = replace(
+            current,
+            choice_problem="repair_unique_candidate_set_leak",
+            candidates=tuple(v1_family["candidates"]),
+            target=v1_family["target"],
+        )
+        with patch.object(module, "FAMILY_SPECS", tuple(
+                candidate_set_leak if family.family_id == current.family_id
+                else family for family in module.FAMILY_SPECS)):
             with self.assertRaises(BenchmarkProtocolError):
                 validate_v2_cases()
 

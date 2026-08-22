@@ -392,12 +392,12 @@ FAMILY_SPECS = (
             ("项目收尾时安排总结会的时间，通知相关人员参加",
              "工作结束以后预订会议室，并提醒大家按时到场"),
             "整理项目总结", "语义改为安排总结会议"),
-    _family("v2-window-02", "window_64", "v2analysis_alpha", ("分析", "反习"), "分析",
-            ("拿到实验结果后先分析原因，再决定后续方案",
-             "数据收集完成后查找规律，随后制定下一步计划"),
-            ("拿到实验结果后先保存文件，再等待负责人签字",
-             "数据收集完成后归档材料，随后等待审批流程"),
-            "分析实验结果", "语义改为归档并审批"),
+    _family("v2-window-02", "window_64", "v2verification_alpha", ("核验", "河沿"), "核验",
+            ("实验结果已经汇总，今天先核验数据再安排下一步",
+             "测量记录全部整理，工作人员会逐项确认准确性"),
+            ("实验结果已经汇总，今天先封存资料再安排下一步",
+             "测量记录全部整理，工作人员会把文件送入档案室"),
+            "核验实验数据", "语义改为封存资料"),
     _family("v2-window-03", "window_64", "v2handoff_alpha", ("交接", "交界"), "交接",
             ("值班结束前完成交接，把未完成事项说明清楚",
              "轮班人员已经见面，工作记录会逐项交给下一班"),
@@ -443,18 +443,18 @@ FAMILY_SPECS = (
             ("这次报告希望完整，先给全部推导再概括结论",
              "阅读时我更需要详细过程，不能只保留几个要点"),
             "偏好简短清楚", "偏好完整详尽"),
-    _family("v2-preference-02", "preference_change", "v2light_alpha", ("轻量", "清凉"), "轻量",
-            ("部署方案优先选择轻量版本，机器资源比较有限",
-             "这次更看重运行负担小，先使用精简配置"),
-            ("部署方案优先选择完整版本，可以接受更高资源消耗",
-             "这次更看重功能覆盖广，宁可使用复杂配置"),
-            "偏好低资源方案", "偏好功能完整方案"),
-    _family("v2-preference-03", "preference_change", "v2stable_alpha", ("稳定", "问鼎"), "稳定",
-            ("上线方案首先要稳定，速度慢一些也可以接受",
-             "这次发布把可靠性放在第一位，性能可以适当让步"),
-            ("上线方案首先要快速，偶尔波动也可以接受",
-             "这次发布把响应时间放在第一位，稳定性可以暂时让步"),
-            "偏好可靠性", "偏好速度"),
+    _family("v2-preference-02", "preference_change", "v2resource_tradeoff_alpha", ("省电", "盛典"), "省电",
+            ("移动设备优先采用省电方案，续航比峰值性能更重要",
+             "这次配置希望减少能耗，运行速度稍慢也可以接受"),
+            ("移动设备优先采用高性能方案，可以接受更多能耗",
+             "这次配置希望提高处理速度，续航时间可以暂时让步"),
+            "偏好低能耗方案", "偏好高性能方案"),
+    _family("v2-preference-03", "preference_change", "v2reliable_tradeoff_alpha", ("可靠", "来客"), "可靠",
+            ("数据传输优先选择可靠链路，慢一点也不要丢包",
+             "这次服务把连续可用放在第一位，吞吐量可以适当降低"),
+            ("数据传输优先选择高速链路，偶尔重试也可以接受",
+             "这次服务把吞吐量放在第一位，偶发中断可以暂时容忍"),
+            "偏好传输可靠性", "偏好传输速度"),
     _family("v2-preference-04", "preference_change", "v2transparent_alpha", ("透明", "通明"), "透明",
             ("选择方案时希望规则透明，每一步依据都能解释",
              "后续复核需要看懂决策过程，不能只看最终结果"),
@@ -479,12 +479,12 @@ FAMILY_SPECS = (
             ("调查报告只要快速结论，不需要展开全部原因",
              "请直接说明结果，详细背景可以暂时省略"),
             "偏好深入分析", "偏好快速结论"),
-    _family("v2-preference-08", "preference_change", "v2standard_alpha", ("标准", "表准"), "标准",
-            ("报告最好采用统一规范，方便不同团队相互比较",
-             "文档使用一致格式更重要，后续审阅会更容易"),
-            ("报告最好允许自由写法，不必拘泥统一规范",
-             "文档可以按作者习惯组织，不需要强行保持一致"),
-            "偏好统一格式", "偏好自由格式"),
+    _family("v2-preference-08", "preference_change", "v2format_tradeoff_alpha", ("规范", "规劝"), "规范",
+            ("接口文档优先保持规范，便于工具自动解析字段",
+             "这套说明需要遵循固定格式，服务之间才能顺利交换"),
+            ("接口文档优先保持灵活，可以按团队习惯调整字段",
+             "这套说明不必遵循固定格式，各服务可以自行组织内容"),
+            "偏好机器可解析的规范", "偏好团队自定义的格式"),
 )
 
 
@@ -642,18 +642,28 @@ def _v1_families():
     return tuple(v1_families)
 
 
-def _v1_text_pairs():
-    pairs = set()
-    for family in _v1_families():
-        for relation in (family["positive"], family["negative"]):
-            pairs.add(frozenset(relation))
-    return pairs
-
-
-def _v1_choice_sets():
+def _v1_source_sentences():
     return {
-        (family["choice_problem"], frozenset(family["candidates"]))
+        sentence
         for family in _v1_families()
+        for relation in (family["positive"], family["negative"])
+        for sentence in relation
+    }
+
+
+def _v1_choice_problems():
+    return {family["choice_problem"] for family in _v1_families()}
+
+
+def _v1_candidate_sets():
+    return {frozenset(family["candidates"]) for family in _v1_families()}
+
+
+def _v1_case_triplets():
+    return {
+        (case.query_preceding_text, case.recorded_preceding_text,
+         case.expected_candidate)
+        for case in v1_benchmark_cases()
     }
 
 
@@ -671,10 +681,30 @@ def validate_v2_cases():
     if {axis: sum(axis in family.axes for family in families)
             for axis in AXES} != V2_FAMILY_DISTRIBUTION:
         raise BenchmarkProtocolError("v2 family axis distribution changed")
-    text_pairs = _v1_text_pairs()
-    choice_sets = _v1_choice_sets()
+    v1_source_sentences = _v1_source_sentences()
+    v1_choice_problems = _v1_choice_problems()
+    v1_candidate_sets = _v1_candidate_sets()
+    v1_case_triplets = _v1_case_triplets()
     seen_text_pairs = set()
-    seen_choice_sets = set()
+    seen_source_sentences = set()
+    seen_case_triplets = set()
+    seen_choice_problems = set()
+    seen_candidate_sets = set()
+    v2_source_sentences = {
+        sentence
+        for family in families
+        for relation in (family.positive, family.negative)
+        for sentence in relation
+    }
+    if v2_source_sentences & v1_source_sentences:
+        raise BenchmarkProtocolError("v2 source sentence overlaps v1")
+    v2_case_triplets = {
+        (case.query_preceding_text, case.recorded_preceding_text,
+         case.query_candidate)
+        for case in cases
+    }
+    if v2_case_triplets & v1_case_triplets:
+        raise BenchmarkProtocolError("v2 expanded case overlaps v1")
     for family in families:
         if len(family.positive) != 2 or len(family.negative) != 2:
             raise BenchmarkProtocolError(
@@ -683,22 +713,27 @@ def validate_v2_cases():
         if len(family.axes) != 1 or family.axes[0] not in AXES:
             raise BenchmarkProtocolError(
                 "family %s has an unknown or composite axis" % family.family_id)
-        choice_set = (family.choice_problem, frozenset(family.candidates))
-        if choice_set in seen_choice_sets:
+        candidate_set = frozenset(family.candidates)
+        if family.choice_problem in v1_choice_problems or \
+                family.choice_problem in seen_choice_problems:
             raise BenchmarkProtocolError(
-                "v2 choice problem/candidate set is duplicated")
-        seen_choice_sets.add(choice_set)
+                "v2 choice problem overlaps or is duplicated")
+        if candidate_set in v1_candidate_sets or \
+                candidate_set in seen_candidate_sets:
+            raise BenchmarkProtocolError(
+                "v2 candidate set overlaps or is duplicated")
+        seen_choice_problems.add(family.choice_problem)
+        seen_candidate_sets.add(candidate_set)
         for relation in (family.positive, family.negative):
-            if frozenset(relation) in text_pairs:
-                raise BenchmarkProtocolError(
-                    "family %s reuses a v1 text pair" % family.family_id)
             pair = frozenset(relation)
             if pair in seen_text_pairs:
                 raise BenchmarkProtocolError("v2 text pair is duplicated")
             seen_text_pairs.add(pair)
-        if choice_set in choice_sets:
-            raise BenchmarkProtocolError(
-                "family %s reuses a v1 choice problem" % family.family_id)
+            for sentence in relation:
+                if sentence in seen_source_sentences:
+                    raise BenchmarkProtocolError(
+                        "v2 source sentence is duplicated")
+                seen_source_sentences.add(sentence)
     case_ids = [case.case_id for case in cases]
     if len(case_ids) != len(set(case_ids)):
         raise BenchmarkProtocolError("v2 case IDs are not unique")
@@ -714,6 +749,12 @@ def validate_v2_cases():
                 "candidate identity differs between query and history")
         if case.query_candidate not in case.candidates:
             raise BenchmarkProtocolError("query candidate is not in candidate set")
+        case_triplet = (case.query_preceding_text,
+                        case.recorded_preceding_text,
+                        case.query_candidate)
+        if case_triplet in seen_case_triplets:
+            raise BenchmarkProtocolError("v2 expanded case is duplicated")
+        seen_case_triplets.add(case_triplet)
         if case.query_preceding_text != _last_64(case.source_query_text):
             raise BenchmarkProtocolError("query context is not last-64")
         if case.recorded_preceding_text != _last_64(case.source_recorded_text):
