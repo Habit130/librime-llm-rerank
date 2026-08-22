@@ -21,6 +21,7 @@ module without MLX installed.
 
 from evidence import EvidenceError, RepresentationProvider
 from representations import (
+    CandidateRepresentationSpec,
     EXACT_LAYERS,
     SPLIT_REUSE_LAYER,
     EmptyContextRepresentationError,
@@ -30,6 +31,7 @@ from representations import (
     RepresentationError,
     RepresentationSpec,
     build_model_token_identity,
+    candidate_tokenization_for,
     exact_tokenization_for,
     l2_normalize,
     representation_id,
@@ -42,6 +44,26 @@ def _lazy_mlx():
     from mlx_lm.models.base import create_attention_mask
     from mlx_lm.models.cache import make_prompt_cache
     return mx, create_attention_mask, make_prompt_cache
+
+
+def pool_candidate_hidden_states(hidden_states, candidate_start,
+                                 candidate_count, pooling):
+    """Pool an already RMSNormed sequence over the candidate span only."""
+    end = candidate_start + candidate_count
+    if candidate_start < 0 or candidate_count < 1 \
+            or end > len(hidden_states):
+        raise InvalidRepresentationSpec("candidate token span is invalid")
+    span = hidden_states[candidate_start:end]
+    if pooling == "candidate_span_mean":
+        dimension = len(span[0])
+        draft = [sum(row[index] for row in span) / len(span)
+                 for index in range(dimension)]
+    elif pooling == "last_candidate_token":
+        draft = span[-1]
+    else:
+        raise InvalidRepresentationSpec(
+            "unsupported candidate pooling %r" % pooling)
+    return l2_normalize(draft)
 
 
 class HiddenStateExtractor:
@@ -246,6 +268,55 @@ class HiddenStateExtractor:
             lambda: self._run(tail_ids, prefix_cache, {SPLIT_REUSE_LAYER}))
         return self._final_validate(snapshots[SPLIT_REUSE_LAYER]), cache
 
+    def _run_candidate(self, ids, candidate_start, candidate_count,
+                       layer_number, pooling):
+        """Forward one candidate payload and pool only its token span."""
+        mx, create_attention_mask, _ = _lazy_mlx()
+        if not ids:
+            raise EmptyContextRepresentationError("no candidate payload tokens")
+        if candidate_count < 1 or candidate_start < 0 \
+                or candidate_start + candidate_count > len(ids):
+            raise InvalidRepresentationSpec("candidate token span is invalid")
+        model, inner = self._require_model()
+        del model
+        token_ids = mx.array([list(ids)])
+        h = inner.embed_tokens(token_ids)
+        layer_cache = [None] * len(inner.layers)
+        mask = create_attention_mask(h, layer_cache[0])
+        try:
+            for index, layer in enumerate(inner.layers):
+                h = layer(h, mask, layer_cache[index])
+                if index + 1 != layer_number:
+                    continue
+                normalized = inner.norm(h).astype(mx.float32)
+                import numpy as np
+                span = np.asarray(
+                    normalized[0, candidate_start:
+                               candidate_start + candidate_count]).reshape(
+                                   candidate_count, -1)
+                return pool_candidate_hidden_states(
+                    span.tolist(), 0, candidate_count, pooling)
+        except RepresentationError:
+            raise
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise ModelForwardRepresentationError(
+                "candidate-conditioned forward failed: %s" % error) from error
+        raise InvalidRepresentationSpec(
+            "candidate layer %d was not reached" % layer_number)
+
+    def candidate(self, spec, preceding_text, candidate):
+        """Generate one frozen candidate-conditioned route vector."""
+        if not isinstance(spec, CandidateRepresentationSpec):
+            raise InvalidRepresentationSpec(
+                "candidate requires a CandidateRepresentationSpec")
+        self._require_model()
+        tokenizer = self._tokenizer()
+        _, ids, start, count = candidate_tokenization_for(
+            tokenizer, preceding_text, candidate,
+            spec.window_chars, spec=spec)
+        return self._guarded(lambda: self._run_candidate(
+            ids, start, count, spec.layer, spec.pooling))
+
 
 class HiddenStateRepresentationProvider(RepresentationProvider):
     """One pre-declared representation behind the #61 provider seam (#62).
@@ -284,6 +355,56 @@ class HiddenStateRepresentationProvider(RepresentationProvider):
             if self._spec.kind == "exact":
                 return self._extractor.exact(self._spec, context)
             return self._extractor.split_reuse(context)[0]
+        except EvidenceError:
+            raise
+        except RepresentationError as error:
+            raise EvidenceError(
+                "representation_fault", "representation failed: %s" % error
+            ) from error
+
+
+class HiddenStateCandidateRepresentationProvider(RepresentationProvider):
+    """Candidate-conditioned provider for one frozen Qwen route."""
+
+    def __init__(self, extractor, spec):
+        if not isinstance(spec, CandidateRepresentationSpec):
+            raise InvalidRepresentationSpec(
+                "spec must be a CandidateRepresentationSpec")
+        self._extractor = extractor
+        self._spec = spec
+
+    def representation_id(self):
+        return self._extractor.representation_id(self._spec)
+
+    def is_candidate_conditioned(self):
+        return True
+
+    def query_vector(self, preceding_text):
+        raise EvidenceError(
+            "representation_fault",
+            "candidate-conditioned query requires a candidate")
+
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        return self._forward(preceding_text, candidate)
+
+    def event_vector(self, event):
+        return self.event_vector_for_candidate(
+            event, event.final_selection_text)
+
+    def event_vector_for_candidate(self, event, candidate):
+        if candidate != event.final_selection_text:
+            raise EvidenceError(
+                "representation_fault",
+                "event vector candidate does not match selection")
+        return self._forward(event.preceding_text, candidate)
+
+    def vector_dimension(self):
+        return self._extractor.identity.hidden_dim
+
+    def _forward(self, preceding_text, candidate):
+        try:
+            return self._extractor.candidate(
+                self._spec, preceding_text, candidate)
         except EvidenceError:
             raise
         except RepresentationError as error:

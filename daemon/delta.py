@@ -513,6 +513,16 @@ class DeltaSnapshot:
             raise DeltaError("snapshot has no query provider")
         return self._query_provider.query_vector(preceding_text)
 
+    def is_candidate_conditioned(self):
+        return (self._query_provider is not None
+                and self._query_provider.is_candidate_conditioned())
+
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        if self._query_provider is None:
+            raise DeltaError("snapshot has no query provider")
+        return self._query_provider.query_vector_for_candidate(
+            preceding_text, candidate)
+
     def accelerate_engine(self, row_index=None):
         """The Accelerate cosine engine over this snapshot's matrix (#72).
 
@@ -2529,17 +2539,29 @@ def _build_provider_from_config(config, representation_id=None):
     ``representation_id`` (#65) overrides the config's declared id so the
     active manifest's published representation can be served.
     """
-    from evidence import FixtureRepresentationProvider
+    from evidence import (CandidateFixtureRepresentationProvider,
+                          FixtureRepresentationProvider)
     try:
         representation_id = representation_id or config["representation_id"]
         kind = config.get("provider_kind", "fixture")
         if kind == "seed_vectors":
             from seed_vectors import build_seed_provider_from_config
             return build_seed_provider_from_config(config)
+        if kind == "candidate_fixture":
+            return CandidateFixtureRepresentationProvider(
+                representation_id,
+                config.get("candidate_query_vectors") or {},
+                config.get("candidate_event_vectors") or {},
+                default_query=config.get("default_query") or
+                (1.0, 0.0, 0.0, 0.0),
+                default_event=config.get("default_event") or
+                (0.0, 1.0, 0.0, 0.0),
+            )
         if kind != "fixture":
             raise EvidenceError(
                 "evidence_unavailable",
-                "unknown provider_kind %r (expected fixture or seed_vectors)"
+                "unknown provider_kind %r (expected fixture, candidate_fixture "
+                "or seed_vectors)"
                 % kind)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}

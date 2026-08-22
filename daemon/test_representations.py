@@ -36,15 +36,23 @@ sys.path.insert(0, os.path.dirname(__file__))
 from hidden_state import (  # noqa: E402
     EXACT_LAYERS,
     HiddenStateExtractor,
+    pool_candidate_hidden_states,
 )
 from representations import (  # noqa: E402
+    CandidateRepresentationSpec,
     EmptyContextRepresentationError,
+    EmptyCandidateRepresentationError,
     InvalidRepresentationSpec,
     ModelForwardRepresentationError,
     ModelTokenIdentity,
     NonFiniteRepresentationError,
     RepresentationSpec,
+    RepresentationError,
     build_model_token_identity,
+    candidate_conditioned_payload,
+    candidate_conditioned_specs,
+    candidate_representation_id,
+    candidate_tokenization_for,
     cosine,
     exact_tokenization_for,
     first_round_specs,
@@ -77,6 +85,16 @@ class RecordingTokenizer:
 
     def decode(self, ids):
         raise NotImplementedError
+
+
+class CharacterTokenizer:
+    """Lossless model-free tokenizer for candidate span fixtures."""
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(character) for character in text]
+
+    def decode(self, ids):
+        return "".join(chr(value) for value in ids)
 
 
 def make_model_dir():
@@ -273,6 +291,91 @@ class FirstRoundSetTest(unittest.TestCase):
     def test_split_spec_layer_fixed(self):
         with self.assertRaises(InvalidRepresentationSpec):
             RepresentationSpec(kind="split_reuse", layer=21)
+
+
+class CandidateRouteTest(unittest.TestCase):
+    def setUp(self):
+        self.root = make_model_dir()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.identity = build_model_token_identity(self.root)
+
+    def test_exactly_four_frozen_routes(self):
+        specs = candidate_conditioned_specs()
+        self.assertEqual(4, len(specs))
+        self.assertEqual(
+            [(14, "candidate_span_mean"),
+             (21, "candidate_span_mean"),
+             (28, "candidate_span_mean"),
+             (28, "last_candidate_token")],
+            [(spec.layer, spec.pooling) for spec in specs])
+        self.assertEqual(4, len({candidate_representation_id(
+            spec, self.identity) for spec in specs}))
+
+    def test_other_layers_and_pooling_are_rejected(self):
+        with self.assertRaises(InvalidRepresentationSpec):
+            CandidateRepresentationSpec(layer=13,
+                                        pooling="candidate_span_mean")
+        with self.assertRaises(InvalidRepresentationSpec):
+            CandidateRepresentationSpec(layer=14,
+                                        pooling="last_candidate_token")
+        with self.assertRaises(InvalidRepresentationSpec):
+            CandidateRepresentationSpec(layer=28, pooling="max")
+
+    def test_candidate_id_binds_payload_and_span_contract(self):
+        identifier = candidate_representation_id(
+            CandidateRepresentationSpec(layer=28,
+                                        pooling="candidate_span_mean"),
+            self.identity)
+        for component in (
+                "payload=candidate-conditioned-concat-v1",
+                "serialization=last64-preceding-plus-candidate",
+                "layer=28", "pool=candidate_span_mean", "window=64",
+                "span=candidate-token-span-v1", "norm=rmsnorm+l2",
+                "dim=8", "dtype=fp32", "metric=cosine"):
+            self.assertIn(component, identifier)
+
+
+class CandidateSpanTest(unittest.TestCase):
+    def test_payload_truncates_before_appending_candidate(self):
+        tokenizer = CharacterTokenizer()
+        payload, ids, start, count = candidate_tokenization_for(
+            tokenizer, "前" * 70, "候选")
+        self.assertEqual("前" * 64 + "候选", payload)
+        self.assertEqual(66, len(ids))
+        self.assertEqual((64, 2), (start, count))
+
+    def test_exactly_64_char_context_and_single_char_candidate(self):
+        payload, ids, start, count = candidate_tokenization_for(
+            CharacterTokenizer(), "前" * 64, "字")
+        self.assertEqual("前" * 64 + "字", payload)
+        self.assertEqual(65, len(ids))
+        self.assertEqual((64, 1), (start, count))
+
+    def test_empty_context_is_valid_and_candidate_is_entire_span(self):
+        result = candidate_tokenization_for(CharacterTokenizer(), "", "单字")
+        self.assertEqual((0, 2), result[2:])
+
+    def test_empty_candidate_is_a_representation_fault(self):
+        with self.assertRaises(EmptyCandidateRepresentationError):
+            candidate_conditioned_payload("上文", "")
+
+    def test_bpe_boundary_is_fail_closed(self):
+        tokenizer = RecordingTokenizer({"今天": [1]})
+        tokenizer.decode = lambda ids: "今天" if tuple(ids) == (1,) else ""
+        with self.assertRaises(RepresentationError):
+            candidate_tokenization_for(tokenizer, "今", "天")
+
+    def test_pooling_uses_span_mean_or_span_last_not_sequence_last(self):
+        sequence = [[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, 99.0]]
+        mean = pool_candidate_hidden_states(
+            sequence, 1, 2, "candidate_span_mean")
+        last = pool_candidate_hidden_states(
+            sequence, 1, 2, "last_candidate_token")
+        norm = math.sqrt(1.5 ** 2 + 1.0 ** 2)
+        self.assertAlmostEqual(1.5 / norm, mean[0])
+        self.assertAlmostEqual(1.0 / norm, mean[1])
+        self.assertAlmostEqual(1.0, last[0])
+        self.assertAlmostEqual(0.0, last[1])
 
 
 class NormalizationTest(unittest.TestCase):

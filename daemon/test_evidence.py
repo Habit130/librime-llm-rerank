@@ -34,6 +34,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from evidence import (  # noqa: E402
+    CandidateFixtureRepresentationProvider,
     DEFAULT_HALF_LIFE,
     DEFAULT_K_EVIDENCE,
     DEFAULT_SATURATION_K,
@@ -280,6 +281,65 @@ class EvidenceServiceTest(unittest.TestCase):
                                segment_input="shijie", selection="时界")
         result = service.serve(self.request())
         self.assertFalse(result["zero_evidence"])
+
+
+class CandidateConditionedEvidenceTest(unittest.TestCase):
+    """AC-109: query and history vectors are paired by candidate."""
+
+    def setUp(self):
+        self.fixture = FactsFixture()
+        self.facts_root = os.path.dirname(self.fixture.db_path)
+        self.fixture.add_event(
+            "e1", schema_id="luna_pinyin", segment_input="shijie",
+            selection="时界", preceding_text="过去", competition=("世界", "时界"))
+        self.params = OracleParams(
+            tau=0.5, k_evidence=8, half_life=float("inf"), saturation_k=1.0)
+
+    def tearDown(self):
+        self.fixture.close()
+
+    def test_only_selected_candidate_pair_receives_evidence(self):
+        provider = CandidateFixtureRepresentationProvider(
+            "candidate-fixture-v1",
+            {("现在", "世界"): (0.0, 1.0, 0.0, 0.0),
+             ("现在", "时界"): QUERY_VECTOR},
+            {("luna_pinyin", "shijie", "时界"): HIT_EVENT_VECTOR},
+            default_event=DEFAULT_EVENT_VECTOR,
+        )
+        service = EvidenceService(
+            self.facts_root, self.params, provider, gamma=0.0)
+        result = service.serve({
+            "schema_id": "luna_pinyin",
+            "category": "word",
+            "canonical_segment_input": "shijie",
+            "preceding_text": "现在",
+            "candidates": ["世界", "时界"],
+            "fact_high_water": None,
+        })
+        self.assertEqual(0.0, result["evidence"][0]["s"])
+        self.assertGreater(result["evidence"][1]["s"], 0.0)
+
+    def test_other_selected_candidate_does_not_use_current_candidate_vector(self):
+        self.fixture.add_event(
+            "e2", schema_id="luna_pinyin", segment_input="shijie",
+            selection="世界", preceding_text="过去", competition=("世界", "时界"))
+        provider = CandidateFixtureRepresentationProvider(
+            "candidate-fixture-v2",
+            {("现在", "世界"): (0.0, 1.0, 0.0, 0.0),
+             ("现在", "时界"): QUERY_VECTOR},
+            {("luna_pinyin", "shijie", "时界"): HIT_EVENT_VECTOR,
+             ("luna_pinyin", "shijie", "世界"): HIT_EVENT_VECTOR},
+            default_event=DEFAULT_EVENT_VECTOR,
+        )
+        service = EvidenceService(
+            self.facts_root, self.params, provider, gamma=0.0)
+        result = service.serve({
+            "schema_id": "luna_pinyin", "category": "word",
+            "canonical_segment_input": "shijie", "preceding_text": "现在",
+            "candidates": ["世界", "时界"], "fact_high_water": None,
+        })
+        self.assertEqual(0.0, result["evidence"][0]["s"])
+        self.assertGreater(result["evidence"][1]["s"], 0.0)
 
 
 class EvidenceProtocolTest(unittest.TestCase):

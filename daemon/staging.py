@@ -1534,7 +1534,8 @@ def _build_desired_provider(config, desired_representation_id, seed=None):
     at the same seam in the integration harness).  ``seed`` optionally
     overrides the config seed so the desired target can differ from the
     active one (the #71 background-rebuild concurrency fixture)."""
-    from evidence import FixtureRepresentationProvider
+    from evidence import (CandidateFixtureRepresentationProvider,
+                          FixtureRepresentationProvider)
     try:
         kind = config.get("provider_kind", "fixture")
         if kind == "seed_vectors":
@@ -1542,10 +1543,21 @@ def _build_desired_provider(config, desired_representation_id, seed=None):
             return build_seed_provider_from_config(
                 config, representation_id=desired_representation_id,
                 seed=seed)
+        if kind == "candidate_fixture":
+            return CandidateFixtureRepresentationProvider(
+                desired_representation_id,
+                config.get("candidate_query_vectors") or {},
+                config.get("candidate_event_vectors") or {},
+                default_query=config.get("default_query") or
+                (1.0, 0.0, 0.0, 0.0),
+                default_event=config.get("default_event") or
+                (0.0, 1.0, 0.0, 0.0),
+            )
         if kind != "fixture":
             raise EvidenceError(
                 "evidence_unavailable",
-                "unknown provider_kind %r (expected fixture or seed_vectors)"
+                "unknown provider_kind %r (expected fixture, candidate_fixture "
+                "or seed_vectors)"
                 % kind)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}

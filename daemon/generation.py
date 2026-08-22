@@ -426,13 +426,17 @@ class _ProjectionReader:
 
 def _compute_probe(probe, events, vfile, row_index, params, as_of):
     """Run the canonical oracle on the container's projection for one probe."""
+    query_vectors = probe.get("query_vectors")
     query = OracleQuery(
         schema_id=probe["schema_id"],
         canonical_segment_input=probe["canonical_segment_input"],
         candidates=list(probe["candidates"]),
-        query_vector=list(probe["query_vector"]),
+        query_vector=list(probe.get("query_vector") or query_vectors[0]),
         category=probe.get("category", "word"),
         as_of=as_of,
+        candidate_query_vectors=(
+            [list(vector) for vector in query_vectors]
+            if query_vectors is not None else None),
     )
 
     def vector_for(event_id):
@@ -918,8 +922,16 @@ def _compute_probes(facts_root, provider, events, rows, vectors_path,
                 if not candidates:
                     candidates = [stored.final_selection_text]
                 try:
-                    query_vector = list(provider.query_vector(
-                        stored.preceding_text))
+                    if provider.is_candidate_conditioned():
+                        query_vectors = [list(
+                            provider.query_vector_for_candidate(
+                                stored.preceding_text, candidate))
+                            for candidate in candidates]
+                        query_vector = query_vectors[0]
+                    else:
+                        query_vectors = None
+                        query_vector = list(provider.query_vector(
+                            stored.preceding_text))
                 except EvidenceError as error:
                     raise BuildBlockedError(
                         "cannot build generation: probe query vector for "
@@ -937,6 +949,8 @@ def _compute_probes(facts_root, provider, events, rows, vectors_path,
                     "candidates": list(candidates),
                     "query_vector": query_vector,
                 }
+                if query_vectors is not None:
+                    probe["query_vectors"] = query_vectors
                 result = _compute_probe(probe, events, vfile, row_index,
                                         probe_params, source_hlc)
                 probes["items"].append(dict(probe, results_fingerprint=(
@@ -1541,10 +1555,25 @@ class GenerationRepresentationProvider(RepresentationProvider):
     def representation_id(self):
         return self._generation.representation_id
 
+    def is_candidate_conditioned(self):
+        return self._query_provider.is_candidate_conditioned()
+
     def query_vector(self, preceding_text):
         return self._query_provider.query_vector(preceding_text)
 
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        return self._query_provider.query_vector_for_candidate(
+            preceding_text, candidate)
+
     def event_vector(self, event):
+        return self._generation.event_vector(event.event_id)
+
+    def event_vector_for_candidate(self, event, candidate):
+        if self.is_candidate_conditioned() \
+                and candidate != event.final_selection_text:
+            raise EvidenceError(
+                "representation_fault",
+                "event vector candidate does not match selection")
         return self._generation.event_vector(event.event_id)
 
     def vector_dimension(self):
