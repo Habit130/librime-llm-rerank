@@ -35,6 +35,17 @@ sha256 on the fast build path; the from-source build path keeps using
 
 Simplified Chinese (简体) only, developed against the `luna_pinyin` schema.
 
+## Dedicated Embedding Adapters
+
+AC-110-v1 provides two model-free-testable candidate-conditioned adapters:
+`qwen3-embedding-0.6b` with the frozen query instruction and
+`bge-m3-dense-1024` with dense-only 1024-dimensional output. Both use the
+AC-109 `last64(preceding_text) + candidate` payload, L2-normalized fp32 cosine
+vectors, and identity-bound isolated dependency versions. A process loads at
+most one heavyweight embedding model; load, inference, and identity faults
+fail closed. See `docs/dedicated-embedding-adapters.md` for the isolated
+`.venv-embeddings` setup and the deferred v2 boundary.
+
 ## Fact Maintenance
 
 The semantic-memory fact root contains an owner-only `maintenance.lock`. Fact
