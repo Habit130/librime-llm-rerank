@@ -32,6 +32,9 @@ class DedicatedEmbeddingBenchmarkTest(unittest.TestCase):
         self.assertEqual("not_read_or_run", report["v2"])
         self.assertEqual(2, len(report["representation_ids"]))
 
+    def test_fixture_adapter_is_deterministic_for_both_routes(self):
+        self.assertEqual(run_fixture_adapter(), run_fixture_adapter())
+
 
 if __name__ == "__main__":
     unittest.main()

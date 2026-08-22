@@ -67,24 +67,17 @@ class EmbeddingRoute:
     model_name: str
 
     def __post_init__(self):
-        if self.route_id not in ("qwen3-embedding-0.6b", "bge-m3-dense-1024"):
-            raise EmbeddingIdentityError("unsupported embedding route")
-        if self.adapter not in ("qwen3", "bge-m3"):
-            raise EmbeddingIdentityError("unsupported embedding adapter")
-        if self.pooling not in ("last-token", "dense-mean"):
-            raise EmbeddingIdentityError("unsupported embedding pooling")
-        if not self.model_name:
-            raise EmbeddingIdentityError("model name must not be empty")
-        if self.adapter == "qwen3":
-            if self.instruction != QWEN3_QUERY_INSTRUCTION:
-                raise EmbeddingIdentityError("Qwen instruction is not frozen")
-            if self.pooling != "last-token":
-                raise EmbeddingIdentityError("Qwen route must use last-token pooling")
-        else:
-            if self.instruction != "none":
-                raise EmbeddingIdentityError("BGE route must not use an instruction")
-            if self.pooling != "dense-mean":
-                raise EmbeddingIdentityError("BGE route must use dense mean pooling")
+        expected = {
+            "qwen3-embedding-0.6b": (
+                "qwen3", QWEN3_QUERY_INSTRUCTION, "last-token",
+                "Qwen3-Embedding-0.6B"),
+            "bge-m3-dense-1024": (
+                "bge-m3", "none", "dense-mean", "BGE-M3"),
+        }.get(self.route_id)
+        if expected is None or (
+                self.adapter, self.instruction, self.pooling, self.model_name
+        ) != expected:
+            raise EmbeddingIdentityError("embedding route semantics are not frozen")
 
 
 QWEN3_EMBEDDING_ROUTE = EmbeddingRoute(
@@ -408,12 +401,11 @@ class DedicatedEmbeddingAdapter:
             self._validate_identity()
             return
         self._validate_identity()
-        if self.model_path is None:
-            model_key = ("injected", self.identity.model_digest,
-                         self.identity.tokenizer_digest)
-        else:
-            model_key = (os.path.realpath(self.model_path),
-                         self.identity.model_digest)
+        model_key = (
+            "injected" if self.model_path is None
+            else os.path.realpath(self.model_path),
+            self.representation_id,
+        )
         loader = self._loader or self._default_loader
         model, tokenizer = _load_or_reuse_model(
             model_key, loader, validator=self._validate_model_shape)
@@ -427,6 +419,13 @@ class DedicatedEmbeddingAdapter:
         if dimension is not None and dimension != EMBEDDING_OUTPUT_DIMENSION:
             raise EmbeddingIdentityError(
                 "loaded model dimension is not 1024")
+        model_type = getattr(config, "model_type", None)
+        expected_type = "qwen3" if self.route.adapter == "qwen3" \
+            else "xlm-roberta"
+        if model_type != expected_type:
+            raise EmbeddingIdentityError(
+                "loaded model architecture %r does not match %s route"
+                % (model_type, self.route.route_id))
 
     def _input_text(self, preceding_text, candidate, is_query):
         payload = candidate_conditioned_payload(preceding_text, candidate)

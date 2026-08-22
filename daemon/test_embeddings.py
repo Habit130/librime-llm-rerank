@@ -77,6 +77,18 @@ class EmbeddingRouteTest(unittest.TestCase):
         self.assertEqual("none", BGE_M3_EMBEDDING_ROUTE.instruction)
         self.assertEqual("dense-mean", BGE_M3_EMBEDDING_ROUTE.pooling)
 
+    def test_mixed_route_semantics_are_rejected(self):
+        from embeddings import EmbeddingRoute
+
+        with self.assertRaises(EmbeddingIdentityError):
+            EmbeddingRoute(
+                route_id="qwen3-embedding-0.6b",
+                adapter="bge-m3",
+                instruction="none",
+                pooling="dense-mean",
+                model_name="BGE-M3",
+            )
+
     def test_identity_binds_all_embedding_components(self):
         identity = fixture_embedding_identity(QWEN3_EMBEDDING_ROUTE)
         identifier = embedding_representation_id(QWEN3_EMBEDDING_ROUTE,
@@ -120,9 +132,10 @@ class AdapterTest(unittest.TestCase):
     def tearDown(self):
         _reset_model_registry_for_tests()
 
-    def make_model(self, values, token_count=2):
+    def make_model(self, values, token_count=2, model_type="qwen3"):
         tokenizer = FakeTokenizer(token_count)
         model = FakeModel(values)
+        model.config.model_type = model_type
         return model, tokenizer, lambda: (model, tokenizer)
 
     def test_qwen_query_instruction_and_document_payload(self):
@@ -148,7 +161,8 @@ class AdapterTest(unittest.TestCase):
     def test_bge_query_and_document_have_no_instruction_and_use_dense_mean(self):
         first = embedding_fixture_vector(0)
         second = embedding_fixture_vector(1)
-        model, tokenizer, loader = self.make_model(rows(first, second))
+        model, tokenizer, loader = self.make_model(
+            rows(first, second), model_type="xlm-roberta")
         adapter = BGEM3EmbeddingAdapter(
             identity=fixture_embedding_identity(BGE_M3_EMBEDDING_ROUTE),
             loader=loader,
@@ -178,26 +192,37 @@ class AdapterTest(unittest.TestCase):
             other.query("上文", "候选")
 
     def test_loader_fault_never_returns_a_vector(self):
-        def fail():
-            raise RuntimeError("weights unavailable")
+        for adapter_type, route in (
+                (Qwen3EmbeddingAdapter, QWEN3_EMBEDDING_ROUTE),
+                (BGEM3EmbeddingAdapter, BGE_M3_EMBEDDING_ROUTE)):
+            with self.subTest(route=route.route_id):
+                _reset_model_registry_for_tests()
 
-        adapter = Qwen3EmbeddingAdapter(
-            identity=fixture_embedding_identity(QWEN3_EMBEDDING_ROUTE),
-            loader=fail,
-        )
-        with self.assertRaises(EmbeddingLoadError):
-            adapter.query("上文", "候选")
+                def fail():
+                    raise RuntimeError("weights unavailable")
+
+                adapter = adapter_type(
+                    identity=fixture_embedding_identity(route), loader=fail)
+                with self.assertRaises(EmbeddingLoadError):
+                    adapter.query("上文", "候选")
 
     def test_dirty_forward_never_returns_a_vector(self):
-        dirty = list(embedding_fixture_vector(0))
-        dirty[0] = float("nan")
-        _model, _tokenizer, loader = self.make_model(rows(dirty, dirty))
-        adapter = Qwen3EmbeddingAdapter(
-            identity=fixture_embedding_identity(QWEN3_EMBEDDING_ROUTE),
-            loader=loader,
-        )
-        with self.assertRaises(EmbeddingInferenceError):
-            adapter.query("上文", "候选")
+        for adapter_type, route, model_type in (
+                (Qwen3EmbeddingAdapter, QWEN3_EMBEDDING_ROUTE, "qwen3"),
+                (BGEM3EmbeddingAdapter, BGE_M3_EMBEDDING_ROUTE,
+                 "xlm-roberta")):
+            with self.subTest(route=route.route_id):
+                _reset_model_registry_for_tests()
+                dirty = list(embedding_fixture_vector(0))
+                dirty[0] = float("nan")
+                _model, _tokenizer, loader = self.make_model(
+                    rows(dirty, dirty), model_type=model_type)
+                adapter = adapter_type(
+                    identity=fixture_embedding_identity(route),
+                    loader=loader,
+                )
+                with self.assertRaises(EmbeddingInferenceError):
+                    adapter.query("上文", "候选")
 
 
 class IdentityFaultTest(unittest.TestCase):
@@ -225,6 +250,7 @@ class IdentityFaultTest(unittest.TestCase):
         )
         model = FakeModel(rows(embedding_fixture_vector(0),
                                embedding_fixture_vector(0)))
+        model.config.model_type = "qwen3"
         tokenizer = FakeTokenizer()
         adapter = Qwen3EmbeddingAdapter(
             model_path=self.root,
