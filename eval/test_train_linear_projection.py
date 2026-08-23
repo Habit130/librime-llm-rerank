@@ -75,6 +75,11 @@ class TrainingContractTest(unittest.TestCase):
         candidate_event.preceding_text = ""
         self.assertTrue(trainer._event_is_replayable(candidate_event))
 
+    def test_competition_membership_uses_existing_normalized_fact_semantics(self):
+        candidate_event = event("variant", "於", (1, 0))
+        candidate_event.competition = ("于",)
+        self.assertTrue(trainer._event_is_replayable(candidate_event))
+
     def test_feature_concat_requires_three_unit_sources(self):
         source = np.zeros(1024, dtype=np.float32)
         source[0] = 1.0
@@ -114,6 +119,10 @@ class TrainingContractTest(unittest.TestCase):
                     cutoff=(1000000, 0))
         finally:
             facts.close()
+
+    def test_weights_cannot_be_written_outside_ignored_local_root(self):
+        with self.assertRaises(trainer.TrainingError):
+            trainer.run_training("unused", "unused", "/tmp/ac111-weights")
 
     def test_suffix_event_and_retraction_are_rejected(self):
         for retract in (False, True):

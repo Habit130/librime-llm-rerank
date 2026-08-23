@@ -29,11 +29,11 @@
   "fit": {
     "fit": {
       "best_epoch": 120,
-      "best_validation_loss": 0.12143594567037179,
+      "best_validation_loss": 0.10151128944414559,
       "epochs_run": 120,
       "stop_reason": "max_epochs",
-      "train_loss": 0.08755258541170234,
-      "validation_loss": 0.12143594567037179
+      "train_loss": 0.06035821379718097,
+      "validation_loss": 0.10151128944414559
     },
     "pairs": {
       "train_events": 1528,
@@ -41,7 +41,7 @@
       "validation_events": 382,
       "validation_pairs": 1036
     },
-    "weight_digest": "0b59fe742a4711dae20f86cbb543edbb2e93e8d114dc46c5fcb4b3e0fa72bb40"
+    "weight_digest": "65516648791f3db8c53885b272ab913450e71b618bbaaa858e277231bc7364c5"
   },
   "isolation": {
     "alpha": 0,
@@ -77,7 +77,7 @@
     "vectors": "not committed"
   },
   "projection": {
-    "fingerprint": "candidate-conditioned-linear-v1:43559b8bdb09204978091576e062e2d38f04949fa3c662cfe5ec11ed8f717299",
+    "fingerprint": "candidate-conditioned-linear-v1:252fe7d1bbe7e1a178dd3d01278afef6edd6b09ff58dc9a4ce77a6f224392e1a",
     "input_dim": 3072,
     "metric": "cosine",
     "output_dim": 256,
@@ -86,9 +86,9 @@
       "candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=21:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine",
       "candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=28:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine"
     ],
-    "training_code_digest": "ca0cec55f554e02b418cad49c458cb62ed0b48d735ffe3c9fe1439d3b590c12b",
+    "training_code_digest": "0f2699966ec3dfc2fffac82554ad75a80c7eb35fc50035e3ef83103746b1a61f",
     "vector_format": "fp32-l2",
-    "weight_digest": "0b59fe742a4711dae20f86cbb543edbb2e93e8d114dc46c5fcb4b3e0fa72bb40"
+    "weight_digest": "65516648791f3db8c53885b272ab913450e71b618bbaaa858e277231bc7364c5"
   },
   "snapshot": {
     "history_id": "dc3ffbf1a21957e0bb4ceed535c9df56",

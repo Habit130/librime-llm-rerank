@@ -141,6 +141,16 @@ class LinearProjectionTest(unittest.TestCase):
                 projection.metadata["source_representation_ids"], (0, 1000, 2000)))
         adapter = ProjectedCandidateRepresentationProvider(providers, projection)
         vector = adapter.query_vector_for_candidate("unused", "candidate")
+        expected = projection.apply(tuple(
+            value for provider in providers
+            for value in provider.query_vector_for_candidate(
+                "unused", "candidate")))
+        reverse = projection.apply(tuple(
+            value for provider in reversed(providers)
+            for value in provider.query_vector_for_candidate(
+                "unused", "candidate")))
+        self.assertEqual(expected, vector)
+        self.assertNotEqual(reverse, vector)
         self.assertEqual(OUTPUT_DIMENSION, len(vector))
         self.assertAlmostEqual(1.0, math.sqrt(sum(value * value
                                                    for value in vector)),

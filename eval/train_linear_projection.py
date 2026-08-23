@@ -38,6 +38,7 @@ import numpy as np
 
 _ROOT = Path(__file__).resolve().parents[1]
 _DAEMON = _ROOT / "daemon"
+_LOCAL_OUTPUT_ROOT = (_ROOT / ".local-work").resolve()
 if str(_DAEMON) not in sys.path:
     sys.path.insert(0, str(_DAEMON))
 
@@ -166,7 +167,10 @@ def _event_is_replayable(event):
             isinstance(candidate, str) and candidate
             for candidate in event.competition):
         return False
-    selected = _selection_label(event)
+    try:
+        selected = match_text(event.final_selection_text)
+    except Exception as error:  # noqa: BLE001 - malformed facts are excluded
+        raise TrainingError("selection identity is malformed") from error
     return any(match_text(candidate) == selected
                for candidate in event.competition)
 
@@ -413,7 +417,7 @@ def _project_rows(features, weights):
     norms = np.sqrt(np.sum(projected.astype(np.float64) ** 2, axis=1))
     if not bool(np.isfinite(norms).all()) or bool((norms <= 0.0).any()):
         raise TrainingError("projection produced a zero or non-finite norm")
-    return projected / norms[:, None]
+    return projected / norms[:, None], norms
 
 
 def _pair_arrays(pairs, features):
@@ -427,8 +431,8 @@ def _pair_arrays(pairs, features):
 
 def _pair_loss_gradient(weights, arrays):
     left, right, labels = arrays
-    left_projected = _project_rows(left, weights)
-    right_projected = _project_rows(right, weights)
+    left_projected, left_norms = _project_rows(left, weights)
+    right_projected, right_norms = _project_rows(right, weights)
     similarities = np.sum(left_projected * right_projected, axis=1)
     positive = labels > 0
     losses = np.zeros(len(labels), dtype=np.float64)
@@ -452,8 +456,10 @@ def _pair_loss_gradient(weights, arrays):
 
     left_scale = (d_similarity * weights_by_class)[:, None]
     right_scale = left_scale
-    left_gradient = (right_projected - similarities[:, None] * left_projected)
-    right_gradient = (left_projected - similarities[:, None] * right_projected)
+    left_gradient = (right_projected - similarities[:, None] * left_projected) \
+        / left_norms[:, None]
+    right_gradient = (left_projected - similarities[:, None] * right_projected) \
+        / right_norms[:, None]
     left_gradient *= left_scale
     right_gradient *= right_scale
     gradient = left_gradient.T.dot(left) + right_gradient.T.dot(right)
@@ -524,6 +530,11 @@ def training_code_digest(root=_ROOT):
         ("daemon/hidden_state.py", root / "daemon/hidden_state.py"),
         ("daemon/representations.py", root / "daemon/representations.py"),
         ("daemon/oracle.py", root / "daemon/oracle.py"),
+        ("daemon/server.py", root / "daemon/server.py"),
+        ("daemon/opencc_data/TSCharacters.txt",
+         root / "daemon/opencc_data/TSCharacters.txt"),
+        ("daemon/opencc_data/TSPhrases.txt",
+         root / "daemon/opencc_data/TSPhrases.txt"),
         ("eval/walkforward.py", root / "eval/walkforward.py"),
         ("eval/snapshot.py", root / "eval/snapshot.py"),
     )
@@ -652,6 +663,13 @@ def render_summary(dataset, pair_construction, fit_evidence, metadata,
 def run_training(snapshot_path, model_path, output_dir,
                  summary_path=None, seed=SEED):
     """Materialize prefix features, fit, save local weights, and write summary."""
+    if seed != SEED:
+        raise TrainingError("AC-111-v2 seed is frozen at %d" % SEED)
+    output_dir = str(Path(output_dir).expanduser().resolve())
+    local_root = str(_LOCAL_OUTPUT_ROOT)
+    if output_dir != local_root \
+            and not output_dir.startswith(local_root + os.sep):
+        raise TrainingError("projection weights must stay under .local-work")
     # The digest check and all prefix-boundary checks happen before model load.
     dataset = load_prefix_dataset(snapshot_path)
 
@@ -692,7 +710,6 @@ def run_training(snapshot_path, model_path, output_dir,
     }
     metadata = _projection_metadata(dataset, source_ids, training_evidence, seed)
     projection = LinearProjection(weights, metadata)
-    output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     weight_path = os.path.join(output_dir, "candidate-conditioned-linear.npz")
     projection.save(weight_path)

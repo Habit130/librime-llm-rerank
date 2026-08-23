@@ -133,6 +133,16 @@ features remain local; `eval/SUMMARY-linear-projection-AC111.md` is the
 desensitized result. V2 quality and walk-forward selection remain deferred to
 #112/#113. Live ranking remains `alpha=0`, `gamma=0`.
 
+```sh
+daemon/.venv/bin/python eval/train_linear_projection.py \
+  --snapshot <confirmed-prefix-snapshot> \
+  --model /Users/habit/Models/Qwen/Qwen3-0.6B-Base \
+  --output-dir .local-work/ac111 \
+  --summary eval/SUMMARY-linear-projection-AC111.md
+```
+
+The driver refuses to write matrix artifacts outside `.local-work`.
+
 ## Strict-HLC walk-forward evaluation (Habit130/squirrel#70/#77)
 
 `walkforward.py` + `metrics.py` / `bootstrap.py` / `calibration.py` /
