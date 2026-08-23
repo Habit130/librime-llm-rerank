@@ -32,6 +32,7 @@ from representations import (
     RepresentationSpec,
     build_model_token_identity,
     candidate_tokenization_for,
+    candidate_conditioned_specs,
     exact_tokenization_for,
     l2_normalize,
     representation_id,
@@ -268,9 +269,9 @@ class HiddenStateExtractor:
             lambda: self._run(tail_ids, prefix_cache, {SPLIT_REUSE_LAYER}))
         return self._final_validate(snapshots[SPLIT_REUSE_LAYER]), cache
 
-    def _run_candidate(self, ids, candidate_start, candidate_count,
-                       layer_number, pooling):
-        """Forward one candidate payload and pool only its token span."""
+    def _run_candidate_layers(self, ids, candidate_start, candidate_count,
+                               layer_numbers, pooling):
+        """Forward one candidate payload and pool the requested layers."""
         mx, create_attention_mask, _ = _lazy_mlx()
         if not ids:
             raise EmptyContextRepresentationError("no candidate payload tokens")
@@ -283,10 +284,15 @@ class HiddenStateExtractor:
         h = inner.embed_tokens(token_ids)
         layer_cache = [None] * len(inner.layers)
         mask = create_attention_mask(h, layer_cache[0])
+        wanted = set(layer_numbers)
+        if not wanted:
+            raise InvalidRepresentationSpec("candidate layer set is empty")
+        snapshots = {}
         try:
             for index, layer in enumerate(inner.layers):
                 h = layer(h, mask, layer_cache[index])
-                if index + 1 != layer_number:
+                layer_number = index + 1
+                if layer_number not in wanted:
                     continue
                 normalized = inner.norm(h).astype(mx.float32)
                 import numpy as np
@@ -294,15 +300,17 @@ class HiddenStateExtractor:
                     normalized[0, candidate_start:
                                candidate_start + candidate_count]).reshape(
                                    candidate_count, -1)
-                return pool_candidate_hidden_states(
+                snapshots[layer_number] = pool_candidate_hidden_states(
                     span.tolist(), 0, candidate_count, pooling)
+            if len(snapshots) != len(wanted):
+                raise InvalidRepresentationSpec(
+                    "candidate layers were not all reached")
+            return snapshots
         except RepresentationError:
             raise
         except Exception as error:  # noqa: BLE001 - fail closed
             raise ModelForwardRepresentationError(
                 "candidate-conditioned forward failed: %s" % error) from error
-        raise InvalidRepresentationSpec(
-            "candidate layer %d was not reached" % layer_number)
 
     def candidate(self, spec, preceding_text, candidate):
         """Generate one frozen candidate-conditioned route vector."""
@@ -314,8 +322,23 @@ class HiddenStateExtractor:
         _, ids, start, count = candidate_tokenization_for(
             tokenizer, preceding_text, candidate,
             spec.window_chars, spec=spec)
-        return self._guarded(lambda: self._run_candidate(
-            ids, start, count, spec.layer, spec.pooling))
+        return self._guarded(lambda: self._run_candidate_layers(
+            ids, start, count, (spec.layer,), spec.pooling)[spec.layer])
+
+    def candidate_span_mean_all(self, preceding_text, candidate):
+        """Generate the three AC-109 span-mean vectors in one forward."""
+        specs = tuple(spec for spec in candidate_conditioned_specs()
+                      if spec.pooling == "candidate_span_mean")
+        if tuple(spec.layer for spec in specs) != (14, 21, 28):
+            raise InvalidRepresentationSpec(
+                "AC-109 span-mean source set changed")
+        self._require_model()
+        tokenizer = self._tokenizer()
+        _, ids, start, count = candidate_tokenization_for(
+            tokenizer, preceding_text, candidate, spec=specs[0])
+        return self._guarded(lambda: self._run_candidate_layers(
+            ids, start, count, tuple(spec.layer for spec in specs),
+            "candidate_span_mean"))
 
 
 class HiddenStateRepresentationProvider(RepresentationProvider):

@@ -26,6 +26,10 @@ from representations import (  # noqa: E402
     candidate_conditioned_payload,
     candidate_conditioned_specs,
 )
+from linear_projection import (  # noqa: E402
+    LinearProjection,
+    ProjectedCandidateRepresentationProvider,
+)
 from semantic_benchmark import (  # noqa: E402
     BENCHMARK_K_EVIDENCE,
     BENCHMARK_SATURATION_K,
@@ -58,8 +62,37 @@ def payload(preceding_text, candidate):
     return candidate_conditioned_payload(preceding_text, candidate)
 
 
+def projected_provider_from_local_weights(weight_path, source_providers):
+    """Load the optional local AC-111 adapter for a #69-v1-style run.
+
+    The path is intentionally explicit.  Without a local, identity-validated
+    artifact this adapter is not constructed, so model-free v1 tests never
+    need projection weights in Git.
+    """
+    if not weight_path:
+        return None
+    projection = LinearProjection.load(weight_path)
+    return ProjectedCandidateRepresentationProvider(source_providers,
+                                                    projection)
+
+
+def projected_provider_from_extractor(weight_path, extractor):
+    """Build the real AC-109 source chain when a local matrix is supplied."""
+    if not weight_path:
+        return None
+    projection = LinearProjection.load(weight_path)
+    return ProjectedCandidateRepresentationProvider.from_extractor(
+        extractor, projection)
+
+
 def _near_axis(cosine):
     return (cosine, math.sqrt(1.0 - cosine * cosine), 0.0, 0.0)
+
+
+def _lift_fixture_vector(vector):
+    """Lift a four-dimensional v1 fixture vector to one AC-109 source width."""
+    values = tuple(float(value) for value in vector)
+    return values + (0.0,) * (1024 - len(values))
 
 
 def _case_result(case, representation_id):
@@ -108,8 +141,61 @@ def _case_result(case, representation_id):
         fixture.close()
 
 
-def run_fixture_adapter():
-    """Run the four routes over a bounded, controlled subset of #69 v1."""
+def _projected_case_result(case, weight_path, source_ids):
+    """Run one v1 fixture through the optional local projection adapter."""
+    fixture = SyntheticFacts(case, FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
+    try:
+        expected = case.expected_candidate
+        query_vectors = {
+            (payload(case.query_preceding_text, candidate), candidate):
+            _lift_fixture_vector(
+                QUERY_AXIS if candidate == expected else ORTHOGONAL_AXIS)
+            for candidate in case.candidates
+        }
+        target_cosine = 0.97 if case.relation == "positive" else 0.10
+        event_vectors = {
+            (payload(case.recorded_preceding_text, case.history_selection),
+             SCHEMA_ID, case.choice_problem, case.history_selection):
+            _lift_fixture_vector(_near_axis(target_cosine))
+        }
+        source_providers = tuple(
+            CandidateFixtureRepresentationProvider(
+                identifier, query_vectors, event_vectors,
+                default_query=_lift_fixture_vector(ORTHOGONAL_AXIS),
+                default_event=_lift_fixture_vector(DEFAULT_EVENT_AXIS))
+            for identifier in source_ids)
+        provider = projected_provider_from_local_weights(
+            weight_path, source_providers)
+        params = OracleParams(
+            tau=BENCHMARK_TAU,
+            k_evidence=BENCHMARK_K_EVIDENCE,
+            half_life=BENCHMARK_HALF_LIFE,
+            saturation_k=BENCHMARK_SATURATION_K,
+        )
+        service = EvidenceService(
+            os.path.dirname(fixture.db_path), params, provider, gamma=0.0)
+        response = service.serve({
+            "schema_id": SCHEMA_ID,
+            "category": CATEGORY,
+            "canonical_segment_input": case.choice_problem,
+            "preceding_text": case.query_preceding_text,
+            "candidates": list(case.candidates),
+            "fact_high_water": None,
+        })
+        return {
+            "relation": case.relation,
+            "status": response["status"],
+            "vector_dimension": provider.vector_dimension(),
+            "finite_evidence": all(
+                math.isfinite(entry["s"])
+                for entry in response["evidence"]),
+        }
+    finally:
+        fixture.close()
+
+
+def run_fixture_adapter(projection_path=None):
+    """Run v1 routes and, optionally, the local AC-111 projection route."""
     manifest = benchmark_manifest()
     if manifest["benchmark_digest"] != V1_DIGEST:
         raise RuntimeError("accepted #69 v1 digest changed")
@@ -130,16 +216,30 @@ def run_fixture_adapter():
                 ],
             })
         results[route] = passed
-    return {
+    report = {
         "contract": CONTRACT_ID,
         "payload_schema": PAYLOAD_SCHEMA,
         "v1_benchmark_digest": manifest["benchmark_digest"],
         "routes": results,
         "v2": "not_read_or_run",
     }
+    if projection_path:
+        projection = LinearProjection.load(projection_path)
+        source_ids = tuple(projection.metadata["source_representation_ids"])
+        report["linear_projection"] = [
+            _projected_case_result(case, projection_path, source_ids)
+            for case in cases
+        ]
+    else:
+        report["linear_projection"] = "not_loaded"
+    return report
 
 
 if __name__ == "__main__":
-    report = run_fixture_adapter()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--projection", default=None,
+                        help="optional owner-local AC-111 NPZ artifact")
+    report = run_fixture_adapter(parser.parse_args().projection)
     print("candidate-conditioned v1 adapter: PASS")
     print("routes: %s" % ", ".join(report["routes"]))

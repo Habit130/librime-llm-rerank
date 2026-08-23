@@ -61,6 +61,10 @@ eval/.venv/bin/python eval/calibrate.py \
 
 Requirements:
 
+- `numpy>=2.0,<3` for the AC-111 projection trainer and model-free projection
+  adapter tests;
+- the matching `daemon/requirements.txt` numeric dependency for daemon
+  projection tests;
 - the daemon venv at `daemon/.venv` with mlx/mlx-lm and the model at
   `--model` (default `/Users/habit/Models/Qwen/Qwen3-0.6B-Base`);
 - a quiet machine (latency-sensitive); total runtime is roughly 2 hours;
@@ -125,9 +129,21 @@ loading a model or producing v2 quality results:
 python3 eval/semantic_benchmark_v2.py --fixture --artifact-dir <dir>
 ```
 
-Real embedding routes, candidate-span extraction, projection training, and v2
-quality results are deferred to issues #109-#113. Live ranking remains
-`alpha=0`, `gamma=0`.
+Real embedding routes are covered by #110, and the AC-111 offline projection
+driver consumes only the confirmed prefix snapshot. Its matrix and extracted
+features remain local; `eval/SUMMARY-linear-projection-AC111.md` is the
+desensitized result. V2 quality and walk-forward selection remain deferred to
+#112/#113. Live ranking remains `alpha=0`, `gamma=0`.
+
+```sh
+daemon/.venv/bin/python eval/train_linear_projection.py \
+  --snapshot <confirmed-prefix-snapshot> \
+  --model /Users/habit/Models/Qwen/Qwen3-0.6B-Base \
+  --output-dir .local-work/ac111 \
+  --summary eval/SUMMARY-linear-projection-AC111.md
+```
+
+The driver refuses to write matrix artifacts outside `.local-work`.
 
 ## Strict-HLC walk-forward evaluation (Habit130/squirrel#70/#77)
 
