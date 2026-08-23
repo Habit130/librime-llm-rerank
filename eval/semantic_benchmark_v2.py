@@ -6,18 +6,21 @@ not edited here.  This module owns only the new v2 acceptance set, its
 candidate-conditioned payloads, the seven-route declaration, v1-only Q95
 calibration, and a fail-closed one-shot artifact boundary.
 
-No function in this module loads a model, reads live facts, opens a daemon
-socket, or reports v2 candidate quality.  The fixture exercises the existing
-exact oracle with disposable facts and controlled vectors so protocol faults
-remain testable without model dependencies.
+The default fixture never loads a model, reads live facts, opens a daemon
+socket, or reports v2 candidate quality.  The explicit AC-112 real runner uses
+only local model paths and disposable synthetic facts after a v1-only freeze.
+The fixture exercises the existing exact oracle with controlled vectors so
+protocol faults remain testable without model dependencies.
 """
 
 import argparse
 import copy
+import datetime
 import hashlib
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, replace
@@ -28,7 +31,13 @@ _DAEMON = _ROOT / "daemon"
 if str(_DAEMON) not in sys.path:
     sys.path.insert(0, str(_DAEMON))
 
-from oracle import OracleParams, OracleQuery, FactReader, compute_evidence  # noqa: E402
+from oracle import (  # noqa: E402
+    CosineEngine,
+    FactReader,
+    OracleParams,
+    OracleQuery,
+    compute_evidence,
+)
 from semantic_benchmark import (  # noqa: E402
     AXES as V1_AXES,
     BENCHMARK_VERSION as V1_BENCHMARK_VERSION,
@@ -42,14 +51,30 @@ from semantic_benchmark import (  # noqa: E402
 
 
 CONTRACT_ID = "AC-108-v1"
+QUALITY_CONTRACT_ID = "AC-112-v1"
 V2_BENCHMARK_VERSION = "candidate-conditioned-semantic-benchmark-v2"
 V2_ROLE = "acceptance"
 PAYLOAD_SCHEMA = "candidate-conditioned-query-history-v1"
 V2_K_EVIDENCE = 8
 Q95 = 0.95
 STRICT_THRESHOLD_SEMANTICS = "cosine > tau"
+REAL_QUALITY_RUN_KIND = "seven_route_v2_quality"
+QUALITY_SEED = 0
 V1_BENCHMARK_DIGEST = (
     "69205442228a14b6942e2a4de999587e893125f24f3d91e3e218a0140e2df1ec"
+)
+PINNED_V2_BENCHMARK_DIGEST = (
+    "4d2ed16b607f127c125f1d5c4cd2bfaced0ad9829550bf3788e637727429e01c"
+)
+PINNED_ROUTE_MATRIX_DIGEST = (
+    "592f42dbd59a06e56f44f07a824ab7aec73758026db15ee058f62e656633b602"
+)
+PINNED_PROJECTION_FINGERPRINT_PREFIX = (
+    "candidate-conditioned-linear-v1:"
+    "cc64768fdc016285eff08a49340efe0351cd39e9b82f99566c6d2e4e72d1307b"
+)
+PINNED_PROJECTION_WEIGHT_DIGEST = (
+    "65516648791f3db8c53885b272ab913450e71b618bbaaa858e277231bc7364c5"
 )
 AXES = tuple(V1_AXES)
 V2_FAMILY_DISTRIBUTION = {
@@ -74,6 +99,9 @@ ARTIFACT_FILENAMES = frozenset({
     "semantic_benchmark_v2_manifest.json",
     "semantic_benchmark_v2_review.md",
     "semantic_benchmark_v2.frozen",
+    "semantic_benchmark_v2_run_freeze.json",
+    "semantic_benchmark_v2.quality_started",
+    "semantic_benchmark_v2.contract_failure.json",
     "semantic_benchmark_v2.accepted",
     "semantic_benchmark_v2_report.json",
 })
@@ -959,6 +987,134 @@ def validate_route_matrix(routes):
     return True
 
 
+EXPECTED_RUNTIME_ADAPTERS = {
+    "dedicated_qwen3_embedding_0_6b": "qwen3-embedding-0.6b",
+    "dedicated_bge_m3": "bge-m3-dense-1024",
+    "qwen_l14_candidate_span_mean": "candidate_l14_candidate_span_mean",
+    "qwen_l21_candidate_span_mean": "candidate_l21_candidate_span_mean",
+    "qwen_l28_candidate_span_mean": "candidate_l28_candidate_span_mean",
+    "qwen_l28_last_candidate_token_control": (
+        "candidate_l28_last_candidate_token"
+    ),
+    "qwen_global_l14_l21_l28_projection_3072_to_256": (
+        "candidate-conditioned-linear-projection"
+    ),
+}
+
+
+def verify_pinned_manifest(manifest):
+    """Reject a changed acceptance set before calibration or quality work."""
+    if not isinstance(manifest, dict):
+        raise BenchmarkProtocolError("v2 manifest must be an object")
+    if manifest.get("benchmark_digest") != PINNED_V2_BENCHMARK_DIGEST:
+        raise BenchmarkProtocolError("pinned v2 benchmark digest mismatch")
+    if manifest.get("route_matrix_digest") != PINNED_ROUTE_MATRIX_DIGEST:
+        raise BenchmarkProtocolError("pinned route matrix digest mismatch")
+    validate_route_matrix(manifest.get("route_matrix"))
+    return True
+
+
+def _validate_dependency_versions(value):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise BenchmarkProtocolError("runtime dependency versions are missing")
+    for item in value:
+        if (not isinstance(item, (list, tuple)) or len(item) != 2
+                or not all(isinstance(part, str) and part for part in item)):
+            raise BenchmarkProtocolError("runtime dependency versions are invalid")
+
+
+def _runtime_id_matches_descriptor(route, binding):
+    route_id = route["route_id"]
+    runtime_id = binding["runtime_id"]
+    if route_id == "dedicated_qwen3_embedding_0_6b":
+        markers = (
+            "dedicated-embedding-repr-v1:route=qwen3-embedding-0.6b:",
+            ":serialization=last64-preceding-plus-candidate:no-separator:no-special:",
+            ":adapter=qwen3:",
+            ":instruction=Represent the candidate-conditioned query for semantic retrieval.",
+            ":pool=last-token:dim=1024:format=fp32-l2:metric=cosine:",
+        )
+    elif route_id == "dedicated_bge_m3":
+        markers = (
+            "dedicated-embedding-repr-v1:route=bge-m3-dense-1024:",
+            ":serialization=last64-preceding-plus-candidate:no-separator:no-special:",
+            ":adapter=bge-m3:", ":instruction=none:",
+            ":pool=dense-mean:dim=1024:format=fp32-l2:metric=cosine:",
+        )
+    elif route_id == "qwen_global_l14_l21_l28_projection_3072_to_256":
+        return runtime_id.startswith(PINNED_PROJECTION_FINGERPRINT_PREFIX)
+    else:
+        markers = (
+            "candidate-conditioned-repr-v1:payload="
+            "candidate-conditioned-concat-v1:",
+            ":serialization=last64-preceding-plus-candidate:no-separator:no-special:",
+            ":layer=%d:" % route["layer"],
+            ":pool=%s:" % route["pooling"],
+            ":window=64:", ":span=candidate-token-span-v1:",
+            ":norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine",
+        )
+    return all(marker in runtime_id for marker in markers)
+
+
+def validate_runtime_bindings(manifest, bindings):
+    """Bind every AC-108 descriptor to exactly one concrete runtime adapter."""
+    verify_pinned_manifest(manifest)
+    if not isinstance(bindings, dict):
+        raise BenchmarkProtocolError("runtime bindings must be an object")
+    expected_ids = {route["route_id"] for route in manifest["route_matrix"]}
+    if set(bindings) != expected_ids:
+        raise BenchmarkProtocolError("runtime binding route set drifted")
+    for route in manifest["route_matrix"]:
+        route_id = route["route_id"]
+        binding = bindings[route_id]
+        if not isinstance(binding, dict):
+            raise BenchmarkProtocolError("runtime binding must be an object")
+        required = {
+            "route_id", "runtime_adapter_id", "runtime_id",
+            "model_identity", "dependency_versions",
+        }
+        if route_id == "qwen_global_l14_l21_l28_projection_3072_to_256":
+            required.update({"projection_fingerprint", "projection_weight_digest"})
+        if set(binding) != required:
+            raise BenchmarkProtocolError("runtime binding schema drifted")
+        if binding["route_id"] != route_id or \
+                binding["runtime_adapter_id"] != EXPECTED_RUNTIME_ADAPTERS[route_id]:
+            raise BenchmarkProtocolError("runtime binding identity drifted")
+        if not isinstance(binding["runtime_id"], str) or not binding["runtime_id"]:
+            raise BenchmarkProtocolError("runtime representation ID is missing")
+        if not _runtime_id_matches_descriptor(route, binding):
+            raise BenchmarkProtocolError("runtime representation ID drifted")
+        identity = binding["model_identity"]
+        if not isinstance(identity, dict) or set(identity) != {
+                "model_digest", "tokenizer_digest", "dimension"}:
+            raise BenchmarkProtocolError("runtime model identity is invalid")
+        if (not isinstance(identity["model_digest"], str)
+                or not identity["model_digest"]
+                or not isinstance(identity["tokenizer_digest"], str)
+                or not identity["tokenizer_digest"]
+                or not isinstance(identity["dimension"], int)
+                or identity["dimension"] != route["dimension"]):
+            raise BenchmarkProtocolError("runtime model identity drifted")
+        if route_id != "qwen_global_l14_l21_l28_projection_3072_to_256":
+            digest_width = 16 if route["kind"].startswith("qwen_") else None
+            model_digest = identity["model_digest"][:digest_width]
+            tokenizer_digest = identity["tokenizer_digest"][:digest_width]
+            if (":model=%s:" % model_digest not in binding["runtime_id"]
+                    or ":tokenizer=%s:" % tokenizer_digest
+                    not in binding["runtime_id"]):
+                raise BenchmarkProtocolError("runtime digest binding drifted")
+        _validate_dependency_versions(binding["dependency_versions"])
+        if route_id == "qwen_global_l14_l21_l28_projection_3072_to_256":
+            if not isinstance(binding["projection_fingerprint"], str) or \
+                    not binding["projection_fingerprint"].startswith(
+                    PINNED_PROJECTION_FINGERPRINT_PREFIX):
+                raise BenchmarkProtocolError("projection fingerprint drifted")
+            if binding["projection_weight_digest"] != \
+                    PINNED_PROJECTION_WEIGHT_DIGEST:
+                raise BenchmarkProtocolError("projection weight digest drifted")
+    return True
+
+
 def benchmark_manifest_v2():
     cases = validate_v2_cases()
     v1 = _v1_snapshot()
@@ -1339,6 +1495,12 @@ def verify_artifact_privacy(artifact_dir):
             if marker in content:
                 raise BenchmarkProtocolError(
                     "privacy marker %r found in %s" % (marker, path))
+    report_path = artifact_dir / "semantic_benchmark_v2_report.json"
+    if report_path.is_file():
+        _assert_desensitized_report(_read_json(report_path))
+    freeze_path = artifact_dir / "semantic_benchmark_v2_run_freeze.json"
+    if freeze_path.is_file():
+        _assert_desensitized_quality_freeze(_read_json(freeze_path))
     return True
 
 
@@ -1357,6 +1519,7 @@ def freeze_inputs(artifact_dir):
     if any(artifact_dir.iterdir()):
         raise BenchmarkProtocolError("v2 artifact boundary must start empty")
     manifest = benchmark_manifest_v2()
+    verify_pinned_manifest(manifest)
     _write_exclusive(artifact_dir / "semantic_benchmark_v2_manifest.json",
                      canonical_json(manifest) + "\n")
     _write_exclusive(artifact_dir / "semantic_benchmark_v2_review.md",
@@ -1398,7 +1561,25 @@ def verify_frozen_inputs(artifact_dir):
     }:
         raise BenchmarkProtocolError("v2 frozen marker mismatch")
     validate_route_matrix(manifest["route_matrix"])
+    verify_pinned_manifest(manifest)
     return manifest
+
+
+def _assert_desensitized_value(value, label):
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    for marker in PRIVACY_MARKERS:
+        if marker in serialized:
+            raise BenchmarkProtocolError("%s contains a privacy marker" % label)
+    for case in tuple(v1_benchmark_cases()) + tuple(benchmark_cases_v2()):
+        values = [
+            case.query_preceding_text,
+            case.recorded_preceding_text,
+            *case.candidates,
+        ]
+        if hasattr(case, "source_query_text"):
+            values.extend((case.source_query_text, case.source_recorded_text))
+        if any(value and value in serialized for value in values):
+            raise BenchmarkProtocolError("%s contains raw benchmark content" % label)
 
 
 def _assert_desensitized_report(report):
@@ -1409,10 +1590,7 @@ def _assert_desensitized_report(report):
     )
     if any('"%s"' % key in serialized for key in forbidden_keys):
         raise BenchmarkProtocolError("report contains raw benchmark payload")
-    for case in benchmark_cases_v2():
-        if case.source_query_text in serialized or \
-                case.source_recorded_text in serialized:
-            raise BenchmarkProtocolError("report contains raw case text")
+    _assert_desensitized_value(report, "report")
 
 
 def _verify_report_calibrations(manifest, report):
@@ -1433,9 +1611,403 @@ def _verify_report_calibrations(manifest, report):
                 "route %s does not use v1-only Q95 calibration" % route_id)
 
 
-def accept_one_shot_report(artifact_dir, report):
+def _quality_one_shot_identity(manifest):
+    return sha256_text(canonical_json({
+        "contract": QUALITY_CONTRACT_ID,
+        "benchmark_version": manifest["benchmark_version"],
+        "benchmark_digest": manifest["benchmark_digest"],
+        "route_matrix_digest": manifest["route_matrix_digest"],
+    }))
+
+
+def _quality_freeze_digest(record):
+    return sha256_text(canonical_json({
+        key: value for key, value in record.items() if key != "freeze_digest"
+    }))
+
+
+def _validate_calibration_records(manifest, calibrations):
+    expected_routes = {route["route_id"] for route in manifest["route_matrix"]}
+    if not isinstance(calibrations, dict) or set(calibrations) != expected_routes:
+        raise BenchmarkProtocolError("calibration route set drifted")
+    for route in manifest["route_matrix"]:
+        record = calibrations[route["route_id"]]
+        if not isinstance(record, dict) or set(record) != {
+                "calibration", "observations"}:
+            raise BenchmarkProtocolError("calibration record is incomplete")
+        observations = record["observations"]
+        calibration = record["calibration"]
+        if not isinstance(observations, list) or not isinstance(calibration, dict):
+            raise BenchmarkProtocolError("calibration record is invalid")
+        if calibrate_v1_q95(observations) != calibration:
+            raise BenchmarkProtocolError("calibration is not v1-only Q95")
+
+
+def _assert_desensitized_quality_freeze(record):
+    _assert_desensitized_value(record, "quality freeze")
+
+
+def freeze_quality_inputs(artifact_dir, calibrations, bindings, code_sha,
+                          started_at, seed=QUALITY_SEED):
+    """Freeze every real-run input after v1 calibration and before v2 metrics."""
+    artifact_dir = Path(artifact_dir)
+    manifest = verify_frozen_inputs(artifact_dir)
+    verify_pinned_manifest(manifest)
+    _validate_calibration_records(manifest, calibrations)
+    validate_runtime_bindings(manifest, bindings)
+    if (not isinstance(code_sha, str) or len(code_sha) < 12
+            or any(character not in "0123456789abcdef" for character in code_sha)):
+        raise BenchmarkProtocolError("code SHA is invalid")
+    if not isinstance(started_at, str) or not started_at:
+        raise BenchmarkProtocolError("run start time is missing")
+    if seed != QUALITY_SEED:
+        raise BenchmarkProtocolError("quality seed drifted")
+    routes = {}
+    for descriptor in manifest["route_matrix"]:
+        route_id = descriptor["route_id"]
+        routes[route_id] = {
+            "descriptor": descriptor,
+            "binding": bindings[route_id],
+            "calibration": calibrations[route_id],
+        }
+    record = {
+        "contract": QUALITY_CONTRACT_ID,
+        "run_kind": REAL_QUALITY_RUN_KIND,
+        "manifest_digest": manifest["benchmark_digest"],
+        "route_matrix_digest": manifest["route_matrix_digest"],
+        "one_shot_identity": _quality_one_shot_identity(manifest),
+        "k_evidence": V2_K_EVIDENCE,
+        "payload_schema": PAYLOAD_SCHEMA,
+        "seed": seed,
+        "started_at": started_at,
+        "code_sha": code_sha,
+        "routes": routes,
+    }
+    record["freeze_digest"] = _quality_freeze_digest(record)
+    _assert_desensitized_quality_freeze(record)
+    _write_exclusive(artifact_dir / "semantic_benchmark_v2_run_freeze.json",
+                     canonical_json(record) + "\n")
+    return record
+
+
+def verify_quality_freeze(artifact_dir):
+    """Validate the pre-v2 real-run record without reading quality metrics."""
+    artifact_dir = Path(artifact_dir)
+    manifest = verify_frozen_inputs(artifact_dir)
+    path = artifact_dir / "semantic_benchmark_v2_run_freeze.json"
+    if not path.is_file():
+        raise BenchmarkProtocolError("real-run inputs were not frozen")
+    record = _read_json(path)
+    expected_keys = {
+        "contract", "run_kind", "manifest_digest", "route_matrix_digest",
+        "one_shot_identity", "k_evidence", "payload_schema", "seed",
+        "started_at", "code_sha", "routes", "freeze_digest",
+    }
+    if not isinstance(record, dict) or set(record) != expected_keys:
+        raise BenchmarkProtocolError("quality freeze schema drifted")
+    if record["contract"] != QUALITY_CONTRACT_ID or \
+            record["run_kind"] != REAL_QUALITY_RUN_KIND or \
+            record["manifest_digest"] != manifest["benchmark_digest"] or \
+            record["route_matrix_digest"] != manifest["route_matrix_digest"] or \
+            record["one_shot_identity"] != _quality_one_shot_identity(manifest) or \
+            record["k_evidence"] != V2_K_EVIDENCE or \
+            record["payload_schema"] != PAYLOAD_SCHEMA or \
+            record["seed"] != QUALITY_SEED:
+        raise BenchmarkProtocolError("quality freeze identity drifted")
+    if (not isinstance(record["code_sha"], str)
+            or len(record["code_sha"]) < 12
+            or any(character not in "0123456789abcdef"
+                   for character in record["code_sha"])):
+        raise BenchmarkProtocolError("quality freeze code SHA is invalid")
+    if not isinstance(record["started_at"], str) or not record["started_at"]:
+        raise BenchmarkProtocolError("quality freeze start time is missing")
+    expected_routes = {route["route_id"] for route in manifest["route_matrix"]}
+    if not isinstance(record["routes"], dict) or set(record["routes"]) != expected_routes:
+        raise BenchmarkProtocolError("quality freeze route set drifted")
+    bindings = {}
+    calibrations = {}
+    for descriptor in manifest["route_matrix"]:
+        route_id = descriptor["route_id"]
+        route_record = record["routes"][route_id]
+        if not isinstance(route_record, dict) or set(route_record) != {
+                "descriptor", "binding", "calibration"}:
+            raise BenchmarkProtocolError("quality freeze route schema drifted")
+        if canonical_json(route_record["descriptor"]) != canonical_json(descriptor):
+            raise BenchmarkProtocolError("quality freeze descriptor drifted")
+        bindings[route_id] = route_record["binding"]
+        calibrations[route_id] = route_record["calibration"]
+    validate_runtime_bindings(manifest, bindings)
+    _validate_calibration_records(manifest, calibrations)
+    if record["freeze_digest"] != _quality_freeze_digest(record):
+        raise BenchmarkProtocolError("quality freeze digest mismatch")
+    _assert_desensitized_quality_freeze(record)
+    return manifest, record
+
+
+def _quality_claim(artifact_dir, record):
+    return {
+        "state": "quality_started",
+        "contract": QUALITY_CONTRACT_ID,
+        "run_kind": REAL_QUALITY_RUN_KIND,
+        "one_shot_identity": record["one_shot_identity"],
+        "run_freeze_digest": record["freeze_digest"],
+    }
+
+
+def claim_v2_quality_run(artifact_dir):
+    """Atomically consume the sole v2-quality attempt before metrics exist."""
+    artifact_dir = Path(artifact_dir)
+    _manifest, record = verify_quality_freeze(artifact_dir)
+    for name in (
+            "semantic_benchmark_v2.accepted",
+            "semantic_benchmark_v2_report.json",
+            "semantic_benchmark_v2.contract_failure.json"):
+        if (artifact_dir / name).exists():
+            raise BenchmarkProtocolError("real quality attempt is already terminal")
+    marker = _quality_claim(artifact_dir, record)
+    _write_exclusive(artifact_dir / "semantic_benchmark_v2.quality_started",
+                     canonical_json(marker) + "\n")
+    return marker
+
+
+def _verify_quality_claim(artifact_dir, record):
+    artifact_dir = Path(artifact_dir)
+    if (artifact_dir / "semantic_benchmark_v2.contract_failure.json").exists():
+        raise BenchmarkProtocolError("v2 quality attempt already ended in contract failure")
+    path = artifact_dir / "semantic_benchmark_v2.quality_started"
+    if not path.is_file() or _read_json(path) != _quality_claim(artifact_dir, record):
+        raise BenchmarkProtocolError("v2 quality attempt was not atomically claimed")
+
+
+def _validate_count_rate(group, count_key, total):
+    if not isinstance(group, dict) or not isinstance(group.get(count_key), int):
+        raise BenchmarkProtocolError("quality count is invalid")
+    if group[count_key] < 0 or group[count_key] > total or \
+            group.get("total") != total:
+        raise BenchmarkProtocolError("quality count drifted")
+    rate = group.get("rate")
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or \
+            not math.isfinite(rate) or not math.isclose(
+                rate, group[count_key] / total, rel_tol=0.0, abs_tol=1e-12):
+        raise BenchmarkProtocolError("quality rate drifted")
+
+
+def _validate_quality_results(manifest, record, routes):
+    expected_route_ids = {route["route_id"] for route in manifest["route_matrix"]}
+    if not isinstance(routes, dict) or set(routes) != expected_route_ids:
+        raise BenchmarkProtocolError("quality route set drifted")
+    cases_by_id = {case.case_id: case for case in benchmark_cases_v2()}
+    passed_routes = []
+    for descriptor in manifest["route_matrix"]:
+        route_id = descriptor["route_id"]
+        result = routes[route_id]
+        expected_keys = {
+            "runtime_id", "tau", "positive", "hard_negative",
+            "exact_top_k", "failures", "gate_pass",
+        }
+        if not isinstance(result, dict) or set(result) != expected_keys:
+            raise BenchmarkProtocolError("quality result schema drifted")
+        calibration = record["routes"][route_id]["calibration"]["calibration"]
+        if result["runtime_id"] != record["routes"][route_id]["binding"]["runtime_id"]:
+            raise BenchmarkProtocolError("quality runtime ID drifted")
+        if (isinstance(result["tau"], bool)
+                or not isinstance(result["tau"], (int, float))
+                or not math.isfinite(result["tau"])
+                or result["tau"] != calibration["tau"]):
+            raise BenchmarkProtocolError("quality threshold drifted")
+        positive = result["positive"]
+        hard_negative = result["hard_negative"]
+        if set(positive) != {"qualified", "total", "rate", "above_tau",
+                             "in_exact_top_k", "matched_candidate"} or \
+                set(hard_negative) != {"no_evidence", "total", "rate",
+                                       "target_above_tau", "target_in_exact_top_k"}:
+            raise BenchmarkProtocolError("quality relation schema drifted")
+        _validate_count_rate(positive, "qualified", 100)
+        _validate_count_rate(hard_negative, "no_evidence", 100)
+        for group, keys in (
+                (positive, ("above_tau", "in_exact_top_k", "matched_candidate")),
+                (hard_negative, ("target_above_tau", "target_in_exact_top_k"))):
+            if any(not isinstance(group[key], int) or group[key] < 0
+                   or group[key] > 100 for key in keys):
+                raise BenchmarkProtocolError("quality aggregate is invalid")
+        if positive["qualified"] > min(
+                positive["above_tau"], positive["in_exact_top_k"],
+                positive["matched_candidate"]) or \
+                hard_negative["no_evidence"] != \
+                100 - hard_negative["target_in_exact_top_k"] or \
+                hard_negative["target_above_tau"] < \
+                hard_negative["target_in_exact_top_k"]:
+            raise BenchmarkProtocolError("quality aggregate relationship drifted")
+        exact_top_k = result["exact_top_k"]
+        if set(exact_top_k) != {"k_evidence", "kept_min", "kept_max",
+                                "kept_at_k"} or \
+                exact_top_k["k_evidence"] != V2_K_EVIDENCE or \
+                any(not isinstance(exact_top_k[key], int)
+                    for key in ("kept_min", "kept_max", "kept_at_k")) or \
+                not 0 <= exact_top_k["kept_min"] <= exact_top_k["kept_max"] <= V2_K_EVIDENCE or \
+                not 0 <= exact_top_k["kept_at_k"] <= 200:
+            raise BenchmarkProtocolError("exact top-K summary is invalid")
+        failures = result["failures"]
+        if not isinstance(failures, list):
+            raise BenchmarkProtocolError("quality failures are invalid")
+        positive_failures = 0
+        negative_failures = 0
+        seen = set()
+        for failure in failures:
+            if not isinstance(failure, dict) or set(failure) != {
+                    "case_id", "relation", "axes", "failure_axes",
+                    "target_cosine", "target_above_tau",
+                    "target_in_exact_top_k", "matched_candidate"}:
+                raise BenchmarkProtocolError("quality failure schema drifted")
+            case = cases_by_id.get(failure["case_id"])
+            if case is None or failure["case_id"] in seen or \
+                    failure["relation"] != case.relation or \
+                    failure["axes"] != list(case.axes):
+                raise BenchmarkProtocolError("quality failure identity drifted")
+            seen.add(failure["case_id"])
+            if (isinstance(failure["target_cosine"], bool)
+                    or not isinstance(failure["target_cosine"], (int, float))
+                    or not math.isfinite(failure["target_cosine"])
+                    or not -1.0 <= failure["target_cosine"] <= 1.0
+                    or not all(isinstance(failure[key], bool) for key in (
+                        "target_above_tau", "target_in_exact_top_k",
+                        "matched_candidate"))):
+                raise BenchmarkProtocolError("quality failure values are invalid")
+            if case.relation == "positive":
+                expected_axes = []
+                if not failure["target_above_tau"]:
+                    expected_axes.append("below_tau")
+                if not failure["target_in_exact_top_k"]:
+                    expected_axes.append("outside_exact_top_k")
+                if not failure["matched_candidate"]:
+                    expected_axes.append("candidate_mismatch")
+                if failure["failure_axes"] != expected_axes or not expected_axes:
+                    raise BenchmarkProtocolError("positive failure axis drifted")
+                positive_failures += 1
+            elif failure["target_in_exact_top_k"] and \
+                    failure["failure_axes"] == ["hard_negative_evidence"]:
+                negative_failures += 1
+            else:
+                raise BenchmarkProtocolError("hard-negative failure axis drifted")
+        if positive_failures != 100 - positive["qualified"] or \
+                negative_failures != 100 - hard_negative["no_evidence"]:
+            raise BenchmarkProtocolError("quality failure counts drifted")
+        gate_pass = positive["rate"] >= 0.95 and hard_negative["rate"] >= 0.95
+        if not isinstance(result["gate_pass"], bool) or result["gate_pass"] != gate_pass:
+            raise BenchmarkProtocolError("quality gate result drifted")
+        if gate_pass:
+            passed_routes.append(route_id)
+    return passed_routes
+
+
+def build_real_quality_report(artifact_dir, routes):
+    """Build the desensitized report after the sole quality claim exists."""
+    artifact_dir = Path(artifact_dir)
+    manifest, record = verify_quality_freeze(artifact_dir)
+    _verify_quality_claim(artifact_dir, record)
+    passed_routes = _validate_quality_results(manifest, record, routes)
+    terminal_state = (
+        "at_least_one_v2_pass" if passed_routes else "seven_route_all_fail"
+    )
+    report = {
+        "contract": QUALITY_CONTRACT_ID,
+        "benchmark_version": V2_BENCHMARK_VERSION,
+        "benchmark_role": V2_ROLE,
+        "run_kind": REAL_QUALITY_RUN_KIND,
+        "manifest_digest": manifest["benchmark_digest"],
+        "route_matrix_digest": manifest["route_matrix_digest"],
+        "one_shot_identity": record["one_shot_identity"],
+        "run_freeze_digest": record["freeze_digest"],
+        "one_shot": {
+            "state": "claimed_before_v2_metrics",
+            "rerun": "refused",
+        },
+        "routes": routes,
+        "v2_quality": "completed",
+        "terminal_state": terminal_state,
+        "v2_pass_route_ids": passed_routes,
+        "live_gamma": 0,
+        "selection": "not_run",
+        "production_enablement": "not_run",
+    }
+    _assert_desensitized_report(report)
+    report["report_digest"] = sha256_text(canonical_json(report))
+    return report
+
+
+def _verify_real_quality_report(artifact_dir, report):
+    manifest, record = verify_quality_freeze(artifact_dir)
+    _verify_quality_claim(artifact_dir, record)
+    expected_keys = {
+        "contract", "benchmark_version", "benchmark_role", "run_kind",
+        "manifest_digest", "route_matrix_digest", "one_shot_identity",
+        "run_freeze_digest", "one_shot", "routes", "v2_quality",
+        "terminal_state", "v2_pass_route_ids", "live_gamma", "selection",
+        "production_enablement", "report_digest",
+    }
+    if not isinstance(report, dict) or set(report) != expected_keys:
+        raise BenchmarkProtocolError("real quality report schema drifted")
+    if report["contract"] != QUALITY_CONTRACT_ID or \
+            report["benchmark_version"] != V2_BENCHMARK_VERSION or \
+            report["benchmark_role"] != V2_ROLE or \
+            report["run_kind"] != REAL_QUALITY_RUN_KIND or \
+            report["manifest_digest"] != manifest["benchmark_digest"] or \
+            report["route_matrix_digest"] != manifest["route_matrix_digest"] or \
+            report["one_shot_identity"] != record["one_shot_identity"] or \
+            report["run_freeze_digest"] != record["freeze_digest"] or \
+            report["one_shot"] != {
+                "state": "claimed_before_v2_metrics", "rerun": "refused"} or \
+            report["v2_quality"] != "completed" or \
+            report["live_gamma"] != 0 or \
+            report["selection"] != "not_run" or \
+            report["production_enablement"] != "not_run":
+        raise BenchmarkProtocolError("real quality report identity drifted")
+    if report["report_digest"] != sha256_text(canonical_json({
+            key: value for key, value in report.items() if key != "report_digest"
+    })):
+        raise BenchmarkProtocolError("real quality report digest mismatch")
+    passed_routes = _validate_quality_results(manifest, record, report["routes"])
+    expected_state = (
+        "at_least_one_v2_pass" if passed_routes else "seven_route_all_fail"
+    )
+    if report["terminal_state"] != expected_state or \
+            report["v2_pass_route_ids"] != passed_routes:
+        raise BenchmarkProtocolError("real quality terminal state drifted")
+    _assert_desensitized_report(report)
+    return manifest, record
+
+
+def record_quality_contract_failure(artifact_dir, stage):
+    """Persist a path-free terminal failure after the one-shot claim."""
+    artifact_dir = Path(artifact_dir)
+    _manifest, record = verify_quality_freeze(artifact_dir)
+    _verify_quality_claim(artifact_dir, record)
+    if stage not in {"vector_generation", "quality_calculation", "report_acceptance"}:
+        raise BenchmarkProtocolError("quality failure stage is invalid")
+    if (artifact_dir / "semantic_benchmark_v2_report.json").exists() or \
+            (artifact_dir / "semantic_benchmark_v2.accepted").exists():
+        raise BenchmarkProtocolError("cannot replace an accepted quality report")
+    failure = {
+        "state": "contract_failure",
+        "contract": QUALITY_CONTRACT_ID,
+        "run_kind": REAL_QUALITY_RUN_KIND,
+        "one_shot_identity": record["one_shot_identity"],
+        "run_freeze_digest": record["freeze_digest"],
+        "stage": stage,
+    }
+    _write_exclusive(artifact_dir / "semantic_benchmark_v2.contract_failure.json",
+                     canonical_json(failure) + "\n")
+    return failure
+
+
+def _accept_fixture_report(artifact_dir, report):
     """Verify and record exactly one report for the frozen route identity."""
     artifact_dir = Path(artifact_dir)
+    if any((artifact_dir / name).exists() for name in (
+            "semantic_benchmark_v2_run_freeze.json",
+            "semantic_benchmark_v2.quality_started",
+            "semantic_benchmark_v2.contract_failure.json")):
+        raise BenchmarkProtocolError("fixture cannot share a real quality boundary")
     manifest = verify_frozen_inputs(artifact_dir)
     if not isinstance(report, dict):
         raise BenchmarkProtocolError("one-shot report must be an object")
@@ -1502,6 +2074,37 @@ def accept_one_shot_report(artifact_dir, report):
             "report_path": str(report_path)}
 
 
+def accept_one_shot_report(artifact_dir, report):
+    """Accept either the model-free fixture or one real seven-route report."""
+    if not isinstance(report, dict):
+        raise BenchmarkProtocolError("one-shot report must be an object")
+    if report.get("run_kind") == "model_free_protocol_fixture":
+        return _accept_fixture_report(artifact_dir, report)
+    if report.get("run_kind") != REAL_QUALITY_RUN_KIND:
+        raise BenchmarkProtocolError("report run kind is unknown")
+    artifact_dir = Path(artifact_dir)
+    manifest, record = _verify_real_quality_report(artifact_dir, report)
+    receipt_path = artifact_dir / "semantic_benchmark_v2.accepted"
+    report_path = artifact_dir / "semantic_benchmark_v2_report.json"
+    receipt = {
+        "state": "accepted",
+        "run_kind": REAL_QUALITY_RUN_KIND,
+        "one_shot_identity": record["one_shot_identity"],
+        "route_matrix_digest": manifest["route_matrix_digest"],
+        "run_freeze_digest": record["freeze_digest"],
+        "report_digest": report["report_digest"],
+    }
+    _write_exclusive(receipt_path, canonical_json(receipt) + "\n")
+    try:
+        _write_exclusive(report_path, canonical_json(report) + "\n")
+    except BenchmarkProtocolError:
+        # A receipt remains an immutable fail-closed claim if report writing races.
+        raise
+    return {"manifest": manifest, "report": report,
+            "receipt_path": str(receipt_path),
+            "report_path": str(report_path)}
+
+
 def run_model_free_fixture(artifact_dir=None):
     if artifact_dir is None:
         artifact_dir = tempfile.mkdtemp(prefix="semantic-benchmark-v2-")
@@ -1510,24 +2113,740 @@ def run_model_free_fixture(artifact_dir=None):
     return accept_one_shot_report(artifact_dir, report)
 
 
+class ExecutionEnvironmentBlocker(BenchmarkProtocolError):
+    """A required local model or isolated runtime is unavailable."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class VectorRequest:
+    """One in-memory synthetic payload sent to a route runtime."""
+
+    key: str
+    side: str
+    preceding_text: str
+    candidate: str
+
+
+DEFAULT_QWEN_BASE_MODEL = os.environ.get(
+    "LLM_RERANK_MODEL", "/Users/habit/Models/Qwen/Qwen3-0.6B-Base")
+DEFAULT_QWEN3_EMBEDDING_MODEL = str(
+    _ROOT / ".local-work" / "models" / "Qwen3-Embedding-0.6B")
+DEFAULT_BGE_M3_MODEL = str(_ROOT / ".local-work" / "models" / "BGE-M3")
+DEFAULT_PROJECTION_PATH = os.environ.get(
+    "AC112_PROJECTION_PATH",
+    "/Users/habit/Developer/librime-llm-rerank/.local-work/ac112/"
+    "candidate-conditioned-linear.npz")
+DEFAULT_EMBEDDING_PYTHON = str(_ROOT / ".venv-embeddings" / "bin" / "python")
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _current_code_sha():
+    try:
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=str(_ROOT), text=True,
+            stderr=subprocess.DEVNULL)
+        if dirty:
+            raise BenchmarkProtocolError(
+                "real quality requires a clean code worktree")
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(_ROOT), text=True,
+            stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise BenchmarkProtocolError("cannot resolve the current code SHA") from error
+
+
+def _require_code_snapshot(code_sha):
+    if _current_code_sha() != code_sha:
+        raise BenchmarkProtocolError("code changed after quality freeze")
+
+
+def _runtime_dependency_versions(packages):
+    from importlib import metadata
+
+    values = []
+    for package in packages:
+        try:
+            version = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            version = "unavailable"
+        values.append((package, version))
+    return values
+
+
+def _validate_requests(requests):
+    requests = tuple(requests)
+    seen = set()
+    for request in requests:
+        if not isinstance(request, VectorRequest) or \
+                request.side not in {"query", "document"} or \
+                not isinstance(request.key, str) or not request.key or \
+                request.key in seen or \
+                not isinstance(request.preceding_text, str) or \
+                not isinstance(request.candidate, str) or not request.candidate:
+            raise BenchmarkProtocolError("vector request is invalid")
+        seen.add(request.key)
+    return requests
+
+
+def _run_cosine(left, right):
+    try:
+        left = tuple(float(value) for value in left)
+        right = tuple(float(value) for value in right)
+    except (TypeError, ValueError) as error:
+        raise BenchmarkProtocolError("route vector is not numeric") from error
+    if not left or len(left) != len(right):
+        raise BenchmarkProtocolError("route vector dimension drifted")
+    if any(not math.isfinite(value) for value in left + right):
+        raise BenchmarkProtocolError("route vector is non-finite")
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        raise BenchmarkProtocolError("route vector has zero norm")
+    cosine = sum(lvalue * rvalue for lvalue, rvalue in zip(left, right)) / \
+        (left_norm * right_norm)
+    if cosine < -1.0 - 1e-12 or cosine > 1.0 + 1e-12:
+        raise BenchmarkProtocolError("route cosine is outside [-1, 1]")
+    return min(1.0, max(-1.0, cosine))
+
+
+class _AffineCosineEngine(CosineEngine):
+    """Map a negative threshold into the oracle's supported [0, 1) domain."""
+
+    def batch_cosines(self, query_vector, event_ids, vector_for):
+        return {
+            event_id: (_run_cosine(query_vector, vector_for(event_id)) + 1.0) / 2.0
+            for event_id in event_ids
+        }
+
+
+def _oracle_for_threshold(tau):
+    """Preserve strict threshold and relevance semantics for every valid Q95."""
+    if isinstance(tau, bool):
+        raise BenchmarkProtocolError("quality threshold is invalid")
+    try:
+        tau = float(tau)
+    except (TypeError, ValueError) as error:
+        raise BenchmarkProtocolError("quality threshold is invalid") from error
+    if not math.isfinite(tau) or not -1.0 <= tau <= 1.0:
+        raise BenchmarkProtocolError("quality threshold is outside [-1, 1]")
+    if tau == 1.0:
+        return None, None
+    if tau < 0.0:
+        # f(c) = (c + 1) / 2 preserves c > tau and
+        # (c - tau) / (1 - tau), while giving OracleParams a legal threshold.
+        return OracleParams(
+            tau=(tau + 1.0) / 2.0,
+            k_evidence=V2_K_EVIDENCE,
+            half_life=float("inf"),
+            saturation_k=1.0), _AffineCosineEngine()
+    return OracleParams(tau=tau, k_evidence=V2_K_EVIDENCE,
+                        half_life=float("inf"), saturation_k=1.0), None
+
+
+def _v1_calibration_cases():
+    return tuple(case for case in v1_benchmark_cases()
+                 if case.relation == "hard_negative")
+
+
+def calibration_requests():
+    """The only forward requests permitted to influence route thresholds."""
+    requests = []
+    for case in _v1_calibration_cases():
+        requests.extend((
+            VectorRequest("v1:%s:query" % case.case_id, "query",
+                          case.query_preceding_text, case.expected_candidate),
+            VectorRequest("v1:%s:history" % case.case_id, "document",
+                          case.recorded_preceding_text, case.history_selection),
+        ))
+    return tuple(requests)
+
+
+def _quality_query_key(case, candidate_index):
+    return "v2:%s:query:%02d" % (case.case_id, candidate_index)
+
+
+def quality_requests():
+    """Build v2 forwards separately, after the calibration freeze is written."""
+    requests = []
+    for case in benchmark_cases_v2():
+        for index, candidate in enumerate(case.candidates):
+            requests.append(VectorRequest(
+                _quality_query_key(case, index), "query",
+                case.query_preceding_text, candidate))
+        requests.append(VectorRequest(
+            "v2:%s:history" % case.case_id, "document",
+            case.recorded_preceding_text,
+            case.historical_selected_candidate))
+        for index, preceding_text in enumerate(
+                FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
+            requests.append(VectorRequest(
+                "v2:%s:distractor:%02d" % (case.case_id, index),
+                "document", preceding_text, case.candidates[-1]))
+    return tuple(requests)
+
+
+def calibrate_runtime_routes(route_vectors):
+    """Calculate all seven thresholds from v1 hard negatives and nothing else."""
+    expected_routes = {route["route_id"] for route in route_matrix()}
+    if not isinstance(route_vectors, dict) or set(route_vectors) != expected_routes:
+        raise BenchmarkProtocolError("calibration runtime route set drifted")
+    calibrations = {}
+    for route_id in sorted(expected_routes):
+        vectors = route_vectors[route_id]
+        observations = []
+        for case in _v1_calibration_cases():
+            observations.append({
+                "case_id": case.case_id,
+                "benchmark_version": V1_BENCHMARK_VERSION,
+                "relation": "hard_negative",
+                "cosine": _run_cosine(
+                    vectors["v1:%s:query" % case.case_id],
+                    vectors["v1:%s:history" % case.case_id]),
+            })
+        calibrations[route_id] = {
+            "observations": observations,
+            "calibration": calibrate_v1_q95(observations),
+        }
+    return calibrations
+
+
+def _route_quality_result(route_id, vectors, tau):
+    """Run one route over all v2 cases through the existing exact oracle."""
+    del route_id
+    cases = validate_v2_cases()
+    params, cosine_engine = _oracle_for_threshold(tau)
+    positive = {"qualified": 0, "above_tau": 0, "in_exact_top_k": 0,
+                "matched_candidate": 0}
+    hard_negative = {"no_evidence": 0, "target_above_tau": 0,
+                     "target_in_exact_top_k": 0}
+    kept_counts = []
+    failures = []
+    for case in cases:
+        fixture = None
+        try:
+            query_vectors = [
+                vectors[_quality_query_key(case, index)]
+                for index in range(len(case.candidates))
+            ]
+            target_index = case.candidates.index(case.query_candidate)
+            query_vector = query_vectors[target_index]
+            target_vector = vectors["v2:%s:history" % case.case_id]
+            target_cosine = _run_cosine(query_vector, target_vector)
+            if params is None:
+                target = None
+                kept_count = 0
+            else:
+                fixture = V1SyntheticFacts(
+                    case, FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
+                vector_by_event = {fixture.target_event_id: target_vector}
+                for index, _preceding_text in enumerate(
+                        FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
+                    vector_by_event[
+                        "distractor-%s-%02d" % (case.case_id, index)] = \
+                        vectors["v2:%s:distractor:%02d" % (case.case_id, index)]
+                reader = FactReader(fixture.db_path)
+                try:
+                    result = compute_evidence(
+                        reader, params,
+                        OracleQuery(
+                            schema_id=SCHEMA_ID,
+                            category=CATEGORY,
+                            canonical_segment_input=case.choice_problem,
+                            candidates=case.candidates,
+                            query_vector=(),
+                            candidate_query_vectors=query_vectors,
+                        ),
+                        lambda event_id: vector_by_event[event_id],
+                        cosine_engine=cosine_engine,
+                    )
+                finally:
+                    reader.close()
+                target = next((entry for entry in result.kept
+                               if entry.event_id == fixture.target_event_id), None)
+                kept_count = len(result.kept)
+            above_tau = strict_cosine_above_threshold(target_cosine, tau)
+            in_exact_top_k = target is not None
+            matched_candidate = target is not None and \
+                target.matched_candidate == target_index
+            kept_counts.append(kept_count)
+            if case.relation == "positive":
+                positive["above_tau"] += int(above_tau)
+                positive["in_exact_top_k"] += int(in_exact_top_k)
+                positive["matched_candidate"] += int(matched_candidate)
+                passed = above_tau and in_exact_top_k and matched_candidate
+                positive["qualified"] += int(passed)
+                failure_axes = []
+                if not above_tau:
+                    failure_axes.append("below_tau")
+                if not in_exact_top_k:
+                    failure_axes.append("outside_exact_top_k")
+                if not matched_candidate:
+                    failure_axes.append("candidate_mismatch")
+            else:
+                hard_negative["target_above_tau"] += int(above_tau)
+                hard_negative["target_in_exact_top_k"] += int(in_exact_top_k)
+                passed = not in_exact_top_k
+                hard_negative["no_evidence"] += int(passed)
+                failure_axes = ["hard_negative_evidence"] if not passed else []
+            if not passed:
+                failures.append({
+                    "case_id": case.case_id,
+                    "relation": case.relation,
+                    "axes": list(case.axes),
+                    "failure_axes": failure_axes,
+                    "target_cosine": round(target_cosine, 6),
+                    "target_above_tau": above_tau,
+                    "target_in_exact_top_k": in_exact_top_k,
+                    "matched_candidate": matched_candidate,
+                })
+        finally:
+            if fixture is not None:
+                fixture.close()
+    positive["total"] = 100
+    positive["rate"] = positive["qualified"] / positive["total"]
+    hard_negative["total"] = 100
+    hard_negative["rate"] = (
+        hard_negative["no_evidence"] / hard_negative["total"])
+    return {
+        "tau": tau,
+        "positive": positive,
+        "hard_negative": hard_negative,
+        "exact_top_k": {
+            "k_evidence": V2_K_EVIDENCE,
+            "kept_min": min(kept_counts),
+            "kept_max": max(kept_counts),
+            "kept_at_k": sum(count == V2_K_EVIDENCE for count in kept_counts),
+        },
+        "failures": failures,
+        "gate_pass": positive["rate"] >= 0.95 and \
+        hard_negative["rate"] >= 0.95,
+    }
+
+
+class _QwenRouteExecutor:
+    """One MLX process that derives the four pooling and projection routes."""
+
+    _ROUTE_BY_SPEC = {
+        (14, "candidate_span_mean"): "qwen_l14_candidate_span_mean",
+        (21, "candidate_span_mean"): "qwen_l21_candidate_span_mean",
+        (28, "candidate_span_mean"): "qwen_l28_candidate_span_mean",
+        (28, "last_candidate_token"): "qwen_l28_last_candidate_token_control",
+    }
+    _PROJECTION_ROUTE = "qwen_global_l14_l21_l28_projection_3072_to_256"
+
+    def __init__(self, model_path, projection_path):
+        self._model_path = model_path
+        self._projection_path = projection_path
+        self._extractor = None
+        self._span_specs = None
+        self._control_spec = None
+        self._projection = None
+        self._bindings = None
+
+    def _ensure_initialized(self):
+        if self._bindings is not None:
+            return
+        from hidden_state import (  # noqa: PLC0415
+            HiddenStateCandidateRepresentationProvider,
+            HiddenStateExtractor,
+        )
+        from linear_projection import (  # noqa: PLC0415
+            LinearProjection,
+            ProjectedCandidateRepresentationProvider,
+        )
+        from representations import candidate_conditioned_specs  # noqa: PLC0415
+        from server import ModelState  # noqa: PLC0415
+
+        specs = tuple(candidate_conditioned_specs())
+        expected_specs = (
+            (14, "candidate_span_mean"),
+            (21, "candidate_span_mean"),
+            (28, "candidate_span_mean"),
+            (28, "last_candidate_token"),
+        )
+        if tuple((spec.layer, spec.pooling) for spec in specs) != expected_specs:
+            raise BenchmarkProtocolError("AC-109 runtime descriptors drifted")
+        self._extractor = HiddenStateExtractor(ModelState(self._model_path))
+        providers = {
+            (spec.layer, spec.pooling):
+            HiddenStateCandidateRepresentationProvider(self._extractor, spec)
+            for spec in specs
+        }
+        self._span_specs = tuple(spec for spec in specs
+                                 if spec.pooling == "candidate_span_mean")
+        self._control_spec = next(spec for spec in specs
+                                  if spec.pooling == "last_candidate_token")
+        self._projection = LinearProjection.load(self._projection_path)
+        projection_provider = ProjectedCandidateRepresentationProvider.from_extractor(
+            self._extractor, self._projection)
+        if not self._projection.fingerprint.startswith(
+                PINNED_PROJECTION_FINGERPRINT_PREFIX) or \
+                self._projection.weight_digest != PINNED_PROJECTION_WEIGHT_DIGEST:
+            raise BenchmarkProtocolError("AC-111 projection identity drifted")
+        identity = self._extractor.identity
+        model_identity = {
+            "model_digest": identity.model_digest,
+            "tokenizer_digest": identity.tokenizer_digest,
+            "dimension": identity.hidden_dim,
+        }
+        dependencies = _runtime_dependency_versions(("mlx", "mlx-lm", "numpy"))
+        bindings = {}
+        for spec in specs:
+            route_id = self._ROUTE_BY_SPEC[(spec.layer, spec.pooling)]
+            bindings[route_id] = {
+                "route_id": route_id,
+                "runtime_adapter_id": spec.short_name,
+                "runtime_id": providers[(spec.layer, spec.pooling)].representation_id(),
+                "model_identity": model_identity,
+                "dependency_versions": dependencies,
+            }
+        bindings[self._PROJECTION_ROUTE] = {
+            "route_id": self._PROJECTION_ROUTE,
+            "runtime_adapter_id": "candidate-conditioned-linear-projection",
+            "runtime_id": projection_provider.representation_id(),
+            "model_identity": {
+                **model_identity,
+                "dimension": 256,
+            },
+            "dependency_versions": dependencies,
+            "projection_fingerprint": self._projection.fingerprint,
+            "projection_weight_digest": self._projection.weight_digest,
+        }
+        self._bindings = bindings
+
+    def bindings(self):
+        self._ensure_initialized()
+        return copy.deepcopy(self._bindings)
+
+    def forward(self, requests):
+        self._ensure_initialized()
+        requests = _validate_requests(requests)
+        vectors = {route_id: {} for route_id in self._bindings}
+        cached = {}
+        for request in requests:
+            cache_key = (request.preceding_text, request.candidate)
+            if cache_key not in cached:
+                spans = self._extractor.candidate_span_mean_all(
+                    request.preceding_text, request.candidate)
+                control = self._extractor.candidate(
+                    self._control_spec, request.preceding_text, request.candidate)
+                concatenated = []
+                for spec in self._span_specs:
+                    concatenated.extend(spans[spec.layer])
+                cached[cache_key] = {
+                    "qwen_l14_candidate_span_mean": spans[14],
+                    "qwen_l21_candidate_span_mean": spans[21],
+                    "qwen_l28_candidate_span_mean": spans[28],
+                    "qwen_l28_last_candidate_token_control": control,
+                    self._PROJECTION_ROUTE: self._projection.apply(concatenated),
+                }
+                for vector in cached[cache_key].values():
+                    _run_cosine(vector, vector)
+            for route_id, vector in cached[cache_key].items():
+                vectors[route_id][request.key] = vector
+        return vectors
+
+
+def _embedding_binding(route_id, runtime_id, identity):
+    return {
+        "route_id": route_id,
+        "runtime_adapter_id": identity["route_id"],
+        "runtime_id": runtime_id,
+        "model_identity": {
+            "model_digest": identity["model_digest"],
+            "tokenizer_digest": identity["tokenizer_digest"],
+            "dimension": identity["output_dimension"],
+        },
+        "dependency_versions": identity["dependency_versions"],
+    }
+
+
+def _embedding_worker_main(route_id, model_path):
+    """Run one dedicated embedding model in its own isolated interpreter."""
+    try:
+        raw = json.load(sys.stdin)
+        if not isinstance(raw, dict) or set(raw) != {"requests"} or \
+                not isinstance(raw["requests"], list):
+            raise BenchmarkProtocolError("embedding worker input is invalid")
+        requests = tuple(VectorRequest(
+            key=item["key"], side=item["side"],
+            preceding_text=item["preceding_text"], candidate=item["candidate"])
+            for item in raw["requests"] if isinstance(item, dict))
+        if len(requests) != len(raw["requests"]):
+            raise BenchmarkProtocolError("embedding worker request is invalid")
+        requests = _validate_requests(requests)
+        from embeddings import (  # noqa: PLC0415
+            BGEM3EmbeddingAdapter,
+            Qwen3EmbeddingAdapter,
+        )
+
+        adapters = {
+            "qwen3-embedding-0.6b": Qwen3EmbeddingAdapter,
+            "bge-m3-dense-1024": BGEM3EmbeddingAdapter,
+        }
+        if route_id not in adapters:
+            raise BenchmarkProtocolError("embedding worker route is invalid")
+        adapter = adapters[route_id](model_path=model_path)
+        identity = adapter.identity
+        vectors = {}
+        cached = {}
+        for request in requests:
+            cache_key = (request.side, request.preceding_text, request.candidate)
+            if cache_key not in cached:
+                cached[cache_key] = (
+                    adapter.query(request.preceding_text, request.candidate)
+                    if request.side == "query" else
+                    adapter.document(request.preceding_text, request.candidate))
+            vectors[request.key] = cached[cache_key]
+        print(canonical_json({
+            "route_id": route_id,
+            "binding": _embedding_binding(
+                route_id, adapter.representation_id, {
+                    "route_id": identity.route_id,
+                    "model_digest": identity.model_digest,
+                    "tokenizer_digest": identity.tokenizer_digest,
+                    "output_dimension": identity.output_dimension,
+                    "dependency_versions": list(identity.dependency_versions),
+                }),
+            "vectors": vectors,
+        }))
+        return 0
+    except Exception:  # noqa: BLE001 - parent records only a desensitized code
+        return 1
+
+
+def _run_embedding_worker(python_path, route_id, model_path, requests,
+                          pre_quality):
+    if not os.path.isfile(python_path):
+        raise ExecutionEnvironmentBlocker("embedding_runtime_unavailable")
+    requests = _validate_requests(requests)
+    payload = {"requests": [
+        {
+            "key": request.key,
+            "side": request.side,
+            "preceding_text": request.preceding_text,
+            "candidate": request.candidate,
+        }
+        for request in requests
+    ]}
+    completed = subprocess.run(
+        [python_path, str(Path(__file__).resolve()), "--embedding-worker",
+         "--embedding-route", route_id, "--embedding-model", model_path],
+        input=canonical_json(payload), text=True, capture_output=True,
+        check=False)
+    if completed.returncode != 0:
+        if pre_quality:
+            raise ExecutionEnvironmentBlocker("embedding_worker_unavailable")
+        raise BenchmarkProtocolError("embedding worker failed during v2 run")
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise BenchmarkProtocolError("embedding worker emitted invalid output") from error
+    if not isinstance(result, dict) or set(result) != {
+            "route_id", "binding", "vectors"} or result["route_id"] != route_id:
+        raise BenchmarkProtocolError("embedding worker identity drifted")
+    expected_keys = {request.key for request in requests}
+    if not isinstance(result["vectors"], dict) or set(result["vectors"]) != expected_keys:
+        raise BenchmarkProtocolError("embedding worker vector set drifted")
+    for vector in result["vectors"].values():
+        _run_cosine(vector, vector)
+    return result["vectors"], result["binding"]
+
+
+class _SevenRouteExecutor:
+    """Combine one Qwen process with sequential one-model embedding workers."""
+
+    _EMBEDDING_ROUTES = (
+        ("dedicated_qwen3_embedding_0_6b", "qwen3-embedding-0.6b"),
+        ("dedicated_bge_m3", "bge-m3-dense-1024"),
+    )
+
+    def __init__(self, manifest, qwen_model, projection_path,
+                 embedding_python, qwen_embedding_model, bge_m3_model):
+        self._manifest = manifest
+        self._qwen = _QwenRouteExecutor(qwen_model, projection_path)
+        self._embedding_python = embedding_python
+        self._embedding_models = {
+            "qwen3-embedding-0.6b": qwen_embedding_model,
+            "bge-m3-dense-1024": bge_m3_model,
+        }
+
+    def forward(self, requests, expected_bindings=None, pre_quality=False):
+        requests = _validate_requests(requests)
+        vectors = self._qwen.forward(requests)
+        bindings = self._qwen.bindings()
+        for matrix_route, adapter_route in self._EMBEDDING_ROUTES:
+            route_vectors, binding = _run_embedding_worker(
+                self._embedding_python, adapter_route,
+                self._embedding_models[adapter_route], requests, pre_quality)
+            vectors[matrix_route] = route_vectors
+            binding = dict(binding)
+            binding["route_id"] = matrix_route
+            bindings[matrix_route] = binding
+        validate_runtime_bindings(self._manifest, bindings)
+        if expected_bindings is not None and \
+                canonical_json(bindings) != canonical_json(expected_bindings):
+            raise BenchmarkProtocolError("runtime identity changed after freeze")
+        return vectors, bindings
+
+
+def _require_real_environment(qwen_model, projection_path, embedding_python,
+                              qwen_embedding_model, bge_m3_model):
+    missing = []
+    if not os.path.isfile(os.path.join(qwen_model, "model.safetensors")):
+        missing.append("qwen_base_model")
+    if not os.path.isfile(projection_path):
+        missing.append("projection")
+    if not os.path.isdir(qwen_embedding_model):
+        missing.append("qwen3_embedding_model")
+    if not os.path.isdir(bge_m3_model):
+        missing.append("bge_m3_model")
+    if not os.path.isfile(embedding_python):
+        missing.append("embedding_runtime")
+    if missing:
+        raise ExecutionEnvironmentBlocker("missing_" + "_and_".join(missing))
+
+
+def _best_effort_contract_failure(artifact_dir, stage):
+    try:
+        record_quality_contract_failure(artifact_dir, stage)
+    except BenchmarkProtocolError:
+        pass
+
+
+def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
+                        projection_path=DEFAULT_PROJECTION_PATH,
+                        embedding_python=DEFAULT_EMBEDDING_PYTHON,
+                        qwen_embedding_model=DEFAULT_QWEN3_EMBEDDING_MODEL,
+                        bge_m3_model=DEFAULT_BGE_M3_MODEL):
+    """Perform the frozen AC-112 one-shot, with no live daemon or facts input."""
+    if not artifact_dir:
+        raise BenchmarkProtocolError("real quality requires an artifact directory")
+    _require_real_environment(
+        qwen_model, projection_path, embedding_python,
+        qwen_embedding_model, bge_m3_model)
+    code_sha = _current_code_sha()
+    manifest = freeze_inputs(artifact_dir)
+    started_at = _utc_now()
+    executor = _SevenRouteExecutor(
+        manifest, qwen_model, projection_path, embedding_python,
+        qwen_embedding_model, bge_m3_model)
+    calibration_vectors, bindings = executor.forward(
+        calibration_requests(), pre_quality=True)
+    calibrations = calibrate_runtime_routes(calibration_vectors)
+    if _current_code_sha() != code_sha:
+        raise BenchmarkProtocolError("code changed during v1 calibration")
+    freeze_quality_inputs(
+        artifact_dir, calibrations, bindings, code_sha, started_at)
+    claim_v2_quality_run(artifact_dir)
+    try:
+        _require_code_snapshot(code_sha)
+        route_vectors, _bindings = executor.forward(
+            quality_requests(), expected_bindings=bindings, pre_quality=False)
+        _require_code_snapshot(code_sha)
+    except Exception:  # noqa: BLE001 - the consumed shot remains terminal
+        _best_effort_contract_failure(artifact_dir, "vector_generation")
+        raise
+    try:
+        routes = {}
+        for route in manifest["route_matrix"]:
+            route_id = route["route_id"]
+            result = _route_quality_result(
+                route_id, route_vectors[route_id],
+                calibrations[route_id]["calibration"]["tau"])
+            result["runtime_id"] = bindings[route_id]["runtime_id"]
+            routes[route_id] = result
+    except Exception:  # noqa: BLE001 - no partial seven-route judgment escapes
+        _best_effort_contract_failure(artifact_dir, "quality_calculation")
+        raise
+    try:
+        report = build_real_quality_report(artifact_dir, routes)
+        return accept_one_shot_report(artifact_dir, report)
+    except Exception:  # noqa: BLE001 - a report protocol failure cannot be retried
+        _best_effort_contract_failure(artifact_dir, "report_acceptance")
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", action="store_true",
                         help="run the model-free v2 protocol fixture")
+    parser.add_argument("--run-quality", action="store_true",
+                        help="run the frozen real seven-route quality gate")
+    parser.add_argument("--embedding-worker", action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--artifact-dir", default=None,
                         help="temporary local artifact boundary")
+    parser.add_argument("--model", default=DEFAULT_QWEN_BASE_MODEL,
+                        help="local Qwen3-0.6B-Base directory")
+    parser.add_argument("--projection", default=DEFAULT_PROJECTION_PATH,
+                        help="local AC-111 projection NPZ")
+    parser.add_argument("--embedding-python", default=DEFAULT_EMBEDDING_PYTHON,
+                        help="isolated embedding interpreter")
+    parser.add_argument("--qwen3-embedding-model",
+                        default=DEFAULT_QWEN3_EMBEDDING_MODEL,
+                        help="local Qwen3-Embedding-0.6B directory")
+    parser.add_argument("--bge-m3-model", default=DEFAULT_BGE_M3_MODEL,
+                        help="local BGE-M3 directory")
+    parser.add_argument("--embedding-route", default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--embedding-model", default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not args.fixture:
-        parser.error("--fixture is required; real v2 routes are deferred")
-    result = run_model_free_fixture(args.artifact_dir)
+    if args.embedding_worker:
+        if not args.embedding_route or not args.embedding_model:
+            parser.error("embedding worker requires a route and model")
+        return _embedding_worker_main(args.embedding_route, args.embedding_model)
+    if args.fixture == args.run_quality:
+        parser.error("choose exactly one of --fixture or --run-quality")
+    if args.fixture:
+        result = run_model_free_fixture(args.artifact_dir)
+        print(json.dumps({
+            "contract": result["report"]["contract"],
+            "benchmark_digest": result["manifest"]["benchmark_digest"],
+            "route_matrix_digest": result["manifest"]["route_matrix_digest"],
+            "one_shot_identity": result["report"]["one_shot_identity"],
+            "v2_quality": result["report"]["v2_quality"],
+            "report_path": result["report_path"],
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
+    try:
+        result = run_real_v2_quality(
+            args.artifact_dir, qwen_model=args.model,
+            projection_path=args.projection,
+            embedding_python=args.embedding_python,
+            qwen_embedding_model=args.qwen3_embedding_model,
+            bge_m3_model=args.bge_m3_model)
+    except ExecutionEnvironmentBlocker as error:
+        print(json.dumps({
+            "contract": QUALITY_CONTRACT_ID,
+            "run_kind": REAL_QUALITY_RUN_KIND,
+            "state": "execution_environment_blocker",
+            "blocker": error.code,
+        }, sort_keys=True))
+        return 2
+    except BenchmarkProtocolError:
+        print(json.dumps({
+            "contract": QUALITY_CONTRACT_ID,
+            "run_kind": REAL_QUALITY_RUN_KIND,
+            "state": "contract_failure",
+        }, sort_keys=True))
+        return 1
+    report = result["report"]
     print(json.dumps({
-        "contract": result["report"]["contract"],
-        "benchmark_digest": result["manifest"]["benchmark_digest"],
-        "route_matrix_digest": result["manifest"]["route_matrix_digest"],
-        "one_shot_identity": result["report"]["one_shot_identity"],
-        "v2_quality": result["report"]["v2_quality"],
-        "report_path": result["report_path"],
-    }, ensure_ascii=False, sort_keys=True))
+        "contract": report["contract"],
+        "run_kind": report["run_kind"],
+        "terminal_state": report["terminal_state"],
+        "v2_pass_route_ids": report["v2_pass_route_ids"],
+        "report_digest": report["report_digest"],
+    }, sort_keys=True))
     return 0
 
 

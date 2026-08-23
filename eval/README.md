@@ -104,7 +104,7 @@ byte-for-byte summary regeneration. Must pass on the committed artifacts.
   `daemon/integration_cache_limit.py`, and an isolated daemon plus
   `daemon/integration_memory.py --socket <sock> --pid <pid>`.
 
-## Candidate-conditioned benchmark v2 (AC-108-v1)
+## Candidate-conditioned benchmark v2 (AC-108-v1 / AC-112-v1)
 
 `semantic_benchmark.py` is the unchanged #69 v1 development/regression set.
 `semantic_benchmark_v2.py` adds exactly 50 new synthetic Simplified-Chinese
@@ -114,26 +114,55 @@ candidate, and history as the historical last-64 上文 plus its selected
 candidate. Choice problems remain hard partitions and hard-negative evidence
 is never inferred from candidate identity alone.
 
-The v2 manifest must be frozen before a report is accepted. Each future route
+The v2 manifest must be frozen before a report is accepted. Each route
 calibrates its own threshold from exactly the 100 v1 hard-negative cosines by
 nearest-rank Q95; evidence uses strict `cosine > tau`. The seven route
 descriptor binds payload, model/instruction, 64-character window, pooling,
 vector format, dimensions, and metric. It and the manifest digest are checked
-before metrics, and the one-shot
-artifact boundary rejects a second report for the same benchmark/route
-identity. The model-free fixture proves exact top-K, strict equality, positive
-and no-evidence decisions, manifest verification, and report identity without
-loading a model or producing v2 quality results:
+before metrics. The model-free fixture proves exact top-K, strict equality,
+positive and no-evidence decisions, manifest verification, and report identity
+without loading a model or producing v2 quality results:
 
 ```sh
 python3 eval/semantic_benchmark_v2.py --fixture --artifact-dir <dir>
 ```
 
-Real embedding routes are covered by #110, and the AC-111 offline projection
-driver consumes only the confirmed prefix snapshot. Its matrix and extracted
-features remain local; `eval/SUMMARY-linear-projection-AC111.md` is the
-desensitized result. V2 quality and walk-forward selection remain deferred to
-#112/#113. Live ranking remains `alpha=0`, `gamma=0`.
+`--run-quality` is the AC-112 real runner. It binds the two AC-110 embedding
+adapters, the four AC-109 Qwen pooling routes, and the AC-111 projection to the
+frozen matrix before scoring. It uses one MLX process for Qwen/pooling/
+projection and a separate sequential `.venv-embeddings` process for each
+embedding model. It freezes all seven v1-only thresholds, K, payload,
+instructions, model/tokenizer and dependency identities, projection identity,
+code SHA, seed, and start time before it atomically claims the one permitted v2
+attempt. The code worktree must be clean before calibration and remain on that
+same commit until the freeze is written. The runner rechecks that snapshot
+immediately before and after v2 forwards; a drift consumes the claim as a
+contract failure rather than accepting a report with an ambiguous code SHA.
+
+```sh
+daemon/.venv/bin/python eval/semantic_benchmark_v2.py --run-quality \
+  --artifact-dir .local-work/ac112/v2-quality \
+  --model /Users/habit/Models/Qwen/Qwen3-0.6B-Base \
+  --projection /Users/habit/Developer/librime-llm-rerank/.local-work/ac112/candidate-conditioned-linear.npz \
+  --qwen3-embedding-model .local-work/models/Qwen3-Embedding-0.6B \
+  --bge-m3-model .local-work/models/BGE-M3
+```
+
+The real artifact contains stable case IDs, failure axes, numeric evidence, and
+identity hashes only. It never contains source text, candidate text, live facts,
+or absolute paths. A second claim or acceptance fails. If either dedicated
+embedding directory is missing, the command stops before threshold calibration,
+v2 metrics, or a quality artifact; it must not publish a five-route judgment.
+
+The only completed quality terminal states are `at_least_one_v2_pass` and
+`seven_route_all_fail`. The latter is a valid one-shot result, keeps live
+`gamma=0`, and does not authorize suffix evaluation, ANN, or #113 work. A
+v2-pass route still does not enable live evidence: live `alpha=0`, `gamma=0`
+remain unchanged until the separate #113 gate.
+
+The AC-111 offline projection driver consumes only the confirmed prefix
+snapshot. Its matrix and extracted features remain local;
+`eval/SUMMARY-linear-projection-AC111.md` is the desensitized result.
 
 ```sh
 daemon/.venv/bin/python eval/train_linear_projection.py \
