@@ -15,7 +15,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 from semantic_benchmark_v2 import (  # noqa: E402
     AXES,
     BenchmarkProtocolError,
+    ExecutionEnvironmentBlocker,
+    EXPECTED_RUNTIME_ADAPTERS,
+    PINNED_PROJECTION_FINGERPRINT_PREFIX,
+    PINNED_PROJECTION_WEIGHT_DIGEST,
     PRIVACY_MARKERS,
+    QUALITY_CONTRACT_ID,
+    REAL_QUALITY_RUN_KIND,
     V1_BENCHMARK_DIGEST,
     V1_BENCHMARK_VERSION,
     V2_BENCHMARK_VERSION,
@@ -24,16 +30,24 @@ from semantic_benchmark_v2 import (  # noqa: E402
     benchmark_manifest_v2,
     benchmark_cases_v2,
     build_fixture_report,
+    build_real_quality_report,
+    calibrate_runtime_routes,
+    calibration_requests,
     canonical_manifest_digest,
+    claim_v2_quality_run,
     family_specs_v2,
+    freeze_quality_inputs,
     freeze_inputs,
+    run_real_v2_quality,
     run_fixture_gate,
     render_review_table,
     route_matrix,
     route_matrix_digest,
+    validate_runtime_bindings,
     validate_route_matrix,
     validate_v2_cases,
     verify_artifact_privacy,
+    verify_quality_freeze,
 )
 
 
@@ -487,6 +501,230 @@ class SemanticBenchmarkV2ProtocolTest(unittest.TestCase):
                 json.dump(manifest, handle, ensure_ascii=False, sort_keys=True)
             with self.assertRaises(BenchmarkProtocolError):
                 accept_one_shot_report(root, {})
+
+
+class SevenRouteQualityProtocolTest(unittest.TestCase):
+    def _bindings(self):
+        bindings = {}
+        for route in route_matrix():
+            route_id = route["route_id"]
+            if route_id == "dedicated_qwen3_embedding_0_6b":
+                runtime_id = (
+                    "dedicated-embedding-repr-v1:route=qwen3-embedding-0.6b:"
+                    "payload=candidate-conditioned-concat-v1:"
+                    "model=" + "a" * 64 + ":tokenizer=" + "b" * 64 +
+                    ":adapter=qwen3:instruction=Represent the candidate-conditioned "
+                    "query for semantic retrieval.:pool=last-token:dim=1024:"
+                    "format=fp32-l2:metric=cosine:deps=fixture@1")
+            elif route_id == "dedicated_bge_m3":
+                runtime_id = (
+                    "dedicated-embedding-repr-v1:route=bge-m3-dense-1024:"
+                    "payload=candidate-conditioned-concat-v1:model=" + "a" * 64 +
+                    ":tokenizer=" + "b" * 64 + ":adapter=bge-m3:"
+                    "instruction=none:pool=dense-mean:dim=1024:format=fp32-l2:"
+                    "metric=cosine:deps=fixture@1")
+            elif route_id == "qwen_global_l14_l21_l28_projection_3072_to_256":
+                runtime_id = PINNED_PROJECTION_FINGERPRINT_PREFIX
+            else:
+                runtime_id = (
+                    "candidate-conditioned-repr-v1:"
+                    "payload=candidate-conditioned-concat-v1:"
+                    "serialization=last64-preceding-plus-candidate:no-separator:"
+                    "no-special:model=" + "a" * 16 + ":tokenizer=" + "b" * 16 +
+                    ":mlxlm=fixture:graph=1:"
+                    "layer=%d:pool=%s:window=64:span=candidate-token-span-v1:"
+                    "norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine"
+                    % (route["layer"], route["pooling"]))
+            binding = {
+                "route_id": route_id,
+                "runtime_adapter_id": EXPECTED_RUNTIME_ADAPTERS[route_id],
+                "runtime_id": runtime_id,
+                "model_identity": {
+                    "model_digest": "a" * 64,
+                    "tokenizer_digest": "b" * 64,
+                    "dimension": route["dimension"],
+                },
+                "dependency_versions": [["fixture-runtime", "1"]],
+            }
+            if route_id == "qwen_global_l14_l21_l28_projection_3072_to_256":
+                binding.update({
+                    "projection_fingerprint": PINNED_PROJECTION_FINGERPRINT_PREFIX,
+                    "projection_weight_digest": PINNED_PROJECTION_WEIGHT_DIGEST,
+                })
+            bindings[route_id] = binding
+        return bindings
+
+    def _calibrations(self):
+        from semantic_benchmark_v2 import (  # noqa: PLC0415
+            calibrate_v1_q95,
+            v1_benchmark_cases,
+        )
+
+        negative_cases = [case for case in v1_benchmark_cases()
+                          if case.relation == "hard_negative"]
+        calibrations = {}
+        for index, route in enumerate(route_matrix()):
+            observations = [{
+                "case_id": case.case_id,
+                "benchmark_version": V1_BENCHMARK_VERSION,
+                "relation": "hard_negative",
+                "cosine": 0.1 + index / 1000.0,
+            } for case in negative_cases]
+            calibrations[route["route_id"]] = {
+                "observations": observations,
+                "calibration": calibrate_v1_q95(observations),
+            }
+        return calibrations
+
+    def _quality_routes(self, bindings, calibrations, all_fail=False):
+        routes = {}
+        positive_cases = [case for case in benchmark_cases_v2()
+                          if case.relation == "positive"]
+        for route in route_matrix():
+            route_id = route["route_id"]
+            failures = []
+            qualified = 100
+            if all_fail:
+                qualified = 0
+                failures = [{
+                    "case_id": case.case_id,
+                    "relation": case.relation,
+                    "axes": list(case.axes),
+                    "failure_axes": ["below_tau", "outside_exact_top_k",
+                                     "candidate_mismatch"],
+                    "target_cosine": 0.0,
+                    "target_above_tau": False,
+                    "target_in_exact_top_k": False,
+                    "matched_candidate": False,
+                } for case in positive_cases]
+            routes[route_id] = {
+                "runtime_id": bindings[route_id]["runtime_id"],
+                "tau": calibrations[route_id]["calibration"]["tau"],
+                "positive": {
+                    "qualified": qualified,
+                    "total": 100,
+                    "rate": qualified / 100.0,
+                    "above_tau": qualified,
+                    "in_exact_top_k": qualified,
+                    "matched_candidate": qualified,
+                },
+                "hard_negative": {
+                    "no_evidence": 100,
+                    "total": 100,
+                    "rate": 1.0,
+                    "target_above_tau": 0,
+                    "target_in_exact_top_k": 0,
+                },
+                "exact_top_k": {
+                    "k_evidence": 8,
+                    "kept_min": 0 if all_fail else 8,
+                    "kept_max": 8,
+                    "kept_at_k": 0 if all_fail else 200,
+                },
+                "failures": failures,
+                "gate_pass": not all_fail,
+            }
+        return routes
+
+    def _freeze_real_run(self, root):
+        bindings = self._bindings()
+        calibrations = self._calibrations()
+        manifest = freeze_inputs(root)
+        validate_runtime_bindings(manifest, bindings)
+        freeze_quality_inputs(
+            root, calibrations, bindings, "c" * 40,
+            "2026-08-23T00:00:00+00:00")
+        return bindings, calibrations
+
+    def test_runtime_bindings_refuse_identity_drift_before_scoring(self):
+        manifest = benchmark_manifest_v2()
+        bindings = self._bindings()
+        self.assertTrue(validate_runtime_bindings(manifest, bindings))
+
+        changed = copy.deepcopy(bindings)
+        changed["dedicated_bge_m3"]["runtime_adapter_id"] = "wrong-adapter"
+        with self.assertRaises(BenchmarkProtocolError):
+            validate_runtime_bindings(manifest, changed)
+
+        changed = copy.deepcopy(bindings)
+        changed["qwen_l14_candidate_span_mean"]["runtime_id"] = "wrong-id"
+        with self.assertRaises(BenchmarkProtocolError):
+            validate_runtime_bindings(manifest, changed)
+
+        changed = copy.deepcopy(bindings)
+        changed["qwen_global_l14_l21_l28_projection_3072_to_256"][
+            "projection_weight_digest"] = "0" * 64
+        with self.assertRaises(BenchmarkProtocolError):
+            validate_runtime_bindings(manifest, changed)
+
+    def test_runtime_calibration_cannot_read_v2_cases(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        requests = calibration_requests()
+        self.assertEqual(200, len(requests))
+        self.assertTrue(all(request.key.startswith("v1:") for request in requests))
+        vectors = {
+            route["route_id"]: {
+                request.key: (1.0, 0.0) for request in requests
+            }
+            for route in route_matrix()
+        }
+        with patch.object(module, "benchmark_cases_v2",
+                          side_effect=AssertionError("v2 must stay isolated")):
+            calibrations = calibrate_runtime_routes(vectors)
+        self.assertEqual({route["route_id"] for route in route_matrix()},
+                         set(calibrations))
+        self.assertTrue(all(
+            item["calibration"]["source_case_count"] == 100
+            and item["calibration"]["tau"] == 1.0
+            for item in calibrations.values()))
+
+    def test_real_report_is_accepted_once_and_all_fail_keeps_gamma_zero(self):
+        with tempfile.TemporaryDirectory(prefix="ac112-real-one-shot-") as root:
+            bindings, calibrations = self._freeze_real_run(root)
+            claim_v2_quality_run(root)
+            report = build_real_quality_report(
+                root, self._quality_routes(bindings, calibrations, all_fail=True))
+            self.assertEqual(QUALITY_CONTRACT_ID, report["contract"])
+            self.assertEqual(REAL_QUALITY_RUN_KIND, report["run_kind"])
+            self.assertEqual("seven_route_all_fail", report["terminal_state"])
+            self.assertEqual(0, report["live_gamma"])
+            accepted = accept_one_shot_report(root, report)
+            self.assertTrue(os.path.isfile(accepted["report_path"]))
+            self.assertTrue(verify_artifact_privacy(root))
+            with self.assertRaises(BenchmarkProtocolError):
+                claim_v2_quality_run(root)
+            with self.assertRaises(BenchmarkProtocolError):
+                accept_one_shot_report(root, report)
+
+    def test_real_freeze_and_report_privacy_probes_reject_raw_content(self):
+        with tempfile.TemporaryDirectory(prefix="ac112-real-privacy-") as root:
+            bindings, calibrations = self._freeze_real_run(root)
+            manifest, record = verify_quality_freeze(root)
+            self.assertEqual(manifest["benchmark_digest"], record["manifest_digest"])
+            claim_v2_quality_run(root)
+            report = build_real_quality_report(
+                root, self._quality_routes(bindings, calibrations))
+            report["leaked_raw_text"] = benchmark_cases_v2()[0].source_query_text
+            path = os.path.join(root, "semantic_benchmark_v2_report.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, sort_keys=True)
+            with self.assertRaises(BenchmarkProtocolError):
+                verify_artifact_privacy(root)
+
+    def test_missing_embedding_environment_stops_before_freeze_or_metrics(self):
+        with tempfile.TemporaryDirectory(prefix="ac112-missing-models-") as root:
+            missing = os.path.join(root, "missing")
+            with self.assertRaises(ExecutionEnvironmentBlocker):
+                run_real_v2_quality(
+                    root,
+                    qwen_model=missing,
+                    projection_path=missing,
+                    embedding_python=missing,
+                    qwen_embedding_model=missing,
+                    bge_m3_model=missing,
+                )
+            self.assertEqual([], os.listdir(root))
 
 
 if __name__ == "__main__":
