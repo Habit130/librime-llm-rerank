@@ -51,7 +51,7 @@ from semantic_benchmark import (  # noqa: E402
 
 
 CONTRACT_ID = "AC-108-v1"
-QUALITY_CONTRACT_ID = "AC-112-v1"
+QUALITY_CONTRACT_ID = "AC-112-v2"
 V2_BENCHMARK_VERSION = "candidate-conditioned-semantic-benchmark-v2"
 V2_ROLE = "acceptance"
 PAYLOAD_SCHEMA = "candidate-conditioned-query-history-v1"
@@ -60,6 +60,7 @@ Q95 = 0.95
 STRICT_THRESHOLD_SEMANTICS = "cosine > tau"
 REAL_QUALITY_RUN_KIND = "seven_route_v2_quality"
 QUALITY_SEED = 0
+MIN_FINITE_V1_HN = 80
 V1_BENCHMARK_DIGEST = (
     "69205442228a14b6942e2a4de999587e893125f24f3d91e3e218a0140e2df1ec"
 )
@@ -100,6 +101,7 @@ ARTIFACT_FILENAMES = frozenset({
     "semantic_benchmark_v2_review.md",
     "semantic_benchmark_v2.frozen",
     "semantic_benchmark_v2_run_freeze.json",
+    "semantic_benchmark_v2.preclaim_refusal.json",
     "semantic_benchmark_v2.quality_started",
     "semantic_benchmark_v2.contract_failure.json",
     "semantic_benchmark_v2.accepted",
@@ -109,6 +111,14 @@ ARTIFACT_FILENAMES = frozenset({
 
 class BenchmarkProtocolError(Exception):
     """A frozen benchmark or one-shot protocol input is invalid."""
+
+
+class PreClaimQualityRefusal(BenchmarkProtocolError):
+    """A route lacks enough finite v1 HN cosines to claim v2 quality."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        super().__init__("fewer than 80 finite v1 hard-negative cosines")
 
 
 def canonical_json(value):
@@ -1248,17 +1258,22 @@ def nearest_rank_q95(values):
     return sorted(values)[max(0, min(index, len(values) - 1))]
 
 
-def calibrate_v1_q95(observations):
-    """Calibrate one route from exactly the 100 v1 hard-negative cases."""
+def calibrate_v1_q95(observations, excluded_case_ids=()):
+    """Calibrate one route from its finite v1 hard-negative cosines only."""
     observations = tuple(_observation(value) for value in observations)
-    v1_ids = set(_v1_snapshot()["case_ids"])
-    v1_negative_ids = {
+    v1_negative_ids = tuple(
         case.case_id for case in v1_benchmark_cases()
         if case.relation == "hard_negative"
-    }
-    if len(observations) != 100:
+    )
+    v1_negative_id_set = set(v1_negative_ids)
+    if not isinstance(excluded_case_ids, (list, tuple)):
         raise BenchmarkProtocolError(
-            "v1 Q95 calibration requires exactly 100 observations")
+            "excluded v1 hard-negative case IDs must be a list")
+    excluded_case_ids = tuple(excluded_case_ids)
+    if (any(not isinstance(case_id, str) for case_id in excluded_case_ids)
+            or len(set(excluded_case_ids)) != len(excluded_case_ids)
+            or not set(excluded_case_ids) <= v1_negative_id_set):
+        raise BenchmarkProtocolError("excluded v1 hard-negative IDs are invalid")
     seen = set()
     values = []
     for observation in observations:
@@ -1268,8 +1283,7 @@ def calibrate_v1_q95(observations):
         if observation.relation != "hard_negative":
             raise BenchmarkProtocolError(
                 "calibration input must be v1 hard-negative")
-        if observation.case_id not in v1_ids or \
-                observation.case_id not in v1_negative_ids:
+        if observation.case_id not in v1_negative_id_set:
             raise BenchmarkProtocolError(
                 "calibration input contains a non-v1 hard-negative case")
         if observation.case_id in seen:
@@ -1284,14 +1298,22 @@ def calibrate_v1_q95(observations):
         if not math.isfinite(cosine) or not -1.0 <= cosine <= 1.0:
             raise BenchmarkProtocolError("cosine must be finite and in [-1, 1]")
         values.append(cosine)
-    if seen != v1_negative_ids:
+    expected_excluded = tuple(
+        case_id for case_id in v1_negative_ids if case_id not in seen)
+    if excluded_case_ids != expected_excluded:
         raise BenchmarkProtocolError("v1 hard-negative calibration set is incomplete")
+    if len(observations) < MIN_FINITE_V1_HN:
+        raise BenchmarkProtocolError(
+            "v1 Q95 calibration requires at least 80 finite observations")
     return {
         "source_benchmark_version": V1_BENCHMARK_VERSION,
         "source_relation": "hard_negative",
+        "attempted_case_count": len(v1_negative_ids),
         "source_case_count": len(observations),
         "source_case_ids_digest": sha256_text(canonical_json(
             [observation.case_id for observation in observations])),
+        "excluded_case_ids_digest": sha256_text(canonical_json(
+            list(excluded_case_ids))),
         "quantile": "Q95",
         "quantile_method": "nearest_rank",
         "tau": nearest_rank_q95(values),
@@ -1420,6 +1442,7 @@ def _run_fixture_gate(manifest):
         calibration = calibrate_v1_q95(observations)
         calibrations[route["route_id"]] = {
             "calibration": calibration,
+            "excluded_case_ids": [],
             "observations": list(observations),
         }
         routes[route["route_id"]] = _fixture_route_gate(
@@ -1501,6 +1524,10 @@ def verify_artifact_privacy(artifact_dir):
     freeze_path = artifact_dir / "semantic_benchmark_v2_run_freeze.json"
     if freeze_path.is_file():
         _assert_desensitized_quality_freeze(_read_json(freeze_path))
+    refusal_path = artifact_dir / "semantic_benchmark_v2.preclaim_refusal.json"
+    if refusal_path.is_file():
+        _assert_desensitized_value(
+            _read_json(refusal_path), "pre-claim quality refusal")
     return True
 
 
@@ -1602,10 +1629,14 @@ def _verify_report_calibrations(manifest, report):
         route_id = route["route_id"]
         record = calibrations[route_id]
         observations = record.get("observations")
+        excluded_case_ids = record.get("excluded_case_ids")
         actual = record.get("calibration")
-        if not isinstance(observations, list) or not isinstance(actual, dict):
+        if (set(record) != {"calibration", "excluded_case_ids", "observations"}
+                or not isinstance(observations, list)
+                or not isinstance(excluded_case_ids, list)
+                or not isinstance(actual, dict)):
             raise BenchmarkProtocolError("report calibration is incomplete")
-        expected = calibrate_v1_q95(observations)
+        expected = calibrate_v1_q95(observations, excluded_case_ids)
         if actual != expected:
             raise BenchmarkProtocolError(
                 "route %s does not use v1-only Q95 calibration" % route_id)
@@ -1633,13 +1664,16 @@ def _validate_calibration_records(manifest, calibrations):
     for route in manifest["route_matrix"]:
         record = calibrations[route["route_id"]]
         if not isinstance(record, dict) or set(record) != {
-                "calibration", "observations"}:
+                "calibration", "excluded_case_ids", "observations"}:
             raise BenchmarkProtocolError("calibration record is incomplete")
         observations = record["observations"]
+        excluded_case_ids = record["excluded_case_ids"]
         calibration = record["calibration"]
-        if not isinstance(observations, list) or not isinstance(calibration, dict):
+        if (not isinstance(observations, list)
+                or not isinstance(excluded_case_ids, list)
+                or not isinstance(calibration, dict)):
             raise BenchmarkProtocolError("calibration record is invalid")
-        if calibrate_v1_q95(observations) != calibration:
+        if calibrate_v1_q95(observations, excluded_case_ids) != calibration:
             raise BenchmarkProtocolError("calibration is not v1-only Q95")
 
 
@@ -1744,6 +1778,69 @@ def verify_quality_freeze(artifact_dir):
     return manifest, record
 
 
+def _validate_preclaim_refusal_routes(manifest, routes):
+    expected_route_ids = {route["route_id"] for route in manifest["route_matrix"]}
+    if not isinstance(routes, dict) or set(routes) != expected_route_ids:
+        raise BenchmarkProtocolError("pre-claim refusal route set drifted")
+    v1_negative_ids = tuple(
+        case.case_id for case in v1_benchmark_cases()
+        if case.relation == "hard_negative"
+    )
+    for route_id in expected_route_ids:
+        route = routes[route_id]
+        if not isinstance(route, dict) or set(route) != {
+                "finite_v1_hn_count", "excluded_v1_case_ids"}:
+            raise BenchmarkProtocolError("pre-claim refusal route is invalid")
+        count = route["finite_v1_hn_count"]
+        excluded = route["excluded_v1_case_ids"]
+        if (not isinstance(count, int) or count < 0 or count > len(v1_negative_ids)
+                or not isinstance(excluded, list)
+                or any(not isinstance(case_id, str) for case_id in excluded)
+                or len(set(excluded)) != len(excluded)):
+            raise BenchmarkProtocolError("pre-claim refusal values are invalid")
+        excluded_set = set(excluded)
+        if (not excluded_set <= set(v1_negative_ids)
+                or excluded != [case_id for case_id in v1_negative_ids
+                                if case_id in excluded_set]
+                or count + len(excluded) != len(v1_negative_ids)):
+            raise BenchmarkProtocolError("pre-claim refusal partition drifted")
+    if not any(route["finite_v1_hn_count"] < MIN_FINITE_V1_HN
+               for route in routes.values()):
+        raise BenchmarkProtocolError("pre-claim refusal has no insufficient route")
+
+
+def record_preclaim_refusal(artifact_dir, routes, code_sha):
+    """Record an insufficient v1 calibration without consuming the v2 claim."""
+    artifact_dir = Path(artifact_dir)
+    manifest = verify_frozen_inputs(artifact_dir)
+    if (not isinstance(code_sha, str) or len(code_sha) < 12
+            or any(character not in "0123456789abcdef" for character in code_sha)):
+        raise BenchmarkProtocolError("pre-claim refusal code SHA is invalid")
+    _validate_preclaim_refusal_routes(manifest, routes)
+    for name in (
+            "semantic_benchmark_v2_run_freeze.json",
+            "semantic_benchmark_v2.quality_started",
+            "semantic_benchmark_v2.contract_failure.json",
+            "semantic_benchmark_v2_report.json",
+            "semantic_benchmark_v2.accepted"):
+        if (artifact_dir / name).exists():
+            raise BenchmarkProtocolError("pre-claim refusal is not pre-claim")
+    record = {
+        "state": "pre_claim_refusal",
+        "contract": QUALITY_CONTRACT_ID,
+        "run_kind": REAL_QUALITY_RUN_KIND,
+        "manifest_digest": manifest["benchmark_digest"],
+        "route_matrix_digest": manifest["route_matrix_digest"],
+        "code_sha": code_sha,
+        "minimum_finite_v1_hn": MIN_FINITE_V1_HN,
+        "routes": routes,
+    }
+    _assert_desensitized_value(record, "pre-claim quality refusal")
+    _write_exclusive(artifact_dir / "semantic_benchmark_v2.preclaim_refusal.json",
+                     canonical_json(record) + "\n")
+    return record
+
+
 def _quality_claim(artifact_dir, record):
     return {
         "state": "quality_started",
@@ -1761,7 +1858,8 @@ def claim_v2_quality_run(artifact_dir):
     for name in (
             "semantic_benchmark_v2.accepted",
             "semantic_benchmark_v2_report.json",
-            "semantic_benchmark_v2.contract_failure.json"):
+            "semantic_benchmark_v2.contract_failure.json",
+            "semantic_benchmark_v2.preclaim_refusal.json"):
         if (artifact_dir / name).exists():
             raise BenchmarkProtocolError("real quality attempt is already terminal")
     marker = _quality_claim(artifact_dir, record)
@@ -1772,6 +1870,8 @@ def claim_v2_quality_run(artifact_dir):
 
 def _verify_quality_claim(artifact_dir, record):
     artifact_dir = Path(artifact_dir)
+    if (artifact_dir / "semantic_benchmark_v2.preclaim_refusal.json").exists():
+        raise BenchmarkProtocolError("v2 quality attempt ended before claim")
     if (artifact_dir / "semantic_benchmark_v2.contract_failure.json").exists():
         raise BenchmarkProtocolError("v2 quality attempt already ended in contract failure")
     path = artifact_dir / "semantic_benchmark_v2.quality_started"
@@ -1796,14 +1896,15 @@ def _validate_quality_results(manifest, record, routes):
     expected_route_ids = {route["route_id"] for route in manifest["route_matrix"]}
     if not isinstance(routes, dict) or set(routes) != expected_route_ids:
         raise BenchmarkProtocolError("quality route set drifted")
-    cases_by_id = {case.case_id: case for case in benchmark_cases_v2()}
+    cases = tuple(benchmark_cases_v2())
+    cases_by_id = {case.case_id: case for case in cases}
     passed_routes = []
     for descriptor in manifest["route_matrix"]:
         route_id = descriptor["route_id"]
         result = routes[route_id]
         expected_keys = {
             "runtime_id", "tau", "positive", "hard_negative",
-            "exact_top_k", "failures", "gate_pass",
+            "exact_top_k", "failures", "unreplayable_case_ids", "gate_pass",
         }
         if not isinstance(result, dict) or set(result) != expected_keys:
             raise BenchmarkProtocolError("quality result schema drifted")
@@ -1817,8 +1918,26 @@ def _validate_quality_results(manifest, record, routes):
             raise BenchmarkProtocolError("quality threshold drifted")
         positive = result["positive"]
         hard_negative = result["hard_negative"]
+        unreplayable_case_ids = result["unreplayable_case_ids"]
+        if (not isinstance(unreplayable_case_ids, list)
+                or any(not isinstance(case_id, str)
+                       for case_id in unreplayable_case_ids)
+                or len(set(unreplayable_case_ids)) != len(unreplayable_case_ids)
+                or not set(unreplayable_case_ids) <= set(cases_by_id)):
+            raise BenchmarkProtocolError("unreplayable case IDs are invalid")
+        unreplayable_case_id_set = set(unreplayable_case_ids)
+        expected_unreplayable_order = [
+            case.case_id for case in cases
+            if case.case_id in unreplayable_case_id_set
+        ]
+        if unreplayable_case_ids != expected_unreplayable_order:
+            raise BenchmarkProtocolError("unreplayable case IDs are not stable")
+        unreplayable_positive = sum(
+            case.relation == "positive" for case in cases
+            if case.case_id in unreplayable_case_id_set)
+        unreplayable_negative = len(unreplayable_case_ids) - unreplayable_positive
         if set(positive) != {"qualified", "total", "rate", "above_tau",
-                             "in_exact_top_k", "matched_candidate"} or \
+                              "in_exact_top_k", "matched_candidate"} or \
                 set(hard_negative) != {"no_evidence", "total", "rate",
                                        "target_above_tau", "target_in_exact_top_k"}:
             raise BenchmarkProtocolError("quality relation schema drifted")
@@ -1830,6 +1949,11 @@ def _validate_quality_results(manifest, record, routes):
             if any(not isinstance(group[key], int) or group[key] < 0
                    or group[key] > 100 for key in keys):
                 raise BenchmarkProtocolError("quality aggregate is invalid")
+        if (any(positive[key] > 100 - unreplayable_positive for key in (
+                    "above_tau", "in_exact_top_k", "matched_candidate"))
+                or any(hard_negative[key] > 100 - unreplayable_negative for key in (
+                    "target_above_tau", "target_in_exact_top_k"))):
+            raise BenchmarkProtocolError("unreplayable case has invented evidence")
         if positive["qualified"] > min(
                 positive["above_tau"], positive["in_exact_top_k"],
                 positive["matched_candidate"]) or \
@@ -1840,12 +1964,15 @@ def _validate_quality_results(manifest, record, routes):
             raise BenchmarkProtocolError("quality aggregate relationship drifted")
         exact_top_k = result["exact_top_k"]
         if set(exact_top_k) != {"k_evidence", "kept_min", "kept_max",
-                                "kept_at_k"} or \
+                                "kept_at_k", "evaluated", "unreplayable"} or \
                 exact_top_k["k_evidence"] != V2_K_EVIDENCE or \
                 any(not isinstance(exact_top_k[key], int)
-                    for key in ("kept_min", "kept_max", "kept_at_k")) or \
+                    for key in ("kept_min", "kept_max", "kept_at_k",
+                                "evaluated", "unreplayable")) or \
                 not 0 <= exact_top_k["kept_min"] <= exact_top_k["kept_max"] <= V2_K_EVIDENCE or \
-                not 0 <= exact_top_k["kept_at_k"] <= 200:
+                not 0 <= exact_top_k["kept_at_k"] <= exact_top_k["evaluated"] or \
+                exact_top_k["evaluated"] + exact_top_k["unreplayable"] != len(cases) or \
+                exact_top_k["unreplayable"] != len(unreplayable_case_ids):
             raise BenchmarkProtocolError("exact top-K summary is invalid")
         failures = result["failures"]
         if not isinstance(failures, list):
@@ -1865,6 +1992,17 @@ def _validate_quality_results(manifest, record, routes):
                     failure["axes"] != list(case.axes):
                 raise BenchmarkProtocolError("quality failure identity drifted")
             seen.add(failure["case_id"])
+            if failure["case_id"] in unreplayable_case_id_set:
+                if (case.relation != "positive"
+                        or failure["failure_axes"] != ["unreplayable"]
+                        or failure["target_cosine"] is not None
+                        or any(failure[key] is not False for key in (
+                            "target_above_tau", "target_in_exact_top_k",
+                            "matched_candidate"))):
+                    raise BenchmarkProtocolError(
+                        "unreplayable case has invalid failure evidence")
+                positive_failures += 1
+                continue
             if (isinstance(failure["target_cosine"], bool)
                     or not isinstance(failure["target_cosine"], (int, float))
                     or not math.isfinite(failure["target_cosine"])
@@ -1889,6 +2027,13 @@ def _validate_quality_results(manifest, record, routes):
                 negative_failures += 1
             else:
                 raise BenchmarkProtocolError("hard-negative failure axis drifted")
+        expected_unreplayable_positive_ids = {
+            case.case_id for case in cases
+            if case.relation == "positive"
+            and case.case_id in unreplayable_case_id_set
+        }
+        if not expected_unreplayable_positive_ids <= seen:
+            raise BenchmarkProtocolError("unreplayable positive miss is absent")
         if positive_failures != 100 - positive["qualified"] or \
                 negative_failures != 100 - hard_negative["no_evidence"]:
             raise BenchmarkProtocolError("quality failure counts drifted")
@@ -2006,7 +2151,8 @@ def _accept_fixture_report(artifact_dir, report):
     if any((artifact_dir / name).exists() for name in (
             "semantic_benchmark_v2_run_freeze.json",
             "semantic_benchmark_v2.quality_started",
-            "semantic_benchmark_v2.contract_failure.json")):
+            "semantic_benchmark_v2.contract_failure.json",
+            "semantic_benchmark_v2.preclaim_refusal.json")):
         raise BenchmarkProtocolError("fixture cannot share a real quality boundary")
     manifest = verify_frozen_inputs(artifact_dir)
     if not isinstance(report, dict):
@@ -2195,6 +2341,30 @@ def _validate_requests(requests):
     return requests
 
 
+def _validate_route_outcome(requests, vectors, unreplayable):
+    """Ensure every request either has a finite vector or an explicit fault."""
+    requests = _validate_requests(requests)
+    expected_keys = {request.key for request in requests}
+    if not isinstance(vectors, dict):
+        raise BenchmarkProtocolError("route vectors must be an object")
+    if not isinstance(unreplayable, (list, tuple)) or \
+            any(not isinstance(key, str) for key in unreplayable):
+        raise BenchmarkProtocolError("unreplayable request IDs are invalid")
+    unreplayable = tuple(unreplayable)
+    if len(set(unreplayable)) != len(unreplayable):
+        raise BenchmarkProtocolError("unreplayable request IDs are duplicated")
+    vector_keys = set(vectors)
+    unreplayable_keys = set(unreplayable)
+    if (not vector_keys <= expected_keys
+            or not unreplayable_keys <= expected_keys
+            or vector_keys & unreplayable_keys
+            or vector_keys | unreplayable_keys != expected_keys):
+        raise BenchmarkProtocolError("route vector outcome is incomplete")
+    for vector in vectors.values():
+        _run_cosine(vector, vector)
+    return unreplayable
+
+
 def _run_cosine(left, right):
     try:
         left = tuple(float(value) for value in left)
@@ -2292,35 +2462,71 @@ def quality_requests():
     return tuple(requests)
 
 
-def calibrate_runtime_routes(route_vectors):
-    """Calculate all seven thresholds from v1 hard negatives and nothing else."""
+def calibrate_runtime_routes(route_vectors, unreplayable_by_route=None):
+    """Calculate seven thresholds from finite v1 HN cosines only."""
     expected_routes = {route["route_id"] for route in route_matrix()}
     if not isinstance(route_vectors, dict) or set(route_vectors) != expected_routes:
         raise BenchmarkProtocolError("calibration runtime route set drifted")
+    if unreplayable_by_route is None:
+        unreplayable_by_route = {route_id: () for route_id in expected_routes}
+    if (not isinstance(unreplayable_by_route, dict)
+            or set(unreplayable_by_route) != expected_routes):
+        raise BenchmarkProtocolError("calibration unreplayable route set drifted")
+    requests = calibration_requests()
     calibrations = {}
+    statuses = {}
     for route_id in sorted(expected_routes):
         vectors = route_vectors[route_id]
+        unreplayable = set(_validate_route_outcome(
+            requests, vectors, unreplayable_by_route[route_id]))
         observations = []
+        excluded_case_ids = []
         for case in _v1_calibration_cases():
+            query_key = "v1:%s:query" % case.case_id
+            history_key = "v1:%s:history" % case.case_id
+            if query_key in unreplayable or history_key in unreplayable:
+                excluded_case_ids.append(case.case_id)
+                continue
             observations.append({
                 "case_id": case.case_id,
                 "benchmark_version": V1_BENCHMARK_VERSION,
                 "relation": "hard_negative",
                 "cosine": _run_cosine(
-                    vectors["v1:%s:query" % case.case_id],
-                    vectors["v1:%s:history" % case.case_id]),
+                    vectors[query_key], vectors[history_key]),
             })
+        statuses[route_id] = {
+            "finite_v1_hn_count": len(observations),
+            "excluded_v1_case_ids": excluded_case_ids,
+        }
+        if len(observations) < MIN_FINITE_V1_HN:
+            continue
         calibrations[route_id] = {
             "observations": observations,
-            "calibration": calibrate_v1_q95(observations),
+            "excluded_case_ids": excluded_case_ids,
+            "calibration": calibrate_v1_q95(
+                observations, excluded_case_ids),
         }
+    if len(calibrations) != len(expected_routes):
+        raise PreClaimQualityRefusal(statuses)
     return calibrations
 
 
-def _route_quality_result(route_id, vectors, tau):
+def _quality_case_request_keys(case):
+    return tuple(
+        [_quality_query_key(case, index)
+         for index in range(len(case.candidates))]
+        + ["v2:%s:history" % case.case_id]
+        + ["v2:%s:distractor:%02d" % (case.case_id, index)
+           for index in range(1, len(FIXTURE_DISTRACTOR_PRECEDING_TEXTS) + 1)]
+    )
+
+
+def _route_quality_result(route_id, vectors, tau, unreplayable=()):
     """Run one route over all v2 cases through the existing exact oracle."""
     del route_id
     cases = validate_v2_cases()
+    unreplayable = set(_validate_route_outcome(
+        quality_requests(), vectors, unreplayable))
     params, cosine_engine = _oracle_for_threshold(tau)
     positive = {"qualified": 0, "above_tau": 0, "in_exact_top_k": 0,
                 "matched_candidate": 0}
@@ -2328,7 +2534,24 @@ def _route_quality_result(route_id, vectors, tau):
                      "target_in_exact_top_k": 0}
     kept_counts = []
     failures = []
+    unreplayable_case_ids = []
     for case in cases:
+        if any(key in unreplayable for key in _quality_case_request_keys(case)):
+            unreplayable_case_ids.append(case.case_id)
+            if case.relation == "positive":
+                failures.append({
+                    "case_id": case.case_id,
+                    "relation": case.relation,
+                    "axes": list(case.axes),
+                    "failure_axes": ["unreplayable"],
+                    "target_cosine": None,
+                    "target_above_tau": False,
+                    "target_in_exact_top_k": False,
+                    "matched_candidate": False,
+                })
+            else:
+                hard_negative["no_evidence"] += 1
+            continue
         fixture = None
         try:
             query_vectors = [
@@ -2420,11 +2643,14 @@ def _route_quality_result(route_id, vectors, tau):
         "hard_negative": hard_negative,
         "exact_top_k": {
             "k_evidence": V2_K_EVIDENCE,
-            "kept_min": min(kept_counts),
-            "kept_max": max(kept_counts),
+            "kept_min": min(kept_counts) if kept_counts else 0,
+            "kept_max": max(kept_counts) if kept_counts else 0,
             "kept_at_k": sum(count == V2_K_EVIDENCE for count in kept_counts),
+            "evaluated": len(kept_counts),
+            "unreplayable": len(unreplayable_case_ids),
         },
         "failures": failures,
+        "unreplayable_case_ids": unreplayable_case_ids,
         "gate_pass": positive["rate"] >= 0.95 and \
         hard_negative["rate"] >= 0.95,
     }
@@ -2527,31 +2753,60 @@ class _QwenRouteExecutor:
 
     def forward(self, requests):
         self._ensure_initialized()
+        from linear_projection import ProjectionError  # noqa: PLC0415
+        from representations import RepresentationError  # noqa: PLC0415
+
         requests = _validate_requests(requests)
         vectors = {route_id: {} for route_id in self._bindings}
+        unreplayable = {route_id: [] for route_id in self._bindings}
+        span_route_ids = {
+            self._ROUTE_BY_SPEC[(spec.layer, spec.pooling)]
+            for spec in self._span_specs
+        }
+        span_route_ids.add(self._PROJECTION_ROUTE)
         cached = {}
         for request in requests:
             cache_key = (request.preceding_text, request.candidate)
             if cache_key not in cached:
-                spans = self._extractor.candidate_span_mean_all(
-                    request.preceding_text, request.candidate)
-                control = self._extractor.candidate(
-                    self._control_spec, request.preceding_text, request.candidate)
-                concatenated = []
-                for spec in self._span_specs:
-                    concatenated.extend(spans[spec.layer])
-                cached[cache_key] = {
-                    "qwen_l14_candidate_span_mean": spans[14],
-                    "qwen_l21_candidate_span_mean": spans[21],
-                    "qwen_l28_candidate_span_mean": spans[28],
-                    "qwen_l28_last_candidate_token_control": control,
-                    self._PROJECTION_ROUTE: self._projection.apply(concatenated),
-                }
-                for vector in cached[cache_key].values():
+                route_vectors = {}
+                faulted_routes = set()
+                try:
+                    spans = self._extractor.candidate_span_mean_all(
+                        request.preceding_text, request.candidate)
+                except RepresentationError:
+                    faulted_routes.update(span_route_ids)
+                else:
+                    concatenated = []
+                    for spec in self._span_specs:
+                        route_id = self._ROUTE_BY_SPEC[(spec.layer, spec.pooling)]
+                        route_vectors[route_id] = spans[spec.layer]
+                        concatenated.extend(spans[spec.layer])
+                    try:
+                        route_vectors[self._PROJECTION_ROUTE] = \
+                            self._projection.apply(concatenated)
+                    except ProjectionError:
+                        faulted_routes.add(self._PROJECTION_ROUTE)
+                try:
+                    route_vectors["qwen_l28_last_candidate_token_control"] = \
+                        self._extractor.candidate(
+                            self._control_spec,
+                            request.preceding_text,
+                            request.candidate)
+                except RepresentationError:
+                    faulted_routes.add("qwen_l28_last_candidate_token_control")
+                for vector in route_vectors.values():
                     _run_cosine(vector, vector)
-            for route_id, vector in cached[cache_key].items():
-                vectors[route_id][request.key] = vector
-        return vectors
+                cached[cache_key] = (route_vectors, faulted_routes)
+            route_vectors, faulted_routes = cached[cache_key]
+            for route_id in self._bindings:
+                if route_id in route_vectors:
+                    vectors[route_id][request.key] = route_vectors[route_id]
+                elif route_id in faulted_routes:
+                    unreplayable[route_id].append(request.key)
+                else:
+                    raise BenchmarkProtocolError("qwen route outcome is incomplete")
+        return vectors, {route_id: tuple(keys)
+                         for route_id, keys in unreplayable.items()}
 
 
 def _embedding_binding(route_id, runtime_id, identity):
@@ -2584,8 +2839,10 @@ def _embedding_worker_main(route_id, model_path):
         requests = _validate_requests(requests)
         from embeddings import (  # noqa: PLC0415
             BGEM3EmbeddingAdapter,
+            EmbeddingInferenceError,
             Qwen3EmbeddingAdapter,
         )
+        from representations import RepresentationError  # noqa: PLC0415
 
         adapters = {
             "qwen3-embedding-0.6b": Qwen3EmbeddingAdapter,
@@ -2596,15 +2853,22 @@ def _embedding_worker_main(route_id, model_path):
         adapter = adapters[route_id](model_path=model_path)
         identity = adapter.identity
         vectors = {}
+        unreplayable = []
         cached = {}
         for request in requests:
             cache_key = (request.side, request.preceding_text, request.candidate)
             if cache_key not in cached:
-                cached[cache_key] = (
-                    adapter.query(request.preceding_text, request.candidate)
-                    if request.side == "query" else
-                    adapter.document(request.preceding_text, request.candidate))
-            vectors[request.key] = cached[cache_key]
+                try:
+                    cached[cache_key] = (
+                        adapter.query(request.preceding_text, request.candidate)
+                        if request.side == "query" else
+                        adapter.document(request.preceding_text, request.candidate))
+                except (EmbeddingInferenceError, RepresentationError):
+                    cached[cache_key] = None
+            if cached[cache_key] is None:
+                unreplayable.append(request.key)
+            else:
+                vectors[request.key] = cached[cache_key]
         print(canonical_json({
             "route_id": route_id,
             "binding": _embedding_binding(
@@ -2614,8 +2878,9 @@ def _embedding_worker_main(route_id, model_path):
                     "tokenizer_digest": identity.tokenizer_digest,
                     "output_dimension": identity.output_dimension,
                     "dependency_versions": list(identity.dependency_versions),
-                }),
+            }),
             "vectors": vectors,
+            "unreplayable": unreplayable,
         }))
         return 0
     except Exception:  # noqa: BLE001 - parent records only a desensitized code
@@ -2650,14 +2915,12 @@ def _run_embedding_worker(python_path, route_id, model_path, requests,
     except json.JSONDecodeError as error:
         raise BenchmarkProtocolError("embedding worker emitted invalid output") from error
     if not isinstance(result, dict) or set(result) != {
-            "route_id", "binding", "vectors"} or result["route_id"] != route_id:
+            "route_id", "binding", "vectors", "unreplayable"} or \
+            result["route_id"] != route_id:
         raise BenchmarkProtocolError("embedding worker identity drifted")
-    expected_keys = {request.key for request in requests}
-    if not isinstance(result["vectors"], dict) or set(result["vectors"]) != expected_keys:
-        raise BenchmarkProtocolError("embedding worker vector set drifted")
-    for vector in result["vectors"].values():
-        _run_cosine(vector, vector)
-    return result["vectors"], result["binding"]
+    unreplayable = _validate_route_outcome(
+        requests, result["vectors"], result["unreplayable"])
+    return result["vectors"], result["binding"], unreplayable
 
 
 class _SevenRouteExecutor:
@@ -2680,21 +2943,26 @@ class _SevenRouteExecutor:
 
     def forward(self, requests, expected_bindings=None, pre_quality=False):
         requests = _validate_requests(requests)
-        vectors = self._qwen.forward(requests)
+        vectors, unreplayable = self._qwen.forward(requests)
         bindings = self._qwen.bindings()
         for matrix_route, adapter_route in self._EMBEDDING_ROUTES:
-            route_vectors, binding = _run_embedding_worker(
+            route_vectors, binding, route_unreplayable = _run_embedding_worker(
                 self._embedding_python, adapter_route,
                 self._embedding_models[adapter_route], requests, pre_quality)
             vectors[matrix_route] = route_vectors
+            unreplayable[matrix_route] = route_unreplayable
             binding = dict(binding)
             binding["route_id"] = matrix_route
             bindings[matrix_route] = binding
         validate_runtime_bindings(self._manifest, bindings)
+        for route_id in self._manifest["route_matrix"]:
+            _validate_route_outcome(
+                requests, vectors[route_id["route_id"]],
+                unreplayable[route_id["route_id"]])
         if expected_bindings is not None and \
                 canonical_json(bindings) != canonical_json(expected_bindings):
             raise BenchmarkProtocolError("runtime identity changed after freeze")
-        return vectors, bindings
+        return vectors, unreplayable, bindings
 
 
 def _require_real_environment(qwen_model, projection_path, embedding_python,
@@ -2738,9 +3006,16 @@ def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
     executor = _SevenRouteExecutor(
         manifest, qwen_model, projection_path, embedding_python,
         qwen_embedding_model, bge_m3_model)
-    calibration_vectors, bindings = executor.forward(
+    calibration_vectors, calibration_unreplayable, bindings = executor.forward(
         calibration_requests(), pre_quality=True)
-    calibrations = calibrate_runtime_routes(calibration_vectors)
+    try:
+        calibrations = calibrate_runtime_routes(
+            calibration_vectors, calibration_unreplayable)
+    except PreClaimQualityRefusal as error:
+        _require_code_snapshot(code_sha)
+        refusal = record_preclaim_refusal(
+            artifact_dir, error.routes, code_sha)
+        return {"pre_claim_refusal": refusal}
     if _current_code_sha() != code_sha:
         raise BenchmarkProtocolError("code changed during v1 calibration")
     freeze_quality_inputs(
@@ -2748,7 +3023,7 @@ def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
     claim_v2_quality_run(artifact_dir)
     try:
         _require_code_snapshot(code_sha)
-        route_vectors, _bindings = executor.forward(
+        route_vectors, route_unreplayable, _bindings = executor.forward(
             quality_requests(), expected_bindings=bindings, pre_quality=False)
         _require_code_snapshot(code_sha)
     except Exception:  # noqa: BLE001 - the consumed shot remains terminal
@@ -2760,7 +3035,8 @@ def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
             route_id = route["route_id"]
             result = _route_quality_result(
                 route_id, route_vectors[route_id],
-                calibrations[route_id]["calibration"]["tau"])
+                calibrations[route_id]["calibration"]["tau"],
+                route_unreplayable[route_id])
             result["runtime_id"] = bindings[route_id]["runtime_id"]
             routes[route_id] = result
     except Exception:  # noqa: BLE001 - no partial seven-route judgment escapes
@@ -2839,6 +3115,17 @@ def main():
             "state": "contract_failure",
         }, sort_keys=True))
         return 1
+    if "pre_claim_refusal" in result:
+        refusal = result["pre_claim_refusal"]
+        print(json.dumps({
+            "contract": refusal["contract"],
+            "run_kind": refusal["run_kind"],
+            "state": refusal["state"],
+            "insufficient_route_ids": sorted(
+                route_id for route_id, route in refusal["routes"].items()
+                if route["finite_v1_hn_count"] < MIN_FINITE_V1_HN),
+        }, sort_keys=True))
+        return 2
     report = result["report"]
     print(json.dumps({
         "contract": report["contract"],
