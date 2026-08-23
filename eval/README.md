@@ -135,7 +135,9 @@ embedding model. It freezes all seven v1-only thresholds, K, payload,
 instructions, model/tokenizer and dependency identities, projection identity,
 code SHA, seed, and start time before it atomically claims the one permitted v2
 attempt. The code worktree must be clean before calibration and remain on that
-same commit until the freeze is written.
+same commit until the freeze is written. The runner rechecks that snapshot
+immediately before and after v2 forwards; a drift consumes the claim as a
+contract failure rather than accepting a report with an ambiguous code SHA.
 
 ```sh
 daemon/.venv/bin/python eval/semantic_benchmark_v2.py --run-quality \

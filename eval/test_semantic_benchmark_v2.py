@@ -744,6 +744,9 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
                           return_value=" M eval/semantic_benchmark_v2.py\n"):
             with self.assertRaises(BenchmarkProtocolError):
                 module._current_code_sha()
+        with patch.object(module, "_current_code_sha", return_value="d" * 40):
+            with self.assertRaises(BenchmarkProtocolError):
+                module._require_code_snapshot("c" * 40)
 
     def test_real_report_is_accepted_once_and_all_fail_keeps_gamma_zero(self):
         with tempfile.TemporaryDirectory(prefix="ac112-real-one-shot-") as root:

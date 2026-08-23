@@ -2162,6 +2162,11 @@ def _current_code_sha():
         raise BenchmarkProtocolError("cannot resolve the current code SHA") from error
 
 
+def _require_code_snapshot(code_sha):
+    if _current_code_sha() != code_sha:
+        raise BenchmarkProtocolError("code changed after quality freeze")
+
+
 def _runtime_dependency_versions(packages):
     from importlib import metadata
 
@@ -2742,8 +2747,10 @@ def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
         artifact_dir, calibrations, bindings, code_sha, started_at)
     claim_v2_quality_run(artifact_dir)
     try:
+        _require_code_snapshot(code_sha)
         route_vectors, _bindings = executor.forward(
             quality_requests(), expected_bindings=bindings, pre_quality=False)
+        _require_code_snapshot(code_sha)
     except Exception:  # noqa: BLE001 - the consumed shot remains terminal
         _best_effort_contract_failure(artifact_dir, "vector_generation")
         raise
