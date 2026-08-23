@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -40,6 +41,7 @@ from semantic_benchmark_v2 import (  # noqa: E402
     freeze_inputs,
     run_real_v2_quality,
     run_fixture_gate,
+    quality_requests,
     render_review_table,
     route_matrix,
     route_matrix_digest,
@@ -512,6 +514,8 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
                 runtime_id = (
                     "dedicated-embedding-repr-v1:route=qwen3-embedding-0.6b:"
                     "payload=candidate-conditioned-concat-v1:"
+                    "serialization=last64-preceding-plus-candidate:no-separator:"
+                    "no-special:"
                     "model=" + "a" * 64 + ":tokenizer=" + "b" * 64 +
                     ":adapter=qwen3:instruction=Represent the candidate-conditioned "
                     "query for semantic retrieval.:pool=last-token:dim=1024:"
@@ -519,7 +523,9 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
             elif route_id == "dedicated_bge_m3":
                 runtime_id = (
                     "dedicated-embedding-repr-v1:route=bge-m3-dense-1024:"
-                    "payload=candidate-conditioned-concat-v1:model=" + "a" * 64 +
+                    "payload=candidate-conditioned-concat-v1:"
+                    "serialization=last64-preceding-plus-candidate:no-separator:"
+                    "no-special:model=" + "a" * 64 +
                     ":tokenizer=" + "b" * 64 + ":adapter=bge-m3:"
                     "instruction=none:pool=dense-mean:dim=1024:format=fp32-l2:"
                     "metric=cosine:deps=fixture@1")
@@ -657,6 +663,16 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
         with self.assertRaises(BenchmarkProtocolError):
             validate_runtime_bindings(manifest, changed)
 
+        changed = copy.deepcopy(bindings)
+        changed["dedicated_qwen3_embedding_0_6b"]["runtime_id"] = \
+            changed["dedicated_qwen3_embedding_0_6b"]["runtime_id"].replace(
+                "serialization=last64-preceding-plus-candidate:no-separator:"
+                "no-special",
+                "serialization=drifted",
+            )
+        with self.assertRaises(BenchmarkProtocolError):
+            validate_runtime_bindings(manifest, changed)
+
     def test_runtime_calibration_cannot_read_v2_cases(self):
         import semantic_benchmark_v2 as module  # noqa: PLC0415
 
@@ -678,6 +694,56 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
             item["calibration"]["source_case_count"] == 100
             and item["calibration"]["tau"] == 1.0
             for item in calibrations.values()))
+
+    def test_quality_uses_one_query_vector_per_current_candidate(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        requests = quality_requests()
+        self.assertEqual(
+            sum(len(case.candidates) + 1 + len(module.FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
+                for case in benchmark_cases_v2()),
+            len(requests),
+        )
+        first = benchmark_cases_v2()[0]
+        self.assertEqual({
+            "v2:%s:query:00" % first.case_id,
+            "v2:%s:query:01" % first.case_id,
+        }, {request.key for request in requests
+            if request.key.startswith("v2:%s:query:" % first.case_id)})
+        vectors = {request.key: (1.0, 0.0) for request in requests}
+        observed = []
+
+        def fake_compute(_reader, _params, query, _vector_for,
+                         cosine_engine=None):
+            self.assertIsNone(cosine_engine)
+            self.assertEqual((), query.query_vector)
+            self.assertEqual(len(query.candidates), len(query.candidate_query_vectors))
+            observed.append(query.candidate_query_vectors)
+            return SimpleNamespace(kept=())
+
+        with patch.object(module, "compute_evidence", side_effect=fake_compute):
+            module._route_quality_result("fixture", vectors, 0.0)
+        self.assertEqual(200, len(observed))
+
+    def test_quality_supports_every_valid_q95_boundary(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        vectors = {request.key: (1.0, 0.0) for request in quality_requests()}
+        at_one = module._route_quality_result("fixture", vectors, 1.0)
+        self.assertEqual(0, at_one["positive"]["qualified"])
+        self.assertEqual(100, at_one["hard_negative"]["no_evidence"])
+
+        negative = module._route_quality_result("fixture", vectors, -1.0)
+        self.assertEqual(100, negative["positive"]["qualified"])
+        self.assertEqual(0, negative["hard_negative"]["no_evidence"])
+
+    def test_real_runner_requires_a_clean_code_worktree(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        with patch.object(module.subprocess, "check_output",
+                          return_value=" M eval/semantic_benchmark_v2.py\n"):
+            with self.assertRaises(BenchmarkProtocolError):
+                module._current_code_sha()
 
     def test_real_report_is_accepted_once_and_all_fail_keeps_gamma_zero(self):
         with tempfile.TemporaryDirectory(prefix="ac112-real-one-shot-") as root:

@@ -31,7 +31,13 @@ _DAEMON = _ROOT / "daemon"
 if str(_DAEMON) not in sys.path:
     sys.path.insert(0, str(_DAEMON))
 
-from oracle import OracleParams, OracleQuery, FactReader, compute_evidence  # noqa: E402
+from oracle import (  # noqa: E402
+    CosineEngine,
+    FactReader,
+    OracleParams,
+    OracleQuery,
+    compute_evidence,
+)
 from semantic_benchmark import (  # noqa: E402
     AXES as V1_AXES,
     BENCHMARK_VERSION as V1_BENCHMARK_VERSION,
@@ -1023,6 +1029,7 @@ def _runtime_id_matches_descriptor(route, binding):
     if route_id == "dedicated_qwen3_embedding_0_6b":
         markers = (
             "dedicated-embedding-repr-v1:route=qwen3-embedding-0.6b:",
+            ":serialization=last64-preceding-plus-candidate:no-separator:no-special:",
             ":adapter=qwen3:",
             ":instruction=Represent the candidate-conditioned query for semantic retrieval.",
             ":pool=last-token:dim=1024:format=fp32-l2:metric=cosine:",
@@ -1030,6 +1037,7 @@ def _runtime_id_matches_descriptor(route, binding):
     elif route_id == "dedicated_bge_m3":
         markers = (
             "dedicated-embedding-repr-v1:route=bge-m3-dense-1024:",
+            ":serialization=last64-preceding-plus-candidate:no-separator:no-special:",
             ":adapter=bge-m3:", ":instruction=none:",
             ":pool=dense-mean:dim=1024:format=fp32-l2:metric=cosine:",
         )
@@ -2141,6 +2149,12 @@ def _utc_now():
 
 def _current_code_sha():
     try:
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=str(_ROOT), text=True,
+            stderr=subprocess.DEVNULL)
+        if dirty:
+            raise BenchmarkProtocolError(
+                "real quality requires a clean code worktree")
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=str(_ROOT), text=True,
             stderr=subprocess.DEVNULL).strip()
@@ -2190,8 +2204,45 @@ def _run_cosine(left, right):
     right_norm = math.sqrt(sum(value * value for value in right))
     if left_norm == 0.0 or right_norm == 0.0:
         raise BenchmarkProtocolError("route vector has zero norm")
-    return sum(lvalue * rvalue for lvalue, rvalue in zip(left, right)) / \
+    cosine = sum(lvalue * rvalue for lvalue, rvalue in zip(left, right)) / \
         (left_norm * right_norm)
+    if cosine < -1.0 - 1e-12 or cosine > 1.0 + 1e-12:
+        raise BenchmarkProtocolError("route cosine is outside [-1, 1]")
+    return min(1.0, max(-1.0, cosine))
+
+
+class _AffineCosineEngine(CosineEngine):
+    """Map a negative threshold into the oracle's supported [0, 1) domain."""
+
+    def batch_cosines(self, query_vector, event_ids, vector_for):
+        return {
+            event_id: (_run_cosine(query_vector, vector_for(event_id)) + 1.0) / 2.0
+            for event_id in event_ids
+        }
+
+
+def _oracle_for_threshold(tau):
+    """Preserve strict threshold and relevance semantics for every valid Q95."""
+    if isinstance(tau, bool):
+        raise BenchmarkProtocolError("quality threshold is invalid")
+    try:
+        tau = float(tau)
+    except (TypeError, ValueError) as error:
+        raise BenchmarkProtocolError("quality threshold is invalid") from error
+    if not math.isfinite(tau) or not -1.0 <= tau <= 1.0:
+        raise BenchmarkProtocolError("quality threshold is outside [-1, 1]")
+    if tau == 1.0:
+        return None, None
+    if tau < 0.0:
+        # f(c) = (c + 1) / 2 preserves c > tau and
+        # (c - tau) / (1 - tau), while giving OracleParams a legal threshold.
+        return OracleParams(
+            tau=(tau + 1.0) / 2.0,
+            k_evidence=V2_K_EVIDENCE,
+            half_life=float("inf"),
+            saturation_k=1.0), _AffineCosineEngine()
+    return OracleParams(tau=tau, k_evidence=V2_K_EVIDENCE,
+                        half_life=float("inf"), saturation_k=1.0), None
 
 
 def _v1_calibration_cases():
@@ -2212,17 +2263,22 @@ def calibration_requests():
     return tuple(requests)
 
 
+def _quality_query_key(case, candidate_index):
+    return "v2:%s:query:%02d" % (case.case_id, candidate_index)
+
+
 def quality_requests():
     """Build v2 forwards separately, after the calibration freeze is written."""
     requests = []
     for case in benchmark_cases_v2():
-        requests.extend((
-            VectorRequest("v2:%s:query" % case.case_id, "query",
-                          case.query_preceding_text, case.query_candidate),
-            VectorRequest("v2:%s:history" % case.case_id, "document",
-                          case.recorded_preceding_text,
-                          case.historical_selected_candidate),
-        ))
+        for index, candidate in enumerate(case.candidates):
+            requests.append(VectorRequest(
+                _quality_query_key(case, index), "query",
+                case.query_preceding_text, candidate))
+        requests.append(VectorRequest(
+            "v2:%s:history" % case.case_id, "document",
+            case.recorded_preceding_text,
+            case.historical_selected_candidate))
         for index, preceding_text in enumerate(
                 FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
             requests.append(VectorRequest(
@@ -2260,8 +2316,7 @@ def _route_quality_result(route_id, vectors, tau):
     """Run one route over all v2 cases through the existing exact oracle."""
     del route_id
     cases = validate_v2_cases()
-    params = OracleParams(tau=tau, k_evidence=V2_K_EVIDENCE,
-                          half_life=float("inf"), saturation_k=1.0)
+    params, cosine_engine = _oracle_for_threshold(tau)
     positive = {"qualified": 0, "above_tau": 0, "in_exact_top_k": 0,
                 "matched_candidate": 0}
     hard_negative = {"no_evidence": 0, "target_above_tau": 0,
@@ -2269,38 +2324,53 @@ def _route_quality_result(route_id, vectors, tau):
     kept_counts = []
     failures = []
     for case in cases:
-        fixture = V1SyntheticFacts(case, FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
+        fixture = None
         try:
-            query_vector = vectors["v2:%s:query" % case.case_id]
+            query_vectors = [
+                vectors[_quality_query_key(case, index)]
+                for index in range(len(case.candidates))
+            ]
+            target_index = case.candidates.index(case.query_candidate)
+            query_vector = query_vectors[target_index]
             target_vector = vectors["v2:%s:history" % case.case_id]
             target_cosine = _run_cosine(query_vector, target_vector)
-            vector_by_event = {fixture.target_event_id: target_vector}
-            for index, _preceding_text in enumerate(
-                    FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
-                vector_by_event["distractor-%s-%02d" % (case.case_id, index)] = \
-                    vectors["v2:%s:distractor:%02d" % (case.case_id, index)]
-            reader = FactReader(fixture.db_path)
-            try:
-                result = compute_evidence(
-                    reader, params,
-                    OracleQuery(
-                        schema_id=SCHEMA_ID,
-                        category=CATEGORY,
-                        canonical_segment_input=case.choice_problem,
-                        candidates=case.candidates,
-                        query_vector=query_vector,
-                    ),
-                    lambda event_id: vector_by_event[event_id],
-                )
-            finally:
-                reader.close()
-            target = next((entry for entry in result.kept
-                           if entry.event_id == fixture.target_event_id), None)
+            if params is None:
+                target = None
+                kept_count = 0
+            else:
+                fixture = V1SyntheticFacts(
+                    case, FIXTURE_DISTRACTOR_PRECEDING_TEXTS)
+                vector_by_event = {fixture.target_event_id: target_vector}
+                for index, _preceding_text in enumerate(
+                        FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
+                    vector_by_event[
+                        "distractor-%s-%02d" % (case.case_id, index)] = \
+                        vectors["v2:%s:distractor:%02d" % (case.case_id, index)]
+                reader = FactReader(fixture.db_path)
+                try:
+                    result = compute_evidence(
+                        reader, params,
+                        OracleQuery(
+                            schema_id=SCHEMA_ID,
+                            category=CATEGORY,
+                            canonical_segment_input=case.choice_problem,
+                            candidates=case.candidates,
+                            query_vector=(),
+                            candidate_query_vectors=query_vectors,
+                        ),
+                        lambda event_id: vector_by_event[event_id],
+                        cosine_engine=cosine_engine,
+                    )
+                finally:
+                    reader.close()
+                target = next((entry for entry in result.kept
+                               if entry.event_id == fixture.target_event_id), None)
+                kept_count = len(result.kept)
             above_tau = strict_cosine_above_threshold(target_cosine, tau)
             in_exact_top_k = target is not None
             matched_candidate = target is not None and \
-                target.matched_candidate == case.candidates.index(case.query_candidate)
-            kept_counts.append(len(result.kept))
+                target.matched_candidate == target_index
+            kept_counts.append(kept_count)
             if case.relation == "positive":
                 positive["above_tau"] += int(above_tau)
                 positive["in_exact_top_k"] += int(in_exact_top_k)
@@ -2332,7 +2402,8 @@ def _route_quality_result(route_id, vectors, tau):
                     "matched_candidate": matched_candidate,
                 })
         finally:
-            fixture.close()
+            if fixture is not None:
+                fixture.close()
     positive["total"] = 100
     positive["rate"] = positive["qualified"] / positive["total"]
     hard_negative["total"] = 100
@@ -2471,6 +2542,8 @@ class _QwenRouteExecutor:
                     "qwen_l28_last_candidate_token_control": control,
                     self._PROJECTION_ROUTE: self._projection.apply(concatenated),
                 }
+                for vector in cached[cache_key].values():
+                    _run_cosine(vector, vector)
             for route_id, vector in cached[cache_key].items():
                 vectors[route_id][request.key] = vector
         return vectors
@@ -2654,6 +2727,7 @@ def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
     _require_real_environment(
         qwen_model, projection_path, embedding_python,
         qwen_embedding_model, bge_m3_model)
+    code_sha = _current_code_sha()
     manifest = freeze_inputs(artifact_dir)
     started_at = _utc_now()
     executor = _SevenRouteExecutor(
@@ -2662,8 +2736,10 @@ def run_real_v2_quality(artifact_dir, qwen_model=DEFAULT_QWEN_BASE_MODEL,
     calibration_vectors, bindings = executor.forward(
         calibration_requests(), pre_quality=True)
     calibrations = calibrate_runtime_routes(calibration_vectors)
+    if _current_code_sha() != code_sha:
+        raise BenchmarkProtocolError("code changed during v1 calibration")
     freeze_quality_inputs(
-        artifact_dir, calibrations, bindings, _current_code_sha(), started_at)
+        artifact_dir, calibrations, bindings, code_sha, started_at)
     claim_v2_quality_run(artifact_dir)
     try:
         route_vectors, _bindings = executor.forward(

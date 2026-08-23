@@ -134,7 +134,8 @@ projection and a separate sequential `.venv-embeddings` process for each
 embedding model. It freezes all seven v1-only thresholds, K, payload,
 instructions, model/tokenizer and dependency identities, projection identity,
 code SHA, seed, and start time before it atomically claims the one permitted v2
-attempt.
+attempt. The code worktree must be clean before calibration and remain on that
+same commit until the freeze is written.
 
 ```sh
 daemon/.venv/bin/python eval/semantic_benchmark_v2.py --run-quality \
