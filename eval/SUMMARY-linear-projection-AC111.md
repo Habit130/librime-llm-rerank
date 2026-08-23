@@ -77,7 +77,7 @@
     "vectors": "not committed"
   },
   "projection": {
-    "fingerprint": "candidate-conditioned-linear-v1:252fe7d1bbe7e1a178dd3d01278afef6edd6b09ff58dc9a4ce77a6f224392e1a",
+    "fingerprint": "candidate-conditioned-linear-v1:cc64768fdc016285eff08a49340efe0351cd39e9b82f99566c6d2e4e72d1307b",
     "input_dim": 3072,
     "metric": "cosine",
     "output_dim": 256,
@@ -86,7 +86,7 @@
       "candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=21:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine",
       "candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=28:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine"
     ],
-    "training_code_digest": "0f2699966ec3dfc2fffac82554ad75a80c7eb35fc50035e3ef83103746b1a61f",
+    "training_code_digest": "1801b1a2f5ae75a37c95c7ff002610d3ed943719e9ab6826d8bdad89facd0d8f",
     "vector_format": "fp32-l2",
     "weight_digest": "65516648791f3db8c53885b272ab913450e71b618bbaaa858e277231bc7364c5"
   },

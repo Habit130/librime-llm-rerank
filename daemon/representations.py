@@ -480,7 +480,11 @@ def split_tokenization_for(tokenizer, context, window_chars=WINDOW_CHARS,
     return prefix_text, prefix_ids, tail_text, tail_ids
 
 
-class EmptyCandidateRepresentationError(RepresentationError):
+class CandidateSpanRepresentationError(RepresentationError):
+    """The tokenizer cannot establish a lossless candidate token span."""
+
+
+class EmptyCandidateRepresentationError(CandidateSpanRepresentationError):
     """An empty candidate has no token span and cannot be represented."""
 
 
@@ -512,9 +516,11 @@ def candidate_tokenization_for(tokenizer, preceding_text, candidate,
         preceding_text, candidate, window_chars)
     ids = tokenizer.encode(payload, add_special_tokens=False)
     if not ids:
-        raise EmptyContextRepresentationError("payload tokenizes to no tokens")
+        raise CandidateSpanRepresentationError(
+            "payload tokenizes to no tokens")
     if tokenizer.decode(ids) != payload:
-        raise RepresentationError("lossy candidate-conditioned tokenization")
+        raise CandidateSpanRepresentationError(
+            "lossy candidate-conditioned tokenization")
     context = window_text(preceding_text, window_chars)
     if not context:
         if tokenizer.decode(ids) != candidate:
@@ -527,9 +533,10 @@ def candidate_tokenization_for(tokenizer, preceding_text, candidate,
             raise EmptyCandidateRepresentationError(
                 "candidate token span is empty")
         if tokenizer.decode(ids[boundary:]) != candidate:
-            raise RepresentationError("candidate suffix mismatch")
+            raise CandidateSpanRepresentationError("candidate suffix mismatch")
         return payload, tuple(ids), boundary, len(ids) - boundary
-    raise RepresentationError("token straddles context/candidate boundary")
+    raise CandidateSpanRepresentationError(
+        "token straddles context/candidate boundary")
 
 
 def seam_changed(prefix_text, prefix_ids, tail_text, tail_ids,

@@ -365,19 +365,6 @@ def feature_from_extractor(extractor, event):
                                             for layer in SOURCE_LAYERS))
 
 
-def materialize_features(events, feature_function):
-    """Build an in-memory event-id -> feature map; no feature is persisted."""
-    result = {}
-    for event in events:
-        feature = np.asarray(feature_function(event), dtype=np.float32)
-        if feature.shape != (INPUT_DIMENSION,):
-            raise TrainingError("feature dimension mismatch for event")
-        if not bool(np.isfinite(feature).all()):
-            raise TrainingError("feature contains a non-finite value")
-        result[event.event_id] = feature
-    return result
-
-
 def materialize_candidate_features(dataset, extractor):
     """Materialize representable AC-109 events and exclude seam faults.
 
@@ -385,8 +372,8 @@ def materialize_candidate_features(dataset, extractor):
     is unreplayable under the existing AC-109 seam and is counted, not turned
     into a synthetic vector.  A model load/forward fault remains a hard error.
     """
-    from representations import ModelForwardRepresentationError
-    from representations import RepresentationError
+    from representations import (CandidateSpanRepresentationError,
+                                 ModelForwardRepresentationError)
 
     representable = []
     features = {}
@@ -396,7 +383,7 @@ def materialize_candidate_features(dataset, extractor):
             feature = feature_from_extractor(extractor, event)
         except ModelForwardRepresentationError:
             raise
-        except RepresentationError:
+        except CandidateSpanRepresentationError:
             skipped += 1
             continue
         features[event.event_id] = np.asarray(feature, dtype=np.float32)

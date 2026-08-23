@@ -124,6 +124,21 @@ class TrainingContractTest(unittest.TestCase):
         with self.assertRaises(trainer.TrainingError):
             trainer.run_training("unused", "unused", "/tmp/ac111-weights")
 
+    def test_non_span_representation_fault_stays_fail_closed(self):
+        from representations import NonFiniteRepresentationError
+
+        dataset = trainer.PrefixDataset(
+            (event("fault", "a", (1, 0)),), {}, "snapshot", {
+                "unreplayable_events": 0, "excluded_events": 0})
+
+        class FaultyExtractor:
+            def candidate_span_mean_all(self, preceding_text, candidate):
+                del preceding_text, candidate
+                raise NonFiniteRepresentationError("dirty fixture vector")
+
+        with self.assertRaises(NonFiniteRepresentationError):
+            trainer.materialize_candidate_features(dataset, FaultyExtractor())
+
     def test_suffix_event_and_retraction_are_rejected(self):
         for retract in (False, True):
             facts = SyntheticFacts()
