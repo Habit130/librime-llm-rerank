@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from candidate_conditioned_benchmark import (  # noqa: E402
     V1_DIGEST,
     payload,
+    projected_provider_from_extractor,
+    projected_provider_from_local_weights,
     route_ids,
     run_fixture_adapter,
 )
@@ -39,6 +41,10 @@ class CandidateConditionedAdapterTest(unittest.TestCase):
             self.assertEqual(2, len(cases), route)
             self.assertTrue(all(item["passed"] for item in cases), route)
         self.assertEqual("not_read_or_run", report["v2"])
+
+    def test_projection_adapter_is_optional_without_local_weights(self):
+        self.assertIsNone(projected_provider_from_local_weights(None, ()))
+        self.assertIsNone(projected_provider_from_extractor(None, object()))
 
 
 if __name__ == "__main__":

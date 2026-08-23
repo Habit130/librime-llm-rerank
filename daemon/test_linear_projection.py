@@ -2,6 +2,7 @@
 """Model-free tests for the AC-111 projection and provider adapter."""
 
 import hashlib
+import json
 import math
 import os
 import sys
@@ -112,6 +113,22 @@ class LinearProjectionTest(unittest.TestCase):
             self.assertEqual(projection.weight_digest, loaded.weight_digest)
             self.assertEqual(projection.apply((1.0,) * INPUT_DIMENSION),
                              loaded.apply((1.0,) * INPUT_DIMENSION))
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_tampered_fingerprint_is_rejected(self):
+        projection = make_projection()
+        metadata = projection.metadata
+        metadata["seed"] += 1
+        root = tempfile.mkdtemp(prefix="ac111-projection-tamper-")
+        try:
+            path = os.path.join(root, "projection.npz")
+            np.savez(path, weights=projection.weights,
+                     metadata_json=np.array(json.dumps(metadata,
+                                                       sort_keys=True)))
+            with self.assertRaises(ProjectionError):
+                LinearProjection.load(path)
         finally:
             import shutil
             shutil.rmtree(root, ignore_errors=True)

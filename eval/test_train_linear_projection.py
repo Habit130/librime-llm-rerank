@@ -16,6 +16,7 @@ for path in (_DAEMON, _ROOT):
         sys.path.insert(0, path)
 
 import train_linear_projection as trainer  # noqa: E402
+from fixture_facts import SyntheticFacts  # noqa: E402
 
 
 def event(event_id, selection, hlc, key="same"):
@@ -46,6 +47,28 @@ class TrainingContractTest(unittest.TestCase):
         self.assertTrue(all(pair.label == -1 for pair in negatives))
         self.assertTrue(all(pair.left_event_id != pair.right_event_id
                             for pair in positives + negatives))
+
+    def test_pair_labels_do_not_normalize_distinct_recorded_selections(self):
+        events = (event("traditional", "於", (1, 0)),
+                  event("simplified", "于", (2, 0)))
+        positives, negatives = trainer._all_pairs(events)
+        self.assertEqual([], positives)
+        self.assertEqual(1, len(negatives))
+
+    def test_split_has_no_cross_split_pairs(self):
+        events = tuple(event("e%d" % index, "a", (index + 1, 0))
+                       for index in range(8))
+        construction = trainer.build_pairs(events, split_fraction=0.5,
+                                           max_pairs_per_class=16)
+        train_ids = {item.event_id for item in construction.train_events}
+        validation_ids = {item.event_id
+                          for item in construction.validation_events}
+        for pair in construction.train_pairs:
+            self.assertIn(pair.left_event_id, train_ids)
+            self.assertIn(pair.right_event_id, train_ids)
+        for pair in construction.validation_pairs:
+            self.assertIn(pair.left_event_id, validation_ids)
+            self.assertIn(pair.right_event_id, validation_ids)
 
     def test_empty_preceding_is_not_excluded_for_candidate_routes(self):
         candidate_event = event("empty", "a", (1, 0))
@@ -79,6 +102,41 @@ class TrainingContractTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(first.tobytes()).hexdigest(),
                          hashlib.sha256(second.tobytes()).hexdigest())
         self.assertEqual(first_fit, second_fit)
+
+    def test_prefix_digest_mismatch_is_rejected_before_read(self):
+        facts = SyntheticFacts()
+        try:
+            facts.add_event("e1", "a", "a", "a", ("a",), (1000000, 0))
+            with self.assertRaises(trainer.TrainingError):
+                trainer.load_prefix_dataset(
+                    facts.db_path, expected_snapshot_sha256="0" * 64,
+                    expected_history_id=None, expected_store_epoch=None,
+                    cutoff=(1000000, 0))
+        finally:
+            facts.close()
+
+    def test_suffix_event_and_retraction_are_rejected(self):
+        for retract in (False, True):
+            facts = SyntheticFacts()
+            try:
+                facts.add_event(
+                    "e1", "a", "a", "a", ("a",), (1000001, 0),
+                    retract_at=(1000001, 1) if retract else None)
+                expected = trainer.sha256_file(facts.db_path)
+                with self.assertRaises(trainer.TrainingError):
+                    trainer.load_prefix_dataset(
+                        facts.db_path, expected_snapshot_sha256=expected,
+                        expected_history_id=None, expected_store_epoch=None,
+                        cutoff=(1000000, 0))
+            finally:
+                facts.close()
+
+    def test_committed_summary_withholds_owner_paths(self):
+        summary_path = os.path.join(_ROOT, "SUMMARY-linear-projection-AC111.md")
+        with open(summary_path, encoding="utf-8") as handle:
+            summary = handle.read()
+        self.assertNotIn("facts-prefix-hlc-1787065441087.sqlite3", summary)
+        self.assertNotIn("candidate-conditioned-linear.npz", summary)
 
     def test_training_code_does_not_reference_v2_driver(self):
         source_path = __file__.replace("test_train_linear_projection.py",

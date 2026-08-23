@@ -72,12 +72,12 @@
   },
   "privacy": {
     "candidate_text": "not committed",
-    "projection_weights": "local ignored artifact: /Users/habit/Developer/librime-llm-rerank-worktrees/candidate-conditioned-linear-projection/.local-work/ac111/candidate-conditioned-linear.npz",
+    "projection_weights": "owner-local ignored artifact (path withheld)",
     "raw_preceding_text": "not committed",
     "vectors": "not committed"
   },
   "projection": {
-    "fingerprint": "candidate-conditioned-linear-v1:08eea4b2e06b9c815250b3b838bdc06cda025dabc6c2f4e66ca199d67487997e",
+    "fingerprint": "candidate-conditioned-linear-v1:43559b8bdb09204978091576e062e2d38f04949fa3c662cfe5ec11ed8f717299",
     "input_dim": 3072,
     "metric": "cosine",
     "output_dim": 256,
@@ -86,7 +86,7 @@
       "candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=21:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine",
       "candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=28:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine"
     ],
-    "training_code_digest": "7316193e48b6844c050bb9d27e2445627bbbcf171e8acc395d43a797e13e1afe",
+    "training_code_digest": "ca0cec55f554e02b418cad49c458cb62ed0b48d735ffe3c9fe1439d3b590c12b",
     "vector_format": "fp32-l2",
     "weight_digest": "0b59fe742a4711dae20f86cbb543edbb2e93e8d114dc46c5fcb4b3e0fa72bb40"
   },
@@ -96,7 +96,7 @@
       1787065441087,
       0
     ],
-    "path": "/Users/habit/Developer/librime-llm-rerank/.local-work/ac111-prefix/facts-prefix-hlc-1787065441087.sqlite3",
+    "path": "owner-local confirmed-prefix snapshot (path withheld)",
     "sha256": "ce69b7292a92cf6a64c24c512d843250cfdd2a3c837c3772b277bae686709be7",
     "store_epoch": "8407bd6b456ba5c5a526b4b95951bac3"
   }

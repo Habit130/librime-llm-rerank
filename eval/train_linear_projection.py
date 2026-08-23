@@ -129,11 +129,11 @@ def _event_sort_key(event):
 
 
 def _selection_label(event):
-    """Use the existing simplified-NFC candidate identity for pair labels."""
-    try:
-        return match_text(event.final_selection_text)
-    except Exception as error:  # noqa: BLE001 - malformed facts are excluded
-        raise TrainingError("selection identity is malformed") from error
+    """Use the recorded final-selection field for pair labels."""
+    if not isinstance(event.final_selection_text, str) \
+            or not event.final_selection_text:
+        raise TrainingError("selection identity is malformed")
+    return event.final_selection_text
 
 
 def _identity_complete(event):
@@ -523,6 +523,9 @@ def training_code_digest(root=_ROOT):
         ("daemon/linear_projection.py", root / "daemon/linear_projection.py"),
         ("daemon/hidden_state.py", root / "daemon/hidden_state.py"),
         ("daemon/representations.py", root / "daemon/representations.py"),
+        ("daemon/oracle.py", root / "daemon/oracle.py"),
+        ("eval/walkforward.py", root / "eval/walkforward.py"),
+        ("eval/snapshot.py", root / "eval/snapshot.py"),
     )
     digest = hashlib.sha256(b"ac111-training-code-v1\n")
     for name, path in paths:
@@ -594,12 +597,12 @@ def _projection_metadata(dataset, source_ids, training_evidence, seed):
 
 
 def render_summary(dataset, pair_construction, fit_evidence, metadata,
-                   weight_path):
+                   _weight_path):
     """Render only hashes, counts, and declared numeric configuration."""
     evidence = {
         "contract": CONTRACT_ID,
         "snapshot": {
-            "path": os.path.abspath(CONFIRMED_SNAPSHOT_PATH),
+            "path": "owner-local confirmed-prefix snapshot (path withheld)",
             "sha256": dataset.snapshot_sha256,
             "history_id": dataset.identity["history_id"],
             "store_epoch": dataset.identity["store_epoch"],
@@ -631,8 +634,7 @@ def render_summary(dataset, pair_construction, fit_evidence, metadata,
             "raw_preceding_text": "not committed",
             "candidate_text": "not committed",
             "vectors": "not committed",
-            "projection_weights": "local ignored artifact: %s"
-            % os.path.abspath(weight_path),
+            "projection_weights": "owner-local ignored artifact (path withheld)",
         },
         "isolation": {
             "suffix_events_read": 0,

@@ -32,11 +32,12 @@ eligible because the AC-109 candidate-conditioned payload is the candidate
 itself in that case.
 
 Events are ordered by `(HLC, event_id)` and split 80/20. Pairs never cross the
-split. A positive pair has the same choice-problem key and the same selected
-candidate under the existing simplified-NFC fact semantics. A hard negative
-has the same key and a different selected candidate. All valid pairs are
-enumerated first; each class is then capped at 1024 by evenly spaced stable
-order, with no replacement.
+split. A positive pair has the same choice-problem key and the same recorded
+`final_selection_text` field. A hard negative has the same key and a different
+`final_selection_text` field. Saved competition membership is checked with the
+existing simplified-NFC fact semantics, but it does not rewrite the pair label.
+All valid pairs are enumerated first; each class is then capped at 1024 by
+evenly spaced stable order, with no replacement.
 
 Training is full-batch and class-balanced. The positive loss targets cosine 1;
 the negative loss is a squared hinge above margin 0.20. The matrix has no bias,

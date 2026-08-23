@@ -61,6 +61,8 @@ eval/.venv/bin/python eval/calibrate.py \
 
 Requirements:
 
+- `numpy>=2.0,<3` for the AC-111 projection trainer and model-free projection
+  adapter tests;
 - the daemon venv at `daemon/.venv` with mlx/mlx-lm and the model at
   `--model` (default `/Users/habit/Models/Qwen/Qwen3-0.6B-Base`);
 - a quiet machine (latency-sensitive); total runtime is roughly 2 hours;

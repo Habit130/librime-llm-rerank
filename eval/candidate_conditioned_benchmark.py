@@ -76,6 +76,15 @@ def projected_provider_from_local_weights(weight_path, source_providers):
                                                     projection)
 
 
+def projected_provider_from_extractor(weight_path, extractor):
+    """Build the real AC-109 source chain when a local matrix is supplied."""
+    if not weight_path:
+        return None
+    projection = LinearProjection.load(weight_path)
+    return ProjectedCandidateRepresentationProvider.from_extractor(
+        extractor, projection)
+
+
 def _near_axis(cosine):
     return (cosine, math.sqrt(1.0 - cosine * cosine), 0.0, 0.0)
 

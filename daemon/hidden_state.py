@@ -269,9 +269,9 @@ class HiddenStateExtractor:
             lambda: self._run(tail_ids, prefix_cache, {SPLIT_REUSE_LAYER}))
         return self._final_validate(snapshots[SPLIT_REUSE_LAYER]), cache
 
-    def _run_candidate(self, ids, candidate_start, candidate_count,
-                       layer_number, pooling):
-        """Forward one candidate payload and pool only its token span."""
+    def _run_candidate_layers(self, ids, candidate_start, candidate_count,
+                               layer_numbers, pooling):
+        """Forward one candidate payload and pool the requested layers."""
         mx, create_attention_mask, _ = _lazy_mlx()
         if not ids:
             raise EmptyContextRepresentationError("no candidate payload tokens")
@@ -284,44 +284,10 @@ class HiddenStateExtractor:
         h = inner.embed_tokens(token_ids)
         layer_cache = [None] * len(inner.layers)
         mask = create_attention_mask(h, layer_cache[0])
-        try:
-            for index, layer in enumerate(inner.layers):
-                h = layer(h, mask, layer_cache[index])
-                if index + 1 != layer_number:
-                    continue
-                normalized = inner.norm(h).astype(mx.float32)
-                import numpy as np
-                span = np.asarray(
-                    normalized[0, candidate_start:
-                               candidate_start + candidate_count]).reshape(
-                                   candidate_count, -1)
-                return pool_candidate_hidden_states(
-                    span.tolist(), 0, candidate_count, pooling)
-        except RepresentationError:
-            raise
-        except Exception as error:  # noqa: BLE001 - fail closed
-            raise ModelForwardRepresentationError(
-                "candidate-conditioned forward failed: %s" % error) from error
-        raise InvalidRepresentationSpec(
-            "candidate layer %d was not reached" % layer_number)
-
-    def _run_candidate_all(self, ids, candidate_start, candidate_count,
-                           layer_numbers, pooling):
-        """Forward one payload and pool several candidate-span layers."""
-        mx, create_attention_mask, _ = _lazy_mlx()
-        if not ids:
-            raise EmptyContextRepresentationError("no candidate payload tokens")
-        if candidate_count < 1 or candidate_start < 0 \
-                or candidate_start + candidate_count > len(ids):
-            raise InvalidRepresentationSpec("candidate token span is invalid")
-        model, inner = self._require_model()
-        del model
-        token_ids = mx.array([list(ids)])
-        layer_cache = [None] * len(inner.layers)
-        h = inner.embed_tokens(token_ids)
-        mask = create_attention_mask(h, layer_cache[0])
-        snapshots = {}
         wanted = set(layer_numbers)
+        if not wanted:
+            raise InvalidRepresentationSpec("candidate layer set is empty")
+        snapshots = {}
         try:
             for index, layer in enumerate(inner.layers):
                 h = layer(h, mask, layer_cache[index])
@@ -356,8 +322,8 @@ class HiddenStateExtractor:
         _, ids, start, count = candidate_tokenization_for(
             tokenizer, preceding_text, candidate,
             spec.window_chars, spec=spec)
-        return self._guarded(lambda: self._run_candidate(
-            ids, start, count, spec.layer, spec.pooling))
+        return self._guarded(lambda: self._run_candidate_layers(
+            ids, start, count, (spec.layer,), spec.pooling)[spec.layer])
 
     def candidate_span_mean_all(self, preceding_text, candidate):
         """Generate the three AC-109 span-mean vectors in one forward."""
@@ -370,7 +336,7 @@ class HiddenStateExtractor:
         tokenizer = self._tokenizer()
         _, ids, start, count = candidate_tokenization_for(
             tokenizer, preceding_text, candidate, spec=specs[0])
-        return self._guarded(lambda: self._run_candidate_all(
+        return self._guarded(lambda: self._run_candidate_layers(
             ids, start, count, tuple(spec.layer for spec in specs),
             "candidate_span_mean"))
 
