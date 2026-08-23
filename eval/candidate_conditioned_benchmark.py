@@ -26,6 +26,10 @@ from representations import (  # noqa: E402
     candidate_conditioned_payload,
     candidate_conditioned_specs,
 )
+from linear_projection import (  # noqa: E402
+    LinearProjection,
+    ProjectedCandidateRepresentationProvider,
+)
 from semantic_benchmark import (  # noqa: E402
     BENCHMARK_K_EVIDENCE,
     BENCHMARK_SATURATION_K,
@@ -56,6 +60,20 @@ def route_ids():
 def payload(preceding_text, candidate):
     """Expose the frozen payload for adapter tests and reports."""
     return candidate_conditioned_payload(preceding_text, candidate)
+
+
+def projected_provider_from_local_weights(weight_path, source_providers):
+    """Load the optional local AC-111 adapter for a #69-v1-style run.
+
+    The path is intentionally explicit.  Without a local, identity-validated
+    artifact this adapter is not constructed, so model-free v1 tests never
+    need projection weights in Git.
+    """
+    if not weight_path:
+        return None
+    projection = LinearProjection.load(weight_path)
+    return ProjectedCandidateRepresentationProvider(source_providers,
+                                                    projection)
 
 
 def _near_axis(cosine):

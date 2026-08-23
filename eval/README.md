@@ -125,9 +125,11 @@ loading a model or producing v2 quality results:
 python3 eval/semantic_benchmark_v2.py --fixture --artifact-dir <dir>
 ```
 
-Real embedding routes, candidate-span extraction, projection training, and v2
-quality results are deferred to issues #109-#113. Live ranking remains
-`alpha=0`, `gamma=0`.
+Real embedding routes are covered by #110, and the AC-111 offline projection
+driver consumes only the confirmed prefix snapshot. Its matrix and extracted
+features remain local; `eval/SUMMARY-linear-projection-AC111.md` is the
+desensitized result. V2 quality and walk-forward selection remain deferred to
+#112/#113. Live ranking remains `alpha=0`, `gamma=0`.
 
 ## Strict-HLC walk-forward evaluation (Habit130/squirrel#70/#77)
 
