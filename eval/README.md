@@ -104,7 +104,7 @@ byte-for-byte summary regeneration. Must pass on the committed artifacts.
   `daemon/integration_cache_limit.py`, and an isolated daemon plus
   `daemon/integration_memory.py --socket <sock> --pid <pid>`.
 
-## Candidate-conditioned benchmark v2 (AC-108-v1 / AC-112-v1)
+## Candidate-conditioned benchmark v2 (AC-108-v1 / AC-112-v2)
 
 `semantic_benchmark.py` is the unchanged #69 v1 development/regression set.
 `semantic_benchmark_v2.py` adds exactly 50 new synthetic Simplified-Chinese
@@ -114,14 +114,18 @@ candidate, and history as the historical last-64 上文 plus its selected
 candidate. Choice problems remain hard partitions and hard-negative evidence
 is never inferred from candidate identity alone.
 
-The v2 manifest must be frozen before a report is accepted. Each route
-calibrates its own threshold from exactly the 100 v1 hard-negative cosines by
-nearest-rank Q95; evidence uses strict `cosine > tau`. The seven route
-descriptor binds payload, model/instruction, 64-character window, pooling,
-vector format, dimensions, and metric. It and the manifest digest are checked
-before metrics. The model-free fixture proves exact top-K, strict equality,
-positive and no-evidence decisions, manifest verification, and report identity
-without loading a model or producing v2 quality results:
+The v2 manifest must be frozen before a report is accepted. Each route attempts
+all 100 v1 hard-negative cases and calibrates its threshold from the finite
+cosines by nearest-rank Q95; evidence uses strict `cosine > tau`. A
+candidate-span or model-forward fault is recorded as an unreplayable stable
+case ID, never as an invented vector or cosine. A route with fewer than 80
+finite v1 hard-negative cosines writes a pre-claim refusal and does not start
+the v2 shot. The seven route descriptor binds payload, model/instruction,
+64-character window, pooling, vector format, dimensions, and metric. It and
+the manifest digest are checked before metrics. The model-free fixture proves
+exact top-K, strict equality, positive and no-evidence decisions, manifest
+verification, and report identity without loading a model or producing v2
+quality results:
 
 ```sh
 python3 eval/semantic_benchmark_v2.py --fixture --artifact-dir <dir>
@@ -150,9 +154,11 @@ daemon/.venv/bin/python eval/semantic_benchmark_v2.py --run-quality \
 
 The real artifact contains stable case IDs, failure axes, numeric evidence, and
 identity hashes only. It never contains source text, candidate text, live facts,
-or absolute paths. A second claim or acceptance fails. If either dedicated
-embedding directory is missing, the command stops before threshold calibration,
-v2 metrics, or a quality artifact; it must not publish a five-route judgment.
+or absolute paths. A v2 positive with an unreplayable request is a miss; a v2
+hard-negative with one is no-evidence. Both denominators remain 100. A second
+claim or acceptance fails. If either dedicated embedding directory is missing,
+the command stops before threshold calibration, v2 metrics, or a quality
+artifact; it must not publish a five-route judgment.
 
 The only completed quality terminal states are `at_least_one_v2_pass` and
 `seven_route_all_fail`. The latter is a valid one-shot result, keeps live

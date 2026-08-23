@@ -20,6 +20,7 @@ from semantic_benchmark_v2 import (  # noqa: E402
     EXPECTED_RUNTIME_ADAPTERS,
     PINNED_PROJECTION_FINGERPRINT_PREFIX,
     PINNED_PROJECTION_WEIGHT_DIGEST,
+    PreClaimQualityRefusal,
     PRIVACY_MARKERS,
     QUALITY_CONTRACT_ID,
     REAL_QUALITY_RUN_KIND,
@@ -578,9 +579,20 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
             } for case in negative_cases]
             calibrations[route["route_id"]] = {
                 "observations": observations,
+                "excluded_case_ids": [],
                 "calibration": calibrate_v1_q95(observations),
             }
         return calibrations
+
+    @staticmethod
+    def _calibration_vectors():
+        requests = calibration_requests()
+        return {
+            route["route_id"]: {
+                request.key: (1.0, 0.0) for request in requests
+            }
+            for route in route_matrix()
+        }
 
     def _quality_routes(self, bindings, calibrations, all_fail=False):
         routes = {}
@@ -626,8 +638,11 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
                     "kept_min": 0 if all_fail else 8,
                     "kept_max": 8,
                     "kept_at_k": 0 if all_fail else 200,
+                    "evaluated": 200,
+                    "unreplayable": 0,
                 },
                 "failures": failures,
+                "unreplayable_case_ids": [],
                 "gate_pass": not all_fail,
             }
         return routes
@@ -679,12 +694,7 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
         requests = calibration_requests()
         self.assertEqual(200, len(requests))
         self.assertTrue(all(request.key.startswith("v1:") for request in requests))
-        vectors = {
-            route["route_id"]: {
-                request.key: (1.0, 0.0) for request in requests
-            }
-            for route in route_matrix()
-        }
+        vectors = self._calibration_vectors()
         with patch.object(module, "benchmark_cases_v2",
                           side_effect=AssertionError("v2 must stay isolated")):
             calibrations = calibrate_runtime_routes(vectors)
@@ -694,6 +704,173 @@ class SevenRouteQualityProtocolTest(unittest.TestCase):
             item["calibration"]["source_case_count"] == 100
             and item["calibration"]["tau"] == 1.0
             for item in calibrations.values()))
+
+    def test_span_fault_is_unreplayable_and_other_calibration_cases_continue(self):
+        cases = [case for case in calibration_requests()
+                 if case.side == "query"]
+        straddled_case_id = cases[0].key.split(":")[1]
+        straddled_key = "v1:%s:query" % straddled_case_id
+        vectors = self._calibration_vectors()
+        unreplayable = {}
+        for route in route_matrix():
+            route_id = route["route_id"]
+            del vectors[route_id][straddled_key]
+            unreplayable[route_id] = [straddled_key]
+
+        calibrations = calibrate_runtime_routes(vectors, unreplayable)
+
+        for record in calibrations.values():
+            self.assertEqual(99, record["calibration"]["source_case_count"])
+            self.assertEqual([straddled_case_id], record["excluded_case_ids"])
+            self.assertNotIn(straddled_case_id, {
+                observation["case_id"] for observation in record["observations"]
+            })
+
+    def test_fewer_than_80_finite_calibration_cases_refuses_before_claim(self):
+        requests = [request for request in calibration_requests()
+                    if request.side == "query"]
+        excluded_ids = [request.key.split(":")[1] for request in requests[:21]]
+        faulted_keys = {"v1:%s:query" % case_id for case_id in excluded_ids}
+        vectors = self._calibration_vectors()
+        unreplayable = {
+            route["route_id"]: [] for route in route_matrix()
+        }
+        route_id = route_matrix()[0]["route_id"]
+        for key in faulted_keys:
+            del vectors[route_id][key]
+        unreplayable[route_id] = sorted(faulted_keys)
+
+        with self.assertRaises(PreClaimQualityRefusal) as caught:
+            calibrate_runtime_routes(vectors, unreplayable)
+
+        refusal = caught.exception.routes[route_id]
+        self.assertEqual(79, refusal["finite_v1_hn_count"])
+        self.assertEqual(sorted(excluded_ids),
+                         sorted(refusal["excluded_v1_case_ids"]))
+
+    def test_qwen_span_fault_marks_only_that_request_unreplayable(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+        from representations import CandidateSpanRepresentationError  # noqa: PLC0415
+
+        class FakeExtractor:
+            @staticmethod
+            def candidate_span_mean_all(_preceding_text, candidate):
+                if candidate == "straddle":
+                    raise CandidateSpanRepresentationError("straddled")
+                return {14: (1.0, 0.0), 21: (1.0, 0.0), 28: (1.0, 0.0)}
+
+            @staticmethod
+            def candidate(_spec, _preceding_text, candidate):
+                if candidate == "straddle":
+                    raise CandidateSpanRepresentationError("straddled")
+                return (1.0, 0.0)
+
+        executor = module._QwenRouteExecutor("unused", "unused")
+        executor._bindings = {route["route_id"]: {} for route in route_matrix()
+                              if route["route_id"].startswith("qwen_")}
+        executor._extractor = FakeExtractor()
+        executor._span_specs = tuple(
+            SimpleNamespace(layer=layer, pooling="candidate_span_mean")
+            for layer in (14, 21, 28)
+        )
+        executor._control_spec = SimpleNamespace()
+        executor._projection = SimpleNamespace(apply=lambda _values: (1.0, 0.0))
+        requests = (
+            module.VectorRequest("fault", "query", "context", "straddle"),
+            module.VectorRequest("good", "query", "context", "stable"),
+        )
+
+        vectors, unreplayable = executor.forward(requests)
+
+        self.assertTrue(all("fault" in values for values in unreplayable.values()))
+        self.assertTrue(all("good" in values for values in vectors.values()))
+        self.assertTrue(all("fault" not in values for values in vectors.values()))
+
+    def test_unreplayable_v2_positive_is_a_miss_and_hard_negative_is_no_evidence(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        positive_case = next(case for case in benchmark_cases_v2()
+                             if case.relation == "positive")
+        negative_case = next(case for case in benchmark_cases_v2()
+                             if case.relation == "hard_negative")
+        vectors = {}
+        for case in benchmark_cases_v2():
+            for index, candidate in enumerate(case.candidates):
+                if case.relation == "positive":
+                    vector = (1.0, 0.0) if candidate == case.query_candidate \
+                        else (-1.0, 0.0)
+                else:
+                    vector = (1.0, 0.0)
+                vectors[module._quality_query_key(case, index)] = vector
+            vectors["v2:%s:history" % case.case_id] = (
+                (1.0, 0.0) if case.relation == "positive" else (0.0, 1.0)
+            )
+            for index, _preceding_text in enumerate(
+                    module.FIXTURE_DISTRACTOR_PRECEDING_TEXTS, start=1):
+                vectors["v2:%s:distractor:%02d" % (case.case_id, index)] = \
+                    (0.0, 1.0)
+        positive_key = module._quality_query_key(
+            positive_case,
+            positive_case.candidates.index(positive_case.query_candidate),
+        )
+        negative_key = "v2:%s:history" % negative_case.case_id
+        del vectors[positive_key]
+        del vectors[negative_key]
+
+        result = module._route_quality_result(
+            "fixture", vectors, 0.5, (positive_key, negative_key))
+
+        self.assertEqual(99, result["positive"]["qualified"])
+        self.assertEqual(100, result["hard_negative"]["no_evidence"])
+        self.assertIn(positive_case.case_id, result["unreplayable_case_ids"])
+        self.assertIn(negative_case.case_id, result["unreplayable_case_ids"])
+        failure = next(item for item in result["failures"]
+                       if item["case_id"] == positive_case.case_id)
+        self.assertEqual(["unreplayable"], failure["failure_axes"])
+        self.assertIsNone(failure["target_cosine"])
+
+    def test_real_runner_refuses_before_quality_claim_with_fewer_than_80_finite_hn(self):
+        import semantic_benchmark_v2 as module  # noqa: PLC0415
+
+        vectors = self._calibration_vectors()
+        first_route = route_matrix()[0]["route_id"]
+        faulted_keys = [
+            request.key for request in calibration_requests()
+            if request.side == "query"
+        ][:21]
+        for key in faulted_keys:
+            del vectors[first_route][key]
+        unreplayable = {
+            route["route_id"]: [] for route in route_matrix()
+        }
+        unreplayable[first_route] = faulted_keys
+        test_case = self
+
+        class FakeExecutor:
+            def __init__(self, *_args):
+                pass
+
+            @staticmethod
+            def forward(requests, expected_bindings=None, pre_quality=False):
+                test_case.assertTrue(pre_quality)
+                test_case.assertIsNone(expected_bindings)
+                test_case.assertEqual(calibration_requests(), requests)
+                return vectors, unreplayable, {}
+
+        with tempfile.TemporaryDirectory(prefix="ac112-preclaim-refusal-") as root:
+            with patch.object(module, "_require_real_environment"), \
+                    patch.object(module, "_current_code_sha", return_value="c" * 40), \
+                    patch.object(module, "_require_code_snapshot"), \
+                    patch.object(module, "_SevenRouteExecutor", FakeExecutor), \
+                    patch.object(module, "claim_v2_quality_run") as claim:
+                result = module.run_real_v2_quality(root)
+            claim.assert_not_called()
+            refusal = result["pre_claim_refusal"]
+            self.assertEqual("pre_claim_refusal", refusal["state"])
+            self.assertEqual(79, refusal["routes"][first_route]["finite_v1_hn_count"])
+            self.assertTrue(os.path.isfile(os.path.join(
+                root, "semantic_benchmark_v2.preclaim_refusal.json")))
+            self.assertTrue(verify_artifact_privacy(root))
 
     def test_quality_uses_one_query_vector_per_current_candidate(self):
         import semantic_benchmark_v2 as module  # noqa: PLC0415
