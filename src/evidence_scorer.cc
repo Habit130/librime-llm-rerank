@@ -193,7 +193,10 @@ bool ParseEvidenceResponse(const string& response,
       !document["kind"].IsString() ||
       document["kind"].GetStringLength() != sizeof(kEvidenceKind) - 1 ||
       std::memcmp(document["kind"].GetString(), kEvidenceKind,
-                  sizeof(kEvidenceKind) - 1) != 0) {
+                  sizeof(kEvidenceKind) - 1) != 0 ||
+      !document["request_id"].IsString() ||
+      !document["plan_identity"].IsString() ||
+      !document["config_identity"].IsString()) {
     LogEvidenceFailure("invalid_protocol", "validate", expected_count);
     return false;
   }
@@ -237,7 +240,9 @@ bool ParseEvidenceResponse(const string& response,
 
   const auto& query_point = document["query_point"];
   if (!query_point.IsNull() &&
-      !HasExactMembers(query_point, {"hlc_physical_ms", "hlc_logical"})) {
+      (!HasExactMembers(query_point, {"hlc_physical_ms", "hlc_logical"}) ||
+       !query_point["hlc_physical_ms"].IsInt64() ||
+       !query_point["hlc_logical"].IsInt64())) {
     LogEvidenceFailure("invalid_protocol", "validate", expected_count);
     return false;
   }
@@ -352,17 +357,24 @@ bool EvidenceScorer::ReadFactHighWater(const path& facts_root,
 
 bool EvidenceScorer::SendRequest(const GroupRequest& request,
                                  const string& request_id,
+                                 int remaining_deadline_ms,
                                  string* response) {
   const string json = BuildEvidenceRequest(request, request_id);
-  return ExchangeJson(socket_path_, json, deadline_ms_, response);
+  return ExchangeJson(socket_path_, json, remaining_deadline_ms, response);
 }
 
 bool EvidenceScorer::ScoreGroup(const GroupRequest& request,
-                                vector<double>* s_c) {
+                                vector<double>* s_c,
+                                int remaining_deadline_ms) {
   if (!s_c || request.candidate_texts.empty() ||
       request.plan_identity.empty() || request.schema_id.empty() ||
       request.category.empty() || request.config_identity.empty()) {
     LogEvidenceFailure("invalid_request", "validate",
+                       request.candidate_texts.size());
+    return false;
+  }
+  if (remaining_deadline_ms <= 0) {
+    LogEvidenceFailure("deadline_exceeded", "score",
                        request.candidate_texts.size());
     return false;
   }
@@ -371,7 +383,7 @@ bool EvidenceScorer::ScoreGroup(const GroupRequest& request,
   const string request_id = "llm-evidence-v1:" + std::to_string(getpid()) +
                             ":" + std::to_string(next_request++);
   string response;
-  if (!SendRequest(request, request_id, &response)) {
+  if (!SendRequest(request, request_id, remaining_deadline_ms, &response)) {
     LogEvidenceFailure("transport_failed", "score",
                        request.candidate_texts.size());
     return false;

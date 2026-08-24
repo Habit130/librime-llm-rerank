@@ -1229,3 +1229,167 @@ TEST(EvidenceProtocolTest, DuplicateFieldsPassThroughWholeWindow) {
     return response;
   });
 }
+
+string ReplaceStringFieldWithRaw(string json,
+                                 const string& field,
+                                 const string& raw) {
+  const string prefix = "\"" + field + "\":\"";
+  const size_t start = json.find(prefix);
+  if (start == string::npos)
+    return string();
+  const size_t value_open = start + prefix.size() - 1;
+  const size_t value_close = json.find('"', value_open + 1);
+  if (value_close == string::npos)
+    return string();
+  json.replace(value_open, value_close - value_open + 1, raw);
+  return json;
+}
+
+string HealthyEvidencePayload() {
+  return "[{\"index\":0,\"s\":0.0},{\"index\":1,\"s\":0.0}]";
+}
+
+EvidenceScorer::GroupRequest MinimalEvidenceRequest() {
+  EvidenceScorer::GroupRequest request;
+  request.plan_identity = "plan";
+  request.schema_id = "test";
+  request.category = "word";
+  request.canonical_segment_input = "ab";
+  request.preceding_text = "x";
+  request.config_identity =
+      "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4";
+  request.candidate_texts = {"甲", "乙"};
+  return request;
+}
+
+TEST(EvidenceProtocolTest, NonStringIdentityFieldsPassThroughWholeWindow) {
+  for (const string& field : {"request_id", "plan_identity", "config_identity",
+                              "kind", "status"}) {
+    SCOPED_TRACE(field);
+    ExpectEvidenceFailure([&](const string& request) -> std::optional<string> {
+      const string patched = ReplaceStringFieldWithRaw(
+          EvidenceResponse(request, HealthyEvidencePayload()), field, "1");
+      EXPECT_FALSE(patched.empty());
+      return patched;
+    });
+  }
+}
+
+TEST(EvidenceProtocolTest, WrongTypesOnOtherSuccessFieldsPassThroughWindow) {
+  const vector<pair<string, string>> patches = {
+      {"\"version\":2", "\"version\":\"2\""},
+      {"\"zero_evidence\":false", "\"zero_evidence\":1"},
+      {HealthyEvidencePayload(), "true"},
+      {"\"hlc_physical_ms\":1", "\"hlc_physical_ms\":\"1\""},
+      {"\"hlc_logical\":0", "\"hlc_logical\":true"},
+      {"\"fact_high_water\":null", "\"fact_high_water\":1"},
+  };
+  for (const auto& patch : patches) {
+    const string needle = patch.first;
+    const string replacement = patch.second;
+    SCOPED_TRACE(needle + " -> " + replacement);
+    ExpectEvidenceFailure([needle,
+                           replacement](const string& request) -> std::optional<string> {
+      string response = EvidenceResponse(request, HealthyEvidencePayload());
+      const size_t pos = response.find(needle);
+      EXPECT_NE(string::npos, pos);
+      response.replace(pos, needle.size(), replacement);
+      return response;
+    });
+  }
+}
+
+TEST(EvidenceProtocolTest, WrongTypeFactHighWaterMembersAreProtocolFailure) {
+  for (const string& water :
+       {"{\"store_epoch\":1,\"hlc_physical_ms\":10,\"hlc_logical\":1}",
+        "{\"store_epoch\":\"epoch-1\",\"hlc_physical_ms\":\"10\","
+        "\"hlc_logical\":1}",
+        "{\"store_epoch\":\"epoch-1\",\"hlc_physical_ms\":10,"
+        "\"hlc_logical\":true}"}) {
+    SCOPED_TRACE(water);
+    FakeDaemon daemon([water](const string& request) -> std::optional<string> {
+      return EvidenceResponse(request, HealthyEvidencePayload(), std::nullopt,
+                              std::nullopt, std::nullopt, water);
+    });
+    auto request = MinimalEvidenceRequest();
+    request.fact_high_water.present = true;
+    request.fact_high_water.store_epoch = "epoch-1";
+    request.fact_high_water.hlc_physical_ms = 10;
+    request.fact_high_water.hlc_logical = 1;
+    EvidenceScorer scorer(daemon.path(), request.config_identity, 200);
+    vector<double> scores;
+    EXPECT_FALSE(scorer.ScoreGroup(request, &scores));
+  }
+}
+
+TEST(EvidenceProtocolTest, ZeroRemainingBudgetDoesNotOpenSocket) {
+  bool contacted = false;
+  FakeDaemon daemon([&](const string&) -> std::optional<string> {
+    contacted = true;
+    return std::nullopt;
+  });
+  EvidenceScorer scorer(
+      daemon.path(), "evidence-v1:repr=r:tau=0.5:kev=8:H=32:sat=1:gamma=4",
+      200);
+  vector<double> scores;
+  EXPECT_FALSE(scorer.ScoreGroup(MinimalEvidenceRequest(), &scores, 0));
+  EXPECT_FALSE(contacted);
+}
+
+TEST(EvidenceProtocolTest, ExhaustedWindowDeadlinePreservesOriginalOrder) {
+  size_t connections = 0;
+  FakeDaemon daemon(
+      [&](const string& request) -> std::optional<string> {
+        ++connections;
+        return EvidenceResponse(request,
+                                "[{\"index\":0,\"s\":0.5},"
+                                "{\"index\":1,\"s\":0.0}]");
+      },
+      2);
+  auto filter = FilterWithEvidenceDaemon(daemon.path(), 10.0);
+  const auto t0 = std::chrono::steady_clock::now();
+  int ticks = 0;
+  filter.set_deadline_ms(200);
+  filter.set_now([&] {
+    ++ticks;
+    if (ticks <= 2)
+      return t0;
+    return t0 + std::chrono::milliseconds(200);
+  });
+  CandidateList candidates;
+  EXPECT_EQ(kProtocolOriginalOrder,
+            CollectProtocolTexts(filter.Apply(
+                New<ProtocolTranslation>(ProtocolCandidates()), &candidates)));
+  EXPECT_EQ(1u, connections);
+}
+
+TEST(EvidenceProtocolTest, HealthyMultiGroupSharesDeadlineAndAppliesEvidence) {
+  size_t connections = 0;
+  FakeDaemon daemon(
+      [&](const string& request) -> std::optional<string> {
+        ++connections;
+        if (request.find("\"canonical_segment_input\":\"ab\"") != string::npos)
+          return EvidenceResponse(request,
+                                  "[{\"index\":0,\"s\":0.5},"
+                                  "{\"index\":1,\"s\":0.0}]");
+        return EvidenceResponse(request,
+                                "[{\"index\":0,\"s\":0.0},"
+                                "{\"index\":1,\"s\":0.0}]");
+      },
+      2);
+  auto filter = FilterWithEvidenceDaemon(daemon.path(), 10.0);
+  const auto t0 = std::chrono::steady_clock::now();
+  int ticks = 0;
+  filter.set_deadline_ms(200);
+  filter.set_now([&] {
+    ++ticks;
+    if (ticks <= 2)
+      return t0;
+    return t0 + std::chrono::milliseconds(80);
+  });
+  CandidateList candidates;
+  EXPECT_EQ((vector<string>{"甲", "，", "乙", "丁", "丙", "整句"}),
+            CollectProtocolTexts(filter.Apply(
+                New<ProtocolTranslation>(ProtocolCandidates()), &candidates)));
+  EXPECT_EQ(2u, connections);
+}
