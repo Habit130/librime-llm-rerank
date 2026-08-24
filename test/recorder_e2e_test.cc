@@ -31,6 +31,7 @@
 
 #include "recorder_coordinator.h"
 #include "maintenance_lock.h"
+#include "fact_store.h"
 
 namespace fs = std::filesystem;
 
@@ -1208,7 +1209,7 @@ class RecorderE2ETest : public ::testing::Test {
     // Build the tiny prediction corpus into predict.db (read by the
     // predictor of e2e_prediction from the shared data dir).
     const char* kBuildPredict = LLM_RERANK_BUILD_PREDICT;
-    if (kBuildPredict && *kBuildPredict) {
+    if (kBuildPredict && *kBuildPredict && fs::exists(kBuildPredict)) {
       const char* kPredictCorpus =
           "$\t我\t7\n"
           "我\t世界\t5\n"
@@ -1220,9 +1221,6 @@ class RecorderE2ETest : public ::testing::Test {
       fputs(kPredictCorpus, proc);
       ASSERT_EQ(0, pclose(proc));
       ASSERT_TRUE(fs::exists(fs::path(g_rime_dir) / "predict.db"));
-    } else {
-      FAIL() << "LLM_RERANK_BUILD_PREDICT not defined; prediction e2e "
-                "cannot construct its db";
     }
 
     RIME_STRUCT(RimeTraits, traits);
@@ -1493,9 +1491,10 @@ TEST_F(RecorderE2ETest, EngineCommitDuringExclusiveMaintenanceIsBuffered) {
   RimeSessionId session = NewSession(kE2eSchema);
   ASSERT_NE(0, session);
 
-  // The recorder has already initialized the facts root. Holding the real
-  // maintenance lock forces the production coordinator down its bounded FIFO
-  // path; no SQLite or fsync is reachable from the commit notifier.
+  // SCN-134-5: the recorder has already initialized the facts root. Holding
+  // the real maintenance lock forces the production coordinator down its
+  // bounded FIFO path; no SQLite or fsync is reachable from the commit
+  // notifier.
   rime::MaintenanceLock exclusive;
   ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
                                 rime::MaintenanceLock::Mode::kExclusive));
@@ -1513,6 +1512,145 @@ TEST_F(RecorderE2ETest, EngineCommitDuringExclusiveMaintenanceIsBuffered) {
   ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
   EXPECT_EQ(1LL, count);
   sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, SessionCreatedDuringMaintenanceResumesAfterUnlock) {
+  fs::create_directories(FactsRoot());
+  ASSERT_EQ(0, chmod(FactsRoot().c_str(), 0700));
+  {
+    rime::FactStore store(FactsRoot());
+    ASSERT_EQ(rime::FactStore::Status::kOk, store.Open());
+  }
+  rime::MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
+                                rime::MaintenanceLock::Mode::kExclusive));
+
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  EXPECT_EQ("maintenance_locked",
+            Property(session, "llm_rerank.recording_fault"));
+  EXPECT_EQ("0", Property(session, "llm_rerank.recording_gap_count"));
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+
+  exclusive.Release();
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  std::vector<EventRow> first_events;
+  ASSERT_TRUE(ReadAllEvents(db, &first_events));
+  ASSERT_EQ(1u, first_events.size());
+  const std::string session_id = first_events[0].session_id;
+  sqlite3_close(db);
+
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  std::vector<EventRow> events;
+  ASSERT_TRUE(ReadAllEvents(db, &events));
+  ASSERT_EQ(2u, events.size());
+  EXPECT_EQ(session_id, events[0].session_id);
+  EXPECT_EQ(session_id, events[1].session_id);
+  EXPECT_NE(events[0].event_id, events[1].event_id);
+  sqlite3_close(db);
+  g_rime->destroy_session(session);
+  session_ = 0;
+}
+
+TEST_F(RecorderE2ETest, RepeatedMaintenanceLocksStayTransientOnSameSession) {
+  fs::create_directories(FactsRoot());
+  ASSERT_EQ(0, chmod(FactsRoot().c_str(), 0700));
+  {
+    rime::FactStore store(FactsRoot());
+    ASSERT_EQ(rime::FactStore::Status::kOk, store.Open());
+  }
+  rime::MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
+                                rime::MaintenanceLock::Mode::kExclusive));
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  EXPECT_EQ("maintenance_locked",
+            Property(session, "llm_rerank.recording_fault"));
+  exclusive.Release();
+
+  ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
+                                rime::MaintenanceLock::Mode::kExclusive));
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  exclusive.Release();
+
+  ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
+                                rime::MaintenanceLock::Mode::kExclusive));
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  exclusive.Release();
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(2LL, count);
+  EXPECT_EQ("0", Property(session, "llm_rerank.recording_gap_count"));
+  sqlite3_close(db);
+  g_rime->destroy_session(session);
+  session_ = 0;
+}
+
+TEST_F(RecorderE2ETest, DestroyingSessionDuringMaintenanceRecoveryIsSafe) {
+  fs::create_directories(FactsRoot());
+  ASSERT_EQ(0, chmod(FactsRoot().c_str(), 0700));
+  {
+    rime::FactStore store(FactsRoot());
+    ASSERT_EQ(rime::FactStore::Status::kOk, store.Open());
+  }
+  rime::MaintenanceLock exclusive;
+  ASSERT_TRUE(exclusive.Acquire(FactsRoot(),
+                                rime::MaintenanceLock::Mode::kExclusive));
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  g_rime->destroy_session(session);
+  session_ = 0;
+  exclusive.Release();
+
+  sqlite3* db = OpenFactsDb();
+  ASSERT_TRUE(db != nullptr);
+  long long count = -1;
+  ASSERT_TRUE(QueryCount(db, "SELECT COUNT(*) FROM selection_events;", &count));
+  EXPECT_EQ(1LL, count);
+  sqlite3_close(db);
+}
+
+TEST_F(RecorderE2ETest, PermanentIntegrityFaultStaysDisabledAfterRepair) {
+  fs::create_directories(FactsRoot());
+  chmod(FactsRoot().c_str(), 0755);
+
+  RimeSessionId session = NewSession(kE2eSchema);
+  ASSERT_NE(0, session);
+  EXPECT_EQ("root_permission",
+            Property(session, "llm_rerank.recording_fault"));
+
+  chmod(FactsRoot().c_str(), 0700);
+  TypeString(session, "shijie");
+  ASSERT_TRUE(g_rime->process_key(session, '2', 0));
+  EXPECT_EQ("时界", CommitText(session));
+  EXPECT_EQ("root_permission",
+            Property(session, "llm_rerank.recording_fault"));
+  g_rime->destroy_session(session);
+  session_ = 0;
+  EXPECT_FALSE(fs::exists(FactsRoot() / "facts.sqlite3"));
 }
 
 TEST_F(RecorderE2ETest, EngineCommitDoesNotWaitForMarkerFsync) {
@@ -2621,6 +2759,9 @@ TEST_F(RecorderE2ETest, PredictionCandidateSelectionFormsNoEvent) {
   // After committing 我, the predictor appends a prediction segment with
   // candidates 世界/时界 (type "prediction"); selecting one is a real
   // selection that must not form an event.
+  if (!fs::exists(fs::path(g_rime_dir) / "predict.db")) {
+    GTEST_SKIP() << "build_predict is not available on this host";
+  }
   RimeSessionId session = NewSession(kPredictionSchema);
   ASSERT_NE(0, session);
 

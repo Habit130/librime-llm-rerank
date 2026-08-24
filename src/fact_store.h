@@ -30,8 +30,10 @@ constexpr int kEventFormatVersion = 1;
 //
 // Fail-closed policy: the root directory and the database file must be real
 // paths (not symlinks) owned by the current user with exact 0700 / 0600
-// permissions. Any anomaly disables recording for the session and reports a
-// stable fault code; the original files are never modified on failure.
+// permissions. Integrity and permission anomalies disable recording for the
+// session and report a stable fault code. A maintenance lock is transient
+// and does not disable the session. The original files are never modified
+// on failure.
 class FactStore {
  public:
   enum class Status {
