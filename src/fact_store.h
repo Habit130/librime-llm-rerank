@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -216,6 +217,12 @@ class FactStore {
   static const char* StatusCode(Status status);
   static const char* StatusMessage(Status status);
 
+  // Test seam: install a SQLite progress handler on the open connection.
+  // Production never calls this.
+  void InstallProgressHandlerForTesting(int n_ops,
+                                        int (*handler)(void*),
+                                        void* ctx);
+
  private:
   Status VerifyRoot();
   Status VerifyDbFile();
@@ -231,6 +238,10 @@ class FactStore {
   bool meta_initialized_ = false;
   MaintenanceLock maintenance_lock_;
 };
+
+// Test seam: invoked after InspectSnapshotFile opens its read-only handle,
+// before validation. Production never sets this.
+void SetInspectSnapshotHookForTesting(std::function<void(sqlite3*)> hook);
 
 }  // namespace rime
 

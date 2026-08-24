@@ -85,10 +85,12 @@ eval/.venv/bin/python eval/verify_artifacts.py \
 
 Checks the committed fixture, the manifest checksum (canonical rule:
 `sha256(canonical_json(manifest minus manifest_sha256))`), results<->manifest
-consistency including the recomputed decision fields, the baseline candidate
-manifest (including that at least one case's ordered checksum differs from its
-multiset checksum, i.e. the ordered hash really captures emission order), and
-byte-for-byte summary regeneration. Must pass on the committed artifacts.
+consistency, metrics and harmful-regression counts recomputed from committed
+`case_ranks` (both copied summaries and the decision must match those derived
+values), the baseline candidate manifest (including that at least one case's
+ordered checksum differs from its multiset checksum, i.e. the ordered hash
+really captures emission order), and byte-for-byte summary regeneration. Must
+pass on the committed artifacts.
 
 ## Model-free vs integration tests
 

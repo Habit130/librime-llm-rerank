@@ -15,6 +15,7 @@
 #include "fact_store.h"
 #include "fact_migrator.h"
 #include "recorder_session.h"
+#include "sqlite_step.h"
 
 namespace rime {
 
@@ -151,31 +152,33 @@ bool QueryBoolValue(sqlite3* db, const char* sql, bool* value) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
     return false;
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
+  int rc = sqlite3_step(stmt);
+  bool ok = rc == SQLITE_ROW;
   if (ok) {
     *value = sqlite3_column_int(stmt, 0) != 0;
   }
-  sqlite3_finalize(stmt);
+  if (sqlite3_finalize(stmt) != SQLITE_OK)
+    return false;
   return ok;
 }
 
 // quick_check yields one text row ("ok" on success); any other outcome is a
-// corruption signal.
+// corruption signal. A terminal error is not an empty success.
 bool QueryQuickCheck(sqlite3* db, bool* ok) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, "PRAGMA quick_check;", -1, &stmt, nullptr) !=
       SQLITE_OK) {
     return false;
   }
-  bool got_row = sqlite3_step(stmt) == SQLITE_ROW;
-  if (got_row) {
-    const unsigned char* text = sqlite3_column_text(stmt, 0);
-    *ok = text && std::strcmp(reinterpret_cast<const char*>(text), "ok") == 0;
-  } else {
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
     *ok = false;
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return got_row;
+  const unsigned char* text = sqlite3_column_text(stmt, 0);
+  *ok = text && std::strcmp(reinterpret_cast<const char*>(text), "ok") == 0;
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
 }  // namespace
@@ -258,13 +261,14 @@ bool ReadMetaText(sqlite3* db, const char* key, string* value) {
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
     return false;
   sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
-  if (ok) {
-    const unsigned char* text = sqlite3_column_text(stmt, 0);
-    *value = text ? reinterpret_cast<const char*>(text) : string();
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return ok;
+  const unsigned char* text = sqlite3_column_text(stmt, 0);
+  *value = text ? reinterpret_cast<const char*>(text) : string();
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
 bool ParseInt64(const string& text, int64_t* value) {
@@ -865,12 +869,13 @@ bool QueryCount(sqlite3* db, const char* table, int64_t* count) {
   string sql = "SELECT COUNT(*) FROM " + string(table) + ";";
   if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
     return false;
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
-  if (ok) {
-    *count = sqlite3_column_int64(stmt, 0);
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return ok;
+  *count = sqlite3_column_int64(stmt, 0);
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
 }  // namespace
@@ -905,13 +910,14 @@ FactStore::Status FactStore::CheckpointTruncate() {
     status_ = Status::kDbWriteFailed;
     return status_;
   }
-  bool got_row = sqlite3_step(stmt) == SQLITE_ROW;
+  int rc = sqlite3_step(stmt);
   // The first column is the busy flag; any non-zero value means the
   // checkpoint did not complete and the main file alone is not a complete
   // store.
-  int busy = got_row ? sqlite3_column_int(stmt, 0) : 1;
-  sqlite3_finalize(stmt);
-  if (!got_row || busy != 0) {
+  int busy = rc == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 1;
+  if (sqlite3_finalize(stmt) != SQLITE_OK)
+    rc = SQLITE_ERROR;
+  if (rc != SQLITE_ROW || busy != 0) {
     status_ = Status::kDbWriteFailed;
     return status_;
   }
@@ -948,7 +954,8 @@ bool ReadIdentity(sqlite3* db, string* store_epoch, string* history_id) {
 }
 
 // Full integrity check; any row other than a single "ok" is a corruption
-// signal.
+// signal. The scan must end in SQLITE_DONE; INTERRUPT after an "ok" row is
+// not success.
 bool QueryIntegrityCheck(sqlite3* db) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, "PRAGMA integrity_check;", -1, &stmt, nullptr) !=
@@ -957,7 +964,8 @@ bool QueryIntegrityCheck(sqlite3* db) {
   }
   bool ok = true;
   int rows = 0;
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
+  int rc = SQLITE_OK;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     ++rows;
     const unsigned char* text = sqlite3_column_text(stmt, 0);
     const char* value = reinterpret_cast<const char*>(text);
@@ -965,20 +973,23 @@ bool QueryIntegrityCheck(sqlite3* db) {
       ok = false;
     }
   }
-  sqlite3_finalize(stmt);
-  return ok && rows == 1;
+  return ok && rows == 1 && SqliteFinishDone(stmt, rc);
 }
 
-// Foreign-key check must produce zero rows.
+// Foreign-key check must produce zero rows. Only SQLITE_DONE is success;
+// SQLITE_INTERRUPT and other terminal errors fail closed.
 bool QueryForeignKeyCheck(sqlite3* db) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, "PRAGMA foreign_key_check;", -1, &stmt, nullptr) !=
       SQLITE_OK) {
     return false;
   }
-  bool ok = sqlite3_step(stmt) != SQLITE_ROW;
-  sqlite3_finalize(stmt);
-  return ok;
+  int rc = sqlite3_step(stmt);
+  if (rc == SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
+  }
+  return SqliteFinishDone(stmt, rc);
 }
 
 // The reported journal mode; a WAL journal means the file alone is not a
@@ -989,13 +1000,14 @@ bool QueryJournalMode(sqlite3* db, string* mode) {
       SQLITE_OK) {
     return false;
   }
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
-  if (ok) {
-    const unsigned char* text = sqlite3_column_text(stmt, 0);
-    *mode = text ? reinterpret_cast<const char*>(text) : string();
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return ok;
+  const unsigned char* text = sqlite3_column_text(stmt, 0);
+  *mode = text ? reinterpret_cast<const char*>(text) : string();
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
 // Highest event HLC and event-format range. Empty stores report -1 markers
@@ -1008,16 +1020,21 @@ bool QueryEventStats(sqlite3* db, int64_t* hlc_physical_ms,
       " ORDER BY hlc_physical_ms DESC, hlc_logical DESC LIMIT 1;";
   if (sqlite3_prepare_v2(db, kQueryHlc, -1, &stmt, nullptr) != SQLITE_OK)
     return false;
-  bool has_row = sqlite3_step(stmt) == SQLITE_ROW;
+  int rc = sqlite3_step(stmt);
+  if (!SqliteIsRowOrDone(rc)) {
+    sqlite3_finalize(stmt);
+    return false;
+  }
+  bool has_row = rc == SQLITE_ROW;
   if (has_row) {
     *hlc_physical_ms = sqlite3_column_int64(stmt, 0);
     *hlc_logical = sqlite3_column_int64(stmt, 1);
-  }
-  sqlite3_finalize(stmt);
-  if (!has_row) {
+  } else {
     *hlc_physical_ms = -1;
     *hlc_logical = -1;
   }
+  if (sqlite3_finalize(stmt) != SQLITE_OK)
+    return false;
   sqlite3_stmt* range_stmt = nullptr;
   const char* kQueryRange = "SELECT MIN(event_format_version),"
       " MAX(event_format_version) FROM selection_events;";
@@ -1025,18 +1042,19 @@ bool QueryEventStats(sqlite3* db, int64_t* hlc_physical_ms,
       SQLITE_OK) {
     return false;
   }
-  bool got_range = sqlite3_step(range_stmt) == SQLITE_ROW;
-  if (got_range) {
-    if (sqlite3_column_type(range_stmt, 0) == SQLITE_NULL) {
-      *format_min = -1;
-      *format_max = -1;
-    } else {
-      *format_min = sqlite3_column_int(range_stmt, 0);
-      *format_max = sqlite3_column_int(range_stmt, 1);
-    }
+  int range_rc = sqlite3_step(range_stmt);
+  if (range_rc != SQLITE_ROW) {
+    sqlite3_finalize(range_stmt);
+    return false;
   }
-  sqlite3_finalize(range_stmt);
-  return got_range;
+  if (sqlite3_column_type(range_stmt, 0) == SQLITE_NULL) {
+    *format_min = -1;
+    *format_max = -1;
+  } else {
+    *format_min = sqlite3_column_int(range_stmt, 0);
+    *format_max = sqlite3_column_int(range_stmt, 1);
+  }
+  return sqlite3_finalize(range_stmt) == SQLITE_OK;
 }
 
 // Counts every fact table. Any failure is a corruption signal.
@@ -1231,10 +1249,12 @@ FactStore::Status FactStore::SnapshotTo(const path& output_path,
     sqlite3_close(dest);
     return status_;
   }
-  bool got_row = sqlite3_step(checkpoint) == SQLITE_ROW;
-  int busy = got_row ? sqlite3_column_int(checkpoint, 0) : 1;
-  sqlite3_finalize(checkpoint);
-  if (!got_row || busy != 0) {
+  int checkpoint_rc = sqlite3_step(checkpoint);
+  int busy = checkpoint_rc == SQLITE_ROW ? sqlite3_column_int(checkpoint, 0)
+                                         : 1;
+  if (sqlite3_finalize(checkpoint) != SQLITE_OK)
+    checkpoint_rc = SQLITE_ERROR;
+  if (checkpoint_rc != SQLITE_ROW || busy != 0) {
     status_ = Status::kDbWriteFailed;
     sqlite3_close(dest);
     return status_;
@@ -1294,6 +1314,23 @@ FactStore::Status FactStore::SnapshotTo(const path& output_path,
   return status_;
 }
 
+namespace {
+
+std::function<void(sqlite3*)> g_inspect_hook;
+
+}  // namespace
+
+void SetInspectSnapshotHookForTesting(std::function<void(sqlite3*)> hook) {
+  g_inspect_hook = std::move(hook);
+}
+
+void FactStore::InstallProgressHandlerForTesting(int n_ops,
+                                                 int (*handler)(void*),
+                                                 void* ctx) {
+  if (db_)
+    sqlite3_progress_handler(db_, n_ops, handler, ctx);
+}
+
 FactStore::Status FactStore::InspectSnapshotFile(const path& db_path,
                                                  SnapshotStats* stats) {
   if (db_path.empty() || !stats) {
@@ -1307,6 +1344,8 @@ FactStore::Status FactStore::InspectSnapshotFile(const path& db_path,
     }
     return Status::kDbOpenFailed;
   }
+  if (g_inspect_hook)
+    g_inspect_hook(db);
   bool valid = InspectSnapshotHandle(db, stats,
                                      FactStore::OpenMode::kRecorder);
   sqlite3_close(db);
@@ -1372,7 +1411,8 @@ bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
   sqlite3_bind_int64(stmt, 1, hlc_physical_ms);
   sqlite3_bind_int64(stmt, 2, hlc_logical);
   out->clear();
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
+  int rc = SQLITE_OK;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     Event event;
     event.event_id =
         reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
@@ -1403,7 +1443,10 @@ bool FactStore::QueryActiveEventsAsOf(int64_t hlc_physical_ms,
     event.utc_confirmed_at_ms = sqlite3_column_int64(stmt, 18);
     out->push_back(std::move(event));
   }
-  sqlite3_finalize(stmt);
+  if (!SqliteFinishDone(stmt, rc)) {
+    out->clear();
+    return false;
+  }
   return true;
 }
 

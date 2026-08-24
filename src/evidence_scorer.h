@@ -64,8 +64,16 @@ class EvidenceScorer {
 
   // Returns per-candidate s_c in [0, 1) only on a complete, identity-bound
   // success response; zero evidence is a success with all-zero s_c.  Any
-  // fault returns false.
-  virtual bool ScoreGroup(const GroupRequest& request, vector<double>* s_c);
+  // fault returns false.  remaining_deadline_ms is the leftover budget for
+  // this group's connect/write/read; callers share one absolute window
+  // deadline across groups.  The two-argument form uses the instance
+  // deadline as a single-request budget.
+  bool ScoreGroup(const GroupRequest& request, vector<double>* s_c) {
+    return ScoreGroup(request, s_c, deadline_ms_);
+  }
+  virtual bool ScoreGroup(const GroupRequest& request,
+                          vector<double>* s_c,
+                          int remaining_deadline_ms);
 
   // Canonical evidence config identity shared with the daemon
   // (daemon/evidence.py compose_config_identity).  The double formatting must
@@ -86,6 +94,7 @@ class EvidenceScorer {
  private:
   bool SendRequest(const GroupRequest& request,
                    const string& request_id,
+                   int remaining_deadline_ms,
                    string* response);
 
   string socket_path_;

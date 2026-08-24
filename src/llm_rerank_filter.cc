@@ -3,7 +3,10 @@
 // Distributed under the BSD License
 //
 
+#include <chrono>
 #include <cmath>
+#include <functional>
+#include <limits>
 #include <set>
 #include <utility>
 
@@ -120,16 +123,36 @@ static string CategoryOf(const string& type) {
   return type;
 }
 
+static std::chrono::steady_clock::time_point NowOr(
+    const std::function<std::chrono::steady_clock::time_point()>& now) {
+  return now ? now() : std::chrono::steady_clock::now();
+}
+
+static int RemainingDeadlineMs(
+    std::chrono::steady_clock::time_point deadline,
+    const std::function<std::chrono::steady_clock::time_point()>& now) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - NowOr(now))
+                             .count();
+  if (remaining <= 0)
+    return 0;
+  if (remaining > std::numeric_limits<int>::max())
+    return std::numeric_limits<int>::max();
+  return static_cast<int>(remaining);
+}
+
 class LlmRerankTranslation : public PrefetchTranslation {
  public:
   LlmRerankTranslation(an<Translation> translation,
                        an<Scorer> scorer,
                        an<EvidenceScorer> evidence_scorer,
                        bool evidence_active,
-                       path facts_root,
-                       int window,
-                       string schema_id,
-                       string input,
+                        path facts_root,
+                        int window,
+                        int deadline_ms,
+                        std::function<std::chrono::steady_clock::time_point()> now,
+                        string schema_id,
+                        string input,
                        string preceding_text,
                        string previous_word,
                        RerankScoringPolicy scoring_policy,
@@ -143,6 +166,8 @@ class LlmRerankTranslation : public PrefetchTranslation {
         evidence_active_(evidence_active),
         facts_root_(std::move(facts_root)),
         window_(window),
+        deadline_ms_(deadline_ms),
+        now_(std::move(now)),
         schema_id_(std::move(schema_id)),
         input_(std::move(input)),
         preceding_text_(std::move(preceding_text)),
@@ -166,6 +191,8 @@ class LlmRerankTranslation : public PrefetchTranslation {
   bool evidence_active_ = false;
   path facts_root_;
   int window_;
+  int deadline_ms_ = 200;
+  std::function<std::chrono::steady_clock::time_point()> now_;
   string schema_id_;
   string input_;
   string preceding_text_;
@@ -303,10 +330,12 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   // Retrieval evidence (#61): one evidence request per complete rerank group
   // (each group is one choice problem). The plugin applies gamma * s_c only
   // on a complete, identity-bound success; any fault passes the whole window
-  // through in original order.  The trial envelope (#74) rides along: the
-  // plugin's γ=0 base scores for this group, so the daemon can replay the
-  // same group with γ=0 (shadow) and with the served evidence (final) and
-  // record an identity-only order-change trace (or aggregates only).
+  // through in original order.  All groups in this window share one absolute
+  // deadline (connect/write/read included); later groups see only leftover
+  // budget.  The trial envelope (#74) rides along: the plugin's γ=0 base
+  // scores for this group, so the daemon can replay the same group with γ=0
+  // (shadow) and with the served evidence (final) and record an identity-only
+  // order-change trace (or aggregates only).
   if (evidence_active_) {
     if (!evidence_scorer_) {
       LogWindowFailure("evidence_unavailable", "evidence", buffer.size());
@@ -316,6 +345,8 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     EvidenceScorer::ReadFactHighWater(
         facts_root_.empty() ? FactStore::DefaultRootDir() : facts_root_,
         &high_water);
+    const auto window_deadline =
+        NowOr(now_) + std::chrono::milliseconds(deadline_ms_);
     for (const auto& group : *plan.groups) {
       if (!*group.complete)
         continue;
@@ -334,7 +365,10 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
         evidence_request.trial.base_scores.push_back(scores[index].base_score);
       }
       vector<double> group_evidence;
-      if (!evidence_scorer_->ScoreGroup(evidence_request, &group_evidence) ||
+      const int remaining = RemainingDeadlineMs(window_deadline, now_);
+      if (remaining <= 0 ||
+          !evidence_scorer_->ScoreGroup(evidence_request, &group_evidence,
+                                        remaining) ||
           group_evidence.size() != group.candidate_indexes->size()) {
         LogWindowFailure("evidence_scoring_failed", "evidence",
                          buffer.size());
@@ -579,9 +613,9 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   return New<LlmRerankTranslation>(
       translation, reranking_enabled_ ? scorer_ : nullptr,
       evidence_active_ ? evidence_scorer_ : nullptr, evidence_active_,
-      facts_root_, window_, schema_id_, input, preceding_text, last_word_,
-      scoring_policy, recorder_session_, segment_start, want_snapshots,
-      !reranking_enabled_);
+      facts_root_, window_, deadline_ms_, now_, schema_id_, input,
+      preceding_text, last_word_, scoring_policy, recorder_session_,
+      segment_start, want_snapshots, !reranking_enabled_);
 }
 
 }  // namespace rime

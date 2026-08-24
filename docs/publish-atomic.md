@@ -49,16 +49,22 @@ Publish durability order (each step fsynced before the next):
 3. The container is renamed `staging/<id> → generations/<id>` and both
    parent directories fsynced (the generation becomes durable).
 4. The active manifest is replaced with `_write_atomic` (temp write +
-   fsync + rename + parent fsync) — **the commit point**.
+   fsync + rename + parent fsync) — **the commit point**. A successful
+   `os.replace` is already a visible commit: a later parent-directory
+   fsync failure raises `AtomicWriteCommitted` and is treated as
+   committed/ambiguous, never as a pre-commit rollback.
 5. The in-memory query pointer swaps via `publish_switch` (synchronous
    handshake with the delta worker, still under the publish lock).
 
-A failure at any point before step 4 rolls the container rename back
-(`_write_atomic` only raises before its own rename, so the manifest is
-provably unreplaced) and restores the parked progress record: the ready
-staging survives for the publisher's next attempt. A failure at/after
-step 4 leaves the manifest committed; the switch handshake is retried by
-the publisher on later polls, and a restart loads the new generation.
+A failure before the manifest rename rolls the container rename back and
+restores the parked progress record: the ready staging survives for the
+publisher's next attempt. A failure at/after the manifest rename —
+including a post-rename parent fsync fault — leaves the new pointer
+visible. Recovery (`reconcile_active_manifest_commit`) reconciles the
+live manifest with the on-disk generation, is idempotent across retry,
+and never moves a referenced generation back to staging. The switch
+handshake is retried on later polls, and a restart loads the new
+generation.
 
 ## The publish lock and its scope (AC65-2, SCN-65-6)
 
@@ -99,6 +105,7 @@ state of a generation whose `(H0,H1]` window was empty.
 | mid-delta build (deterministic fault) | staging `blocked` (events named) | old active; `retry()` re-arms |
 | after delta, before rename | staging intact + orphan `delta/<id>/` | old active; next publish of the id supersedes |
 | after rename, before manifest | container rolled back (in-process) or orphaned (crash) | old active |
+| after manifest rename, parent fsync failed | new pointer visible; generation stays published | **complete new generation loads**; recovery reconciles, never rolls the referenced generation back |
 | **after manifest replace** | new generation + its checkpoint + new manifest | **complete new generation loads** |
 | during/after the switch | manifest new, live process old | complete new generation loads |
 

@@ -29,12 +29,14 @@ transaction (spec #43 "并发重建与蓝绿发布", clauses 7-11):
    replaced (temp + fsync + rename + parent fsync); only then does the
    delta machine's worker swap the in-memory query pointer (the #65
    ``publish_switch`` handshake, synchronous under the same lock).
-4. **Crash semantics (SCN-65-2/3)**: a crash before the manifest replace
-   leaves the complete old active (the staging, the orphaned checkpoint or
-   the published-but-not-activated generation are harmless leftovers; #66
-   owns their retention).  A crash after the manifest replace loads the
-   complete new generation on restart -- the manifest, not the config, is
-   then the source of truth for the active identity.
+4. **Crash semantics (SCN-65-2/3, SCN-133-2)**: a crash before the
+   manifest replace leaves the complete old active (the staging, the
+   orphaned checkpoint or the published-but-not-activated generation are
+   harmless leftovers; #66 owns their retention).  A crash after the
+   manifest replace -- including a post-rename parent fsync fault --
+   loads the complete new generation on restart.  Recovery reconciles
+   the live pointer with the on-disk generation and never rolls a
+   referenced generation back to staging.
 5. **Post-H1 facts (SCN-65-4)**: facts committed after ``H1`` (e.g. during
    the publish) are absorbed by the new active's catch-up worker before
    the next successful query -- never a stale-watermark success.
@@ -77,6 +79,7 @@ from delta import (  # noqa: E402
 from evidence import EvidenceError  # noqa: E402
 from generation import (  # noqa: E402
     PROGRESS_FILENAME,
+    AtomicWriteCommitted,
     _canonical_json,
     _fsync_directory,
     _write_atomic,
@@ -268,10 +271,115 @@ def _compose_active_manifest(generation, checkpoint_path,
 
 def write_active_manifest(derived_root, manifest):
     """Atomically replace the active manifest (temp + fsync + rename +
-    parent fsync): the crash-atomic commit point of the publish."""
+    parent fsync): the crash-atomic commit point of the publish.
+
+    A post-rename parent fsync failure raises ``AtomicWriteCommitted``:
+    the new manifest is already visible and must not be treated as a
+    pre-commit rollback.
+    """
     _write_atomic(
         os.path.join(derived_root, ACTIVE_MANIFEST_FILENAME),
         _canonical_json(manifest).encode("utf-8"))
+
+
+def _published_generation_dir(derived_root, generation_id):
+    return os.path.join(derived_root, "generations", generation_id)
+
+
+def _staging_generation_dir(derived_root, generation_id):
+    return os.path.join(derived_root, "staging", generation_id)
+
+
+def _restore_published_generation(derived_root, generation_id):
+    """Move a referenced generation from staging/ back to generations/."""
+    published = _published_generation_dir(derived_root, generation_id)
+    staging = _staging_generation_dir(derived_root, generation_id)
+    if os.path.isdir(published) or not os.path.isdir(staging):
+        return
+    published_root = os.path.join(derived_root, "generations")
+    staging_root = os.path.join(derived_root, "staging")
+    os.makedirs(published_root, mode=0o700, exist_ok=True)
+    os.rename(staging, published)
+    _fsync_directory(published_root)
+    _fsync_directory(staging_root)
+
+
+def reconcile_active_manifest_commit(derived_root, generation_id,
+                                     tmp_progress=None):
+    """Reconcile disk state after a possible post-rename manifest commit.
+
+    Idempotent. Never moves a generation the live manifest references out
+    of ``generations/``. If the manifest already names ``generation_id``
+    but the container is still under ``staging/``, restore it.
+    """
+    manifest, _reason = read_active_manifest(derived_root)
+    referenced = (manifest is not None
+                  and manifest.get("generation_id") == generation_id)
+    if referenced:
+        _restore_published_generation(derived_root, generation_id)
+        if tmp_progress is not None and os.path.isfile(tmp_progress):
+            try:
+                os.unlink(tmp_progress)
+            except OSError:
+                pass
+    durable = False
+    try:
+        _fsync_directory(derived_root)
+        durable = True
+    except OSError:
+        pass
+    published = os.path.isdir(
+        _published_generation_dir(derived_root, generation_id))
+    return {
+        "referenced": referenced,
+        "generation_present": published,
+        "durable": durable,
+        "consistent": published if referenced else True,
+    }
+
+
+def _complete_publish_switch(derived_root, generation_id, checkpoint_path,
+                             provider, epoch, delta_machine,
+                             switch_deadline, now):
+    """Finish a committed publish: pointer swap, then retention sweep."""
+    try:
+        ok, error = delta_machine.publish_switch(
+            generation_id, checkpoint_path, provider, epoch,
+            deadline=now() + switch_deadline)
+    except Exception as error:  # noqa: BLE001 - fail closed, committed
+        return {"ok": False, "committed": True,
+                "error": "publish switch fault: %s" % error}
+    if not ok:
+        return {"ok": False, "committed": True, "error": error}
+    try:
+        from retention import sweep_from_manifests
+        sweep_from_manifests(derived_root, active_id=generation_id)
+    except Exception:  # noqa: BLE001 - best effort; never fail a publish
+        pass
+    return {"ok": True, "committed": True, "error": None}
+
+
+def _finish_already_committed(facts_root, derived_root, generation_id,
+                              provider, delta_machine, switch_deadline, now):
+    """Idempotent retry of a publish whose manifest already names the gen."""
+    recovered = reconcile_active_manifest_commit(derived_root, generation_id)
+    if not (recovered["referenced"] and recovered["consistent"]):
+        return None
+    if not recovered["durable"]:
+        return {"ok": False, "committed": True,
+                "error": "active manifest parent fsync still failing"}
+    try:
+        facts_identity = read_facts_identity(facts_root)
+    except DeltaError as error:
+        return {"ok": False, "committed": True,
+                "error": "fact store read failed: %s" % error}
+    if facts_identity is None:
+        return {"ok": False, "committed": True,
+                "error": "fact store is missing"}
+    checkpoint_path = os.path.join("delta", generation_id, DELTA_FILENAME)
+    return _complete_publish_switch(
+        derived_root, generation_id, checkpoint_path, provider,
+        facts_identity[0], delta_machine, switch_deadline, now)
 
 
 def _read_fact_schema_version(facts_root):
@@ -497,6 +605,11 @@ def publish_ready_staging(facts_root, derived_root, staging_machine,
 def _publish_locked(facts_root, derived_root, staging_machine, staging_dir,
                     generation_id, provider, delta_machine,
                     switch_deadline, now):
+    already = _finish_already_committed(
+        facts_root, derived_root, generation_id, provider, delta_machine,
+        switch_deadline, now)
+    if already is not None:
+        return already
     try:
         progress, _pinned = staging_machine.verify_publishable(staging_dir)
     except Exception as error:  # noqa: BLE001 - diagnose and fail closed
@@ -552,10 +665,9 @@ def _publish_locked(facts_root, derived_root, staging_machine, staging_dir,
         _fsync_directory(staging_root)
 
         # Atomic commit point: the active manifest (temp + fsync + rename +
-        # parent fsync).  From here a crash loads the complete new
-        # generation.  ``_write_atomic`` only raises before its rename, so
-        # any exception below still means the manifest was NOT replaced and
-        # the container rename is safe to roll back for the next retry.
+        # parent fsync).  A successful replace is the commit: a later
+        # parent-fsync fault is committed/ambiguous and must never roll the
+        # referenced generation back to staging.
         fact_schema_version = _read_fact_schema_version(facts_root)
         if not fact_schema_version:
             raise PublishError("fact store schema version missing")
@@ -610,52 +722,48 @@ def _publish_locked(facts_root, derived_root, staging_machine, staging_dir,
         except OSError:
             pass  # a leftover .verify-<id>.tmp is harmless (#66 cleanup)
         _fsync_directory(staging_root)
-    except Exception as error:  # noqa: BLE001 - fail closed, roll back
+    except Exception as error:  # noqa: BLE001 - classify, then roll back only pre-commit
         reason = getattr(error, "reason", None) or str(error)
-        # Pre-commit failure: roll the container rename back so the ready
-        # staging survives for the publisher's next attempt (a real crash
-        # at any of these points leaves the same two safe outcomes: the
-        # complete old active, or the complete old active plus an orphaned
-        # published container that #66 retains).
+        post_rename = (
+            isinstance(error, AtomicWriteCommitted)
+            or getattr(error, "committed", False))
         try:
-            if os.path.isdir(os.path.join(published_root, generation_id)):
-                os.rename(os.path.join(published_root, generation_id),
-                          staging_dir)
-                _fsync_directory(staging_root)
-            if tmp_progress is not None and os.path.isfile(tmp_progress):
-                _restore_progress(staging_root, generation_id, tmp_progress)
-        except OSError:
-            pass
-        return {"ok": False, "committed": False,
-                "error": "active manifest write failed: %s" % reason}
+            recovered = reconcile_active_manifest_commit(
+                derived_root, generation_id, tmp_progress)
+        except Exception:  # noqa: BLE001 - inspect disk; never invent pre-commit
+            manifest, _ignored = read_active_manifest(derived_root)
+            referenced = (manifest is not None
+                          and manifest.get("generation_id") == generation_id)
+            if post_rename or referenced:
+                return {"ok": False, "committed": True,
+                        "error": "active manifest write failed: %s" % reason}
+            recovered = {"referenced": False, "consistent": False,
+                         "durable": False, "generation_present": False}
+        if recovered["referenced"] or post_rename:
+            # The name is visible or recovery found the new pointer.
+            # Never move the referenced generation back to staging.
+            if not (recovered["consistent"] and recovered["durable"]):
+                return {"ok": False, "committed": True,
+                        "error": "active manifest write failed: %s" % reason}
+        else:
+            # Pre-commit: roll the container rename back so the ready
+            # staging survives for the publisher's next attempt.
+            try:
+                if os.path.isdir(os.path.join(published_root, generation_id)):
+                    os.rename(os.path.join(published_root, generation_id),
+                              staging_dir)
+                    _fsync_directory(staging_root)
+                if tmp_progress is not None and os.path.isfile(tmp_progress):
+                    _restore_progress(staging_root, generation_id,
+                                      tmp_progress)
+            except OSError:
+                pass
+            return {"ok": False, "committed": False,
+                    "error": "active manifest write failed: %s" % reason}
 
-    # In-memory pointer swap: synchronous handshake with the delta
-    # machine's worker.  A timeout leaves the manifest committed and the
-    # publisher retries the handshake on its next poll; an unexpected
-    # switch fault (e.g. a crash right at the swap) is treated the same
-    # way -- the durable commit stands and a restart loads the new
-    # generation.
-    try:
-        ok, error = delta_machine.publish_switch(
-            generation_id, checkpoint_path, provider, epoch,
-            deadline=now() + switch_deadline)
-    except Exception as error:  # noqa: BLE001 - fail closed, committed
-        return {"ok": False, "committed": True,
-                "error": "publish switch fault: %s" % error}
-    if not ok:
-        return {"ok": False, "committed": True, "error": error}
-    # #67 retention (seam 1): runs only after a SUCCESSFUL publish, never
-    # mid-switch.  The newly published generation is active; the rollback
-    # pointer (registered before the swap above, or a surviving older one)
-    # is the retained rollback; everything outside {active, rollback,
-    # current staging} is deleted.  The only rollback is never deleted
-    # (SCN-67-2/3).
-    try:
-        from retention import sweep_from_manifests
-        sweep_from_manifests(derived_root, active_id=generation_id)
-    except Exception:  # noqa: BLE001 - best effort; never fail a publish
-        pass
-    return {"ok": True, "committed": True, "error": None}
+    return _complete_publish_switch(
+        derived_root, generation_id, checkpoint_path, provider, epoch,
+        delta_machine, switch_deadline, now)
 
 
 # ---------------------------------------------------------------------------

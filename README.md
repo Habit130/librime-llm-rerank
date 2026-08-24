@@ -26,10 +26,15 @@ in `lib/rime-plugins/`.
 
 Tagging this repo with `v*` runs `.github/workflows/release.yml`, which builds
 a universal (arm64 + x86_64) `librime-llm-rerank.dylib` against the pinned
-librime revision used by Squirrel and attaches it to the GitHub Release.
-Squirrel's `action-install.sh` downloads that artifact by tag and verifies its
-sha256 on the fast build path; the from-source build path keeps using
-`install-plugins.sh` instead.
+librime revision used by Squirrel. Before attaching the dylib to the GitHub
+Release the workflow runs the model-free daemon and eval suites, builds with
+`BUILD_TEST=ON`, installs a pinned `rime/librime-predict` checkout so the C++
+prediction e2e can run, runs `llm_rerank_test`, and fails closed unless
+`lipo` reports both `arm64` and `x86_64`. A failed gate publishes no asset.
+Actions are pinned to commit SHAs; Boost and the librime deps archive are
+SHA-256 verified. Squirrel's `action-install.sh` downloads the artifact by
+tag and verifies its sha256 on the fast build path; the from-source build
+path keeps using `install-plugins.sh` instead.
 
 ## Daemon deploy
 
@@ -112,7 +117,10 @@ current schema head. Fact schema evolution is owned exclusively by the C++
 writer (`fact_store_tool migrate`): the ordered, forward-only step table,
 the deterministic per-event-format projection and the pre-commit validation
 (counts, event/commit identities, HLC total order, foreign keys, schema
-invariants) all live in C++. Python only orchestrates the operation through
+invariants) all live in C++. Integrity, foreign-key, projection and HLC
+row loops treat only `SQLITE_DONE` as successful completion;
+`SQLITE_INTERRUPT`, I/O errors and prepare/finalize failures fail closed
+without COMMIT or publish. Python only orchestrates the operation through
 the maintenance seam: a verified safety snapshot is created BEFORE any
 migration work (SQLite Online Backup API + full C++ validation), the
 migration runs on a staging copy of that snapshot inside one SQLite
@@ -202,7 +210,8 @@ commit/event/retraction counts, the HLC and event high-water marks, the
 creation time, the producer version, the database size and its SHA-256, and
 whether the destination was explicitly confirmed as insecure. The snapshot
 comes from the SQLite Online Backup API through the C++ `fact_store_tool`
-seam (Python never interprets fact rows); it is fully integrity-checked,
+seam (Python never interprets fact rows); it is fully integrity-checked (a terminal SQLite error is not treated as an
+empty successful check),
 checkpointed into a single file with no WAL/SHM dependency, fsynced and
 re-verified before publication.
 
@@ -267,7 +276,10 @@ squirrel-semantic-memory restore --from <backup> --discard-current \
 
 Preflight validates the container (exact member set, names, attributes,
 compression, sizes, ratios, CRC), the manifest, the extracted database's
-SHA-256/size/integrity, its schema version and the available space. A
+SHA-256/size/integrity, its schema version and the available space.
+Prepare-restore and inspect treat only `SQLITE_DONE` as a successful empty
+foreign-key or row scan; a terminal SQLite error fails closed without minting
+or publishing. A
 supported-old backup is classified through the migrate seam and is migrated
 **only on the staging copy** during staging — the backup original is never
 modified; a too-new or missing-step backup is refused in preflight. Every
