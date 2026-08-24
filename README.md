@@ -491,6 +491,14 @@ problem (schema + category + canonical segment input), the recent 64-char
 上文, the current candidate group, the evidence config identity and the
 plugin's declared fact high-water (`store_epoch` + max change HLC).
 
+- Config identity (`compose_config_identity` / `ComposeConfigIdentity`)
+  binds the representation id plus `tau`, `k_evidence`, half-life,
+  `saturation_k`, and `gamma`. Six significant digits (`defaultfloat` /
+  `%.6g`) are the canonical domain (Squirrel#132 option 1 / #151): ingest
+  quantizes every double so values that differ only beyond that precision
+  share one identity. Already-canonical bytes stay unchanged; the
+  `evidence-v1` prefix is unchanged (AC-61 is not superseded). Infinity is
+  `inf`; other non-finite values fail closed.
 - `daemon/evidence.py` — `EvidenceService`: read-only facts + the canonical
   oracle behind an injectable `RepresentationProvider` seam (the #62
   generation hook). `FixtureRepresentationProvider` is the injected,

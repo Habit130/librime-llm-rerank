@@ -1072,6 +1072,51 @@ TEST(EvidenceConfigIdentityTest, ComposeMatchesDaemonFormat) {
                 std::numeric_limits<double>::infinity(), 3.0, 2.0));
 }
 
+TEST(EvidenceConfigIdentityTest, CollidingDoublesShareIdentity) {
+  // Shared fixture with daemon/test_evidence.py (#132 pair).
+  string formatted;
+  ASSERT_TRUE(EvidenceScorer::FormatIdentityDouble(0.12345641, &formatted));
+  EXPECT_EQ("0.123456", formatted);
+  ASSERT_TRUE(EvidenceScorer::FormatIdentityDouble(0.12345649, &formatted));
+  EXPECT_EQ("0.123456", formatted);
+  ASSERT_TRUE(EvidenceScorer::FormatIdentityDouble(0.123456, &formatted));
+  EXPECT_EQ("0.123456", formatted);
+  const string canonical = EvidenceScorer::ComposeConfigIdentity(
+      "repr-v1", 0.123456, 8, 32.0, 3.0, 2.0);
+  EXPECT_EQ("evidence-v1:repr=repr-v1:tau=0.123456:kev=8:H=32:sat=3:gamma=2",
+            canonical);
+  EXPECT_EQ(canonical, EvidenceScorer::ComposeConfigIdentity(
+                           "repr-v1", 0.12345641, 8, 32.0, 3.0, 2.0));
+  EXPECT_EQ(canonical, EvidenceScorer::ComposeConfigIdentity(
+                           "repr-v1", 0.12345649, 8, 32.0, 3.0, 2.0));
+}
+
+TEST(EvidenceConfigIdentityTest, AlreadyCanonicalBytesUnchanged) {
+  string formatted;
+  ASSERT_TRUE(EvidenceScorer::FormatIdentityDouble(0.5, &formatted));
+  EXPECT_EQ("0.5", formatted);
+  ASSERT_TRUE(EvidenceScorer::FormatIdentityDouble(2.0, &formatted));
+  EXPECT_EQ("2", formatted);
+  ASSERT_TRUE(EvidenceScorer::FormatIdentityDouble(0.2, &formatted));
+  EXPECT_EQ("0.2", formatted);
+}
+
+TEST(EvidenceConfigIdentityTest, NonFiniteOtherThanInfFailsClosed) {
+  string formatted;
+  EXPECT_FALSE(EvidenceScorer::FormatIdentityDouble(
+      std::numeric_limits<double>::quiet_NaN(), &formatted));
+  EXPECT_TRUE(EvidenceScorer::ComposeConfigIdentity(
+                  "repr-v1", std::numeric_limits<double>::quiet_NaN(), 8,
+                  32.0, 3.0, 2.0)
+                  .empty());
+}
+
+TEST(EvidenceConfigIdentityTest, VersionPrefixUnchanged) {
+  EXPECT_EQ("evidence-v1:repr=repr-v1:tau=0.5:kev=8:H=32:sat=3:gamma=2",
+            EvidenceScorer::ComposeConfigIdentity("repr-v1", 0.5, 8, 32.0,
+                                                  3.0, 2.0));
+}
+
 // --- CompositeScorer (weight + LLM, no context term) ---
 
 TEST(CompositeScorerTest, RejectsWeightlessCandidate) {

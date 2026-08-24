@@ -92,18 +92,34 @@ class EvidenceError(Exception):
         self.message = message
 
 
+def quantize_identity_double(value):
+    """Ingest a double into the six-significant-digit config-identity domain.
+
+    Six significant digits (``defaultfloat`` / ``%.6g``) are the canonical
+    configuration domain (Habit130/squirrel#132 option 1 / #151), not merely
+    a display format. Values that differ only beyond that precision are the
+    same config. Already-canonical values keep today's bytes. Infinity is
+    accepted; other non-finite values fail closed. AC-61 is not superseded.
+    """
+    if math.isinf(value):
+        return float("inf")
+    if not math.isfinite(value):
+        raise EvidenceError("config_identity", "non-finite config value")
+    return float(format(value, ".6g"))
+
+
 def format_identity_double(value):
     """Canonical double formatting shared with the C++ plugin.
 
-    Both sides must produce byte-identical config identities, so the format
-    is fixed: ``%g``-style with six significant digits, ``inf`` for infinity
-    (the C++ side uses defaultfloat + setprecision(6)).
+    Ingests via ``quantize_identity_double`` so colliding inputs share one
+    identity string. Both sides must stay byte-identical: ``%g``-style with
+    six significant digits, ``inf`` for infinity (C++ defaultfloat +
+    setprecision(6)).
     """
-    if math.isinf(value):
+    quantized = quantize_identity_double(value)
+    if math.isinf(quantized):
         return "inf"
-    if not math.isfinite(value):
-        raise EvidenceError("config_identity", "non-finite config value")
-    return format(value, ".6g")
+    return format(quantized, ".6g")
 
 
 def compose_config_identity(representation_id, params, gamma):
@@ -112,7 +128,8 @@ def compose_config_identity(representation_id, params, gamma):
     Covers the representation seam id and every oracle/gamma parameter that
     changes the served evidence semantics; a change in any component yields a
     different identity, and the daemon serves exactly the identity it was
-    configured with.
+    configured with. Every double is ingested into the six-significant-digit
+    domain before the string is composed.
     """
     if not representation_id or not isinstance(representation_id, str):
         raise EvidenceError("config_identity",

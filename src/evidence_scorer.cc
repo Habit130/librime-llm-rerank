@@ -84,6 +84,21 @@ string IdentityDouble(double value) {
   return stream.str();
 }
 
+bool FormatConfigIdentityDouble(double value, string* out) {
+  if (!out)
+    return false;
+  if (std::isnan(value))
+    return false;
+  if (std::isinf(value)) {
+    *out = "inf";
+    return true;
+  }
+  std::ostringstream stream;
+  stream << std::setprecision(6) << value;
+  *out = stream.str();
+  return true;
+}
+
 // One evidence request document; the exact field set is the protocol
 // contract shared with daemon/evidence.py and daemon/server.py.
 string BuildEvidenceRequest(const EvidenceScorer::GroupRequest& request,
@@ -277,17 +292,30 @@ bool ParseEvidenceResponse(const string& response,
 
 }  // namespace
 
+bool EvidenceScorer::FormatIdentityDouble(double value, string* out) {
+  return FormatConfigIdentityDouble(value, out);
+}
+
 string EvidenceScorer::ComposeConfigIdentity(const string& representation_id,
                                              double tau,
                                              int k_evidence,
                                              double half_life,
                                              double saturation_k,
                                              double gamma) {
-  return "evidence-v1:repr=" + representation_id + ":tau=" +
-         IdentityDouble(tau) + ":kev=" + std::to_string(k_evidence) +
-         ":H=" + IdentityDouble(half_life) +
-         ":sat=" + IdentityDouble(saturation_k) +
-         ":gamma=" + IdentityDouble(gamma);
+  string tau_text;
+  string half_life_text;
+  string saturation_text;
+  string gamma_text;
+  if (!FormatConfigIdentityDouble(tau, &tau_text) ||
+      !FormatConfigIdentityDouble(half_life, &half_life_text) ||
+      !FormatConfigIdentityDouble(saturation_k, &saturation_text) ||
+      !FormatConfigIdentityDouble(gamma, &gamma_text)) {
+    LOG(WARNING) << "evidence_scorer: non-finite config identity value";
+    return string();
+  }
+  return "evidence-v1:repr=" + representation_id + ":tau=" + tau_text +
+         ":kev=" + std::to_string(k_evidence) + ":H=" + half_life_text +
+         ":sat=" + saturation_text + ":gamma=" + gamma_text;
 }
 
 bool EvidenceScorer::ReadFactHighWater(const path& facts_root,

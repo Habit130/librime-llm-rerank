@@ -39,6 +39,7 @@ from evidence import (  # noqa: E402
     DEFAULT_K_EVIDENCE,
     DEFAULT_SATURATION_K,
     DEFAULT_TAU,
+    EVIDENCE_CONFIG_ID_VERSION,
     EVIDENCE_KIND,
     EvidenceError,
     EvidenceService,
@@ -47,6 +48,7 @@ from evidence import (  # noqa: E402
     compose_config_identity,
     format_identity_double,
     make_evidence_request,
+    quantize_identity_double,
 )
 from oracle import OracleParams  # noqa: E402
 from server import (  # noqa: E402
@@ -240,6 +242,45 @@ class EvidenceServiceTest(unittest.TestCase):
         self.assertEqual("inf", format_identity_double(float("inf")))
         self.assertEqual("2", format_identity_double(2.0))
         self.assertEqual("0.2", format_identity_double(0.2))
+
+    def test_colliding_doubles_share_canonical_identity(self):
+        # Habit130/squirrel#132 pair: six significant digits are the domain.
+        self.assertEqual("0.123456", format_identity_double(0.12345641))
+        self.assertEqual("0.123456", format_identity_double(0.12345649))
+        self.assertEqual("0.123456", format_identity_double(0.123456))
+        self.assertEqual(0.123456, quantize_identity_double(0.12345641))
+        self.assertEqual(0.123456, quantize_identity_double(0.12345649))
+        self.assertEqual(0.123456, quantize_identity_double(0.123456))
+        canonical = compose_config_identity(
+            REPR_ID,
+            OracleParams(tau=0.123456, k_evidence=8, half_life=32.0,
+                         saturation_k=1.0),
+            GAMMA)
+        self.assertEqual(canonical, compose_config_identity(
+            REPR_ID,
+            OracleParams(tau=0.12345641, k_evidence=8, half_life=32.0,
+                         saturation_k=1.0),
+            GAMMA))
+        self.assertEqual(canonical, compose_config_identity(
+            REPR_ID,
+            OracleParams(tau=0.12345649, k_evidence=8, half_life=32.0,
+                         saturation_k=1.0),
+            GAMMA))
+        self.assertEqual(
+            "evidence-v1:repr=e2e-fixture-repr-v1:tau=0.123456:kev=8:H=32:"
+            "sat=1:gamma=2",
+            canonical)
+
+    def test_nan_identity_double_fails_closed(self):
+        with self.assertRaises(EvidenceError) as ctx:
+            format_identity_double(float("nan"))
+        self.assertEqual("config_identity", ctx.exception.code)
+        with self.assertRaises(EvidenceError) as ctx:
+            quantize_identity_double(float("nan"))
+        self.assertEqual("config_identity", ctx.exception.code)
+        with self.assertRaises(EvidenceError) as ctx:
+            compose_config_identity(REPR_ID, PARAMS, float("nan"))
+        self.assertEqual("config_identity", ctx.exception.code)
 
     def test_representation_fault_missing_query_vector_never_faults(self):
         # The fixture falls back to a deterministic default; a missing entry
@@ -547,6 +588,11 @@ class EvidenceConfigIdentityTest(unittest.TestCase):
             "gamma=2",
             identity,
         )
+
+    def test_identity_version_prefix_is_unchanged(self):
+        self.assertEqual("evidence-v1", EVIDENCE_CONFIG_ID_VERSION)
+        self.assertTrue(compose_config_identity(REPR_ID, PARAMS, GAMMA)
+                        .startswith("evidence-v1:"))
 
     def test_defaults_are_not_winner_params(self):
         # Spec #43: prototype values may not be written as locked winners.
