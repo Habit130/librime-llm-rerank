@@ -257,6 +257,21 @@ def word_metrics(ranks):
     }
 
 
+def metrics_from_ranks(ranks):
+    return {
+        "sentence": word_metrics(ranks["sentence"]),
+        "word": word_metrics(ranks["word"]),
+    }
+
+
+def harmful_regressions_for_run(baseline_word_ranks, run_word_ranks):
+    indexes = [
+        i + 1 for i, rank in enumerate(run_word_ranks)
+        if baseline_word_ranks[i] == 1 and rank != 1
+    ]
+    return {"count": len(indexes), "case_indexes": indexes}
+
+
 class Daemon:
     def __init__(self, socket_path, model_path, scoring, telemetry_path=None):
         self.socket_path = socket_path
@@ -684,18 +699,15 @@ def main():
 
         for run_key, run in results["runs"].items():
             if run_key in results["case_ranks"]:
-                regressions = [
-                    i + 1 for i, rank in enumerate(
-                        results["case_ranks"][run_key]["word"])
-                    if results["case_ranks"]["baseline"]["word"][i] == 1
-                    and rank != 1
-                ]
+                results["harmful_regressions"][run_key] = (
+                    harmful_regressions_for_run(
+                        results["case_ranks"]["baseline"]["word"],
+                        results["case_ranks"][run_key]["word"]))
             else:
-                regressions = []
-            results["harmful_regressions"][run_key] = {
-                "count": len(regressions),
-                "case_indexes": regressions,
-            }
+                results["harmful_regressions"][run_key] = {
+                    "count": 0,
+                    "case_indexes": [],
+                }
     except Exception:
         raise
 
@@ -748,10 +760,8 @@ def run_single(args, script, sentence_targets, word_targets, all_pinyins,
         word_ranks.append(rank_of(target, candidates))
 
     return {
-        "metrics": {
-            "sentence": word_metrics(sentence_ranks),
-            "word": word_metrics(word_ranks),
-        },
+        "metrics": metrics_from_ranks(
+            {"sentence": sentence_ranks, "word": word_ranks}),
         "ranks": {"sentence": sentence_ranks, "word": word_ranks},
         "candidate_checksums": {
             "sentence": [candidate_checksums(s) for s in sentence_emissions],

@@ -11,19 +11,20 @@ Checks, all from committed files (no model, no console run):
    `sha256(canonical_json(manifest minus manifest_sha256))` with the same
    canonical rule calibrate.py uses, and compares with the committed value.
 3. **Results <-> manifest consistency**: every run's alpha/policy/lm_term/
-   metrics/schema-config identity match; the decision fields
-   (final_alpha, final_alpha_value, internal_optimum,
-   positive_alpha_qualified, final_alpha_rationale) are exactly what
-   `decide_final(results)` produces — i.e. nothing was hand-edited after the
-   run.
-4. **Baseline candidate manifest**: `baseline_candidate_manifest_sha256`
+   metrics/schema-config identity match.
+4. **Rank-derived summaries**: word/sentence metrics and harmful-regression
+   counts are recomputed from committed `case_ranks` with the same
+   functions `calibrate.py` uses. Derived values must match both
+   `results.json` and `manifest.json`. Decision fields are recomputed from
+   those derived metrics, not from the copied summaries.
+5. **Baseline candidate manifest**: `baseline_candidate_manifest_sha256`
    equals the canonical checksum of results.json's per-case ordered +
    multiset candidate checksums (522 cases), and at least one case's
    ordered checksum differs from its multiset checksum (proof the ordered
    hash captures emission order, not a re-sorted multiset).
-5. **Summary**: regenerates SUMMARY.md with the same `write_summary` the
+6. **Summary**: regenerates SUMMARY.md with the same `write_summary` the
    script uses and compares byte-for-byte with the committed file.
-6. **Distributions**: results.json carries the summarized score/token-count
+7. **Distributions**: results.json carries the summarized score/token-count
    distribution evidence.
 
 Exit 0 on verification, nonzero otherwise.
@@ -49,6 +50,88 @@ def canonical_json(obj):
     return _canonical(obj)
 
 
+DECISION_FIELDS = (
+    "final_alpha", "final_alpha_value", "internal_optimum",
+    "positive_alpha_qualified", "final_alpha_rationale",
+)
+
+
+def verify_rank_derived_summaries(results, manifest):
+    """Recompute metrics, harmful regressions, and the decision from ranks.
+
+    Returns a list of failure strings (empty when ranks, both copied
+    summaries, and the recorded decision agree).
+    """
+    from calibrate import (
+        decide_final,
+        harmful_regressions_for_run,
+        metrics_from_ranks,
+    )
+
+    failures = []
+    case_ranks = results.get("case_ranks")
+    if not isinstance(case_ranks, dict):
+        return ["results.json missing case_ranks"]
+
+    baseline_ranks = case_ranks.get("baseline")
+    if not isinstance(baseline_ranks, dict) or "word" not in baseline_ranks:
+        return ["case_ranks missing baseline word ranks"]
+    baseline_word = baseline_ranks["word"]
+
+    derived_runs = {}
+    for key, entry in results.get("runs", {}).items():
+        ranks = case_ranks.get(key)
+        if not isinstance(ranks, dict) or "sentence" not in ranks \
+                or "word" not in ranks:
+            failures.append(f"run {key}: missing case_ranks")
+            continue
+
+        derived_metrics = metrics_from_ranks(ranks)
+        if entry.get("metrics") != derived_metrics:
+            failures.append(
+                f"run {key}: results metrics disagree with case_ranks")
+        run_manifest = manifest.get("runs", {}).get(key)
+        if run_manifest is None:
+            failures.append(f"manifest missing run {key}")
+        elif run_manifest.get("metrics") != derived_metrics:
+            failures.append(
+                f"run {key}: manifest metrics disagree with case_ranks")
+
+        if len(ranks["word"]) != len(baseline_word):
+            failures.append(
+                f"run {key}: word rank count {len(ranks['word'])} "
+                f"!= baseline {len(baseline_word)}")
+            continue
+        derived_hr = harmful_regressions_for_run(baseline_word, ranks["word"])
+        stored_hr = results.get("harmful_regressions", {}).get(key)
+        if stored_hr != derived_hr:
+            failures.append(
+                f"run {key}: results harmful_regressions disagree with "
+                "case_ranks")
+        if run_manifest is not None and \
+                run_manifest.get("harmful_regressions") != derived_hr:
+            failures.append(
+                f"run {key}: manifest harmful_regressions disagree with "
+                "case_ranks")
+
+        derived_entry = dict(entry)
+        derived_entry["metrics"] = derived_metrics
+        derived_runs[key] = derived_entry
+
+    if len(derived_runs) != len(results.get("runs", {})):
+        return failures
+
+    derived_results = dict(results)
+    derived_results["runs"] = derived_runs
+    decision = decide_final(derived_results)
+    for field in DECISION_FIELDS:
+        if manifest.get(field) != decision[field]:
+            failures.append(
+                f"decision field {field}: manifest "
+                f"{manifest.get(field)!r} != recomputed {decision[field]!r}")
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dict", type=Path, required=True,
@@ -56,7 +139,7 @@ def main():
     args = ap.parse_args()
 
     sys.path.insert(0, str(EVAL_DIR))
-    from calibrate import decide_final, sha256_bytes, write_summary
+    from calibrate import sha256_bytes, write_summary
     from verify_fixture import verify_fixture
 
     failures = []
@@ -121,15 +204,10 @@ def main():
         if key not in results["runs"]:
             failures.append(f"manifest has unknown run {key}")
 
-    decision = decide_final(results)
-    for field in ("final_alpha", "final_alpha_value", "internal_optimum",
-                  "positive_alpha_qualified", "final_alpha_rationale"):
-        if manifest.get(field) != decision[field]:
-            failures.append(
-                f"decision field {field}: manifest "
-                f"{manifest.get(field)!r} != recomputed {decision[field]!r}")
+    # 4. Rank-derived metrics, harmful regressions, and decision.
+    failures.extend(verify_rank_derived_summaries(results, manifest))
 
-    # 4. Baseline candidate manifest.
+    # 5. Baseline candidate manifest.
     baseline_checksums = results.get("baseline_candidate_checksums")
     if not baseline_checksums:
         failures.append("results.json missing baseline_candidate_checksums")
@@ -171,7 +249,7 @@ def main():
                 f"{manifest.get('baseline_candidate_manifest_sha256')}, "
                 f"recomputed {expected_manifest_sha}")
 
-    # 5. Summary regenerates byte-for-byte.
+    # 6. Summary regenerates byte-for-byte.
     try:
         regenerated = summary_path.with_name(
             "SUMMARY.regenerated.md")
@@ -184,7 +262,7 @@ def main():
     except Exception as error:  # noqa: BLE001
         failures.append(f"summary regeneration failed: {error}")
 
-    # 6. Distribution evidence.
+    # 7. Distribution evidence.
     distributions = results.get("distributions", {})
     for field in ("requests", "samples", "token_count_histogram",
                   "score_min", "score_max", "score_mean"):
