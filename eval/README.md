@@ -3,6 +3,31 @@
 This directory carries the canonical 120/402 eval fixture and the calibration
 driver for the mean-token LM scoring policy (Habit130/squirrel#46).
 
+## Public-layer source slices (Habit130/squirrel#153)
+
+`public_layer_slicer.py` + `run_public_layer.py` freeze the first public-layer
+original-text slices and true-homophone expansions. The committed artifacts
+under `public_layer/` are raw material only: exact source substrings, lexicon
+homophones, offsets, and a twice-reproducible manifest digest. This ticket
+does **not** load a model, emit pairwise scores, pick a public winner, run the
+personal 2×2, or change live `α`/`γ`.
+
+The retired v1/v2 95% representation gates from #69 / #150 are demoted. They
+are not applied to this corpus and do not gate #153. Later public-layer tickets
+use the #150 pairwise rule (A-winner accuracy on B ≥ 70%), not those 95% gates.
+
+```sh
+python3 eval/run_public_layer.py
+python3 -m unittest eval.test_public_layer
+```
+
+Sources are fetched by the frozen SHAs in the #153 table. The `luna_pinyin`
+system lexicon is `rime/rime-luna-pinyin` + `rime/rime-essay` at the SHAs
+recorded in the manifest (squirrel `fcda5e3f639478998e4de3693909fce91745309e`,
+plum `b1be1969f914cc005add4090631b855db00c2591`). User dictionary and
+`~/Library/Rime` are never read. Committed artifacts are `public_layer/manifest.json`,
+`public_layer/slices.tsv`, and `public_layer/REPORT.md`.
+
 ## Canonical fixture
 
 The fixture is reproduced from Squirrel PR #24 (head commit

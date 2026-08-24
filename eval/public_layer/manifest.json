@@ -1,0 +1,73 @@
+{
+  "rule_id": "public-layer-slice-v1",
+  "contract": "AC-153-v1",
+  "squirrel_sha": "fcda5e3f639478998e4de3693909fce91745309e",
+  "plum_sha": "b1be1969f914cc005add4090631b855db00c2591",
+  "luna_pinyin_repo": "rime/rime-luna-pinyin",
+  "luna_pinyin_sha": "56b934b099dfbeab842320f13aa8b461a6ab3e42",
+  "essay_repo": "rime/rime-essay",
+  "essay_sha": "e9b1a374a6ea015fca5bdd04318924b4483ac35a",
+  "sources": [
+    {
+      "split": "A",
+      "repo": "rust-lang-cn/book-cn",
+      "sha": "cde74c448e301ce8ac7960a0d3dc879efd83635d",
+      "spdx": "Apache-2.0 / MIT",
+      "url": "https://github.com/rust-lang-cn/book-cn"
+    },
+    {
+      "split": "A",
+      "repo": "SwiftGGTeam/the-swift-programming-language-in-chinese",
+      "sha": "cfc700e942e8e45e56e834172c6df55412f864d2",
+      "spdx": "Apache-2.0",
+      "url": "https://github.com/SwiftGGTeam/the-swift-programming-language-in-chinese"
+    },
+    {
+      "split": "A",
+      "repo": "Go-zh/go",
+      "sha": "d4e8cec7338bde4c8396df6b642f991199d92186",
+      "spdx": "BSD-3-Clause",
+      "url": "https://github.com/Go-zh/go"
+    },
+    {
+      "split": "B",
+      "repo": "vuejs-translations/docs-zh-cn",
+      "sha": "cfb9e9c56f112964021f9f5246bd1e65a6b15088",
+      "spdx": "CC-BY-4.0",
+      "url": "https://github.com/vuejs-translations/docs-zh-cn"
+    },
+    {
+      "split": "B",
+      "repo": "typst-doc-cn/tutorial",
+      "sha": "b2e19b6c9ddcec580c9f5b2741bd3b323b2eaf8c",
+      "spdx": "Apache-2.0",
+      "url": "https://github.com/typst-doc-cn/tutorial"
+    }
+  ],
+  "lexicon_files": [
+    {
+      "name": "luna_pinyin.dict.yaml",
+      "repo": "rime/rime-luna-pinyin",
+      "sha": "56b934b099dfbeab842320f13aa8b461a6ab3e42",
+      "sha256": "75bcf6eb3ff62b129882ed89cc22b2d80a5347aa72bcfa2ccc839bac298e7314"
+    },
+    {
+      "name": "essay.txt",
+      "repo": "rime/rime-essay",
+      "sha": "e9b1a374a6ea015fca5bdd04318924b4483ac35a",
+      "sha256": "a6f8409c261e5d21bd78e6cbcde8f8e1ef7f68c07ff1c2692c07dd4ff4151cea"
+    }
+  ],
+  "counts": {
+    "A": 462503,
+    "B": 132540
+  },
+  "counts_per_source": {
+    "rust-lang-cn/book-cn": 196476,
+    "SwiftGGTeam/the-swift-programming-language-in-chinese": 209409,
+    "Go-zh/go": 56618,
+    "vuejs-translations/docs-zh-cn": 132487,
+    "typst-doc-cn/tutorial": 53
+  },
+  "digest": "c3df8bd20836ab767a185dc242d16acd6dfac7c036b8647949449e9da6310981"
+}
