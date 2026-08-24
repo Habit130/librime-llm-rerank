@@ -59,15 +59,15 @@
     }
   ],
   "counts": {
-    "A": 462503,
-    "B": 132540
+    "A": 455884,
+    "B": 124321
   },
   "counts_per_source": {
     "rust-lang-cn/book-cn": 196476,
-    "SwiftGGTeam/the-swift-programming-language-in-chinese": 209409,
-    "Go-zh/go": 56618,
-    "vuejs-translations/docs-zh-cn": 132487,
+    "SwiftGGTeam/the-swift-programming-language-in-chinese": 209385,
+    "Go-zh/go": 50023,
+    "vuejs-translations/docs-zh-cn": 124268,
     "typst-doc-cn/tutorial": 53
   },
-  "digest": "c3df8bd20836ab767a185dc242d16acd6dfac7c036b8647949449e9da6310981"
+  "digest": "8818cc8033834db953c69c470453b98ecc418d45469d730d078d7c004d63d667"
 }

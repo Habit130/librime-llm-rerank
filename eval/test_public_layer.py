@@ -129,6 +129,49 @@ class MaskTest(unittest.TestCase):
         self.assertTrue(mask[text.index("!")])
         self.assertFalse(mask[text.index("形")])
 
+    def test_html_pre_masks_go_object_name_comment(self):
+        text = (
+            "<p>假如有以下声明：</p>\n"
+            "<pre>\n"
+            "type T struct {\n"
+            "    name string // 对象名\n"
+            "    value int // 对象值\n"
+            "}\n"
+            "</pre>\n"
+            "<p>后文形式。</p>\n"
+        )
+        mask = ineligible_mask(text)
+        for token in ("对象名", "对象值"):
+            start = text.index(token)
+            self.assertTrue(all(mask[start:start + len(token)]), token)
+        self.assertFalse(mask[text.index("形")])
+
+    def test_html_code_masks_inline_han(self):
+        text = "可见<code>f(g(<i>g 的形参</i>))</code>以及形式。"
+        mask = ineligible_mask(text)
+        start = text.index("的形参")
+        self.assertTrue(all(mask[start:start + 3]))
+        prose = text.index("形式")
+        self.assertFalse(mask[prose])
+
+    def test_html_script_masks_footer_comments(self):
+        text = (
+            "<p>前文形式</p>\n"
+            "<script type=\"text/javascript\">\n"
+            "    // 根据保存的偏好设置配色方案。\n"
+            "    const appearanceKey = 'developer.setting.preferredColorScheme'\n"
+            "</script>\n"
+        )
+        mask = ineligible_mask(text)
+        start = text.index("根据保存")
+        self.assertTrue(all(mask[start:start + 4]))
+        self.assertFalse(mask[text.index("形")])
+
+    def test_markdown_script_setup_mention_is_not_an_html_region(self):
+        text = "详见 [`<script setup>`](/api)。后文形式。"
+        mask = ineligible_mask(text)
+        self.assertFalse(mask[text.index("形式")])
+
 
 class SliceRuleTest(unittest.TestCase):
     def test_target_is_exact_original_substring_at_offsets(self):
@@ -177,6 +220,19 @@ class SliceRuleTest(unittest.TestCase):
             text, lex, repo="ex/repo", path="a.md",
             source_sha="abc", spdx="MIT", split="A")
         self.assertEqual([], [s for s in slices if s["target"] == "形式"])
+
+    def test_html_pre_code_script_do_not_leak_targets(self):
+        lex = fixture_lexicon()
+        text = (
+            "<p>前文这里</p>\n"
+            "<pre>name string // 形式</pre>\n"
+            "<p>中间<code>刑事</code>还有</p>\n"
+            "<script type=\"text/javascript\">// 行事</script>\n"
+        )
+        slices = slice_document(
+            text, lex, repo="ex/repo", path="a.html",
+            source_sha="abc", spdx="MIT", split="A")
+        self.assertEqual([], [s["target"] for s in slices])
 
     def test_preceding_text_is_at_most_64_and_requires_han(self):
         lex = fixture_lexicon()

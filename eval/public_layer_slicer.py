@@ -65,6 +65,10 @@ FENCE_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+HTML_CODE_RE = re.compile(
+    r"<(?P<tag>pre|code|script)\b[^>]*>.*?</(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 IMAGE_LINE_RE = re.compile(
     r"^(?:\s*(?:!\[[^\]]*\]\([^)]+\)|<img\b[^>]*>)\s*)+$",
     re.IGNORECASE,
@@ -321,6 +325,9 @@ def ineligible_mask(text: str) -> list[bool]:
         for index in range(match.start(), match.end()):
             mask[index] = True
     for match in INLINE_CODE_RE.finditer(text):
+        for index in range(match.start(), match.end()):
+            mask[index] = True
+    for match in HTML_CODE_RE.finditer(text):
         for index in range(match.start(), match.end()):
             mask[index] = True
     line_start = 0
