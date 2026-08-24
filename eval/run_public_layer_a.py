@@ -286,7 +286,7 @@ def score_embedding_route(route_id, model_path, slices, lexicon, store,
                           cache, freeze_digest, pair_count, batch_size=32):
     import numpy as np
     import torch
-    from embeddings import BGEM3EmbeddingAdapter, QWEN3EmbeddingAdapter
+    from embeddings import BGEM3EmbeddingAdapter, Qwen3EmbeddingAdapter
     from representations import candidate_conditioned_payload
 
     adapters = {
