@@ -96,7 +96,10 @@ current schema head. Fact schema evolution is owned exclusively by the C++
 writer (`fact_store_tool migrate`): the ordered, forward-only step table,
 the deterministic per-event-format projection and the pre-commit validation
 (counts, event/commit identities, HLC total order, foreign keys, schema
-invariants) all live in C++. Python only orchestrates the operation through
+invariants) all live in C++. Integrity, foreign-key, projection and HLC
+row loops treat only `SQLITE_DONE` as successful completion;
+`SQLITE_INTERRUPT`, I/O errors and prepare/finalize failures fail closed
+without COMMIT or publish. Python only orchestrates the operation through
 the maintenance seam: a verified safety snapshot is created BEFORE any
 migration work (SQLite Online Backup API + full C++ validation), the
 migration runs on a staging copy of that snapshot inside one SQLite
@@ -186,7 +189,8 @@ commit/event/retraction counts, the HLC and event high-water marks, the
 creation time, the producer version, the database size and its SHA-256, and
 whether the destination was explicitly confirmed as insecure. The snapshot
 comes from the SQLite Online Backup API through the C++ `fact_store_tool`
-seam (Python never interprets fact rows); it is fully integrity-checked,
+seam (Python never interprets fact rows); it is fully integrity-checked (a terminal SQLite error is not treated as an
+empty successful check),
 checkpointed into a single file with no WAL/SHM dependency, fsynced and
 re-verified before publication.
 
@@ -251,7 +255,10 @@ squirrel-semantic-memory restore --from <backup> --discard-current \
 
 Preflight validates the container (exact member set, names, attributes,
 compression, sizes, ratios, CRC), the manifest, the extracted database's
-SHA-256/size/integrity, its schema version and the available space. A
+SHA-256/size/integrity, its schema version and the available space.
+Prepare-restore and inspect treat only `SQLITE_DONE` as a successful empty
+foreign-key or row scan; a terminal SQLite error fails closed without minting
+or publishing. A
 supported-old backup is classified through the migrate seam and is migrated
 **only on the staging copy** during staging — the backup original is never
 modified; a too-new or missing-step backup is refused in preflight. Every

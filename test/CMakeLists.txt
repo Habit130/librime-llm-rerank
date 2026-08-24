@@ -14,6 +14,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     fact_store_test.cc
     fact_store_tool_test.cc
     fact_migrator_test.cc
+    fact_sqlite_terminal_test.cc
     recorder_e2e_test.cc
     recorder_coordinator_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
