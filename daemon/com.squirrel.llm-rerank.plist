@@ -4,19 +4,34 @@
 <dict>
 	<key>Label</key>
 	<string>com.squirrel.llm-rerank</string>
+	<key>WorkingDirectory</key>
+	<string>__CHECKOUT__</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/habit/Developer/squirrel/librime/plugins/llm-rerank/daemon/.venv/bin/python3</string>
-		<string>/Users/habit/Developer/squirrel/librime/plugins/llm-rerank/daemon/server.py</string>
+		<string>__INTERPRETER__</string>
+		<string>__SERVER__</string>
 		<string>--serve</string>
+		<string>--socket</string>
+		<string>__SOCKET__</string>
+		<string>--model</string>
+		<string>__MODEL__</string>
+		<string>--facts-root</string>
+		<string>__FACTS_ROOT__</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>LLM_RERANK_MODEL</key>
+		<string>__MODEL__</string>
+		<key>SQUIRREL_SEMANTIC_MEMORY_ROOT</key>
+		<string>__FACTS_ROOT__</string>
+	</dict>
 	<key>KeepAlive</key>
 	<true/>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>/tmp/llm-rerank-daemon.log</string>
+	<string>__LOG__</string>
 	<key>StandardErrorPath</key>
-	<string>/tmp/llm-rerank-daemon.err</string>
+	<string>__LOG_ERR__</string>
 </dict>
 </plist>

@@ -45,7 +45,7 @@ SOCKET_PATH = os.path.expanduser(
 FACTS_ROOT = os.path.expanduser(
     "~/Library/Application Support/Squirrel/SemanticMemory"
 )
-MODEL_PATH = "/Users/habit/Models/Qwen/Qwen3-0.6B-Base"
+MODEL_PATH = os.environ.get("LLM_RERANK_MODEL") or ""
 IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
@@ -1130,13 +1130,16 @@ def serve_scoring_connection(state, conn, coordinator=None,
 def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
                cache_limit_mb=CACHE_LIMIT_MB,
                scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False,
-               control_socket=None, facts_root=None, evidence_config=None):
-    import mlx.core as mx
+               control_socket=None, facts_root=None, evidence_config=None,
+               health_only=False):
+    if not health_only:
+        import mlx.core as mx
 
-    if cache_limit_mb > 0:
-        mx.set_cache_limit(cache_limit_mb * 10**6)
+        if cache_limit_mb > 0:
+            mx.set_cache_limit(cache_limit_mb * 10**6)
 
     state = ModelState(model_path, context_window, scoring_strategy)
+    state.health_only = health_only
     state.cache_limit_mb = cache_limit_mb
     state.started_at = datetime.now(timezone.utc).isoformat()
     facts_root = (facts_root or os.environ.get("SQUIRREL_SEMANTIC_MEMORY_ROOT")
@@ -1455,7 +1458,13 @@ def self_test(sock_path, model_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM rerank daemon")
     parser.add_argument("--socket", default=SOCKET_PATH)
-    parser.add_argument("--model", default=MODEL_PATH)
+    parser.add_argument(
+        "--model",
+        default=MODEL_PATH,
+        help="local mlx-lm model directory; set LLM_RERANK_MODEL or pass "
+        "this flag. Required for scoring. This repository does not ship "
+        "model weights.",
+    )
     parser.add_argument("--facts-root")
     parser.add_argument("--control-socket")
     parser.add_argument(
@@ -1485,6 +1494,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--test", action="store_true")
+    parser.add_argument(
+        "--health-only",
+        action="store_true",
+        help="serve the health handshake without importing MLX or loading "
+        "a model; scoring requests fail closed",
+    )
     args = parser.parse_args()
 
     if args.context_window < 1:
@@ -1505,5 +1520,6 @@ if __name__ == "__main__":
         run_server(
             args.socket, args.model, args.context_window, args.cache_limit_mb,
             args.scoring, test_mode=True, control_socket=args.control_socket,
-            facts_root=args.facts_root, evidence_config=evidence_config
+            facts_root=args.facts_root, evidence_config=evidence_config,
+            health_only=args.health_only,
         )

@@ -31,6 +31,22 @@ Squirrel's `action-install.sh` downloads that artifact by tag and verifies its
 sha256 on the fast build path; the from-source build path keeps using
 `install-plugins.sh` instead.
 
+## Daemon deploy
+
+The released dylib talks to a project-local Python inference daemon. Create
+`daemon/.venv` from the pinned set, launch with portable paths, and verify
+install/start/health/stop without maintainer-specific `/Users/habit/...`
+defaults. Scoring needs a local mlx-lm model directory (`--model` or
+`LLM_RERANK_MODEL`); weights are not shipped. Isolated verification uses
+`--health-only` and a stand-in path. See `docs/daemon-deploy.md`.
+
+```sh
+python3 daemon/deploy.py install
+python3 daemon/deploy.py start --health-only
+python3 daemon/deploy.py health
+python3 daemon/deploy.py stop
+```
+
 ## Scope
 
 Simplified Chinese (简体) only, developed against the `luna_pinyin` schema.
