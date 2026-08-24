@@ -28,6 +28,25 @@ plum `b1be1969f914cc005add4090631b855db00c2591`). User dictionary and
 `~/Library/Rime` are never read. Committed artifacts are `public_layer/manifest.json`,
 `public_layer/slices.tsv`, and `public_layer/REPORT.md`.
 
+## Public-layer A winner (Habit130/squirrel#154)
+
+`public_layer_a.py` + `run_public_layer_a.py` run the three frozen routes on
+**all** A pairs from the #153 digest. A only selects a representation. The
+public 70% pairwise gate is #156 on split B. The retired v1/v2 95% gates stay
+demoted and do not choose the A winner.
+
+```sh
+python3 eval/run_public_layer_a.py
+python3 -m unittest eval.test_public_layer_a
+```
+
+Identity is frozen before any score: #153 digest, code SHA, and the three
+runtime fingerprints. Pair = one A slice × one lexicon competitor. Hit iff
+`cos(enc(ctx+target), enc(ctx+target)) > cos(enc(ctx+target), enc(ctx+homophone))`
+(strict). The three routes share that pair set. B is not scored. Committed
+outputs are `public_layer/a_freeze.json`, `public_layer/a_report.json`, and
+`public_layer/A_REPORT.md`.
+
 ## Canonical fixture
 
 The fixture is reproduced from Squirrel PR #24 (head commit
