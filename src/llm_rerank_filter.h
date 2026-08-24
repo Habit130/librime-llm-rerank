@@ -7,6 +7,8 @@
 
 #include <rime/filter.h>
 
+#include <chrono>
+#include <functional>
 #include <memory>
 
 #include "evidence_scorer.h"
@@ -101,6 +103,10 @@ class LlmRerankFilter : public Filter {
   // a unit fixture never reads real private history.
   void set_facts_root(const path& root) { facts_root_ = root; }
   void set_window(int window) { window_ = window; }
+  void set_deadline_ms(int deadline_ms) { deadline_ms_ = deadline_ms; }
+  void set_now(std::function<std::chrono::steady_clock::time_point()> now) {
+    now_ = std::move(now);
+  }
   void set_gamma(double gamma) { gamma_ = gamma; }
   void set_schema_id(const string& schema_id) { schema_id_ = schema_id; }
   void set_input(const string& input) { input_ = input; }
@@ -131,6 +137,7 @@ class LlmRerankFilter : public Filter {
   double gamma_ = 2.0;
   double saturate_k_ = 3.0;
   int deadline_ms_ = 200;
+  std::function<std::chrono::steady_clock::time_point()> now_;
   bool verbose_ = false;
   // Versioned scoring-policy identity (docs/token-attribution.md); pins the
   // normalization semantics (mean-token since #46). Overridable per machine
