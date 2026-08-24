@@ -561,7 +561,12 @@ squirrel-semantic-memory alarm dismiss <alarm_id> [--reason <text>]
 (never private facts) and refuses unknown IDs.  Exit **alarms** are advisory
 and only ever suggest rollback to `γ=0`; they never write config or any
 switch.  Sliding windows, pinned: 3 user-confirmed mispromotions in any
-consecutive 100 actionable events; true-fault rate > 1% in any consecutive
+consecutive 100 complete-comparable requests (完整可比较组: a complete
+rerank group that can be shadow-compared; stored as the historical wire
+key `trial.actionable`, do not migrate traces).  This is not CONTEXT.md
+Actionable Event, which stays the eval quality denominator (non-zero
+pre-existing retrieval evidence).  The alarm does not switch to
+domain-actionable.  True-fault rate > 1% in any consecutive
 300 semantic requests; two consecutive 300-request windows missing the
 p95/p99 full-request latency gates (50/75 ms, the spec #43 gates #71/#72/
 #73 measure against).  A user may dismiss an alarm (subjective veto);

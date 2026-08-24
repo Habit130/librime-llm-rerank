@@ -466,8 +466,10 @@ class EvidenceProtocolTest(unittest.TestCase):
                           "invalid_request")
 
     def test_trial_envelope_is_validated(self):
-        # The additive trial envelope (#74) must carry exactly actionable +
-        # base_scores aligned with the candidates; anything else is a fault.
+        # The additive trial envelope (#74) must carry exactly the wire
+        # key actionable (complete-comparable, #152) + base_scores aligned
+        # with the candidates; anything else is a fault.  Old fixtures with
+        # "trial":{"actionable":true} still parse.
         good = {"actionable": True, "base_scores": [1.0, 2.0]}
         self.assertEqual("ok", self.call(
             request=evidence_request(trial=good))["status"])

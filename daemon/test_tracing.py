@@ -43,7 +43,7 @@ from tracing import (  # noqa: E402
 PRIVATE = "PRIVATE_MARKER_上文_候选_embedding_%s" % "trace_secret"
 
 
-def request_meta(request_id, actionable=True, **overrides):
+def request_meta(request_id, complete_comparable=True, **overrides):
     meta = {
         "schema_id": "luna_pinyin",
         "category": "word",
@@ -54,7 +54,7 @@ def request_meta(request_id, actionable=True, **overrides):
                            "kev=8:H=32:sat=1:gamma=2",
         "fact_high_water": {"store_epoch": "e1", "hlc_physical_ms": 1000000,
                             "hlc_logical": 0},
-        "actionable": actionable,
+        "complete_comparable": complete_comparable,
         "candidate_count": 2,
     }
     meta.update(overrides)
@@ -240,7 +240,8 @@ class TraceStoreTest(unittest.TestCase):
         self.assertEqual([], self.store.annotations())
 
     def test_scn74_6_mispromotion_alarm_3_in_100(self):
-        # 100 actionable events, 3 of them confirmed mispromotions.
+        # 100 complete-comparable requests, 3 of them confirmed
+        # mispromotions.  Denominator is that bit, not domain-actionable.
         confirmed = (3, 50, 99)
         for i in range(MISPROMOTION_WINDOW):
             rid = "req-mp-%d" % i
@@ -257,10 +258,11 @@ class TraceStoreTest(unittest.TestCase):
         self.assertEqual("rollback to gamma=0", alarms[0]["suggestion"])
         self.assertEqual(MISPROMOTION_LIMIT,
                          alarms[0]["detail"]["confirmed"])
+        self.assertIn("complete-comparable", alarms[0]["message"])
 
     def test_scn74_6_mispromotion_delayed_confirmation_still_fires(self):
         # A confirmation arriving long after the event (past the 100-event
-        # ring) must still count: the window is over the actionable-event
+        # ring) must still count: the window is over the complete-comparable
         # stream, not the recent ring.
         confirmed = (3, 50, 99)
         for i in range(MISPROMOTION_WINDOW + 50):
@@ -284,8 +286,8 @@ class TraceStoreTest(unittest.TestCase):
                              MISPROMOTION_WINDOW)
 
     def test_scn74_6_mispromotion_outside_window_does_not_fire(self):
-        # Three confirmations spanning more than 100 actionable events must
-        # not fire (no 100-event window contains all three).
+        # Three confirmations spanning more than 100 complete-comparable
+        # requests must not fire (no 100-event window contains all three).
         confirmed = (1, 60, 150)
         for i in range(200):
             rid = "req-ow-%d" % i
@@ -304,13 +306,14 @@ class TraceStoreTest(unittest.TestCase):
             rid = "req-fr-%d" % i
             if i < 4:
                 self.store.record_request(
-                    request_meta(rid, actionable=False), "oracle_fault",
+                    request_meta(rid, complete_comparable=False),
+                    "oracle_fault",
                     trace_payload={"kind": "fault",
                                    "error_code": "oracle_fault",
                                    "passthrough": True})
             else:
                 self.store.record_request(
-                    request_meta(rid, actionable=False), "ok")
+                    request_meta(rid, complete_comparable=False), "ok")
         alarms = self.store.list_alarms()
         self.assertEqual(1, len(alarms))
         self.assertEqual("fault_rate", alarms[0]["kind"])
@@ -321,7 +324,8 @@ class TraceStoreTest(unittest.TestCase):
         # Two consecutive 300-request windows above the 50/75 ms gates.
         for i in range(2 * LATENCY_WINDOW + 5):
             self.store.record_request(
-                request_meta("req-lat-%d" % i, actionable=False), "ok",
+                request_meta("req-lat-%d" % i, complete_comparable=False),
+                "ok",
                 latency_segments={"full_request_ms": 60.0})
         alarms = self.store.list_alarms()
         self.assertEqual(1, len(alarms))
@@ -333,7 +337,7 @@ class TraceStoreTest(unittest.TestCase):
     def test_scn74_6_no_alarm_below_thresholds(self):
         for i in range(FAULT_WINDOW):
             self.store.record_request(
-                request_meta("req-n-%d" % i, actionable=False), "ok",
+                request_meta("req-n-%d" % i, complete_comparable=False), "ok",
                 latency_segments={"full_request_ms": 1.0})
         self.assertEqual([], self.store.list_alarms())
 
@@ -390,21 +394,25 @@ class TraceStoreTest(unittest.TestCase):
             st = os.lstat(path)
             self.assertEqual(0o600, stat.S_IMODE(st.st_mode))
 
-    def test_actionable_and_all_request_denominators_never_mixed(self):
-        # Mispromotion windows count actionable events only; fault/latency
-        # windows count all semantic requests.
+    def test_complete_comparable_and_all_request_denominators_never_mixed(
+            self):
+        # Mispromotion windows count complete-comparable requests only
+        # (Squirrel#152); not domain-actionable and not all semantic
+        # requests.  Fault/latency windows count all semantic requests.
+        # Persisted ring key recent_actionable is historical.
         for i in range(MISPROMOTION_WINDOW):
             rid = "req-mix-%d" % i
-            # Not actionable: must not enter the actionable ring.
+            # Not complete-comparable: must not enter the ring.
             self.store.record_request(
-                request_meta(rid, actionable=False), "ok",
+                request_meta(rid, complete_comparable=False), "ok",
                 latency_segments={"full_request_ms": 1.0})
         self.assertEqual(0, len(self.store.aggregates()["recent_actionable"]))
         self.assertEqual(MISPROMOTION_WINDOW,
                          len(self.store.aggregates()["recent_outcomes"]))
-        # Annotations on non-actionable trace requests still require a trace.
+        # Annotations on non-complete-comparable traces still require a
+        # trace.
         self.store.record_request(
-            request_meta("req-mix-ann", actionable=False), "ok",
+            request_meta("req-mix-ann", complete_comparable=False), "ok",
             trace_payload=order_change_trace("req-mix-ann"))
         self.store.record_annotation("req-mix-ann")
         self.assertEqual([], self.store.list_alarms())

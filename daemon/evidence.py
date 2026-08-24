@@ -748,7 +748,9 @@ class EvidenceService:
             "plan_identity": request.get("plan_identity"),
             "config_identity": request.get("config_identity"),
             "fact_high_water": request.get("fact_high_water"),
-            "actionable": bool((request.get("trial") or {}).get(
+            # Live complete-comparable bit (#152).  Wire key trial.actionable
+            # is historical and must keep parsing old AC-74 traces.
+            "complete_comparable": bool((request.get("trial") or {}).get(
                 "actionable")),
             "candidate_count": len(request.get("candidates") or []),
         }

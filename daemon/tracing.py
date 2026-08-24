@@ -30,10 +30,13 @@ File layout (all owner-only, 0700 dir / 0600 files):
         alarms.json                fired + dismissed alarm state
         index.json                 request_id -> trace_id + kind + timestamp
 
-Windows (seam 5, pinned): sliding windows.  Actionable-event windows count
-requests whose group was complete and comparable (the plugin declares
-``actionable``); fault-rate and latency windows count all semantic
-(evidence) requests.  Denominators are never mixed.
+Windows (seam 5, pinned): sliding windows.  Complete-comparable windows
+count requests whose group was complete and comparable (the plugin
+declares the live trial bit; wire key ``trial.actionable`` is historical,
+Squirrel#152).  That bit is not CONTEXT.md Actionable Event (eval
+denominator: non-zero pre-existing retrieval evidence).  Fault-rate and
+latency windows count all semantic (evidence) requests.  Denominators are
+never mixed.
 """
 
 import json
@@ -56,7 +59,7 @@ DIR_MODE = 0o700
 
 # Sliding-window alarm thresholds (spec #43 真实试用退出规则; pinned here so
 # tests and status share one definition).
-MISPROMOTION_WINDOW = 100          # consecutive actionable events
+MISPROMOTION_WINDOW = 100          # consecutive complete-comparable requests
 MISPROMOTION_LIMIT = 3             # user-confirmed mispromotions in window
 FAULT_WINDOW = 300                 # consecutive semantic requests
 FAULT_RATE_LIMIT = 0.01            # true-fault rate > 1% in window
@@ -199,7 +202,8 @@ class TraceStore:
 
         ``request_meta`` is the identity-only request envelope (schema_id,
         category, canonical_segment_input, request_id, plan_identity,
-        config_identity, fact_high_water, actionable, candidate_count).
+        config_identity, fact_high_water, complete_comparable,
+        candidate_count).
         ``outcome`` is "ok" or a stable fault code; ``trace_payload`` is the
         full identity-only trace for order changes and faults (None for
         unchanged successes); ``latency_segments`` is the segmented latency
@@ -284,7 +288,8 @@ class TraceStore:
                     # Already confirmed; return the existing record with the
                     # current alarm state (idempotent confirmation).
                     return a, self._evaluate_alarms(
-                        {"actionable": True, "request_id": request_id},
+                        {"complete_comparable": True,
+                         "request_id": request_id},
                         _now_iso())
             record = {
                 "annotation_id": "ann-%s" % (len(annotations.get(
@@ -302,7 +307,8 @@ class TraceStore:
             self._write_annotations(annotations)
             # A confirmation can push a window over the threshold.
             alarms = self._evaluate_alarms(
-                {"actionable": True, "request_id": request_id}, _now_iso())
+                {"complete_comparable": True, "request_id": request_id},
+                _now_iso())
             return record, alarms
 
     def dismiss_alarm(self, alarm_id, reason=None):
@@ -421,10 +427,14 @@ class TraceStore:
                 entry[key] = request_meta[key]
         self._write_index_entry(index, request_meta, entry)
 
-    def _index_actionable(self, request_meta, outcome, seq, now_iso):
-        """Index one actionable request (trace or not) with its global
-        sequence, so a later mispromotion confirmation can locate the
-        event's position in the actionable stream."""
+    def _index_complete_comparable(self, request_meta, outcome, seq, now_iso):
+        """Index one complete-comparable request (trace or not) with its
+        global sequence, so a later mispromotion confirmation can locate
+        the event's position in the complete-comparable stream.
+
+        Persisted index key ``actionable_seq`` is historical; do not
+        migrate existing files.
+        """
         index = self._read_index()
         existing = index.get(request_meta["request_id"])
         entry = {
@@ -455,8 +465,10 @@ class TraceStore:
                 "created_at": _now_iso(),
                 "updated_at": None,
                 "semantic_requests": 0,
+                # Historical persist keys for the complete-comparable stream
+                # (#152).  Do not rename; existing aggregates.json must load.
                 "actionable_events": 0,
-                "actionable_seq": 0,   # global seq over actionable events
+                "actionable_seq": 0,
                 "order_changes": 0,
                 "faults": 0,
                 "passthroughs": 0,
@@ -475,17 +487,18 @@ class TraceStore:
                            wrote_trace, now_iso):
         aggregates = self._read_aggregates()
         aggregates["semantic_requests"] += 1
-        if request_meta.get("actionable"):
+        if request_meta.get("complete_comparable"):
             aggregates["actionable_events"] += 1
             aggregates["actionable_seq"] += 1
             seq = aggregates["actionable_seq"]
             ring = aggregates["recent_actionable"]
             ring.append(request_meta["request_id"])
             del ring[:-MISPROMOTION_WINDOW]
-            # Index every actionable request with its global sequence so a
-            # mispromotion confirmed much later still knows where the event
-            # sat in the actionable stream (SCN-74-6 "任意连续 100 条").
-            self._index_actionable(request_meta, outcome, seq, now_iso)
+            # Index every complete-comparable request with its global
+            # sequence so a mispromotion confirmed much later still knows
+            # where the event sat in that stream (SCN-74-6 "任意连续 100 条").
+            self._index_complete_comparable(
+                request_meta, outcome, seq, now_iso)
         if outcome != "ok":
             aggregates["faults"] += 1
             # A true fault makes the plugin pass the window through (protocol
@@ -567,14 +580,16 @@ class TraceStore:
         return fired
 
     def _mispromotion_alarm(self, now_iso):
-        """3 user-confirmed mispromotions in any consecutive 100 actionable
-        events.
+        """3 user-confirmed mispromotions in any consecutive 100
+        complete-comparable requests.
 
-        Sliding-window semantics over the actionable-event stream: each
-        actionable request carries a global ``actionable_seq`` in the index,
-        so a confirmation that arrives long after the event still knows the
-        event's position.  Three confirmed events fall inside some 100-event
-        window iff their sequence span (max - min + 1) is at most 100.
+        Sliding-window semantics over the complete-comparable stream (not
+        CONTEXT.md Actionable Event): each complete-comparable request
+        carries a global ``actionable_seq`` in the index (historical persist
+        key), so a confirmation that arrives long after the event still
+        knows the event's position.  Three confirmed events fall inside
+        some 100-event window iff their sequence span (max - min + 1) is at
+        most 100.
         """
         index = self._read_index()
         confirmed = [
@@ -589,8 +604,9 @@ class TraceStore:
         if len(confirmed) < MISPROMOTION_LIMIT:
             return None
         window = MISPROMOTION_WINDOW
-        # The 3 (or more) confirmed events span at most 100 actionable
-        # events: sort their sequences and check every consecutive triple.
+        # The 3 (or more) confirmed events span at most 100
+        # complete-comparable requests: sort their sequences and check every
+        # consecutive triple.
         ordered = sorted(confirmed)
         for i in range(len(ordered) - MISPROMOTION_LIMIT + 1):
             span = ordered[i + MISPROMOTION_LIMIT - 1] - ordered[i] + 1
@@ -601,8 +617,8 @@ class TraceStore:
                      "span_events": span},
                     now_iso,
                     "%d user-confirmed mispromotions within %d consecutive "
-                    "actionable events; suggest rollback to gamma=0"
-                    % (MISPROMOTION_LIMIT, window))
+                    "complete-comparable requests; suggest rollback to "
+                    "gamma=0" % (MISPROMOTION_LIMIT, window))
         return None
 
     def _fault_rate_alarm(self, now_iso):

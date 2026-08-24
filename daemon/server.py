@@ -81,6 +81,8 @@ EVIDENCE_FIELDS = {
     "fact_high_water",
 }
 EVIDENCE_OPTIONAL_FIELDS = {"trial"}
+# Wire keys.  "actionable" is the historical name of the complete-comparable
+# bit (Squirrel#152); do not rename — existing AC-74 traces use it.
 TRIAL_FIELDS = {
     "actionable",
     "base_scores",
@@ -726,7 +728,7 @@ def _record_evidence_fault(state, req, code, phase="evidence"):
                 "plan_identity": req.get("plan_identity"),
                 "config_identity": req.get("config_identity"),
                 "fact_high_water": req.get("fact_high_water"),
-                "actionable": False,
+                "complete_comparable": False,
                 "candidate_count": len(req.get("candidates") or []),
             }
         else:
@@ -737,7 +739,7 @@ def _record_evidence_fault(state, req, code, phase="evidence"):
                 "canonical_segment_input": None,
                 "request_id": "invalid-json",
                 "plan_identity": None, "config_identity": None,
-                "fact_high_water": None, "actionable": False,
+                "fact_high_water": None, "complete_comparable": False,
                 "candidate_count": 0,
             }
         store.record_request(
@@ -807,9 +809,10 @@ def handle_evidence_request(state, data, coordinator=None,
                                phase="validate")
         return protocol_error("invalid_request")
 
-    # Trial envelope validation (#74): identity-only, additive, never raw
-    # text.  When present it must be an object with exactly the allowed
-    # fields; a malformed trial is a fault, never a silent trace drop.
+    # Trial envelope validation (#74/#152): identity-only, additive, never
+    # raw text.  When present it must be an object with exactly the allowed
+    # wire fields (actionable = complete-comparable bit); a malformed trial
+    # is a fault, never a silent trace drop.
     trial = req.get("trial")
     if trial is not None:
         if (

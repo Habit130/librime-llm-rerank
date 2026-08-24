@@ -601,7 +601,7 @@ def _print_trial_human(section):
           % (section.get("trace_count", 0), section.get("annotations", 0)))
     aggregates = section.get("aggregates")
     if isinstance(aggregates, dict):
-        print("  semantic requests: %d; actionable events: %d; "
+        print("  semantic requests: %d; complete-comparable events: %d; "
               "order changes: %d; faults: %d; passthroughs: %d"
               % (aggregates.get("semantic_requests", 0),
                  aggregates.get("actionable_events", 0),
