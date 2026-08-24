@@ -26,10 +26,15 @@ in `lib/rime-plugins/`.
 
 Tagging this repo with `v*` runs `.github/workflows/release.yml`, which builds
 a universal (arm64 + x86_64) `librime-llm-rerank.dylib` against the pinned
-librime revision used by Squirrel and attaches it to the GitHub Release.
-Squirrel's `action-install.sh` downloads that artifact by tag and verifies its
-sha256 on the fast build path; the from-source build path keeps using
-`install-plugins.sh` instead.
+librime revision used by Squirrel. Before attaching the dylib to the GitHub
+Release the workflow runs the model-free daemon and eval suites, builds with
+`BUILD_TEST=ON`, installs a pinned `rime/librime-predict` checkout so the C++
+prediction e2e can run, runs `llm_rerank_test`, and fails closed unless
+`lipo` reports both `arm64` and `x86_64`. A failed gate publishes no asset.
+Actions are pinned to commit SHAs; Boost and the librime deps archive are
+SHA-256 verified. Squirrel's `action-install.sh` downloads the artifact by
+tag and verifies its sha256 on the fast build path; the from-source build
+path keeps using `install-plugins.sh` instead.
 
 ## Scope
 

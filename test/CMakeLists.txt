@@ -29,11 +29,21 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
   else()
     set(llm_rerank_runtime_target rime-llm-rerank)
   endif()
+  set(_llm_rerank_build_predict "")
+  if(EXISTS "${CMAKE_SOURCE_DIR}/plugins/predict/CMakeLists.txt")
+    set(_llm_rerank_build_predict
+      "${CMAKE_BINARY_DIR}/plugins/predict/bin/build_predict")
+    message(STATUS
+      "llm_rerank_test: librime-predict declared at ${CMAKE_SOURCE_DIR}/plugins/predict")
+  else()
+    message(STATUS
+      "llm_rerank_test: librime-predict absent; prediction e2e will skip")
+  endif()
   target_compile_definitions(llm_rerank_test PRIVATE
     LLM_RERANK_DAEMON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../daemon"
     LLM_RERANK_PYTHON="${Python3_EXECUTABLE}"
     LLM_RERANK_PLUGIN_DYLIB="$<TARGET_FILE:${llm_rerank_runtime_target}>"
-    LLM_RERANK_BUILD_PREDICT="${EXECUTABLE_OUTPUT_PATH}/../../predict/bin/build_predict"
+    LLM_RERANK_BUILD_PREDICT="${_llm_rerank_build_predict}"
     LLM_RERANK_FACT_STORE_TOOL="$<TARGET_FILE:rime-llm-rerank-fact-store-tool>")
 
   add_test(NAME llm_rerank_test

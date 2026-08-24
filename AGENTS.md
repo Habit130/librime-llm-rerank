@@ -114,6 +114,12 @@ repo carries its own gtest target (`test/`, built under `librime/build` when
 `BUILD_TEST=ON`, which is the default). Precedents for a plugin adding its own
 build target: `librime-octagram` / `librime-predict` `tools/CMakeLists.txt`.
 
+The C++ prediction e2e needs `librime-predict` as a sibling plugin at
+`librime/plugins/predict` so `build_predict` exists. The release workflow
+installs a pinned checkout and requires that tool. Without the plugin the
+rest of `llm_rerank_test` still runs and the prediction case skips. Model-free
+Python gates are `scripts/run-model-free-gates.sh`.
+
 Good tests assert only externally observable behavior: given a candidate
 sequence and a set of scores, what emission order comes out. They must pass
 deterministically with no model, no dictionary, and no deployed user data
