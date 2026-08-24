@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot public-layer A forward (Squirrel #154 / AC-154-v2)."""
+"""One-shot public-layer A forward (Squirrel #154 / AC-154-v3)."""
 
 from __future__ import annotations
 
@@ -18,15 +18,24 @@ from public_layer_a import (
     DEFAULT_ARTIFACT_DIR,
     PINNED_SLICE_DIGEST,
     PublicLayerAError,
+    QUERY_RULE,
     ROUTE_IDS,
     apply_scores,
+    build_compact_slices,
     build_freeze,
-    count_eligible_a,
-    eligible_a_slices,
+    candidate_text,
+    compact_table_path,
+    guard_scorer_rss,
+    iter_compact_table,
+    load_compact_header,
     load_freeze,
     pair_hit,
+    query_text,
     reconstruct_preceding,
+    sha256_bytes,
     verify_committed_digest,
+    void_v2_artifacts,
+    write_compact_table,
     write_freeze,
 )
 from public_layer_slicer import (
@@ -35,7 +44,6 @@ from public_layer_slicer import (
     LUNA_PINYIN_REPO,
     LUNA_PINYIN_SHA,
     SOURCES,
-    Lexicon,
     fetch_github_sha,
     fetch_raw_file,
     read_slice_table,
@@ -73,7 +81,9 @@ def _cache_dir(cache: Path) -> Path:
     return cache
 
 
-def load_lexicon(cache: Path) -> Lexicon:
+def load_lexicon(cache: Path):
+    from public_layer_slicer import Lexicon
+
     dict_path = fetch_raw_file(
         LUNA_PINYIN_REPO, LUNA_PINYIN_SHA, "luna_pinyin.dict.yaml",
         cache / "lexicon" / "luna_pinyin.dict.yaml")
@@ -224,70 +234,91 @@ def _write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
-def _load_ckpt(cache: Path, route_id: str, freeze_digest: str) -> dict:
+def _load_ckpt(cache: Path, route_id: str, freeze: dict) -> dict:
     path = _ckpt_path(cache, route_id)
+    empty = {
+        "slice_index": 0, "hits": 0, "pairs_seen": 0, "peak_rss_bytes": 0,
+    }
     if not path.exists():
-        return {"a_slice_index": 0, "hits": 0, "pairs_seen": 0}
+        return empty
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("freeze_digest") != freeze_digest:
-        raise PublicLayerAError("checkpoint freeze digest drifted")
-    if data.get("route_id") != route_id:
-        raise PublicLayerAError("checkpoint route drifted")
-    return data
+    if (data.get("contract") != CONTRACT_ID
+            or data.get("query_rule") != QUERY_RULE
+            or data.get("freeze_digest") != freeze["freeze_digest"]
+            or data.get("route_id") != route_id):
+        raise PublicLayerAError("v2 checkpoint unused")
+    return {
+        "slice_index": int(data["slice_index"]),
+        "hits": int(data["hits"]),
+        "pairs_seen": int(data["pairs_seen"]),
+        "peak_rss_bytes": int(data.get("peak_rss_bytes") or 0),
+    }
 
 
-def _save_ckpt(cache: Path, route_id: str, freeze_digest: str, state: dict) -> None:
+def _save_ckpt(cache: Path, route_id: str, freeze: dict, state: dict) -> None:
     _write_json(_ckpt_path(cache, route_id), {
-        "freeze_digest": freeze_digest,
+        "contract": CONTRACT_ID,
+        "query_rule": QUERY_RULE,
+        "freeze_digest": freeze["freeze_digest"],
         "route_id": route_id,
-        "a_slice_index": state["a_slice_index"],
+        "slice_index": state["slice_index"],
         "hits": state["hits"],
         "pairs_seen": state["pairs_seen"],
+        "peak_rss_bytes": state["peak_rss_bytes"],
     })
 
 
-def _finish_hits(cache: Path, route_id: str, freeze_digest: str,
-                 hits: int, pairs: int) -> None:
+def _finish_hits(cache: Path, route_id: str, freeze: dict,
+                 hits: int, pairs: int, peak_rss_bytes: int) -> None:
     _write_json(_hits_path(cache, route_id), {
-        "freeze_digest": freeze_digest,
+        "contract": CONTRACT_ID,
+        "query_rule": QUERY_RULE,
+        "freeze_digest": freeze["freeze_digest"],
         "route_id": route_id,
         "hits": hits,
         "pairs": pairs,
+        "peak_rss_bytes": peak_rss_bytes,
         "complete": True,
     })
 
 
-def load_complete_hits(cache: Path, freeze_digest: str) -> dict:
+def load_complete_hits(cache: Path, freeze: dict) -> dict:
     hits = {}
     for route_id in ROUTE_IDS:
         path = _hits_path(cache, route_id)
         if not path.exists():
             raise PublicLayerAError("hits missing for %s" % route_id)
         data = json.loads(path.read_text(encoding="utf-8"))
-        if (data.get("freeze_digest") != freeze_digest
+        if (data.get("contract") != CONTRACT_ID
+                or data.get("query_rule") != QUERY_RULE
+                or data.get("freeze_digest") != freeze["freeze_digest"]
                 or data.get("route_id") != route_id
                 or not data.get("complete")):
             raise PublicLayerAError("hits identity drifted for %s" % route_id)
         hits[route_id] = int(data["hits"])
-        if int(data["pairs"]) < 1:
-            raise PublicLayerAError("hits pair count missing for %s" % route_id)
+        if int(data["pairs"]) != freeze["pair_count"]:
+            raise PublicLayerAError("hits pair count drifted for %s" % route_id)
     return hits
 
 
-def _iter_a_records(slices, start_index=0):
-    index = 0
-    for record in eligible_a_slices(slices):
-        if index >= start_index:
-            yield index, record
-        index += 1
+def _track_rss(state: dict) -> int:
+    rss = guard_scorer_rss()
+    if rss > state["peak_rss_bytes"]:
+        state["peak_rss_bytes"] = rss
+    return rss
 
 
-def score_embedding_route(route_id, model_path, slices, lexicon, store,
-                          cache, freeze_digest, pair_count, batch_size=32):
+def _qwen_query_input(text: str) -> str:
+    from embeddings import QWEN3_QUERY_INSTRUCTION
+
+    return QWEN3_QUERY_INSTRUCTION + "\n" + text
+
+
+def score_embedding_route(route_id, model_path, table_path, cache, freeze,
+                          batch_size=32):
     import numpy as np
     import torch
     from embeddings import BGEM3EmbeddingAdapter, Qwen3EmbeddingAdapter
-    from representations import candidate_conditioned_payload
 
     adapters = {
         "dedicated_qwen3_embedding_0_6b": Qwen3EmbeddingAdapter,
@@ -302,6 +333,8 @@ def score_embedding_route(route_id, model_path, slices, lexicon, store,
         "mps" if torch.backends.mps.is_available() else "cpu")
     model.to(device)
     model.eval()
+    use_query_instruction = route_id == "dedicated_qwen3_embedding_0_6b"
+    pair_count = freeze["pair_count"]
 
     def encode_texts(texts):
         vectors = [None] * len(texts)
@@ -332,22 +365,35 @@ def score_embedding_route(route_id, model_path, slices, lexicon, store,
                 vectors[offset + index] = cpu[index]
         return vectors
 
-    state = _load_ckpt(cache, route_id, freeze_digest)
+    state = _load_ckpt(cache, route_id, freeze)
     started = time.time()
     last_log = started
-    for index, record in _iter_a_records(slices, state["a_slice_index"]):
-        competitors = lexicon.competitors(
-            record["target"], record["canonical_input"])
-        if not competitors:
-            state["a_slice_index"] = index + 1
+    for index, row in enumerate(iter_compact_table(table_path)):
+        if index < state["slice_index"]:
             continue
-        preceding = store.preceding(record)
-        words = [record["target"], *competitors]
+        _track_rss(state)
+        competitors = row.competitors
+        if not competitors:
+            state["slice_index"] = index + 1
+            continue
         texts = []
         ok = []
-        for word in words:
+        query = query_text(row.preceding)
+        if query:
             try:
-                texts.append(candidate_conditioned_payload(preceding, word))
+                texts.append(
+                    _qwen_query_input(query) if use_query_instruction
+                    else query)
+                ok.append(True)
+            except Exception:  # noqa: BLE001
+                texts.append("")
+                ok.append(False)
+        else:
+            texts.append("")
+            ok.append(False)
+        for word in (row.target, *competitors):
+            try:
+                texts.append(candidate_text(row.preceding, word))
                 ok.append(True)
             except Exception:  # noqa: BLE001
                 texts.append("")
@@ -360,31 +406,40 @@ def score_embedding_route(route_id, model_path, slices, lexicon, store,
             if not flag:
                 vecs.append(None)
                 continue
-            vecs.append(encoded[cursor])
+            vec = encoded[cursor]
             cursor += 1
-        target_vec = vecs[0]
-        if target_vec is not None and np.all(np.isfinite(target_vec)):
-            for competitor_vec in vecs[1:]:
-                if pair_hit(target_vec, competitor_vec):
-                    state["hits"] += 1
+            if vec is not None and not np.all(np.isfinite(vec)):
+                vec = None
+            vecs.append(vec)
+        query_vec = vecs[0]
+        target_vec = vecs[1]
+        for competitor_vec in vecs[2:]:
+            if pair_hit(query_vec, target_vec, competitor_vec):
+                state["hits"] += 1
         state["pairs_seen"] += len(competitors)
-        state["a_slice_index"] = index + 1
+        state["slice_index"] = index + 1
         now = time.time()
         if (index + 1) % 200 == 0 or now - last_log >= 30:
             rate = state["pairs_seen"] / max(now - started, 1e-6)
             print(
                 f"{route_id} slice={index + 1} pairs={state['pairs_seen']}/"
-                f"{pair_count} hits={state['hits']} rate={rate:.1f}/s",
+                f"{pair_count} hits={state['hits']} "
+                f"rss={state['peak_rss_bytes']} rate={rate:.1f}/s",
                 flush=True)
-            _save_ckpt(cache, route_id, freeze_digest, state)
+            _save_ckpt(cache, route_id, freeze, state)
             last_log = now
     if state["pairs_seen"] != pair_count:
         raise PublicLayerAError(
             "%s pair count drifted: %s != %s"
             % (route_id, state["pairs_seen"], pair_count))
-    _save_ckpt(cache, route_id, freeze_digest, state)
-    _finish_hits(cache, route_id, freeze_digest, state["hits"], pair_count)
-    print(f"{route_id} done hits={state['hits']} pairs={pair_count}", flush=True)
+    _track_rss(state)
+    _save_ckpt(cache, route_id, freeze, state)
+    _finish_hits(cache, route_id, freeze, state["hits"], pair_count,
+                 state["peak_rss_bytes"])
+    print(
+        f"{route_id} done hits={state['hits']} pairs={pair_count} "
+        f"peak_rss={state['peak_rss_bytes']}",
+        flush=True)
 
 
 def _clone_prefix_cache(prefix_cache, valid):
@@ -400,7 +455,7 @@ def _clone_prefix_cache(prefix_cache, valid):
     return clones
 
 
-def _l28_from_tail(extractor, tail_ids, cache):
+def _l28_mean(extractor, token_ids, cache=None):
     import numpy as np
     from hidden_state import _lazy_mlx, pool_candidate_hidden_states
 
@@ -408,22 +463,28 @@ def _l28_from_tail(extractor, tail_ids, cache):
     del _unused
     _model, inner = extractor._require_model()
     del _model
-    token_ids = mx.array([list(tail_ids)])
-    hidden = inner.embed_tokens(token_ids)
-    mask = create_attention_mask(hidden, cache[0])
+    token_ids = list(token_ids)
+    if not token_ids:
+        return None
+    hidden = inner.embed_tokens(mx.array([token_ids]))
+    mask = create_attention_mask(hidden, cache[0] if cache else None)
+    layers = cache if cache is not None else [None] * len(inner.layers)
     for index, layer in enumerate(inner.layers):
-        hidden = layer(hidden, mask, cache[index])
+        hidden = layer(hidden, mask, layers[index])
         if index + 1 != 28:
             continue
         normalized = inner.norm(hidden).astype(mx.float32)
-        span = np.asarray(normalized[0]).reshape(len(tail_ids), -1)
+        span = np.asarray(normalized[0]).reshape(len(token_ids), -1)
         return pool_candidate_hidden_states(
-            span.tolist(), 0, len(tail_ids), "candidate_span_mean")
+            span.tolist(), 0, len(token_ids), "candidate_span_mean")
     raise PublicLayerAError("L28 was not reached")
 
 
-def score_l28_route(model_path, slices, lexicon, store, cache, freeze_digest,
-                    pair_count):
+def _l28_from_tail(extractor, tail_ids, cache):
+    return _l28_mean(extractor, tail_ids, cache)
+
+
+def score_l28_route(model_path, table_path, cache, freeze):
     from hidden_state import HiddenStateExtractor
     from representations import (
         CandidateRepresentationSpec,
@@ -454,20 +515,26 @@ def score_l28_route(model_path, slices, lexicon, store, cache, freeze_digest,
     extractor = HiddenStateExtractor(_State(model_path))
     extractor._require_model()
     tokenizer = extractor._tokenizer()
-    state = _load_ckpt(cache, "qwen_l28_candidate_span_mean", freeze_digest)
+    route_id = "qwen_l28_candidate_span_mean"
+    pair_count = freeze["pair_count"]
+    state = _load_ckpt(cache, route_id, freeze)
     started = time.time()
     last_log = started
-    route_id = "qwen_l28_candidate_span_mean"
-    for index, record in _iter_a_records(slices, state["a_slice_index"]):
-        competitors = lexicon.competitors(
-            record["target"], record["canonical_input"])
-        if not competitors:
-            state["a_slice_index"] = index + 1
+    for index, row in enumerate(iter_compact_table(table_path)):
+        if index < state["slice_index"]:
             continue
-        preceding = store.preceding(record)
+        _track_rss(state)
+        competitors = row.competitors
+        if not competitors:
+            state["slice_index"] = index + 1
+            continue
+        query = query_text(row.preceding)
         try:
+            query_ids = tokenizer.encode(query, add_special_tokens=False) \
+                if query else []
+            query_vec = _l28_mean(extractor, query_ids) if query_ids else None
             _payload, target_ids, start, count = candidate_tokenization_for(
-                tokenizer, preceding, record["target"], spec=spec)
+                tokenizer, row.preceding, row.target, spec=spec)
             del _payload
             prefix_ids = target_ids[:start]
             target_tail = target_ids[start:start + count]
@@ -476,45 +543,95 @@ def score_l28_route(model_path, slices, lexicon, store, cache, freeze_digest,
                 extractor, target_tail,
                 _clone_prefix_cache(prefix_cache, len(prefix_ids)))
         except (RepresentationError, PublicLayerAError, ValueError, TypeError):
+            query_vec = None
             target_vec = None
             prefix_ids = None
             prefix_cache = None
-        if target_vec is not None:
-            for competitor in competitors:
-                try:
-                    _payload, ids, start, count = candidate_tokenization_for(
-                        tokenizer, preceding, competitor, spec=spec)
-                    del _payload
-                    if prefix_ids is not None and ids[:start] == prefix_ids:
-                        other = _l28_from_tail(
-                            extractor, ids[start:start + count],
-                            _clone_prefix_cache(prefix_cache, len(prefix_ids)))
-                    else:
-                        other = extractor.candidate(
-                            spec, preceding, competitor)
-                except (RepresentationError, PublicLayerAError, ValueError,
-                        TypeError):
-                    continue
-                if pair_hit(target_vec, other):
-                    state["hits"] += 1
+        for competitor in competitors:
+            try:
+                _payload, ids, start, count = candidate_tokenization_for(
+                    tokenizer, row.preceding, competitor, spec=spec)
+                del _payload
+                if prefix_ids is not None and ids[:start] == prefix_ids:
+                    other = _l28_from_tail(
+                        extractor, ids[start:start + count],
+                        _clone_prefix_cache(prefix_cache, len(prefix_ids)))
+                else:
+                    other = extractor.candidate(
+                        spec, row.preceding, competitor)
+            except (RepresentationError, PublicLayerAError, ValueError,
+                    TypeError):
+                other = None
+            if pair_hit(query_vec, target_vec, other):
+                state["hits"] += 1
         state["pairs_seen"] += len(competitors)
-        state["a_slice_index"] = index + 1
+        state["slice_index"] = index + 1
         now = time.time()
         if (index + 1) % 50 == 0 or now - last_log >= 30:
             rate = state["pairs_seen"] / max(now - started, 1e-6)
             print(
                 f"{route_id} slice={index + 1} pairs={state['pairs_seen']}/"
-                f"{pair_count} hits={state['hits']} rate={rate:.1f}/s",
+                f"{pair_count} hits={state['hits']} "
+                f"rss={state['peak_rss_bytes']} rate={rate:.1f}/s",
                 flush=True)
-            _save_ckpt(cache, route_id, freeze_digest, state)
+            _save_ckpt(cache, route_id, freeze, state)
             last_log = now
     if state["pairs_seen"] != pair_count:
         raise PublicLayerAError(
             "l28 pair count drifted: %s != %s"
             % (state["pairs_seen"], pair_count))
-    _save_ckpt(cache, route_id, freeze_digest, state)
-    _finish_hits(cache, route_id, freeze_digest, state["hits"], pair_count)
-    print(f"{route_id} done hits={state['hits']} pairs={pair_count}", flush=True)
+    _track_rss(state)
+    _save_ckpt(cache, route_id, freeze, state)
+    _finish_hits(cache, route_id, freeze, state["hits"], pair_count,
+                 state["peak_rss_bytes"])
+    print(
+        f"{route_id} done hits={state['hits']} pairs={pair_count} "
+        f"peak_rss={state['peak_rss_bytes']}",
+        flush=True)
+
+
+def require_compact_table(cache: Path, freeze: dict) -> Path:
+    path = compact_table_path(cache)
+    if not path.exists():
+        raise PublicLayerAError("compact table is missing")
+    digest = sha256_bytes(path.read_bytes())
+    if digest != freeze["compact_table_digest"]:
+        raise PublicLayerAError("compact table digest drifted")
+    header = load_compact_header(path)
+    if header["pair_count"] != freeze["pair_count"]:
+        raise PublicLayerAError("compact table pair count drifted")
+    if header["eligible_slice_count"] != freeze["eligible_slice_count"]:
+        raise PublicLayerAError("compact table slice count drifted")
+    return path
+
+
+def run_score_route(route_id, args, cache, output):
+    freeze = load_freeze(output)
+    table_path = require_compact_table(cache, freeze)
+    guard_scorer_rss()
+    if route_id == "qwen_l28_candidate_span_mean":
+        score_l28_route(args.qwen_base, table_path, cache, freeze)
+        return
+    model_path = (
+        args.qwen3_embedding
+        if route_id == "dedicated_qwen3_embedding_0_6b"
+        else args.bge_m3
+    )
+    score_embedding_route(route_id, model_path, table_path, cache, freeze)
+
+
+def build_compact_table_from_sources(cache: Path, output: Path) -> tuple[str, int, int]:
+    lexicon = load_lexicon(cache)
+    slices = read_slice_table(output / "slices.tsv")
+    store = ASourceStore(cache)
+    rows = build_compact_slices(slices, lexicon, store.preceding)
+    del lexicon
+    del store
+    path = compact_table_path(cache)
+    digest = write_compact_table(
+        path, rows, slice_digest=PINNED_SLICE_DIGEST)
+    header = load_compact_header(path)
+    return digest, header["eligible_slice_count"], header["pair_count"]
 
 
 def _spawn(python_path, extra_args):
@@ -541,6 +658,7 @@ def parse_args(argv=None):
     parser.add_argument("--emit-fingerprint", choices=("embedding", "l28"))
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--freeze-only", action="store_true")
+    parser.add_argument("--build-table", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -556,40 +674,48 @@ def main(argv=None) -> int:
     cache = _cache_dir(args.cache)
     output = args.output
     verify_committed_digest(output)
-    print("loading lexicon", flush=True)
-    lexicon = load_lexicon(cache)
-    slices = read_slice_table(output / "slices.tsv")
-    eligible_slice_count, pair_count = count_eligible_a(slices, lexicon)
-    print(f"A eligible slices={eligible_slice_count} pairs={pair_count}",
-          flush=True)
-    if pair_count < 1:
-        raise PublicLayerAError("A pair set is empty")
 
     if args.score_route:
-        freeze = load_freeze(output)
-        if freeze["pair_count"] != pair_count:
-            raise PublicLayerAError("frozen pair count drifted")
-        store = ASourceStore(cache)
-        if args.score_route == "qwen_l28_candidate_span_mean":
-            score_l28_route(
-                args.qwen_base, slices, lexicon, store, cache,
-                freeze["freeze_digest"], pair_count)
-        elif args.score_route == "dedicated_qwen3_embedding_0_6b":
-            score_embedding_route(
-                args.score_route, args.qwen3_embedding, slices, lexicon,
-                store, cache, freeze["freeze_digest"], pair_count)
-        else:
-            score_embedding_route(
-                args.score_route, args.bge_m3, slices, lexicon, store,
-                cache, freeze["freeze_digest"], pair_count)
+        run_score_route(args.score_route, args, cache, output)
+        return 0
+
+    removed = void_v2_artifacts(output, cache)
+    if removed:
+        print("voided v2 artifacts", len(removed), flush=True)
+
+    if args.build_table:
+        digest, slice_count, pair_count = build_compact_table_from_sources(
+            cache, output)
+        print(
+            f"compact table slices={slice_count} pairs={pair_count} "
+            f"digest={digest}",
+            flush=True)
         return 0
 
     if args.report_only:
         freeze = load_freeze(output)
-        hits = load_complete_hits(cache, freeze["freeze_digest"])
+        hits = load_complete_hits(cache, freeze)
         report = apply_scores(output, freeze, hits)
         print("winner", report["winner"])
         return 0
+
+    table = compact_table_path(cache)
+    if not table.exists():
+        print("building compact table", flush=True)
+        _spawn(sys.executable, [
+            "--cache", str(cache),
+            "--output", str(output),
+            "--build-table",
+        ])
+    header = load_compact_header(table)
+    digest = sha256_bytes(table.read_bytes())
+    eligible_slice_count = header["eligible_slice_count"]
+    pair_count = header["pair_count"]
+    print(
+        f"A eligible slices={eligible_slice_count} pairs={pair_count}",
+        flush=True)
+    if pair_count < 1:
+        raise PublicLayerAError("A pair set is empty")
 
     creating = not (output / "a_freeze.json").exists()
     fingerprints = collect_fingerprints(
@@ -601,6 +727,7 @@ def main(argv=None) -> int:
         fingerprints=fingerprints,
         pair_count=pair_count,
         eligible_slice_count=eligible_slice_count,
+        compact_table_digest=digest,
     )
     if creating:
         write_freeze(output, freeze)
@@ -635,12 +762,17 @@ def main(argv=None) -> int:
             continue
         print("scoring", route_id, flush=True)
         _spawn(python_path, common + ["--score-route", route_id])
-    hits = load_complete_hits(cache, freeze["freeze_digest"])
+    hits = load_complete_hits(cache, freeze)
     report = apply_scores(output, freeze, hits)
     print("winner", report["winner"])
     for route_id in ROUTE_IDS:
         row = report["routes"][route_id]
-        print(f"  {route_id} hits={row['hits']} acc={row['accuracy']:.10f}")
+        peak = json.loads(
+            _hits_path(cache, route_id).read_text(encoding="utf-8")
+        ).get("peak_rss_bytes")
+        print(
+            f"  {route_id} hits={row['hits']} acc={row['accuracy']:.10f} "
+            f"peak_rss={peak}")
     return 0
 
 
