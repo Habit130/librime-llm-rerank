@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -760,8 +761,12 @@ class FakeEvidenceScorer : public EvidenceScorer {
  public:
   FakeEvidenceScorer() : EvidenceScorer("", "") {}
 
+  using EvidenceScorer::ScoreGroup;
+
   bool ScoreGroup(const GroupRequest& request,
-                  vector<double>* s_c) override {
+                  vector<double>* s_c,
+                  int remaining_deadline_ms) override {
+    remainings.push_back(remaining_deadline_ms);
     requests.push_back(request);
     if (fail_)
       return false;
@@ -781,6 +786,7 @@ class FakeEvidenceScorer : public EvidenceScorer {
   bool fail_ = false;
   map<string, vector<double>> scripted_;
   vector<GroupRequest> requests;
+  vector<int> remainings;
 };
 
 static const EvidenceScorer::GroupRequest* FindGroupRequest(
@@ -863,6 +869,55 @@ TEST(EvidenceRerankTest, EvidenceFailurePassesThroughWholeWindow) {
 
   EXPECT_EQ(kFailureWindowOriginalOrder,
             CollectTexts(ApplyFilter(filter, FailureWindowCandidates())));
+}
+
+TEST(EvidenceRerankTest, SharedWindowDeadlinePassesRemainingToLaterGroup) {
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.5, 0.0};
+  evidence->scripted_["cd"] = {0.0, 0.0};
+  auto filter = MakeEvidenceFilter(evidence, 10.0);
+  const auto t0 = std::chrono::steady_clock::now();
+  int ticks = 0;
+  filter.set_deadline_ms(200);
+  filter.set_now([&] {
+    ++ticks;
+    if (ticks <= 2)
+      return t0;
+    return t0 + std::chrono::milliseconds(80);
+  });
+  auto filtered = ApplyFilter(filter, {
+                                          MakePhrase("table", 0, 2, "甲", 1.0),
+                                          MakePhrase("table", 0, 2, "乙", 3.0),
+                                          MakePhrase("table", 2, 4, "丙", 5.0),
+                                          MakePhrase("table", 2, 4, "丁", 4.0),
+                                      });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁"}), CollectTexts(filtered));
+  EXPECT_EQ((vector<int>{200, 120}), evidence->remainings);
+}
+
+TEST(EvidenceRerankTest, ExhaustedWindowDeadlineSkipsLaterGroup) {
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.5, 0.0};
+  evidence->scripted_["cd"] = {0.0, 0.0};
+  auto filter = MakeEvidenceFilter(evidence, 10.0);
+  const auto t0 = std::chrono::steady_clock::now();
+  int ticks = 0;
+  filter.set_deadline_ms(200);
+  filter.set_now([&] {
+    ++ticks;
+    if (ticks <= 2)
+      return t0;
+    return t0 + std::chrono::milliseconds(200);
+  });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 1.0),
+                                                 MakePhrase("table", 0, 2, "乙", 3.0),
+                                                 MakePhrase("table", 2, 4, "丙", 5.0),
+                                                 MakePhrase("table", 2, 4, "丁", 4.0),
+                                             })));
+  EXPECT_EQ(1u, evidence->requests.size());
+  EXPECT_EQ((vector<int>{200}), evidence->remainings);
 }
 
 TEST(EvidenceRerankTest, EvidenceOnlyChangesWithinGroup) {

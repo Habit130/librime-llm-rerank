@@ -16,6 +16,7 @@
 #include "fact_migrator.h"
 #include "fact_store.h"
 #include "recorder_session.h"
+#include "sqlite_step.h"
 
 namespace rime {
 
@@ -78,13 +79,14 @@ bool ReadMetaText(sqlite3* db, const char* key, string* value) {
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
     return false;
   sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
-  if (ok) {
-    const unsigned char* text = sqlite3_column_text(stmt, 0);
-    *value = text ? reinterpret_cast<const char*>(text) : string();
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return ok;
+  const unsigned char* text = sqlite3_column_text(stmt, 0);
+  *value = text ? reinterpret_cast<const char*>(text) : string();
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
 bool SetMetaText(sqlite3* db, const char* key, const string& value) {
@@ -94,21 +96,21 @@ bool SetMetaText(sqlite3* db, const char* key, const string& value) {
     return false;
   sqlite3_bind_text(stmt, 1, value.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_text(stmt, 2, key, -1, SQLITE_TRANSIENT);
-  bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-  sqlite3_finalize(stmt);
-  return ok;
+  int rc = sqlite3_step(stmt);
+  return SqliteFinishDone(stmt, rc);
 }
 
 bool QueryCount(sqlite3* db, const std::string& sql, int64_t* count) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
     return false;
-  bool ok = sqlite3_step(stmt) == SQLITE_ROW;
-  if (ok) {
-    *count = sqlite3_column_int64(stmt, 0);
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return ok;
+  *count = sqlite3_column_int64(stmt, 0);
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
 bool QueryQuickCheck(sqlite3* db, bool* ok) {
@@ -117,27 +119,31 @@ bool QueryQuickCheck(sqlite3* db, bool* ok) {
       SQLITE_OK) {
     return false;
   }
-  bool got_row = sqlite3_step(stmt) == SQLITE_ROW;
-  if (got_row) {
-    const unsigned char* text = sqlite3_column_text(stmt, 0);
-    *ok = text && std::strcmp(reinterpret_cast<const char*>(text), "ok") == 0;
-  } else {
+  int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
     *ok = false;
+    sqlite3_finalize(stmt);
+    return false;
   }
-  sqlite3_finalize(stmt);
-  return got_row;
+  const unsigned char* text = sqlite3_column_text(stmt, 0);
+  *ok = text && std::strcmp(reinterpret_cast<const char*>(text), "ok") == 0;
+  return sqlite3_finalize(stmt) == SQLITE_OK;
 }
 
-// Foreign-key check must produce zero rows.
+// Foreign-key check must produce zero rows. Only SQLITE_DONE is success;
+// SQLITE_INTERRUPT and other terminal errors fail closed.
 bool QueryForeignKeyCheck(sqlite3* db) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(db, "PRAGMA foreign_key_check;", -1, &stmt, nullptr) !=
       SQLITE_OK) {
     return false;
   }
-  bool ok = sqlite3_step(stmt) != SQLITE_ROW;
-  sqlite3_finalize(stmt);
-  return ok;
+  int rc = sqlite3_step(stmt);
+  if (rc == SQLITE_ROW) {
+    sqlite3_finalize(stmt);
+    return false;
+  }
+  return SqliteFinishDone(stmt, rc);
 }
 
 bool ReadIdentity(sqlite3* db, string* store_epoch, string* history_id) {
@@ -480,7 +486,8 @@ FactMigrationStatus ApplyStep(sqlite3* db, const MigrationStep& step) {
   if (sqlite3_prepare_v2(db, kSelectHead, -1, &stmt, nullptr) != SQLITE_OK)
     return FactMigrationStatus::kDbError;
   std::vector<CanonicalRow> rows;
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
+  int rc = SQLITE_OK;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
     CanonicalRow row = ReadRow(stmt);
     if (!ProjectRow(&row, step)) {
       sqlite3_finalize(stmt);
@@ -488,7 +495,8 @@ FactMigrationStatus ApplyStep(sqlite3* db, const MigrationStep& step) {
     }
     rows.push_back(std::move(row));
   }
-  sqlite3_finalize(stmt);
+  if (!SqliteFinishDone(stmt, rc))
+    return FactMigrationStatus::kDbError;
   if (Exec(db, kCreateActiveEventsView) != SQLITE_OK)
     return FactMigrationStatus::kDbError;
   for (const CanonicalRow& row : rows) {
@@ -560,7 +568,8 @@ bool ValidateMigratedStore(sqlite3* db) {
     int64_t prev_physical = 0;
     int64_t prev_logical = 0;
     bool ordered = true;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
       int64_t physical = sqlite3_column_int64(stmt, 0);
       int64_t logical = sqlite3_column_int64(stmt, 1);
       if (previous &&
@@ -573,8 +582,11 @@ bool ValidateMigratedStore(sqlite3* db) {
       prev_logical = logical;
       previous = true;
     }
-    sqlite3_finalize(stmt);
-    if (!ordered)
+    if (!ordered) {
+      sqlite3_finalize(stmt);
+      return false;
+    }
+    if (!SqliteFinishDone(stmt, rc))
       return false;
   }
   // Durable clock never falls below the highest event HLC.
@@ -593,14 +605,20 @@ bool ValidateMigratedStore(sqlite3* db) {
         " ORDER BY hlc_physical_ms DESC, hlc_logical DESC LIMIT 1;";
     if (sqlite3_prepare_v2(db, kMaxEventHlc, -1, &stmt, nullptr) != SQLITE_OK)
       return false;
-    bool has_event = sqlite3_step(stmt) == SQLITE_ROW;
+    int hlc_rc = sqlite3_step(stmt);
+    if (!SqliteIsRowOrDone(hlc_rc)) {
+      sqlite3_finalize(stmt);
+      return false;
+    }
+    bool has_event = hlc_rc == SQLITE_ROW;
     int64_t event_physical = -1;
     int64_t event_logical = -1;
     if (has_event) {
       event_physical = sqlite3_column_int64(stmt, 0);
       event_logical = sqlite3_column_int64(stmt, 1);
     }
-    sqlite3_finalize(stmt);
+    if (sqlite3_finalize(stmt) != SQLITE_OK)
+      return false;
     if (has_event &&
         !(std::make_pair(event_physical, event_logical) <=
           std::make_pair(clock_physical, clock_logical)))

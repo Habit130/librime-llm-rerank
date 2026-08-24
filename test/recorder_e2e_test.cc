@@ -1209,7 +1209,10 @@ class RecorderE2ETest : public ::testing::Test {
     // Build the tiny prediction corpus into predict.db (read by the
     // predictor of e2e_prediction from the shared data dir).
     const char* kBuildPredict = LLM_RERANK_BUILD_PREDICT;
-    if (kBuildPredict && *kBuildPredict && fs::exists(kBuildPredict)) {
+    if (kBuildPredict && *kBuildPredict) {
+      ASSERT_TRUE(fs::exists(kBuildPredict))
+          << "librime-predict is declared but build_predict is missing: "
+          << kBuildPredict;
       const char* kPredictCorpus =
           "$\t我\t7\n"
           "我\t世界\t5\n"
@@ -2756,6 +2759,9 @@ TEST_F(RecorderE2ETest, CompletionCandidateSelectionFormsNoEvent) {
 }
 
 TEST_F(RecorderE2ETest, PredictionCandidateSelectionFormsNoEvent) {
+  if (!fs::exists(fs::path(g_rime_dir) / "predict.db")) {
+    GTEST_SKIP() << "librime-predict not installed";
+  }
   // After committing 我, the predictor appends a prediction segment with
   // candidates 世界/时界 (type "prediction"); selecting one is a real
   // selection that must not form an event.

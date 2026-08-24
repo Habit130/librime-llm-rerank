@@ -261,9 +261,10 @@ canonical checksum, and the summary — with no hand-editing afterwards:
   manifest carries their canonical aggregate. Every later alpha run must
   reproduce the baseline multiset checksums.
 - `eval/verify_artifacts.py` (read-only) checks the fixture, the manifest
-  checksum, results<->manifest consistency, the decision fields, the
-  baseline candidate manifest, and that SUMMARY.md regenerates
-  byte-for-byte.
+  checksum, results<->manifest consistency, metrics and harmful-regression
+  counts recomputed from committed `case_ranks` (both copied summaries and
+  the decision must match those derived values), the baseline candidate
+  manifest, and that SUMMARY.md regenerates byte-for-byte.
 
 ## Verification
 

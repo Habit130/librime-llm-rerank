@@ -1566,5 +1566,314 @@ class PublisherTest(PublishBase):
             builder.close()
 
 
+# ---------------------------------------------------------------------------
+# AC-133: post-rename fsync is committed/ambiguous; never invalidate
+# ---------------------------------------------------------------------------
+
+class ManifestCommitClassificationTest(PublishBase):
+    """SCN-133-1..5: classify the active-manifest write, never roll back a
+    referenced generation, and reconcile idempotently after a fault."""
+
+    def _ready_env(self):
+        env = self.make_env()
+        builder = env.staging()
+        progress = env.run_to_ready(builder)
+        env.add_publish_window_facts()
+        return env, builder, progress
+
+    def _assert_generation_exists(self, env, generation_id):
+        published = env.published_dir(generation_id)
+        self.assertTrue(os.path.isdir(published))
+        for name in ("manifest.json", "metadata.json", "vectors.fp32"):
+            self.assertTrue(os.path.isfile(os.path.join(published, name)))
+
+    def _fault_inside_manifest_write(self, install):
+        """Install ``install()`` only around ``write_active_manifest``."""
+        original = publish.write_active_manifest
+
+        def wrapped(*args, **kwargs):
+            restore = install()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                restore()
+
+        publish.write_active_manifest = wrapped
+        return original
+
+    def test_temp_write_failure_is_pre_commit_and_rolls_back(self):
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_os_write = os.write
+
+        def install():
+            def boom(fd, data):
+                raise OSError("injected temp write failed")
+
+            os.write = boom
+            return lambda: setattr(os, "write", original_os_write)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            result = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["committed"])
+        self.assertFalse(os.path.isfile(env.manifest_path()))
+        self.assertTrue(os.path.isdir(env.staging_dir(generation_id)))
+        self.assertFalse(os.path.isdir(env.published_dir(generation_id)))
+
+    def test_temp_fsync_failure_is_pre_commit_and_rolls_back(self):
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_os_fsync = os.fsync
+
+        def install():
+            def boom(fd):
+                raise OSError("injected temp fsync failed")
+
+            os.fsync = boom
+            return lambda: setattr(os, "fsync", original_os_fsync)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            result = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["committed"])
+        self.assertFalse(os.path.isfile(env.manifest_path()))
+        self.assertTrue(os.path.isdir(env.staging_dir(generation_id)))
+        self.assertFalse(os.path.isdir(env.published_dir(generation_id)))
+
+    def test_rename_failure_is_pre_commit_and_rolls_back(self):
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_replace = os.replace
+
+        def install():
+            def boom(src, dst):
+                raise OSError("injected rename failed")
+
+            os.replace = boom
+            return lambda: setattr(os, "replace", original_replace)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            result = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["committed"])
+        self.assertFalse(os.path.isfile(env.manifest_path()))
+        self.assertTrue(os.path.isdir(env.staging_dir(generation_id)))
+        self.assertFalse(os.path.isdir(env.published_dir(generation_id)))
+
+    def test_parent_fsync_failure_does_not_invalidate_the_referenced_generation(
+            self):
+        import generation
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_fsync = generation._fsync_directory
+
+        def install():
+            def boom(path):
+                raise OSError("injected parent fsync failed")
+
+            generation._fsync_directory = boom
+            return lambda: setattr(generation, "_fsync_directory",
+                                   original_fsync)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            result = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertTrue(result["committed"], result)
+        if not result["ok"]:
+            self.assertIn("post-rename fsync failed", result["error"])
+        manifest, reason = read_active_manifest(env.derived_root)
+        self.assertIsNone(reason)
+        self.assertEqual(manifest["generation_id"], generation_id)
+        self._assert_generation_exists(env, generation_id)
+        self.assertFalse(os.path.isdir(env.staging_dir(generation_id)))
+
+    def test_reconcile_after_parent_fsync_fault_is_idempotent(self):
+        import generation
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_fsync = generation._fsync_directory
+
+        def install():
+            def boom(path):
+                raise OSError("injected parent fsync failed")
+
+            generation._fsync_directory = boom
+            return lambda: setattr(generation, "_fsync_directory",
+                                   original_fsync)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            result = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertTrue(result["committed"], result)
+        first = publish.reconcile_active_manifest_commit(
+            env.derived_root, generation_id)
+        second = publish.reconcile_active_manifest_commit(
+            env.derived_root, generation_id)
+        self.assertTrue(first["referenced"])
+        self.assertTrue(first["consistent"])
+        self.assertTrue(first["generation_present"])
+        self.assertEqual(first, second)
+        manifest, reason = read_active_manifest(env.derived_root)
+        self.assertIsNone(reason)
+        self.assertEqual(manifest["generation_id"], generation_id)
+        self._assert_generation_exists(env, generation_id)
+
+    def test_retry_after_parent_fsync_fault_completes_without_rollback(self):
+        import generation
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_fsync = generation._fsync_directory
+
+        def install():
+            def boom(path):
+                raise OSError("injected parent fsync failed")
+
+            generation._fsync_directory = boom
+            return lambda: setattr(generation, "_fsync_directory",
+                                   original_fsync)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            first = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertTrue(first["committed"], first)
+        retry = publish.publish_ready_staging(
+            env.facts_root, env.derived_root, builder,
+            env.staging_dir(generation_id), generation_id,
+            env.desired_provider, machine,
+            publish_lock=env.publish_lock)
+        self.assertTrue(retry["ok"], retry)
+        self.assertTrue(retry["committed"])
+        manifest, reason = read_active_manifest(env.derived_root)
+        self.assertIsNone(reason)
+        self.assertEqual(manifest["generation_id"], generation_id)
+        self._assert_generation_exists(env, generation_id)
+        self.assertFalse(os.path.isdir(env.staging_dir(generation_id)))
+        snapshot = machine.ensure_caught_up()
+        self.assertEqual(snapshot.base_generation_id, generation_id)
+
+    def test_success_has_a_durable_manifest_and_existing_generation(self):
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        result = publish.publish_ready_staging(
+            env.facts_root, env.derived_root, builder,
+            env.staging_dir(generation_id), generation_id,
+            env.desired_provider, machine,
+            publish_lock=env.publish_lock)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["committed"])
+        self.assertIsNone(result["error"])
+        manifest, reason = read_active_manifest(env.derived_root)
+        self.assertIsNone(reason)
+        self.assertEqual(manifest["generation_id"], generation_id)
+        self._assert_generation_exists(env, generation_id)
+        leftovers = [name for name in os.listdir(env.derived_root)
+                     if name.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_recovery_interruption_then_retry_stays_consistent(self):
+        import generation
+        env, builder, progress = self._ready_env()
+        machine = self.machine()
+        generation_id = progress["generation_id"]
+        original_fsync = generation._fsync_directory
+
+        def install():
+            def boom(path):
+                raise OSError("injected parent fsync failed")
+
+            generation._fsync_directory = boom
+            return lambda: setattr(generation, "_fsync_directory",
+                                   original_fsync)
+
+        original = self._fault_inside_manifest_write(install)
+        try:
+            result = publish.publish_ready_staging(
+                env.facts_root, env.derived_root, builder,
+                env.staging_dir(generation_id), generation_id,
+                env.desired_provider, machine,
+                publish_lock=env.publish_lock)
+        finally:
+            publish.write_active_manifest = original
+        self.assertTrue(result["committed"], result)
+        # Simulate the invalidating leftover plus an interrupted restore:
+        # the live manifest names the new generation but the container was
+        # moved back to staging, and the first reconcile raises mid-restore.
+        os.rename(env.published_dir(generation_id),
+                  env.staging_dir(generation_id))
+        original_restore = publish._restore_published_generation
+        interrupted = {"n": 0}
+
+        def interrupt(derived_root, gid):
+            interrupted["n"] += 1
+            original_restore(derived_root, gid)
+            raise OSError("injected recovery interruption")
+
+        publish._restore_published_generation = interrupt
+        try:
+            with self.assertRaises(OSError):
+                publish.reconcile_active_manifest_commit(
+                    env.derived_root, generation_id)
+        finally:
+            publish._restore_published_generation = original_restore
+        self.assertEqual(interrupted["n"], 1)
+        retry = publish.reconcile_active_manifest_commit(
+            env.derived_root, generation_id)
+        self.assertTrue(retry["referenced"])
+        self.assertTrue(retry["consistent"])
+        self.assertTrue(retry["generation_present"])
+        manifest, reason = read_active_manifest(env.derived_root)
+        self.assertIsNone(reason)
+        self.assertEqual(manifest["generation_id"], generation_id)
+        self._assert_generation_exists(env, generation_id)
+        self.assertFalse(os.path.isdir(env.staging_dir(generation_id)))
+
+
 if __name__ == "__main__":
     unittest.main()
