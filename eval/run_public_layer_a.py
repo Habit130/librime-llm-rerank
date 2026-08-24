@@ -363,14 +363,9 @@ def score_embedding_route(route_id, model_path, slices, lexicon, store,
             vecs.append(encoded[cursor])
             cursor += 1
         target_vec = vecs[0]
-        if target_vec is not None:
-            target = np.asarray(target_vec, dtype=np.float64)
-            self_dot = float(target @ target)
+        if target_vec is not None and np.all(np.isfinite(target_vec)):
             for competitor_vec in vecs[1:]:
-                if competitor_vec is None:
-                    continue
-                other = np.asarray(competitor_vec, dtype=np.float64)
-                if self_dot > float(target @ other):
+                if pair_hit(target_vec, competitor_vec):
                     state["hits"] += 1
         state["pairs_seen"] += len(competitors)
         state["a_slice_index"] = index + 1
