@@ -3,5 +3,6 @@
 .cache/
 .local-work/
 daemon/.venv
+daemon/.local-run/
 .venv-release/
 .venv-embeddings/

@@ -1,0 +1,5 @@
+# Pinned inference runtime for daemon/.venv (Habit130/squirrel#131).
+# Scoring needs a local mlx-lm model directory; this file does not ship weights.
+mlx==0.32.0
+mlx-lm==0.31.3
+numpy==2.4.6

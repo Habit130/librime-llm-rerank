@@ -21,7 +21,9 @@ import time
 sys.path.insert(0, os.path.dirname(__file__))
 
 import mlx.core as mx
-from server import MODEL_PATH, ModelState, CACHE_LIMIT_MB
+from server import ModelState, CACHE_LIMIT_MB
+
+MODEL_PATH = os.environ.get("LLM_RERANK_MODEL") or ""
 
 SHORT_WORDS = [
     "攻击", "公鸡", "工具", "工作", "公共", "公司", "功能", "恭喜",
@@ -65,6 +67,11 @@ def main():
     iterations = 40
     cache_limit_mb = CACHE_LIMIT_MB
     latency_budget_ms = 60.0
+
+    if not MODEL_PATH or not os.path.isdir(MODEL_PATH):
+        sys.exit(
+            "FAIL: set LLM_RERANK_MODEL to a local mlx-lm model directory."
+        )
 
     print(f"model: {MODEL_PATH}")
     print(f"cache limit: {cache_limit_mb} MB")
