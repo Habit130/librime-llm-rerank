@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from public_layer_a import (  # noqa: E402
     CONTRACT_ID,
+    PAIR_SET_RULE,
     PINNED_SLICE_DIGEST,
     ROUTE_IDS,
     TIE_TERMINAL,
@@ -108,6 +109,7 @@ class PairSetTest(unittest.TestCase):
              for p in pairs},
         )
         self.assertFalse(any(p.repo.startswith("vuejs") for p in pairs))
+        self.assertTrue(all(len(pair.target) >= 2 for pair in pairs))
 
     def test_pair_sets_are_identical_across_routes(self):
         pairs = expand_a_pairs(fixture_a_slices(), fixture_lexicon())
@@ -127,6 +129,21 @@ class PairSetTest(unittest.TestCase):
         repos = {pair.repo for pair in pairs}
         self.assertEqual(
             {"rust-lang-cn/book-cn", "Go-zh/go"}, repos)
+
+    def test_excludes_single_char_targets_and_keeps_multichar(self):
+        lex = fixture_lexicon()
+        text = "前文提到的形式可以。"
+        mixed = slice_document(
+            text, lex, repo="rust-lang-cn/book-cn", path="a.md",
+            source_sha="cde74c448e301ce8ac7960a0d3dc879efd83635d",
+            spdx="Apache-2.0 / MIT", split="A")
+        targets = {record["target"] for record in mixed}
+        self.assertTrue({"的", "形式"} <= targets)
+        pairs = expand_a_pairs(mixed, lex)
+        self.assertTrue(pairs)
+        self.assertTrue(all(len(pair.target) >= 2 for pair in pairs))
+        self.assertNotIn("的", {pair.target for pair in pairs})
+        self.assertIn("形式", {pair.target for pair in pairs})
 
 
 class PairwiseRuleTest(unittest.TestCase):
@@ -195,10 +212,14 @@ class FreezeAndReportTest(unittest.TestCase):
             code_sha="abc123",
             fingerprints=fixture_fingerprints(),
             pair_count=4,
+            eligible_slice_count=2,
         )
         self.assertEqual(CONTRACT_ID, freeze["contract"])
+        self.assertEqual("AC-154-v2", CONTRACT_ID)
+        self.assertEqual(PAIR_SET_RULE, freeze["pair_set_rule"])
         self.assertEqual(PINNED_SLICE_DIGEST, freeze["slice_digest"])
         self.assertEqual(0, freeze["b_pairs"])
+        self.assertEqual(0, freeze["len1_pairs_scored"])
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             freeze_path = write_freeze(root, freeze)
@@ -217,6 +238,7 @@ class FreezeAndReportTest(unittest.TestCase):
             code_sha="abc123",
             fingerprints=fixture_fingerprints(),
             pair_count=1,
+            eligible_slice_count=1,
         )
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(PublicLayerAError):
@@ -228,6 +250,7 @@ class FreezeAndReportTest(unittest.TestCase):
             code_sha="def456",
             fingerprints=fixture_fingerprints(),
             pair_count=10,
+            eligible_slice_count=3,
         )
         report = build_report(freeze, {
             "dedicated_qwen3_embedding_0_6b": 10,
@@ -238,6 +261,9 @@ class FreezeAndReportTest(unittest.TestCase):
         self.assertFalse(report["b_used_to_pick"])
         self.assertEqual(0, report["b_pairs_scored"])
         self.assertEqual(10, report["pair_count"])
+        self.assertEqual(3, report["eligible_slice_count"])
+        self.assertEqual(0, report["len1_pairs_scored"])
+        self.assertEqual(PAIR_SET_RULE, report["pair_set_rule"])
         for route_id in ROUTE_IDS:
             row = report["routes"][route_id]
             self.assertEqual(10, row["pairs"])
@@ -260,9 +286,11 @@ class FreezeAndReportTest(unittest.TestCase):
         text = (Path(__file__).resolve().parent / "README.md").read_text(
             encoding="utf-8")
         self.assertIn("A only selects", text)
+        self.assertIn("len≥2", text)
         self.assertIn("#156", text)
         self.assertIn("70%", text)
         self.assertIn("demoted", text)
+        self.assertIn("same length rule", text)
 
 
 if __name__ == "__main__":

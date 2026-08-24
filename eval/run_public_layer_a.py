@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot public-layer A forward (Squirrel #154 / AC-154-v1)."""
+"""One-shot public-layer A forward (Squirrel #154 / AC-154-v2)."""
 
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ from public_layer_a import (
     PublicLayerAError,
     ROUTE_IDS,
     apply_scores,
-    a_only,
     build_freeze,
-    count_a_pairs,
+    count_eligible_a,
+    eligible_a_slices,
     load_freeze,
     pair_hit,
     reconstruct_preceding,
@@ -276,7 +276,7 @@ def load_complete_hits(cache: Path, freeze_digest: str) -> dict:
 
 def _iter_a_records(slices, start_index=0):
     index = 0
-    for record in a_only(slices):
+    for record in eligible_a_slices(slices):
         if index >= start_index:
             yield index, record
         index += 1
@@ -564,8 +564,9 @@ def main(argv=None) -> int:
     print("loading lexicon", flush=True)
     lexicon = load_lexicon(cache)
     slices = read_slice_table(output / "slices.tsv")
-    pair_count = count_a_pairs(slices, lexicon)
-    print(f"A pairs={pair_count}", flush=True)
+    eligible_slice_count, pair_count = count_eligible_a(slices, lexicon)
+    print(f"A eligible slices={eligible_slice_count} pairs={pair_count}",
+          flush=True)
     if pair_count < 1:
         raise PublicLayerAError("A pair set is empty")
 
@@ -604,6 +605,7 @@ def main(argv=None) -> int:
         code_sha=current_code_sha(require_clean=creating),
         fingerprints=fingerprints,
         pair_count=pair_count,
+        eligible_slice_count=eligible_slice_count,
     )
     if creating:
         write_freeze(output, freeze)

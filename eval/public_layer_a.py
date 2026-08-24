@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public-layer A pairwise selection (Squirrel #154 / AC-154-v1)."""
+"""Public-layer A pairwise selection (Squirrel #154 / AC-154-v2)."""
 
 from __future__ import annotations
 
@@ -26,10 +26,12 @@ from public_layer_slicer import (
 from representations import NonFiniteRepresentationError, cosine
 
 
-CONTRACT_ID = "AC-154-v1"
+CONTRACT_ID = "AC-154-v2"
 PINNED_SLICE_DIGEST = (
     "8818cc8033834db953c69c470453b98ecc418d45469d730d078d7c004d63d667"
 )
+PAIR_SET_RULE = "target_len>=2"
+MIN_TARGET_LEN = 2
 ROUTE_IDS = (
     "dedicated_qwen3_embedding_0_6b",
     "dedicated_bge_m3",
@@ -68,8 +70,16 @@ def a_only(slices):
     return [record for record in slices if record.get("split") == "A"]
 
 
+def eligible_target(record) -> bool:
+    return len(record.get("target") or "") >= MIN_TARGET_LEN
+
+
+def eligible_a_slices(slices):
+    return [record for record in a_only(slices) if eligible_target(record)]
+
+
 def iter_a_pairs(slices, lexicon):
-    for record in a_only(slices):
+    for record in eligible_a_slices(slices):
         competitors = lexicon.competitors(
             record["target"], record["canonical_input"])
         for competitor in competitors:
@@ -89,12 +99,17 @@ def expand_a_pairs(slices, lexicon) -> tuple[APair, ...]:
     return tuple(iter_a_pairs(slices, lexicon))
 
 
-def count_a_pairs(slices, lexicon) -> int:
-    total = 0
-    for record in a_only(slices):
-        total += len(lexicon.competitors(
+def count_eligible_a(slices, lexicon) -> tuple[int, int]:
+    records = eligible_a_slices(slices)
+    pairs = 0
+    for record in records:
+        pairs += len(lexicon.competitors(
             record["target"], record["canonical_input"]))
-    return total
+    return len(records), pairs
+
+
+def count_a_pairs(slices, lexicon) -> int:
+    return count_eligible_a(slices, lexicon)[1]
 
 
 def reconstruct_preceding(text: str, start: int) -> str:
@@ -134,7 +149,8 @@ def select_winner(hits_by_route) -> str:
     return winners[0]
 
 
-def build_freeze(*, slice_digest, code_sha, fingerprints, pair_count) -> dict:
+def build_freeze(*, slice_digest, code_sha, fingerprints, pair_count,
+                 eligible_slice_count) -> dict:
     if slice_digest != PINNED_SLICE_DIGEST:
         raise PublicLayerAError("slice digest is not the accepted #153 pin")
     if set(fingerprints) != set(ROUTE_IDS):
@@ -143,6 +159,8 @@ def build_freeze(*, slice_digest, code_sha, fingerprints, pair_count) -> dict:
         raise PublicLayerAError("code SHA is missing")
     if not isinstance(pair_count, int) or pair_count < 1:
         raise PublicLayerAError("pair count must be a positive integer")
+    if not isinstance(eligible_slice_count, int) or eligible_slice_count < 1:
+        raise PublicLayerAError("eligible slice count must be a positive integer")
     routes = {}
     for route_id in ROUTE_IDS:
         fingerprint = fingerprints[route_id]
@@ -153,8 +171,11 @@ def build_freeze(*, slice_digest, code_sha, fingerprints, pair_count) -> dict:
         "contract": CONTRACT_ID,
         "slice_digest": slice_digest,
         "code_sha": code_sha,
+        "pair_set_rule": PAIR_SET_RULE,
+        "eligible_slice_count": eligible_slice_count,
         "pair_count": pair_count,
         "b_pairs": 0,
+        "len1_pairs_scored": 0,
         "routes": routes,
     }
     freeze["freeze_digest"] = sha256_bytes(
@@ -216,8 +237,11 @@ def build_report(freeze: dict, hits_by_route: dict) -> dict:
         "slice_digest": freeze["slice_digest"],
         "code_sha": freeze["code_sha"],
         "freeze_digest": freeze["freeze_digest"],
+        "pair_set_rule": freeze["pair_set_rule"],
+        "eligible_slice_count": freeze["eligible_slice_count"],
         "pair_count": pair_count,
         "b_pairs_scored": 0,
+        "len1_pairs_scored": 0,
         "b_used_to_pick": False,
         "routes": routes,
         "winner": select_winner(hits_by_route),
@@ -230,14 +254,17 @@ def build_report(freeze: dict, hits_by_route: dict) -> dict:
 
 def render_report_markdown(report: dict) -> str:
     lines = [
-        "# Public-layer A winner (AC-154-v1)",
+        "# Public-layer A winner (AC-154-v2)",
         "",
         f"- contract: `{report['contract']}`",
         f"- slice digest: `{report['slice_digest']}`",
         f"- code SHA: `{report['code_sha']}`",
         f"- freeze digest: `{report['freeze_digest']}`",
+        f"- pair-set rule: `{report['pair_set_rule']}`",
+        f"- eligible A slices: {report['eligible_slice_count']}",
         f"- A pairs: {report['pair_count']}",
         f"- B pairs scored: {report['b_pairs_scored']}",
+        f"- len=1 pairs scored: {report['len1_pairs_scored']}",
         f"- B used to pick: {str(report['b_used_to_pick']).lower()}",
         f"- winner: `{report['winner']}`",
         "",
@@ -261,9 +288,10 @@ def render_report_markdown(report: dict) -> str:
         )
     lines.extend([
         "",
-        "A only selects a representation. The public 70% pairwise gate is",
-        "#156 on split B. The retired v1/v2 95% gates stay demoted.",
-        "B was not scored. Live `α`/`γ` are unchanged.",
+        "A only selects a representation on `target_len>=2` pairs. The",
+        "public 70% pairwise gate is #156 on split B with the same length",
+        "rule. The retired v1/v2 95% gates stay demoted. B and len=1 were",
+        "not scored. Live `α`/`γ` are unchanged.",
         "",
     ])
     return "\n".join(lines)
