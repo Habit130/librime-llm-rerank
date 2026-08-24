@@ -35,9 +35,10 @@ from test_evidence import (  # noqa: E402
 from test_oracle import FactsFixture  # noqa: E402
 
 
-def trial(actionable=True, base_scores=None):
+def trial(complete_comparable=True, base_scores=None):
+    # Wire key "actionable" is historical (#152); old fixtures keep parsing.
     return {
-        "actionable": actionable,
+        "actionable": complete_comparable,
         "base_scores": base_scores if base_scores is not None
         else [1.0, 2.0],
     }

@@ -990,8 +990,9 @@ TEST(EvidenceProtocolTest, RequestCarriesFullContractFields) {
 }
 
 TEST(EvidenceProtocolTest, TrialEnvelopeSerializedIdentityOnly) {
-  // Squirrel#74: the plugin declares the group actionable and its γ=0 base
-  // scores as identity-only JSON (numbers only, never raw text).
+  // Squirrel#74/#152: the plugin declares the group complete-comparable and
+  // its γ=0 base scores as identity-only JSON (numbers only, never raw
+  // text).  Wire key trial.actionable is historical and must stay.
   FakeDaemon daemon([&](const string& request) -> std::optional<string> {
     EXPECT_NE(string::npos, request.find("\"trial\":{\"actionable\":true,"
                                          "\"base_scores\":[1,4]"));

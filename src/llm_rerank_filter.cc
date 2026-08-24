@@ -335,7 +335,8 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   // budget.  The trial envelope (#74) rides along: the plugin's γ=0 base
   // scores for this group, so the daemon can replay the same group with γ=0
   // (shadow) and with the served evidence (final) and record an identity-only
-  // order-change trace (or aggregates only).
+  // order-change trace (or aggregates only).  Each complete group is one
+  // complete-comparable request (#152); incomplete groups are skipped.
   if (evidence_active_) {
     if (!evidence_scorer_) {
       LogWindowFailure("evidence_unavailable", "evidence", buffer.size());
@@ -361,7 +362,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       for (size_t index : *group.candidate_indexes) {
         evidence_request.candidate_texts.push_back(buffer[index]->text());
         evidence_request.trial.present = true;
-        evidence_request.trial.actionable = true;
+        evidence_request.trial.complete_comparable = true;
         evidence_request.trial.base_scores.push_back(scores[index].base_score);
       }
       vector<double> group_evidence;

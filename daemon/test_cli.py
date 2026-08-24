@@ -760,7 +760,7 @@ class TrialCliTest(unittest.TestCase):
                  "request_id": request_id, "plan_identity": "p",
                  "config_identity": "c",
                  "fact_high_water": {"store_epoch": "e1"},
-                 "actionable": True, "candidate_count": 2},
+                 "complete_comparable": True, "candidate_count": 2},
                 "ok",
                 trace_payload={"kind": "order_change",
                                "request_id": request_id,
@@ -783,7 +783,7 @@ class TrialCliTest(unittest.TestCase):
                  "request_id": request_id, "plan_identity": "p",
                  "config_identity": "c",
                  "fact_high_water": {"store_epoch": "e1"},
-                 "actionable": True, "candidate_count": 2},
+                 "complete_comparable": True, "candidate_count": 2},
                 "oracle_fault",
                 trace_payload={"kind": "fault",
                                "error_code": "oracle_fault",
@@ -837,8 +837,8 @@ class TrialCliTest(unittest.TestCase):
             "mispromotion_rate",
             {"window": 100, "confirmed": 3},
             "2026-01-01T00:00:00+00:00",
-            "3 user-confirmed mispromotions in the last 100 actionable "
-            "events; suggest rollback to gamma=0")
+            "3 user-confirmed mispromotions in the last 100 "
+            "complete-comparable requests; suggest rollback to gamma=0")
         rc, out, err = self.run_cli("alarm", "list")
         self.assertEqual(0, rc, err)
         self.assertIn("mispromotion_rate", out)

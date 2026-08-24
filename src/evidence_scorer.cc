@@ -119,11 +119,12 @@ string BuildEvidenceRequest(const EvidenceScorer::GroupRequest& request,
     json += "null";
   }
   // Trial envelope (#74): additive, identity-only; absent when the plugin
-  // does not participate in trace recording.
+  // does not participate in trace recording.  Wire key "actionable" is the
+  // historical name of complete_comparable (#152); do not rename.
   if (request.trial.present) {
     const EvidenceScorer::Trial& trial = request.trial;
     json += ",\"trial\":{\"actionable\":";
-    json += trial.actionable ? "true" : "false";
+    json += trial.complete_comparable ? "true" : "false";
     json += ",\"base_scores\":[";
     for (size_t i = 0; i < trial.base_scores.size(); ++i) {
       if (i > 0)

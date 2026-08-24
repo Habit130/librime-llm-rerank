@@ -30,13 +30,18 @@ class EvidenceScorer {
     int64_t hlc_logical = 0;
   };
 
-  // Trial envelope (Habit130/squirrel#74): the plugin's γ=0 base scores for
-  // desensitized trace recording.  The daemon replays the same group with
-  // γ=0 (shadow) and with the served evidence (final) and compares the emit
-  // orders.  Identity/numbers only -- never 上文, candidate text or
-  // embeddings.
+  // Trial envelope (Habit130/squirrel#74, #152): the plugin's γ=0 base
+  // scores for desensitized trace recording.  The daemon replays the same
+  // group with γ=0 (shadow) and with the served evidence (final) and
+  // compares the emit orders.  Identity/numbers only -- never 上文,
+  // candidate text or embeddings.
+  //
+  // complete_comparable is a complete rerank group that can be
+  // shadow-compared (完整可比较组).  It is not CONTEXT.md Actionable Event
+  // (non-zero pre-existing retrieval evidence).  The wire key stays
+  // "trial.actionable" so existing AC-74 traces parse.
   struct Trial {
-    bool actionable = false;       // request has a complete comparable group
+    bool complete_comparable = false;
     vector<double> base_scores;    // γ=0 scores, one per group candidate
     bool present = false;
   };

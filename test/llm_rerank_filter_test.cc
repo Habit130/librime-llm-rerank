@@ -955,9 +955,9 @@ TEST(EvidenceRerankTest, SupporterMissingLeavesGroupUnchanged) {
 
 TEST(EvidenceRerankTest, TrialEnvelopeCarriesBaseScores) {
   // The trial rides on every complete-group evidence request: it declares
-  // the group actionable and carries the γ=0 base scores (identity-only,
-  // one per group candidate, in merge order).  The daemon replays shadow
-  // vs final emit order from these numbers.
+  // the group complete-comparable and carries the γ=0 base scores
+  // (identity-only, one per group candidate, in merge order).  The daemon
+  // replays shadow vs final emit order from these numbers.
   auto evidence = New<FakeEvidenceScorer>();
   evidence->scripted_["ab"] = {0.0, 0.5};
   auto filter = MakeEvidenceFilter(evidence, 10.0);
@@ -971,7 +971,7 @@ TEST(EvidenceRerankTest, TrialEnvelopeCarriesBaseScores) {
   ASSERT_NE(nullptr, ab);
   const auto& trial = ab->trial;
   EXPECT_TRUE(trial.present);
-  EXPECT_TRUE(trial.actionable);
+  EXPECT_TRUE(trial.complete_comparable);
   ASSERT_EQ(2u, trial.base_scores.size());
   EXPECT_DOUBLE_EQ(3.0, trial.base_scores[0]);
   EXPECT_DOUBLE_EQ(1.0, trial.base_scores[1]);
@@ -995,7 +995,7 @@ TEST(EvidenceRerankTest, TrialEnvelopeTracksEachGroup) {
   ASSERT_FALSE(evidence->requests.empty());
   for (const auto& request : evidence->requests) {
     EXPECT_TRUE(request.trial.present);
-    EXPECT_TRUE(request.trial.actionable);
+    EXPECT_TRUE(request.trial.complete_comparable);
     EXPECT_EQ(request.candidate_texts.size(),
               request.trial.base_scores.size());
   }
@@ -1054,8 +1054,9 @@ TEST(EvidenceRerankTest, IncompleteGroupSendsNoEvidenceRequest) {
                                           MakePhrase("table", 0, 2, "丙", 2.0),
                                       });
   EXPECT_EQ((vector<string>{"甲", "乙", "丙"}), CollectTexts(filtered));
-  // The truncated first window holds the boundary group without requesting
-  // evidence; the trailing single-candidate complete group is scored.
+  // The truncated first window holds the incomplete group without a
+  // complete-comparable trial; the trailing single-candidate complete group
+  // is scored.
   ASSERT_EQ(1u, evidence->requests.size());
   EXPECT_EQ("ab", evidence->requests[0].canonical_segment_input);
 }
