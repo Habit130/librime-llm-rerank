@@ -116,6 +116,20 @@ GENERATION_FILES = ("manifest.json", "metadata.json", "vectors.fp32")
 PROGRESS_FILENAME = "progress.json"
 
 
+class AtomicWriteCommitted(Exception):
+    """The target path was replaced; parent-directory durability failed.
+
+    The new bytes are already visible at ``path``. Callers must not treat
+    this as a pre-rename failure or roll back a generation the new file
+    references.
+    """
+
+    def __init__(self, message, path=None):
+        super().__init__(message)
+        self.path = path
+        self.committed = True
+
+
 class GenerationError(Exception):
     """Base fault of the generation path (never an empty-memory result)."""
 
@@ -482,9 +496,15 @@ def _write_file(path, content):
 
 
 def _write_atomic(path, content):
-    """Atomic replacement with fsync (used for the progress manifest)."""
+    """Atomic replacement: temp write + fsync + rename + parent fsync.
+
+    Failures before ``os.replace`` leave the target unchanged (pre-commit).
+    A parent-directory fsync failure after a successful replace raises
+    ``AtomicWriteCommitted``: the target already holds the new bytes.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    renamed = False
     try:
         view = memoryview(content) if isinstance(content, bytes) else content
         written = 0
@@ -493,13 +513,18 @@ def _write_atomic(path, content):
         os.fsync(fd)
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
-        _fsync_directory(directory)
+        renamed = True
+        try:
+            _fsync_directory(directory)
+        except OSError as error:
+            raise AtomicWriteCommitted(
+                "post-rename fsync failed: %s" % error, path=path) from error
     finally:
         try:
             os.close(fd)
         except OSError:
             pass
-        if os.path.exists(tmp_path):
+        if not renamed and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
             except OSError:
