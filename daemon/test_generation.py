@@ -50,6 +50,7 @@ from generation import (  # noqa: E402
     RETRIEVAL_BACKEND,
     UNIT_NORM_TOLERANCE,
     VECTOR_FORMAT,
+    AtomicWriteCommitted,
     BuildBlockedError,
     BuildEpochChangedError,
     BuildTargetExistsError,
@@ -57,6 +58,7 @@ from generation import (  # noqa: E402
     GenerationError,
     GenerationRejected,
     GenerationRepresentationProvider,
+    _write_atomic,
     build_generation,
     open_generation,
     replay_exact,
@@ -877,6 +879,93 @@ class EmptyContainerEdgeTest(unittest.TestCase):
         finally:
             facts.close()
             shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# AC-133: pre-rename vs post-rename classification of _write_atomic
+# ---------------------------------------------------------------------------
+
+class AtomicWriteCommitTest(unittest.TestCase):
+    """SCN-133-1/2: temp write, temp fsync and rename stay pre-commit;
+    parent fsync after a successful replace is committed/ambiguous."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="atomic_write_")
+        self.path = os.path.join(self.root, "target.json")
+        with open(self.path, "wb") as handle:
+            handle.write(b"old-bytes")
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_temp_write_failure_leaves_the_target_unchanged(self):
+        original = os.write
+
+        def boom(fd, data):
+            raise OSError("injected temp write failed")
+
+        os.write = boom
+        try:
+            with self.assertRaises(OSError) as raised:
+                _write_atomic(self.path, b"new-bytes")
+        finally:
+            os.write = original
+        self.assertNotIsInstance(raised.exception, AtomicWriteCommitted)
+        self.assertFalse(getattr(raised.exception, "committed", False))
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"old-bytes")
+
+    def test_temp_fsync_failure_leaves_the_target_unchanged(self):
+        original = os.fsync
+
+        def boom(fd):
+            raise OSError("injected temp fsync failed")
+
+        os.fsync = boom
+        try:
+            with self.assertRaises(OSError) as raised:
+                _write_atomic(self.path, b"new-bytes")
+        finally:
+            os.fsync = original
+        self.assertNotIsInstance(raised.exception, AtomicWriteCommitted)
+        self.assertFalse(getattr(raised.exception, "committed", False))
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"old-bytes")
+
+    def test_rename_failure_leaves_the_target_unchanged(self):
+        original = os.replace
+
+        def boom(src, dst):
+            raise OSError("injected rename failed")
+
+        os.replace = boom
+        try:
+            with self.assertRaises(OSError) as raised:
+                _write_atomic(self.path, b"new-bytes")
+        finally:
+            os.replace = original
+        self.assertNotIsInstance(raised.exception, AtomicWriteCommitted)
+        self.assertFalse(getattr(raised.exception, "committed", False))
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"old-bytes")
+
+    def test_parent_fsync_failure_is_committed_and_keeps_the_new_bytes(self):
+        import generation
+        original = generation._fsync_directory
+
+        def boom(path):
+            raise OSError("injected parent fsync failed")
+
+        generation._fsync_directory = boom
+        try:
+            with self.assertRaises(AtomicWriteCommitted) as raised:
+                _write_atomic(self.path, b"new-bytes")
+        finally:
+            generation._fsync_directory = original
+        self.assertTrue(raised.exception.committed)
+        self.assertIn("post-rename fsync failed", str(raised.exception))
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"new-bytes")
 
 
 if __name__ == "__main__":
