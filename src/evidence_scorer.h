@@ -76,15 +76,24 @@ class EvidenceScorer {
                           int remaining_deadline_ms);
 
   // Canonical evidence config identity shared with the daemon
-  // (daemon/evidence.py compose_config_identity).  The double formatting must
-  // stay byte-identical on both sides: defaultfloat, six significant digits,
-  // "inf" for infinity.
+  // (daemon/evidence.py compose_config_identity).  Six significant digits
+  // (defaultfloat / %.6g) are the configuration domain, not merely a display
+  // format (Habit130/squirrel#132 option 1 / #151; AC-61 is not superseded).
+  // Every double is ingested through FormatIdentityDouble so colliding
+  // values share one identity.  Already-canonical bytes stay unchanged;
+  // the evidence-v1 prefix is unchanged.  Infinity is "inf"; other
+  // non-finite values fail closed (empty string).
   static string ComposeConfigIdentity(const string& representation_id,
                                       double tau,
                                       int k_evidence,
                                       double half_life,
                                       double saturation_k,
                                       double gamma);
+
+  // Ingest one double into the six-significant-digit identity domain.
+  // Paired with daemon/evidence.py format_identity_double.  Returns false
+  // for non-finite values other than infinity.
+  static bool FormatIdentityDouble(double value, string* out);
 
   // Read-only fact high-water (store_epoch + max change HLC) for the request
   // watermark.  A missing store or unreadable meta leaves present=false (the
