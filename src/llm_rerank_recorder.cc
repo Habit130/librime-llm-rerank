@@ -93,7 +93,14 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
     // before releasing the shared maintenance lease.
     FactStore store(FactStore::DefaultRootDir());
     FactStore::Status status = store.Open();
-    if (status != FactStore::Status::kOk) {
+    if (status == FactStore::Status::kMaintenanceLocked) {
+      // Transient: the coordinator already retries a locked persist. Do not
+      // disable the session or retry Open() on the input path.
+      session_->fault_code = FactStore::StatusCode(status);
+      LOG(WARNING) << "llm_rerank recorder: code=recording_deferred"
+                   << " reason=" << session_->fault_code
+                   << " schema=" << schema_id;
+    } else if (status != FactStore::Status::kOk) {
       recording_enabled_ = false;
       session_->fault_code = FactStore::StatusCode(status);
       LOG(WARNING) << "llm_rerank recorder: code=recording_disabled"

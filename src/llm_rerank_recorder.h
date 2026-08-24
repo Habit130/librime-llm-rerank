@@ -34,13 +34,19 @@ class KeyEvent;
 // never happens silently.
 //
 // Recording is off by default (`llm_rerank/recording_enabled`, user story 26:
-// upgrades must not start collecting raw preceding text silently).
+// upgrades must not start collecting raw preceding text silently). A
+// construction-time FactStore open that returns `kMaintenanceLocked` is
+// transient: recording stays enabled so the same session can resume after
+// the exclusive lease is released, without retrying open on the input path.
 class LlmRerankRecorder : public Processor {
  public:
   explicit LlmRerankRecorder(const Ticket& ticket);
   ~LlmRerankRecorder() override;
 
   ProcessResult ProcessKeyEvent(const KeyEvent& key_event) override;
+
+  bool recording_enabled() const { return recording_enabled_; }
+  RecorderSession* session() const { return session_.get(); }
 
  private:
   void OnSelect(Context* ctx);

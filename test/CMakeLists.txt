@@ -17,6 +17,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     fact_sqlite_terminal_test.cc
     recorder_e2e_test.cc
     recorder_coordinator_test.cc
+    llm_rerank_recorder_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
   target_link_libraries(llm_rerank_test
     ${rime_library}

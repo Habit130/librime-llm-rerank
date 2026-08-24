@@ -57,9 +57,13 @@ The semantic-memory fact root contains an owner-only `maintenance.lock`. Fact
 writes and daemon fact readers take a shared advisory lease before opening
 SQLite; maintenance callers take a bounded exclusive lease only after their
 preflight and daemon prepare steps complete. The recorder never waits for that
-exclusive lease, and its commit path never performs durable I/O at all: a
-single worker thread owns the store, the per-process crash-evidence marker
-(`.recording_process.*`) and the gap-state files. Complete commit batches and
+exclusive lease, and its commit path never performs durable I/O at all. A
+session constructed while the exclusive lease is held treats the locked open
+as transient: recording stays enabled, events that cannot be retained surface
+as gap/fault status, and the same session resumes after the lease is released
+without an application restart. A single worker thread owns the store, the
+per-process crash-evidence marker (`.recording_process.*`) and the gap-state
+files. Complete commit batches and
 their immediate retractions remain in one process-local FIFO, bounded at 256
 commit batches or 16 MiB of documented logical payload. Overflow and shutdown
 leftovers are recorded in the owner-only, versioned `recording_gap.json`
