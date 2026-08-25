@@ -470,16 +470,33 @@ def _main_driver(args):
             matrix.append(route_result)
         # Reference split data (route-independent facts) for the terminal.
         if all_not_calibratable and not args.fixture:
+            # Deterministic legal terminal (RISK-157-3): every route is
+            # provably not_calibratable from the prefix, so no cell can be
+            # evaluated and no claim set interpretation applies.  The
+            # decision is 无合格方案 by construction, never 数据不足.
+            from shortlist_cc import TERMINAL_NO_QUALIFIED
             data = {
                 "prefix": facts_only_data_count(prefix_targets),
                 "suffix": facts_only_data_count(suffix_targets),
+            }
+            decision = {
+                "outcome": TERMINAL_NO_QUALIFIED,
+                "reason": ("all routes τ not_calibratable (prefix "
+                           "hard-negative queries %d < 200); no τ is "
+                           "invented, no cell is evaluated and the suffix "
+                           "claim gates cannot run (RISK-157-3)" % hn_count),
+                "data": data,
+                "per_route": matrix,
+                "total_eligible_cells": 0,
+                "any_evaluated": False,
+                "live_gamma": 0.0,
             }
         else:
             data = {
                 "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
                 "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
             }
-        decision = assemble_shortlist(matrix, data)
+            decision = assemble_shortlist(matrix, data)
         if args.max_cells is not None:
             decision["partial_scan"] = True
         _write_report(snapshot, matrix, decision, data_by_route, data,
