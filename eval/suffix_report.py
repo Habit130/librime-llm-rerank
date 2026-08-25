@@ -117,6 +117,18 @@ def build_report(*, engine_version, code_sha, snapshot, prefix_events,
         },
         "split": split_hashes(snapshot["path"], prefix_events,
                               suffix_events),
+        "prefix_reference": {
+            # RISK-157-5: the claim-time snapshot's prefix may not
+            # byte-match the #77/#155 prefix after later retractions; the
+            # report carries both the claim-time split and the prior
+            # accepted pins (quoted, not re-verified).
+            "accepted_prefix_pins": [
+                ("b1bfde41a9399a67409691f0de22dda7690a69ceb87edebcd3"
+                 "fe44059c87ba76"),
+                ("ce69b7292a92cf6a64c24c512d843250cfdd2a3c837c3772b"
+                 "277bae686709be7"),
+            ],
+        },
         "seed": seed,
         "replicates": replicates,
         "environment": environment_summary(),
