@@ -536,6 +536,7 @@ def main(argv=None) -> int:
             raise EnvironmentBlocker("missing_mlx_runtime")
         if not os.path.isdir(args.model):
             raise EnvironmentBlocker("missing_mlx_model")
+        _write_keys(cache, rows)
         print("l28 preflight over %d complete keys" % len(rows), flush=True)
         _spawn(args.daemon_python, ["--preflight-l28"],
                cache=cache, output=output)
