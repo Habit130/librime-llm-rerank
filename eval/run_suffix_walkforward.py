@@ -474,7 +474,7 @@ def _main_driver(args):
         decision = assemble_shortlist(matrix, data)
         if args.max_cells is not None:
             decision["partial_scan"] = True
-        _write_report(snapshot, matrix, decision, data_by_route,
+        _write_report(snapshot, matrix, decision, data_by_route, data,
                       prefix_targets, suffix_targets, code_sha, args,
                       cache, output)
         print("terminal outcome: %s" % decision["outcome"], flush=True)
@@ -510,7 +510,7 @@ def _build_freeze(code_sha, snapshot, identities, args):
     }
 
 
-def _write_report(snapshot, matrix, decision, data_by_route,
+def _write_report(snapshot, matrix, decision, data_by_route, data,
                   prefix_targets, suffix_targets, code_sha, args,
                   cache, output):
     report = build_report(
@@ -521,7 +521,7 @@ def _write_report(snapshot, matrix, decision, data_by_route,
         suffix_events=suffix_targets,
         route_results=matrix,
         decision=decision,
-        data=data_by_route,
+        data=data,
         tau_status=[{"route_id": r["route_id"], "tau": r.get("tau")}
                     for r in matrix],
         margin_base={"note": "prefix events where the shadow baseline "
