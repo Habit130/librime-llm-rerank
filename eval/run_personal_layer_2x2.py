@@ -531,8 +531,7 @@ def main(argv=None) -> int:
     groups = group_keys(events)
     complete, reasons = classify_keys(groups)
     rows = _rows_from_complete(complete)
-    creating = not (output / "prefix_2x2_freeze.json").exists()
-    if creating and rows:
+    if rows:
         if not os.path.isfile(args.daemon_python):
             raise EnvironmentBlocker("missing_mlx_runtime")
         if not os.path.isdir(args.model):
@@ -555,6 +554,7 @@ def main(argv=None) -> int:
         complete_key_count=len(rows),
         incomplete_reasons=reasons,
     )
+    creating = not (output / "prefix_2x2_freeze.json").exists()
     if creating:
         write_freeze(output, freeze)
         print("froze %s complete=%d incomplete=%s" % (
