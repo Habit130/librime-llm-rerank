@@ -96,7 +96,7 @@ def prefix_hard_negative_query_count(facts, prefix_targets):
     calibration would report.
     """
     from walkforward_cc import WalkForwardReplay  # circular-safe local import
-    retracted = set(facts.all_retractions())
+    retracted = facts.all_retractions()
     events = facts.events()
     by_key = {}
     for event in events:
