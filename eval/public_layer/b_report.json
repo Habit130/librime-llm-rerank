@@ -1,0 +1,22 @@
+{
+  "contract": "AC-156-v1",
+  "slice_digest": "8818cc8033834db953c69c470453b98ecc418d45469d730d078d7c004d63d667",
+  "code_sha": "461cab18425bb76f62e2d6ac67d883efb6892de4",
+  "freeze_digest": "fb72da82ddb5a4691446b137d754f6cd344f3de8c1c818c5ebdb87adb1a8cb81",
+  "a_winner": "dedicated_bge_m3",
+  "a_freezer_digest": "091af6f9b84925b920dced2dfb218a8079052351b8c1a2735eb9f37081250ed1",
+  "a_winner_fingerprint": "dedicated-embedding-repr-v1:route=bge-m3-dense-1024:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=b9d800590cbaf23471af0d0722870b0a6f8681dc09630ed12cd57db0a9c34b2d:tokenizer=ec113500465479de593e55e1972aee45f0932447604272792b5e98db0fb9a35a:adapter=bge-m3:instruction=none:pool=dense-mean:dim=1024:format=fp32-l2:metric=cosine:deps=torch@2.7.1,transformers@4.52.4,tokenizers@0.21.1,safetensors@0.5.3",
+  "pair_set_rule": "target_len>=2;stride=8;index_mod=0;split=B",
+  "query_rule": "ctx-as-query:last64",
+  "b_source_table_digest": "e93f25f11826b3cbaf93d372f65b8bea5060d240235ffe99a9b71b83d720f7cc",
+  "b_source_slice_count": 17982,
+  "b_source_pair_count": 118081,
+  "eligible_slice_count": 2248,
+  "pair_count": 14725,
+  "compact_table_digest": "16de4da09538c318961b8102d89fe71fbdc6d6aa627070dad75a1c5e048a7795",
+  "gate_accuracy": 0.7,
+  "hits": 11953,
+  "accuracy": 0.811748726655348,
+  "gate_passed": true,
+  "winner": "dedicated_bge_m3"
+}
