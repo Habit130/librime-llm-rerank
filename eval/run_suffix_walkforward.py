@@ -62,6 +62,18 @@ from suffix_report import (build_report, verify_privacy,  # noqa: E402
                            render_markdown)
 
 
+# Machine-bound defaults follow the AC-155 precedent: runtimes, models and
+# the claim-time work area live in the main librime-llm-rerank checkout
+# (`.local-work/` is gitignored there; the worktree carries only code).
+MAIN_REPO = Path(os.path.abspath(__file__)).resolve().parents[1]
+if not (MAIN_REPO / ".local-work").exists():
+    MAIN_REPO = Path("/Users/habit/Developer/librime-llm-rerank")
+
+
+def _main_path(*parts):
+    return str(MAIN_REPO.joinpath(*parts))
+
+
 FREEZE_NAME = "suffix_walkforward_freeze.json"
 REPORT_JSON_NAME = "suffix_walkforward_report.json"
 REPORT_MD_NAME = "SUFFIX_WALKFORWARD_REPORT.md"
@@ -268,18 +280,14 @@ def parse_args(argv=None):
         "~/Developer/librime-llm-rerank/daemon/squirrel-semantic-memory"))
     parser.add_argument("--qwen-base", default="/Users/habit/Models/Qwen/"
                          "Qwen3-0.6B-Base")
-    parser.add_argument("--qwen3-embedding-model", default=str(
-        Path(__file__).resolve().parents[1] / ".local-work" / "models" /
-        "Qwen3-Embedding-0.6B"))
-    parser.add_argument("--bge-model", default=str(
-        Path(__file__).resolve().parents[1] / ".local-work" / "models" /
-        "BGE-M3"))
-    parser.add_argument("--embedding-python", default=str(
-        Path(__file__).resolve().parents[1] / ".local-work" /
-        "venv-embeddings" / "bin" / "python"))
-    parser.add_argument("--daemon-python", default=str(
-        Path(__file__).resolve().parents[1] / "daemon" / ".venv" / "bin" /
-        "python"))
+    parser.add_argument("--qwen3-embedding-model", default=_main_path(
+        ".local-work", "models", "Qwen3-Embedding-0.6B"))
+    parser.add_argument("--bge-model", default=_main_path(
+        ".local-work", "models", "BGE-M3"))
+    parser.add_argument("--embedding-python", default=_main_path(
+        ".local-work", "venv-embeddings", "bin", "python"))
+    parser.add_argument("--daemon-python", default=_main_path(
+        "daemon", ".venv", "bin", "python"))
     parser.add_argument("--seed", type=int, default=BOOTSTRAP_SEED)
     parser.add_argument("--replicates", type=int, default=BOOTSTRAP_REPLICATES)
     parser.add_argument("--snapshot", default=None,
