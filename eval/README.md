@@ -65,6 +65,36 @@ set. B and len=1 are not scored. Committed outputs are
 `public_layer/a_freeze.json`, `public_layer/a_report.json`, and
 `public_layer/A_REPORT.md`.
 
+## Public-layer B gate (Habit130/squirrel#156)
+
+`public_layer_b.py` + `run_public_layer_b.py` score **only** the frozen A
+winner `dedicated_bge_m3` on the **stride-8 subset** of every #153 B slice
+whose target length is ≥ 2: same compact-table sorting and file-order
+`i % 8 == 0` rule as A, all competitors kept, rebuilt from B slices
+(`pair_set_rule target_len>=2;stride=8;index_mod=0;split=B`). BGE gets no
+instruction on either side. A is never rescored and its winner is not
+re-picked after B is seen.
+
+```sh
+python3 eval/run_public_layer_b.py
+python3 -m unittest eval.test_public_layer_b
+```
+
+The B compact table is rebuilt from the B source table, never from the A
+stride file. The build phase drops the slicer lexicon before any scoring;
+the scoring process streams the compact table and must not load essay-DFS
+or full `pinyin_to_words`. A scoring process that exceeds 8G physical
+footprint stops.
+
+The gate is the #150 public rule: `accuracy >= 0.70` on B → public winner
+`dedicated_bge_m3`; below → `无公开赢家`. Both are legal terminals. It is
+not the retired 95% τ, not a personal `r`, and a public winner here does
+not enable `γ` or #113. #155 is not started by this ticket. Identity is
+frozen before any score: #153 digest, A-winner fingerprint from the #154
+freeze, this ticket's code SHA, and the B pair-set rule. Committed outputs
+are `public_layer/b_freeze.json`, `public_layer/b_report.json`, and
+`public_layer/B_REPORT.md`.
+
 ## Canonical fixture
 
 The fixture is reproduced from Squirrel PR #24 (head commit
