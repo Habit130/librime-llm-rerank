@@ -84,6 +84,44 @@ def query_hard_negative_cosines(replay, prefix_targets):
     return result
 
 
+def prefix_hard_negative_query_count(facts, prefix_targets):
+    """Facts-only count of prefix queries that WILL have a hard negative.
+
+    A prefix target contributes a query-level hard negative iff a same-key
+    history event exists with a different final selection whose (normalized)
+    text matches one of the target's current-group candidates — the exact
+    condition ``query_hard_negative_cosines`` uses, minus the cosine
+    (which needs vectors).  This lets the driver decide not_calibratable /
+    terminal BEFORE any model forward (RISK-157-3), with the same count the
+    calibration would report.
+    """
+    from walkforward_cc import WalkForwardReplay  # circular-safe local import
+    retracted = set(facts.all_retractions())
+    events = facts.events()
+    by_key = {}
+    for event in events:
+        by_key.setdefault(event.key, []).append(event)
+    count = 0
+    for target in prefix_targets:
+        target_selection = match_text(target.final_selection_text)
+        candidates = {match_text(c) for c in target.competition}
+        for h in by_key.get(target.key, ()):
+            if h.commit_id == target.commit_id:
+                continue
+            if h.hlc > target.hlc:
+                continue
+            retraction = retracted.get(h.commit_id)
+            if retraction is not None and retraction <= target.hlc:
+                continue
+            selected = match_text(h.final_selection_text)
+            if selected == target_selection:
+                continue
+            if selected in candidates:
+                count += 1
+                break
+    return count
+
+
 def nearest_rank_quantile(sorted_values, q):
     """Nearest-rank quantile of a sorted ascending sample."""
     if not sorted_values:

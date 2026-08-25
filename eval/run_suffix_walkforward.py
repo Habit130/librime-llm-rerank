@@ -55,8 +55,8 @@ from walkforward_cc import (  # noqa: E402
     ROUTE_IDS, L28_ROUTE_ID, BOOTSTRAP_SEED, BOOTSTRAP_REPLICATES,
     CandidateVectorTable, WalkForwardReplay, needed_query_pairs,
     margin_base_prefix, prefix_suffix_split)
-from calibration_cc import calibrate_tau  # noqa: E402
-from grid_cc import data_counts, grid_manifest, run_route  # noqa: E402
+from calibration_cc import calibrate_tau, prefix_hard_negative_query_count  # noqa: E402
+from grid_cc import data_counts, facts_only_data_count, grid_manifest, run_route  # noqa: E402
 from shortlist_cc import assemble_shortlist  # noqa: E402
 from suffix_report import (build_report, verify_privacy,  # noqa: E402
                            render_markdown)
@@ -381,6 +381,15 @@ def _main_driver(args):
             if identities[route_id]["route_id"] != route_id:
                 raise EnvironmentBlocker("identity drifted for %s" % route_id)
 
+        # -- facts-only not_calibratable pre-check (RISK-157-3) -----------
+        # The hard-negative query count is a pure fact of the prefix (which
+        # queries would have a differing-selection same-key history).  When
+        # it is below the frozen 200 for every route, all routes are
+        # provably not_calibratable BEFORE any model forward: the legal
+        # terminal is 无合格方案 and no GPU/MLX work is spent.
+        hn_count = prefix_hard_negative_query_count(facts, prefix_targets)
+        all_not_calibratable = hn_count < 200
+
         # -- freeze BEFORE any score --------------------------------------
         freeze = _build_freeze(code_sha, snapshot, identities, args)
         frozen_path = output / FREEZE_NAME
@@ -398,27 +407,46 @@ def _main_driver(args):
 
         # -- per-route vector workers (exclusive GPU/MLX, one at a time) --
         providers = {}
-        for route_id in ROUTE_IDS:
-            if args.fixture:
-                provider = _fixture_provider(events, route_id)
-            else:
-                spawn_python = (args.embedding_python
-                                if route_id != L28_ROUTE_ID
-                                else args.daemon_python)
-                _spawn(spawn_python, ["--score-route", route_id],
-                       cache=cache, output=output, snapshot=snapshot_path)
-                provider = _load_route_vectors(
-                    cache, route_id, identities[route_id])
-            providers[route_id] = provider
+        if not all_not_calibratable or args.fixture:
+            for route_id in ROUTE_IDS:
+                if args.fixture:
+                    provider = _fixture_provider(events, route_id)
+                else:
+                    spawn_python = (args.embedding_python
+                                    if route_id != L28_ROUTE_ID
+                                    else args.daemon_python)
+                    _spawn(spawn_python, ["--score-route", route_id],
+                           cache=cache, output=output, snapshot=snapshot_path)
+                    provider = _load_route_vectors(
+                        cache, route_id, identities[route_id])
+                providers[route_id] = provider
 
         # -- replay + calibration + grid -----------------------------------
         matrix = []
         data_by_route = {}
+        tau_status_by_route = {}
         for route_id in ROUTE_IDS:
+            if all_not_calibratable and not args.fixture:
+                # Legal terminal (RISK-157-3): no τ can be calibrated from
+                # the prefix (< 200 hard-negative queries); no FX forward
+                # is spent and the route leaves the shortlist.
+                tau_status_by_route[route_id] = {
+                    "state": "not_calibratable",
+                    "queries": hn_count,
+                    "min_queries": 200,
+                    "prefix_count": len(prefix_targets),
+                }
+                route_result = run_route(
+                    None, route_id, tau_status_by_route[route_id],
+                    {"prefix": {}, "suffix": {}}, seed=args.seed,
+                    replicates=args.replicates)
+                matrix.append(route_result)
+                continue
             provider = providers[route_id]
             vectors = CandidateVectorTable(events, provider)
             replay = WalkForwardReplay(facts, vectors)
             tau_status = calibrate_tau(replay, prefix_targets)
+            tau_status_by_route[route_id] = tau_status
             reference = replay.replay(_reference_params(), 0.0)
             prefix_ref = [o for o in reference if o.in_prefix]
             suffix_ref = [o for o in reference if not o.in_prefix]
@@ -432,10 +460,18 @@ def _main_driver(args):
                 seed=args.seed, replicates=args.replicates,
                 max_cells=args.max_cells, margin_p10=margin_p10)
             matrix.append(route_result)
-        decision = assemble_shortlist(matrix, {
-            "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
-            "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
-        })
+        # Reference split data (route-independent facts) for the terminal.
+        if all_not_calibratable and not args.fixture:
+            data = {
+                "prefix": facts_only_data_count(prefix_targets),
+                "suffix": facts_only_data_count(suffix_targets),
+            }
+        else:
+            data = {
+                "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
+                "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
+            }
+        decision = assemble_shortlist(matrix, data)
         if args.max_cells is not None:
             decision["partial_scan"] = True
         _write_report(snapshot, matrix, decision, data_by_route,

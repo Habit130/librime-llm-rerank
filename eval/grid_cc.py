@@ -169,6 +169,37 @@ def data_counts(outcomes):
     }
 
 
+def facts_only_data_count(targets):
+    """Facts-only counts for the legal 无合格方案 terminal (RISK-157-3).
+
+    When every route is provably `not_calibratable` from the prefix (fewer
+    than 200 hard-negative queries, a property of the facts alone), the
+    run reports the legal terminal without spending any FX forward; the
+    data-state block then carries the counts that are knowable from the
+    snapshot (replayable / group-complete / keys / strata).  Actionability
+    needs a replay, so it is not invented here.
+    """
+    group_complete = [t for t in targets if t.group_complete]
+    keys = set(t.key_hash for t in group_complete)
+    explicit_indexed = sum(1 for t in group_complete
+                           if t.confirmation_source == "explicit_indexed")
+    rank_gt1 = sum(1 for t in group_complete if (
+        not (t.display_page == 1 and t.display_rank == 1)))
+    return {
+        "replayable": len(targets),
+        "group_complete": len(group_complete),
+        "keys": len(keys),
+        "explicit_indexed": explicit_indexed,
+        "rank_gt1": rank_gt1,
+        "actionable_group_complete": 0,
+        "actionable_keys": 0,
+        "coverage": (len(group_complete) / len(targets)
+                     if targets else 0.0),
+        "actionable_note": "not scored: no route calibratable from the "
+                           "prefix (RISK-157-3)",
+    }
+
+
 def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES):
     """Run one grid cell; suffix gates + prefix selection metrics.
 
