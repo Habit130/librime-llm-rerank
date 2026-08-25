@@ -74,8 +74,9 @@ def query_hard_negative_cosines(replay, prefix_targets):
             query_vector = replay._vectors.query_vector_for_candidate(
                 target.preceding_text, target.competition[slot])
             event_vector = replay._vectors.event_vector(h.event_id)
-            cosine = float(np.asarray(query_vector, dtype=np.float64) @
-                           np.asarray(event_vector, dtype=np.float64))
+            cosine = float(np.dot(np.asarray(query_vector, dtype=np.float64),
+                                  np.asarray(event_vector,
+                                             dtype=np.float64)))
             values.append(cosine)
         if not values:
             continue

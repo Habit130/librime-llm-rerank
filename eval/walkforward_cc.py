@@ -340,7 +340,7 @@ class CandidateFastEvidence:
         event_matrix = np.asarray(event_vectors, dtype=np.float64)
         # Per (candidate, event) cosine matrix, then row-select the matched
         # candidate per event; an event matching no candidate gets no slot.
-        cosine_matrix = query_matrix @ event_matrix.T
+        cosine_matrix = np.dot(query_matrix, event_matrix.T)
         # Map each history event to its representative candidate slot:
         # the FIRST normalized-equal candidate wins, mirroring the oracle's
         # per-candidate pairing (compute_evidence events_by_candidate).
