@@ -334,7 +334,7 @@ class CandidateFastEvidence:
         into the event-vector lists.  Every kept event matched a candidate.
         """
         candidates = [match_text(c) for c in candidates]
-        if not event_vectors:
+        if not event_vectors or not candidate_indexes:
             return ([0.0] * len(candidates), (), (), (), 0.0)
         query_matrix = np.asarray(query_vectors, dtype=np.float64)
         event_matrix = np.asarray(event_vectors, dtype=np.float64)
