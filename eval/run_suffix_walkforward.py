@@ -66,7 +66,7 @@ from suffix_report import (build_report, verify_privacy,  # noqa: E402
 # the claim-time work area live in the main librime-llm-rerank checkout
 # (`.local-work/` is gitignored there; the worktree carries only code).
 MAIN_REPO = Path(os.path.abspath(__file__)).resolve().parents[1]
-if not (MAIN_REPO / ".local-work").exists():
+if not (MAIN_REPO / ".local-work" / "models").is_dir():
     MAIN_REPO = Path("/Users/habit/Developer/librime-llm-rerank")
 
 
