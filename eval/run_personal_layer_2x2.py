@@ -81,9 +81,15 @@ def _route_ds_path(cache, route_id):
 
 
 def _acquire_snapshot_copy(source, cache, expected_sha):
-    """Read-only worktree copy of the pinned snapshot, byte-verified."""
+    """Read-only worktree copy of the pinned snapshot, byte-verified.
+
+    The pinned store is a WAL database, so the `-shm`/`-wal` sidecars are
+    copied next to the main file or a read-only open cannot reach the shared
+    index on the first query.
+    """
     dest = cache / "prefix-snapshot.sqlite3"
-    if dest.exists() and sha256_bytes(dest.read_bytes()) == expected_sha:
+    if dest.exists() and sha256_bytes(dest.read_bytes()) == expected_sha \
+            and _sidecar_copy_ok(cache):
         return dest
     digest = sha256_bytes(Path(source).read_bytes())
     if digest != expected_sha:
@@ -91,10 +97,31 @@ def _acquire_snapshot_copy(source, cache, expected_sha):
             "snapshot has %s; accepted pins: primary %s, fallback %s"
             % (digest, PRIMARY_PIN_SHA256, FALLBACK_PIN_SHA256))
     shutil.copy2(source, dest)
+    _copy_sidecars(source, cache)
     os.chmod(dest, 0o400)
     if sha256_bytes(dest.read_bytes()) != expected_sha:
         raise EnvironmentBlocker("snapshot copy failed verification")
     return dest
+
+
+def _copy_sidecars(source, cache):
+    """Copy `-shm`/`-wal` sidecars next to the snapshot copy."""
+    for suffix in ("-shm", "-wal"):
+        src = Path(source).with_name(Path(source).name + suffix)
+        if not src.exists():
+            continue
+        dest = cache / ("prefix-snapshot.sqlite3" + suffix)
+        shutil.copy2(src, dest)
+        os.chmod(dest, 0o400)
+
+
+def _sidecar_copy_ok(cache):
+    for suffix in ("-shm", "-wal"):
+        src = Path(DEFAULT_SNAPSHOT).with_name(FALLBACK_PIN_NAME + suffix)
+        dest = cache / ("prefix-snapshot.sqlite3" + suffix)
+        if src.exists() and not dest.exists():
+            return False
+    return True
 
 
 def _dereference_snapshot(source, cache):
