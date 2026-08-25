@@ -1,0 +1,35 @@
+# Public-layer A winner (AC-154-v4)
+
+- contract: `AC-154-v4`
+- slice digest: `8818cc8033834db953c69c470453b98ecc418d45469d730d078d7c004d63d667`
+- code SHA: `6fc4762fb22d07f2d20e4e44bcebcac571605a0a`
+- freeze digest: `091af6f9b84925b920dced2dfb218a8079052351b8c1a2735eb9f37081250ed1`
+- pair-set rule: `target_len>=2;stride=8;index_mod=0`
+- query rule: `ctx-as-query:last64`
+- eligible A slices: 8113
+- A pairs: 53696
+- compact table digest: `9c20f39fde762499043fcd7694bdd8428fb754c71b6f9f1aa05ba9027e649ddd`
+- B pairs scored: 0
+- len=1 pairs scored: 0
+- B used to pick: false
+- winner: `dedicated_bge_m3`
+
+| Route | Pairs | Hits | Accuracy |
+| --- | ---: | ---: | ---: |
+| `dedicated_qwen3_embedding_0_6b` | 53696 | 42316 | 0.7880661502 |
+| `dedicated_bge_m3` | 53696 | 45211 | 0.8419807807 |
+| `qwen_l28_candidate_span_mean` | 53696 | 30436 | 0.5668206198 |
+
+Fingerprints:
+
+- `dedicated_qwen3_embedding_0_6b`: `dedicated-embedding-repr-v1:route=qwen3-embedding-0.6b:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=09f7f379c919ff068b2d943ae8eaaa1260a0b16ffb5d3c799c9e383b241b4b81:tokenizer=83454d38a40edd5660ddae6fc9c31429d8fcd1cd4cae8e894489a97fd463d0b5:adapter=qwen3:instruction=Represent the candidate-conditioned query for semantic retrieval.:pool=last-token:dim=1024:format=fp32-l2:metric=cosine:deps=torch@2.7.1,transformers@4.52.4,tokenizers@0.21.1,safetensors@0.5.3`
+- `dedicated_bge_m3`: `dedicated-embedding-repr-v1:route=bge-m3-dense-1024:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=b9d800590cbaf23471af0d0722870b0a6f8681dc09630ed12cd57db0a9c34b2d:tokenizer=ec113500465479de593e55e1972aee45f0932447604272792b5e98db0fb9a35a:adapter=bge-m3:instruction=none:pool=dense-mean:dim=1024:format=fp32-l2:metric=cosine:deps=torch@2.7.1,transformers@4.52.4,tokenizers@0.21.1,safetensors@0.5.3`
+- `qwen_l28_candidate_span_mean`: `candidate-conditioned-repr-v1:payload=candidate-conditioned-concat-v1:serialization=last64-preceding-plus-candidate:no-separator:no-special:model=7f3b14fa146519f6:tokenizer=6fd1f1efb6b89f98:mlxlm=0.31.3:graph=1:layer=28:pool=candidate_span_mean:window=64:span=candidate-token-span-v1:norm=rmsnorm+l2:dim=1024:dtype=fp32:metric=cosine`
+
+A only selects a representation on the stride-8 subset of
+`target_len>=2` pairs (every 8th #153 A slice in file order) with
+query `ctx-as-query:last64`. The public 70% pairwise gate is #156
+on split B with the same query, length, and stride rules. The
+retired v1-v3 95%/gate keeps no official status; the v3 full-set
+Qwen3 score is diagnostic only and is not the A gate. B and len=1
+were not scored. Live `α`/`γ` are unchanged.
