@@ -95,6 +95,46 @@ freeze, this ticket's code SHA, and the B pair-set rule. Committed outputs
 are `public_layer/b_freeze.json`, `public_layer/b_report.json`, and
 `public_layer/B_REPORT.md`.
 
+## Personal-layer 2x2 candidate contribution (Habit130/squirrel#155)
+
+`personal_layer_2x2.py` + `run_personal_layer_2x2.py` run the frozen
+complete-key 2x2 on the #77 pinned prefix snapshot with exactly two routes
+(`dedicated_qwen3_embedding_0_6b`, `qwen_l28_candidate_span_mean`). Key =
+`(schema_id, category, canonical_segment_input)`; base/partner follow the
+frozen pair rule (earliest replayable base with an unselected real candidate,
+earliest partner with a literally different last-64 window). Every complete
+key contributes `key_d_cand = median(1-cos(ctx1,sel vs ctx1,u))` and
+`key_d_ctx = 1-cos(ctx1,sel vs ctx2,sel)`; all four cells use the
+`last64(preceding)+candidate` payload and the Qwen3-emb query instruction is
+not applied. Route `r = median(key_d_cand) / median(key_d_ctx)` with the
+frozen knife (`< 0.5` context-dominant, `>= 1` candidate signal,
+`[0.5, 1)` grey, `median == 0` or no keys no conclusion); fewer than 30
+complete keys stops the layer with **无结论**. Cross-route synthesis is one
+of 双主导 / 双有信号 / 分裂 / 任一灰色, and grey after exhausting the prefix
+keys stops.
+
+The personal layer answers **candidate contribution only**: it cannot
+calibrate the public gate (#156 B accuracy is never mixed into `r`), cannot
+approve `gamma` (#113 stays parked), and is a different question from the
+public-layer pairwise gate. Committed artifacts
+(`eval/personal_layer/prefix_2x2_freeze.json`,
+`eval/personal_layer/prefix_2x2_report.json`,
+`eval/personal_layer/PX2X_REPORT.md`) carry key hashes, complete/incomplete
+counts, per-route medians and `r`, the knife and the cross-route verdict
+only — never preceding text, candidate text, machine paths or live facts.
+
+```sh
+python3 -m unittest eval.test_personal_layer_2x2
+python3 eval/run_personal_layer_2x2.py
+```
+
+The runner byte-verifies the pinned #77 prefix snapshot (primary
+`b1bfde41...` or the accepted AC-111 extract `ce69b729...`), copies it
+read-only into `eval/.cache/personal_layer_2x2/`, and scores the two routes
+with two isolated workers (`.local-work/venv-embeddings` for the embedding
+route, `daemon/.venv` for the L28 route). Missing pins or models are
+environment blockers that stop before any score.
+
 ## Canonical fixture
 
 The fixture is reproduced from Squirrel PR #24 (head commit

@@ -56,6 +56,13 @@ python3 daemon/deploy.py stop
 
 Simplified Chinese (简体) only, developed against the `luna_pinyin` schema.
 
+## Personal-layer 2x2 (Squirrel#155)
+
+The offline personal-layer 2x2 answers candidate contribution only: it runs
+on a pinned #77 prefix snapshot, calibrates no public gate, does not approve
+`gamma`, and never mixes with public-layer accuracy. See
+`eval/README.md` → "Personal-layer 2x2 candidate contribution".
+
 ## Dedicated Embedding Adapters
 
 AC-110-v1 provides two model-free-testable candidate-conditioned adapters:
