@@ -35,6 +35,7 @@ from personal_layer_2x2 import (  # noqa: E402
     PRIMARY_PIN_SHA256,
     ROUTE_IDS,
     Personal2x2Error,
+    apply_preflight,
     apply_scores,
     base_and_partner,
     build_freeze,
@@ -340,6 +341,21 @@ class CompleteKeyTest(unittest.TestCase):
         self.assertEqual(len(first), 64)
         self.assertNotEqual(key_sha256(("luna_pinyin", "word", "nipeng")),
                             first)
+
+    def test_preflight_drops_only_rejected_keys(self):
+        rows = [
+            {"key_sha256": "a" * 64, "ctx1": "x", "selected": "s",
+             "ctx2": "y", "unselected": ["u"]},
+            {"key_sha256": "b" * 64, "ctx1": "x", "selected": "s",
+             "ctx2": "z", "unselected": ["w"]},
+        ]
+        kept, rejected = apply_preflight(rows, ["a" * 64])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(rejected, 1)
+        self.assertEqual(kept[0]["key_sha256"], "b" * 64)
+        kept, rejected = apply_preflight(rows, [])
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(rejected, 0)
 
 
 class KeyCellsTest(unittest.TestCase):

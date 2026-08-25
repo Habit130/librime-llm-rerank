@@ -35,6 +35,7 @@ from personal_layer_2x2 import (  # noqa: E402
     PRIMARY_PIN_SHA256,
     ROUTE_IDS,
     Personal2x2Error,
+    apply_preflight,
     apply_scores,
     build_freeze,
     canonical_json,
@@ -142,8 +143,18 @@ def _dereference_snapshot(source, cache):
     return fallback, digest
 
 
-def _write_keys(cache, complete):
+def _write_keys(cache, rows):
     """Private key table: base/partner windows and candidates by key hash."""
+    path = _keys_path(cache)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(canonical_json(row) + "\n")
+    tmp.replace(path)
+    return rows
+
+
+def _rows_from_complete(complete):
     rows = []
     for key, (base, partner) in sorted(complete.items()):
         rows.append({
@@ -153,12 +164,6 @@ def _write_keys(cache, complete):
             "ctx2": partner.window(),
             "unselected": list(base.unselected()),
         })
-    path = _keys_path(cache)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(canonical_json(row) + "\n")
-    tmp.replace(path)
     return rows
 
 
@@ -396,6 +401,64 @@ def _spawn(python_path, extra_args, *, cache, output):
             "route worker failed: %s" % " ".join(extra_args))
 
 
+REJECTED_REASON = "no_replayable_payload"
+
+
+def _rejected_keys_path(cache):
+    return cache / "rejected-keys.jsonl"
+
+
+def _preflight_l28(rows, model_path):
+    """Deterministic tokenization-fault preflight over every 2x2 cell.
+
+    Runs under the daemon venv with the frozen Qwen3-0.6B-Base tokenizer:
+    a cell whose payload token straddles the context/candidate boundary is
+    an AC-108 representation fault that rejects the whole key (one
+    unreplayable cell makes the key unreplayable; no vector is invented).
+    """
+    from representations import (CandidateRepresentationSpec,
+                                 RepresentationError,
+                                 candidate_tokenization_for)
+
+    spec = CandidateRepresentationSpec(
+        layer=28, pooling="candidate_span_mean")
+    tokenizer = _load_preflight_tokenizer(model_path)
+    rejected = []
+    for row in rows:
+        cells = [(row["ctx1"], row["selected"]),
+                 (row["ctx2"], row["selected"])]
+        cells.extend((row["ctx1"], candidate)
+                     for candidate in row["unselected"])
+        unusable = False
+        for ctx, candidate in cells:
+            try:
+                candidate_tokenization_for(
+                    tokenizer, ctx, candidate, spec=spec)
+            except (RepresentationError, ValueError, TypeError):
+                unusable = True
+                break
+        if unusable:
+            rejected.append(row["key_sha256"])
+    return rejected
+
+
+def _load_preflight_tokenizer(model_path):
+    import mlx.core as mx
+    from mlx_lm.utils import load
+
+    _model, tokenizer = load(model_path)
+    mx.eval(_model.parameters())
+    return tokenizer
+
+
+def _read_rejected(cache):
+    path = _rejected_keys_path(cache)
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, default=Path(__file__).resolve()
@@ -408,6 +471,7 @@ def parse_args(argv=None):
     parser.add_argument("--embedding-python", default=DEFAULT_EMBEDDING_PYTHON)
     parser.add_argument("--daemon-python", default=DEFAULT_DAEMON_PYTHON)
     parser.add_argument("--score-route", choices=ROUTE_IDS, default=None)
+    parser.add_argument("--preflight-l28", action="store_true")
     parser.add_argument("--freeze-only", action="store_true")
     parser.add_argument("--report-only", action="store_true")
     return parser.parse_args(argv)
@@ -417,6 +481,20 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cache = _cache_dir(args.cache)
     output = args.output
+
+    if args.preflight_l28:
+        keys = _read_keys(cache)
+        if not keys:
+            raise Personal2x2Error("key table is empty in %s" % cache)
+        rejected = _preflight_l28(keys, args.model)
+        path = _rejected_keys_path(cache)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text("\n".join(rejected) + ("\n" if rejected else ""),
+                       encoding="utf-8")
+        tmp.replace(path)
+        print("l28 preflight rejected %d/%d keys"
+              % (len(rejected), len(keys)), flush=True)
+        return 0
 
     if args.score_route:
         route_id = args.score_route
@@ -452,20 +530,35 @@ def main(argv=None) -> int:
     events = load_prefix_snapshot(snapshot)
     groups = group_keys(events)
     complete, reasons = classify_keys(groups)
-    _write_keys(cache, complete)
+    rows = _rows_from_complete(complete)
+    creating = not (output / "prefix_2x2_freeze.json").exists()
+    if creating and rows:
+        if not os.path.isfile(args.daemon_python):
+            raise EnvironmentBlocker("missing_mlx_runtime")
+        if not os.path.isdir(args.model):
+            raise EnvironmentBlocker("missing_mlx_model")
+        print("l28 preflight over %d complete keys" % len(rows), flush=True)
+        _spawn(args.daemon_python, ["--preflight-l28"],
+               cache=cache, output=output)
+        rows, rejected = apply_preflight(rows, _read_rejected(cache))
+        if rejected:
+            reasons = dict(reasons)
+            reasons[REJECTED_REASON] = reasons.get(REJECTED_REASON, 0) \
+                + rejected
+            print("preflight dropped %d keys" % rejected, flush=True)
+    _write_keys(cache, rows)
     code_sha = current_code_sha(require_clean=True)
     freeze = build_freeze(
         snapshot_sha256=snapshot_sha,
         code_sha=code_sha,
-        complete_keys=[key_sha256(key) for key in complete],
-        complete_key_count=len(complete),
+        complete_keys=[row["key_sha256"] for row in rows],
+        complete_key_count=len(rows),
         incomplete_reasons=reasons,
     )
-    creating = not (output / "prefix_2x2_freeze.json").exists()
     if creating:
         write_freeze(output, freeze)
         print("froze %s complete=%d incomplete=%s" % (
-            freeze["freeze_digest"], len(complete), reasons), flush=True)
+            freeze["freeze_digest"], len(rows), reasons), flush=True)
     else:
         existing = load_freeze(output)
         if existing != freeze:

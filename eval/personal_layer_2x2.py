@@ -239,6 +239,20 @@ def base_and_partner(group):
     return base, partner
 
 
+def apply_preflight(rows, rejected_hashes):
+    """Drop complete keys whose cells fail payload representation preflight.
+
+    A key is replayable only when every 2x2 cell of the frozen payload can be
+    represented by the route's tokenization seam (the AC-106 analog: one
+    unreplayable candidate makes the whole event unreplayable; here one
+    unattributable cell makes the whole key unreplayable). Returns the kept
+    rows and the rejected count.
+    """
+    rejected = set(rejected_hashes)
+    kept = [row for row in rows if row["key_sha256"] not in rejected]
+    return kept, sum(1 for row in rows if row["key_sha256"] in rejected)
+
+
 def classify_keys(groups):
     """(complete, reasons): every complete key and per-reason counts.
 
