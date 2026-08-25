@@ -554,11 +554,17 @@ def main(argv=None) -> int:
         complete_key_count=len(rows),
         incomplete_reasons=reasons,
     )
-    creating = not (output / "prefix_2x2_freeze.json").exists()
+    frozen_path = output / "prefix_2x2_freeze.json"
+    stale = frozen_path.exists() and \
+        load_freeze(output).get("code_sha") != code_sha
+    creating = not frozen_path.exists() or stale
     if creating:
+        if stale:
+            frozen_path.unlink()
         write_freeze(output, freeze)
-        print("froze %s complete=%d incomplete=%s" % (
-            freeze["freeze_digest"], len(rows), reasons), flush=True)
+        print("froze %s complete=%d incomplete=%s%s" % (
+            freeze["freeze_digest"], len(rows), reasons,
+            " (rebuild)" if stale else ""), flush=True)
     else:
         existing = load_freeze(output)
         if existing != freeze:
