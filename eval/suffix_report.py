@@ -155,6 +155,12 @@ def build_report(*, engine_version, code_sha, snapshot, prefix_events,
     return report
 
 
+def _fmt(value):
+    if value is None:
+        return "-"
+    return "%.4f" % value
+
+
 def verify_privacy(report):
     """Scan the serialized report for private/raw markers.
 
@@ -213,8 +219,49 @@ def render_markdown(report):
     for route in report["routes"]:
         lines.append("### %s" % route["route_id"])
         lines.append("")
+        tau = route.get("tau") or {}
+        lines.append("- τ: `%s` (queries %s / prefix %s)" % (
+            tau.get("state", "?"), tau.get("queries", "-"),
+            tau.get("prefix_count", "-")))
+        cells = route.get("cells") or []
+        eliminated = {}
+        evaluated = []
+        for cell in cells:
+            if "eliminated" in cell:
+                reason = cell["eliminated"]
+                eliminated[reason] = eliminated.get(reason, 0) + 1
+            else:
+                evaluated.append(cell)
+        lines.append("- cells: %d evaluated, %s" % (
+            len(evaluated),
+            ", ".join("%s=%d" % (k, v) for k, v in
+                      sorted(eliminated.items())) or "none eliminated"))
+        if evaluated:
+            lines.append("")
+            lines.append("| H | K | γ | k | τq | top-1 | MRR | gates | lift |")
+            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            for cell in evaluated:
+                c = cell["cell"]
+                hard = cell.get("hard_gates") or {}
+                lift = cell.get("lift") or {}
+                for value in ("half_life", "k_evidence", "gamma",
+                              "saturation_k"):
+                    cell_value = c.get(value)
+                    cell_value = ("inf" if cell_value == float("inf")
+                                  else cell_value)
+                    c = dict(c, **{value: cell_value})
+                lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                    c.get("half_life"), c.get("k_evidence"), c.get("gamma"),
+                    c.get("saturation_k"), c.get("tau_quantile"),
+                    _fmt(cell.get("metrics", {}).get("top1")),
+                    _fmt(cell.get("metrics", {}).get("mrr")),
+                    "pass" if hard.get("pass") else "fail",
+                    "claim" if lift.get("claimable") else "-"))
+        lines.append("")
         lines.append("```json")
-        lines.append(json.dumps(route, ensure_ascii=False, indent=2))
+        lines.append(json.dumps({
+            k: v for k, v in route.items() if k != "cells"},
+            ensure_ascii=False, indent=2))
         lines.append("```")
         lines.append("")
     if report.get("notes"):

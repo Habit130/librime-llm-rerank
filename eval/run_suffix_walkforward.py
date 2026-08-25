@@ -486,7 +486,15 @@ def _main_driver(args):
                            "invented, no cell is evaluated and the suffix "
                            "claim gates cannot run (RISK-157-3)" % hn_count),
                 "data": data,
-                "per_route": matrix,
+                "per_route": [{
+                    "route_id": route_result["route_id"],
+                    "tau": route_result["tau"],
+                    "eligible_cells": 0,
+                    "eliminated_by_reason": {"tau_not_calibratable":
+                                             len(route_result["cells"])},
+                    "evaluated_cells": 0,
+                    "eligible": [],
+                } for route_result in matrix],
                 "total_eligible_cells": 0,
                 "any_evaluated": False,
                 "live_gamma": 0.0,
