@@ -271,11 +271,24 @@ def _score_embedding_route(keys, model_path, batch_size=32):
     return _score_keys(keys, encode, cache)
 
 
+def _pool_candidate_bounds(span, start, count):
+    """Mean-pool the candidate token span of an already-RMSNormed sequence.
+
+    The frozen `qwen_l28_candidate_span_mean` contract pools the candidate
+    token span `[start, start+count)` only; pooling the whole sequence is
+    the AC-155-v1 defect this seam exists to prevent (the L28 worker must
+    pass the attribution bounds from ``candidate_tokenization_for``).
+    """
+    from hidden_state import pool_candidate_hidden_states
+    return pool_candidate_hidden_states(
+        span, int(start), int(count), "candidate_span_mean")
+
+
 def _score_mlx_route(keys, model_path):
     """qwen_l28_candidate_span_mean: MLX forward through Qwen3-0.6B-Base,
     candidate-span mean-pool at layer 28 after the final RMSNorm."""
     import numpy as np
-    from hidden_state import _lazy_mlx, pool_candidate_hidden_states
+    from hidden_state import _lazy_mlx
     from representations import (CandidateRepresentationSpec,
                                  RepresentationError,
                                  candidate_tokenization_for)
@@ -311,9 +324,9 @@ def _score_mlx_route(keys, model_path):
         layer=28, pooling="candidate_span_mean")
 
     def l28_payload(ctx, candidate):
-        _payload, ids, start, count = candidate_tokenization_for(
+        payload, ids, start, count = candidate_tokenization_for(
             tokenizer, ctx, candidate, spec=spec)
-        del _payload
+        del payload
         ids = list(ids)
         hidden = embed(mx.array([ids]))
         mask = create_attention_mask(hidden, None)
@@ -323,8 +336,7 @@ def _score_mlx_route(keys, model_path):
             if index + 1 == 28:
                 normalized = norm(hidden).astype(mx.float32)
                 span = np.asarray(normalized[0]).reshape(len(ids), -1)
-                return pool_candidate_hidden_states(
-                    span.tolist(), 0, len(ids), "candidate_span_mean")
+                return _pool_candidate_bounds(span.tolist(), start, count)
         raise EnvironmentBlocker("L28 was not reached")
 
     cache = {}

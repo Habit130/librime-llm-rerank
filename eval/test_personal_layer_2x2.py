@@ -357,6 +357,52 @@ class CompleteKeyTest(unittest.TestCase):
         self.assertEqual(len(kept), 2)
         self.assertEqual(rejected, 0)
 
+    def test_l28_pool_is_candidate_span_not_full_sequence(self):
+        """Numerical proof that candidate-span mean differs from the
+        full-sequence mean the AC-155-v1 repair prohibited."""
+        from run_personal_layer_2x2 import _pool_candidate_bounds
+        span = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
+        candidate = _pool_candidate_bounds(span, 1, 1)
+        full = _pool_candidate_bounds(span, 0, len(span))
+        self.assertEqual(candidate, (0.0, 1.0))
+        self.assertNotEqual(candidate, full)
+
+    def test_l28_worker_passes_attribution_bounds_to_pooler(self):
+        """Source-structure guard: the L28 worker must hand the pooler the
+        `start, count` from candidate_tokenization_for; discarding them
+        (pooling the whole sequence) fails this test."""
+        import inspect
+        import run_personal_layer_2x2 as runner
+        src = inspect.getsource(runner._score_mlx_route)
+        self.assertIn("candidate_tokenization_for(", src)
+        pool_call = [
+            line.strip() for line in src.splitlines()
+            if "_pool_candidate_bounds(" in line
+        ]
+        self.assertEqual(len(pool_call), 1)
+        self.assertIn("start", pool_call[0])
+        self.assertIn("count", pool_call[0])
+        self.assertNotIn("len(", pool_call[0])
+
+
+class PoolBoundsTest(unittest.TestCase):
+    def test_bounds_pool_over_the_candidate_span_only(self):
+        from run_personal_layer_2x2 import _pool_candidate_bounds
+        span = [[1.0, 0.0], [0.3, 0.0], [0.0, 1.0], [0.0, 0.3]]
+        pooled = _pool_candidate_bounds(span, 1, 2)
+        mean = (0.15, 0.5)
+        norm = (0.15 ** 2 + 0.5 ** 2) ** 0.5
+        self.assertAlmostEqual(pooled[0], mean[0] / norm, places=9)
+        self.assertAlmostEqual(pooled[1], mean[1] / norm, places=9)
+
+    def test_bounds_pool_drops_outside_candidate_tokens(self):
+        from run_personal_layer_2x2 import _pool_candidate_bounds
+        span = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
+        self.assertEqual(_pool_candidate_bounds(span, 1, 1),
+                         (0.0, 1.0))
+        self.assertNotEqual(_pool_candidate_bounds(span, 1, 1),
+                            _pool_candidate_bounds(span, 0, 3))
+
 
 class KeyCellsTest(unittest.TestCase):
     def _encode(self, vectors):
