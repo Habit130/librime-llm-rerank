@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot public-layer A forward (Squirrel #154 / AC-154-v3)."""
+"""One-shot public-layer A forward (Squirrel #154 / AC-154-v4)."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from public_layer_a import (
     PublicLayerAError,
     QUERY_RULE,
     ROUTE_IDS,
+    SOURCE_TABLE_DIGEST,
     apply_scores,
     build_compact_slices,
     build_freeze,
@@ -27,16 +28,20 @@ from public_layer_a import (
     compact_table_path,
     guard_scorer_rss,
     iter_compact_table,
+    iter_source_compact_table,
     load_compact_header,
     load_freeze,
     pair_hit,
     query_text,
     reconstruct_preceding,
     sha256_bytes,
+    source_compact_table_path,
+    stride_rows,
     verify_committed_digest,
     void_v2_artifacts,
     write_compact_table,
     write_freeze,
+    write_source_compact_table,
 )
 from public_layer_slicer import (
     ESSAY_REPO,
@@ -620,16 +625,35 @@ def run_score_route(route_id, args, cache, output):
     score_embedding_route(route_id, model_path, table_path, cache, freeze)
 
 
-def build_compact_table_from_sources(cache: Path, output: Path) -> tuple[str, int, int]:
+def build_source_table_from_sources(cache: Path, output: Path) -> str:
     lexicon = load_lexicon(cache)
     slices = read_slice_table(output / "slices.tsv")
     store = ASourceStore(cache)
     rows = build_compact_slices(slices, lexicon, store.preceding)
     del lexicon
     del store
+    path = source_compact_table_path(cache)
+    return write_source_compact_table(
+        path, rows, slice_digest=PINNED_SLICE_DIGEST)
+
+
+def build_stride_table(cache: Path, output: Path) -> tuple[str, int, int]:
+    source = source_compact_table_path(cache)
+    if not source.exists():
+        print("building v3 source compact table", flush=True)
+        digest = build_source_table_from_sources(cache, output)
+        if digest != SOURCE_TABLE_DIGEST:
+            raise PublicLayerAError("rebuilt source digest drifted")
+    actual = sha256_bytes(source.read_bytes())
+    if actual != SOURCE_TABLE_DIGEST:
+        raise PublicLayerAError(
+            "source compact table digest drifted: "
+            "%s != %s" % (actual, SOURCE_TABLE_DIGEST))
+    rows = tuple(iter_source_compact_table(source))
+    kept = stride_rows(rows)
     path = compact_table_path(cache)
     digest = write_compact_table(
-        path, rows, slice_digest=PINNED_SLICE_DIGEST)
+        path, kept, slice_digest=PINNED_SLICE_DIGEST)
     header = load_compact_header(path)
     return digest, header["eligible_slice_count"], header["pair_count"]
 
@@ -684,10 +708,9 @@ def main(argv=None) -> int:
         print("voided v2 artifacts", len(removed), flush=True)
 
     if args.build_table:
-        digest, slice_count, pair_count = build_compact_table_from_sources(
-            cache, output)
+        digest, slice_count, pair_count = build_stride_table(cache, output)
         print(
-            f"compact table slices={slice_count} pairs={pair_count} "
+            f"stride table slices={slice_count} pairs={pair_count} "
             f"digest={digest}",
             flush=True)
         return 0
@@ -701,7 +724,7 @@ def main(argv=None) -> int:
 
     table = compact_table_path(cache)
     if not table.exists():
-        print("building compact table", flush=True)
+        print("building stride compact table", flush=True)
         _spawn(sys.executable, [
             "--cache", str(cache),
             "--output", str(output),
@@ -712,7 +735,7 @@ def main(argv=None) -> int:
     eligible_slice_count = header["eligible_slice_count"]
     pair_count = header["pair_count"]
     print(
-        f"A eligible slices={eligible_slice_count} pairs={pair_count}",
+        f"A stride slices={eligible_slice_count} pairs={pair_count}",
         flush=True)
     if pair_count < 1:
         raise PublicLayerAError("A pair set is empty")

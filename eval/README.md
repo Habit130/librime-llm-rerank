@@ -31,31 +31,39 @@ plum `b1be1969f914cc005add4090631b855db00c2591`). User dictionary and
 ## Public-layer A winner (Habit130/squirrel#154)
 
 `public_layer_a.py` + `run_public_layer_a.py` run the three frozen routes on
-every #153 A pair whose **target length is ≥ 2**. A only selects a
-representation on that len≥2 set. Single-character pairs stay in the #153
-corpus and are not scored. The public 70% pairwise gate is #156 on split B
-with the same query and length rules. The retired v1/v2 95% gates stay
-demoted and do not choose the A winner.
+the **stride-8 subset** of every #153 A pair whose target length is ≥ 2:
+starting from the full len≥2 v3 compact table, keep every 8th A slice in
+file order (`index % 8 == 0`) and keep every competitor on a kept slice.
+A only selects a representation on that stride filter. The step exists
+because full len≥2 (425,528 pairs × 3 routes) is too slow on this machine.
+The retired v1-v3 gates keep no official status; the v3 full-set Qwen3
+score is diagnostic only and is not the A gate. The public 70% pairwise
+gate is #156 on split B with the same query, length, and stride rules.
+Single-character pairs stay in the #153 corpus and are not scored.
 
 ```sh
 python3 eval/run_public_layer_a.py
 python3 -m unittest eval.test_public_layer_a
 ```
 
-A CPU pass writes a compact competitor table, then drops the slicer
-lexicon. GPU scoring streams that table and must not load essay-DFS or
-full `pinyin_to_words`. A scoring process that exceeds 8G physical
-footprint stops.
+A CPU pass writes the full len≥2 source table (v3 contract), then derives
+the stride-8 compact table and drops the slicer lexicon. GPU scoring
+streams that compact table and must not load essay-DFS or full
+`pinyin_to_words`. One shot after freeze: do not tighten or loosen the
+stride after seeing stride scores. A scoring process that exceeds 8G
+physical footprint stops.
 
 Identity is frozen before any score: #153 digest, code SHA, the three
-runtime fingerprints, pair-set rule `target_len>=2`, and query rule
-`ctx-as-query:last64`. Pair = one eligible A slice × one lexicon
-competitor. Query text is `last64(preceding)` via `window_text(..., 64)`.
-Candidate text is `candidate_conditioned_payload(preceding, word)`. Hit iff
+runtime fingerprints, pair-set rule `target_len>=2;stride=8;index_mod=0`,
+and query rule `ctx-as-query:last64`. Pair = one eligible A slice × one
+lexicon competitor. Query text is `last64(preceding)` via
+`window_text(..., 64)`. Candidate text is
+`candidate_conditioned_payload(preceding, word)`. Hit iff
 `cos(enc(query), enc(ctx+target)) > cos(enc(query), enc(ctx+homophone))`
-(strict). Equal cosine is a miss. The three routes share that pair set. B
-and len=1 are not scored. Committed outputs are `public_layer/a_freeze.json`,
-`public_layer/a_report.json`, and `public_layer/A_REPORT.md`.
+(strict). Equal cosine is a miss. The three routes share that stride pair
+set. B and len=1 are not scored. Committed outputs are
+`public_layer/a_freeze.json`, `public_layer/a_report.json`, and
+`public_layer/A_REPORT.md`.
 
 ## Canonical fixture
 

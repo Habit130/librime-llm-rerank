@@ -19,6 +19,10 @@ from public_layer_a import (  # noqa: E402
     PINNED_SLICE_DIGEST,
     QUERY_RULE,
     ROUTE_IDS,
+    SOURCE_COMPACT_TABLE_NAME,
+    SOURCE_CONTRACT_ID,
+    SOURCE_PAIR_SET_RULE,
+    SOURCE_TABLE_DIGEST,
     TIE_TERMINAL,
     CompactSlice,
     PublicLayerAError,
@@ -32,16 +36,20 @@ from public_layer_a import (  # noqa: E402
     expand_a_pairs,
     guard_scorer_rss,
     iter_compact_table,
+    iter_source_compact_table,
     load_freeze,
     pair_hit,
     query_text,
     score_pairs,
     select_winner,
+    source_compact_table_path,
+    stride_rows,
     validate_freeze,
     verify_committed_digest,
     void_v2_artifacts,
     write_compact_table,
     write_freeze,
+    write_source_compact_table,
 )
 from public_layer_slicer import (  # noqa: E402
     Lexicon,
@@ -277,7 +285,76 @@ class CompactTableTest(unittest.TestCase):
             self.assertEqual(64, len(digest))
             self.assertEqual("ac154", path.parent.name)
             self.assertEqual(COMPACT_TABLE_NAME, path.name)
+            self.assertEqual("a_pairs_stride8.jsonl", COMPACT_TABLE_NAME)
+            self.assertEqual(
+                SOURCE_COMPACT_TABLE_NAME, "a_pairs.jsonl")
             self.assertIn(".cache", path.parts)
+
+    def test_source_table_is_v3_contract_and_stride_table_is_v4(self):
+        rows = build_compact_slices(
+            fixture_a_slices(), fixture_lexicon(), fixture_preceding)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / ".cache" / "public_layer"
+            source = source_compact_table_path(cache)
+            digest = write_source_compact_table(
+                source, rows, slice_digest=PINNED_SLICE_DIGEST)
+            self.assertEqual(64, len(digest))
+            self.assertEqual(SOURCE_COMPACT_TABLE_NAME, source.name)
+            loaded = tuple(iter_source_compact_table(source))
+            self.assertEqual(rows, loaded)
+            header = json.loads(source.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(SOURCE_CONTRACT_ID, header["contract"])
+            self.assertEqual(SOURCE_PAIR_SET_RULE, header["pair_set_rule"])
+            with self.assertRaises(PublicLayerAError):
+                tuple(iter_compact_table(source))
+
+    def test_stride_keeps_every_eighth_slice_in_file_order(self):
+        lex = fixture_lexicon()
+        all_slices = fixture_a_slices() + slice_document(
+            "形式之后还有刑事和行事。", lex,
+            repo="Go-zh/go", path="c.md",
+            source_sha="d4e8cec7338bde4c8396df6b642f991199d92186",
+            spdx="BSD-3-Clause", split="A")
+        rows = build_compact_slices(all_slices, lex, fixture_preceding)
+        picked = stride_rows(rows)
+        expected = tuple(row for index, row in enumerate(rows)
+                         if index % 8 == 0)
+        self.assertEqual(expected, picked)
+        self.assertEqual((len(rows) + 7) // 8, len(picked))
+        self.assertTrue(all(
+            row.competitors == original.competitors
+            for row, original in zip(picked, expected)))
+        ids = [row.identity() for row in picked]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(tuple(sorted(picked)), tuple(picked))
+        self.assertNotEqual(0, len(picked))
+        self.assertLess(len(picked), len(rows))
+
+    def test_stride_rejects_malformed_filters(self):
+        rows = build_compact_slices(
+            fixture_a_slices(), fixture_lexicon(), fixture_preceding)
+        with self.assertRaises(PublicLayerAError):
+            stride_rows(rows, stride=0)
+        with self.assertRaises(PublicLayerAError):
+            stride_rows(rows, stride=8, index_mod=8)
+        with self.assertRaises(PublicLayerAError):
+            stride_rows(rows, stride=8, index_mod=-1)
+
+    def test_stride_is_deterministic_and_pair_set_drives_routes(self):
+        rows = build_compact_slices(
+            fixture_a_slices(), fixture_lexicon(), fixture_preceding)
+        first = stride_rows(rows)
+        second = stride_rows(rows)
+        self.assertEqual(first, second)
+        pair_keys = compact_pair_set(first)
+        self.assertTrue(pair_keys)
+        per_route = {route_id: tuple(pair.key() for pair in pair_keys)
+                     for route_id in ROUTE_IDS}
+        self.assertEqual(1, len(set(per_route.values())))
+        self.assertTrue(all(pair.split == "A" for pair in pair_keys))
+        self.assertTrue(all(len(pair.target) >= 2 for pair in pair_keys))
+        self.assertTrue(all(pair.competitor != pair.target
+                            for pair in pair_keys))
 
     def test_unsorted_competitors_are_rejected(self):
         with self.assertRaises(PublicLayerAError):
@@ -322,8 +399,9 @@ class FreezeAndReportTest(unittest.TestCase):
     def test_freeze_must_precede_scores_and_is_one_shot(self):
         freeze = fixture_freeze()
         self.assertEqual(CONTRACT_ID, freeze["contract"])
-        self.assertEqual("AC-154-v3", CONTRACT_ID)
+        self.assertEqual("AC-154-v4", CONTRACT_ID)
         self.assertEqual(PAIR_SET_RULE, freeze["pair_set_rule"])
+        self.assertEqual("target_len>=2;stride=8;index_mod=0", PAIR_SET_RULE)
         self.assertEqual(QUERY_RULE, freeze["query_rule"])
         self.assertEqual("ctx-as-query:last64", QUERY_RULE)
         self.assertEqual(PINNED_SLICE_DIGEST, freeze["slice_digest"])
@@ -376,6 +454,43 @@ class FreezeAndReportTest(unittest.TestCase):
             with self.assertRaises(PublicLayerAError):
                 load_freeze(root)
 
+    def test_v3_freeze_and_ckpt_are_rejected_and_voided(self):
+        v3 = {
+            "contract": "AC-154-v3",
+            "slice_digest": PINNED_SLICE_DIGEST,
+            "code_sha": "badcafe",
+            "pair_set_rule": "target_len>=2",
+            "query_rule": "ctx-as-query:last64",
+            "eligible_slice_count": 64903,
+            "pair_count": 425528,
+            "compact_table_digest": SOURCE_TABLE_DIGEST,
+            "b_pairs": 0,
+            "len1_pairs_scored": 0,
+            "routes": {"x": {"fingerprint": "f"}},
+            "freeze_digest": "a" * 64,
+        }
+        with self.assertRaises(PublicLayerAError) as raised:
+            validate_freeze(v3)
+        self.assertIn("v2 freeze unused", str(raised.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            hits = cache / "ac154"
+            hits.mkdir(parents=True)
+            (root / "a_freeze.json").write_text(
+                json.dumps(v3), encoding="utf-8")
+            (hits / "dedicated_qwen3_embedding_0_6b.ckpt.json").write_text(
+                json.dumps(v3), encoding="utf-8")
+            (hits / "dedicated_bge_m3.hits.json").write_text(
+                json.dumps(v3), encoding="utf-8")
+            removed = void_v2_artifacts(root, cache)
+            self.assertEqual(3, len(removed))
+            self.assertFalse((root / "a_freeze.json").exists())
+            self.assertEqual([], list(hits.glob("*.ckpt.json")))
+            self.assertEqual([], list(hits.glob("*.hits.json")))
+            with self.assertRaises(PublicLayerAError):
+                load_freeze(root)
+
     def test_apply_scores_without_freeze_fails(self):
         freeze = fixture_freeze(pair_count=1, eligible_slice_count=1)
         with tempfile.TemporaryDirectory() as tmp:
@@ -416,16 +531,18 @@ class FreezeAndReportTest(unittest.TestCase):
         digest = verify_committed_digest()
         self.assertEqual(PINNED_SLICE_DIGEST, digest)
 
-    def test_eval_readme_says_a_selects_and_b_owns_70_with_same_rules(self):
+    def test_eval_readme_says_a_selects_on_stride_and_b_owns_70(self):
         text = (Path(__file__).resolve().parent / "README.md").read_text(
             encoding="utf-8")
         self.assertIn("A only selects", text)
         self.assertIn("len≥2", text)
+        self.assertIn("stride", text)
         self.assertIn("#156", text)
         self.assertIn("70%", text)
         self.assertIn("demoted", text)
-        self.assertIn("same query and length rules", text)
+        self.assertIn("same query, length, and stride", text)
         self.assertIn("ctx-as-query:last64", text)
+        self.assertIn("diagnostic only", text)
 
 
 class MemorySplitTest(unittest.TestCase):

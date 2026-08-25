@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public-layer A pairwise selection (Squirrel #154 / AC-154-v3)."""
+"""Public-layer A pairwise selection (Squirrel #154 / AC-154-v4)."""
 
 from __future__ import annotations
 
@@ -33,13 +33,20 @@ from representations import (
 )
 
 
-CONTRACT_ID = "AC-154-v3"
+CONTRACT_ID = "AC-154-v4"
+SOURCE_CONTRACT_ID = "AC-154-v3"
 PINNED_SLICE_DIGEST = (
     "8818cc8033834db953c69c470453b98ecc418d45469d730d078d7c004d63d667"
 )
-PAIR_SET_RULE = "target_len>=2"
+PAIR_SET_RULE = "target_len>=2;stride=8;index_mod=0"
+SOURCE_PAIR_SET_RULE = "target_len>=2"
 QUERY_RULE = "ctx-as-query:last64"
 MIN_TARGET_LEN = 2
+STRIDE = 8
+INDEX_MOD = 0
+SOURCE_TABLE_DIGEST = (
+    "ddb8a1d020bebb22a2956e2ec36b33510d4a24300a8d0841b5cc9a1a1dfe3a9e"
+)
 ROUTE_IDS = (
     "dedicated_qwen3_embedding_0_6b",
     "dedicated_bge_m3",
@@ -49,10 +56,12 @@ TIE_TERMINAL = "无唯一 A 赢家"
 FREEZE_NAME = "a_freeze.json"
 REPORT_JSON_NAME = "a_report.json"
 REPORT_MD_NAME = "A_REPORT.md"
-COMPACT_TABLE_NAME = "a_pairs.jsonl"
+COMPACT_TABLE_NAME = "a_pairs_stride8.jsonl"
+SOURCE_COMPACT_TABLE_NAME = "a_pairs.jsonl"
 DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parent / "public_layer"
 MAX_SCORER_RSS_BYTES = 8 * 1024 * 1024 * 1024
-VOID_CONTRACTS = frozenset({"AC-154-v1", "AC-154-v2"})
+VOID_CONTRACTS = frozenset(
+    {"AC-154-v1", "AC-154-v2", "AC-154-v3"})
 
 
 class PublicLayerAError(Exception):
@@ -254,13 +263,18 @@ def compact_table_path(cache: Path) -> Path:
     return Path(cache) / "ac154" / COMPACT_TABLE_NAME
 
 
-def table_header(*, slice_digest, eligible_slice_count, pair_count) -> dict:
+def source_compact_table_path(cache: Path) -> Path:
+    return Path(cache) / "ac154" / SOURCE_COMPACT_TABLE_NAME
+
+
+def table_header(*, slice_digest, eligible_slice_count, pair_count,
+                 contract=CONTRACT_ID, pair_set_rule=PAIR_SET_RULE) -> dict:
     return {
         "record": "header",
-        "contract": CONTRACT_ID,
+        "contract": contract,
         "slice_digest": slice_digest,
         "query_rule": QUERY_RULE,
-        "pair_set_rule": PAIR_SET_RULE,
+        "pair_set_rule": pair_set_rule,
         "eligible_slice_count": eligible_slice_count,
         "pair_count": pair_count,
     }
@@ -286,6 +300,28 @@ def write_compact_table(path: Path, rows, *, slice_digest) -> str:
     return sha256_bytes(path.read_bytes())
 
 
+def write_source_compact_table(path: Path, rows, *, slice_digest) -> str:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    slice_count, pair_count = compact_counts(rows)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(
+            table_header(
+                slice_digest=slice_digest,
+                eligible_slice_count=slice_count,
+                pair_count=pair_count,
+                contract=SOURCE_CONTRACT_ID,
+                pair_set_rule=SOURCE_PAIR_SET_RULE,
+            ),
+            ensure_ascii=False, sort_keys=True) + "\n")
+        for row in rows:
+            handle.write(json.dumps(
+                row.to_record(), ensure_ascii=False, sort_keys=True) + "\n")
+    tmp.replace(path)
+    return sha256_bytes(path.read_bytes())
+
+
 def iter_compact_table(path: Path):
     header = None
     with Path(path).open(encoding="utf-8") as handle:
@@ -298,7 +334,7 @@ def iter_compact_table(path: Path):
                 if header is not None:
                     raise PublicLayerAError("compact table has a second header")
                 if record.get("contract") != CONTRACT_ID:
-                    raise PublicLayerAError("compact table contract is not v3")
+                    raise PublicLayerAError("compact table contract is not v4")
                 if record.get("query_rule") != QUERY_RULE:
                     raise PublicLayerAError("compact table query rule drifted")
                 if record.get("pair_set_rule") != PAIR_SET_RULE:
@@ -314,6 +350,34 @@ def iter_compact_table(path: Path):
         raise PublicLayerAError("compact table header is missing")
 
 
+def iter_source_compact_table(path: Path):
+    header = None
+    with Path(path).open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            kind = record.get("record")
+            if kind == "header":
+                if header is not None:
+                    raise PublicLayerAError("source table has a second header")
+                if record.get("contract") != SOURCE_CONTRACT_ID:
+                    raise PublicLayerAError("source table contract is not v3")
+                if record.get("query_rule") != QUERY_RULE:
+                    raise PublicLayerAError("source table query rule drifted")
+                if record.get("pair_set_rule") != SOURCE_PAIR_SET_RULE:
+                    raise PublicLayerAError("source table pair rule drifted")
+                if record.get("slice_digest") != PINNED_SLICE_DIGEST:
+                    raise PublicLayerAError("source table slice digest drifted")
+                header = record
+                continue
+            if kind != "slice":
+                raise PublicLayerAError("source table record kind drifted")
+            yield CompactSlice.from_record(record)
+    if header is None:
+        raise PublicLayerAError("source table header is missing")
+
+
 def load_compact_header(path: Path) -> dict:
     with Path(path).open(encoding="utf-8") as handle:
         first = handle.readline()
@@ -323,8 +387,31 @@ def load_compact_header(path: Path) -> dict:
     if header.get("record") != "header":
         raise PublicLayerAError("compact table header is missing")
     if header.get("contract") != CONTRACT_ID:
-        raise PublicLayerAError("compact table contract is not v3")
+        raise PublicLayerAError("compact table contract is not v4")
     return header
+
+
+def load_source_compact_header(path: Path) -> dict:
+    with Path(path).open(encoding="utf-8") as handle:
+        first = handle.readline()
+    if not first.strip():
+        raise PublicLayerAError("source table is empty")
+    header = json.loads(first)
+    if header.get("record") != "header":
+        raise PublicLayerAError("source table header is missing")
+    if header.get("contract") != SOURCE_CONTRACT_ID:
+        raise PublicLayerAError("source table contract is not v3")
+    return header
+
+
+def stride_rows(rows, *, stride=STRIDE, index_mod=INDEX_MOD) -> tuple:
+    if stride < 1 or index_mod < 0 or index_mod >= stride:
+        raise PublicLayerAError("stride filter is malformed")
+    kept = []
+    for index, row in enumerate(rows):
+        if index % stride == index_mod:
+            kept.append(row)
+    return tuple(kept)
 
 
 def select_winner(hits_by_route) -> str:
@@ -494,7 +581,7 @@ def build_report(freeze: dict, hits_by_route: dict) -> dict:
 
 def render_report_markdown(report: dict) -> str:
     lines = [
-        "# Public-layer A winner (AC-154-v3)",
+        "# Public-layer A winner (AC-154-v4)",
         "",
         f"- contract: `{report['contract']}`",
         f"- slice digest: `{report['slice_digest']}`",
@@ -530,11 +617,13 @@ def render_report_markdown(report: dict) -> str:
         )
     lines.extend([
         "",
-        "A only selects a representation on `target_len>=2` pairs with",
+        "A only selects a representation on the stride-8 subset of",
+        "`target_len>=2` pairs (every 8th #153 A slice in file order) with",
         "query `ctx-as-query:last64`. The public 70% pairwise gate is #156",
-        "on split B with the same query and length rules. The retired",
-        "v1/v2 95% gates stay demoted. B and len=1 were not scored. Live",
-        "`α`/`γ` are unchanged.",
+        "on split B with the same query, length, and stride rules. The",
+        "retired v1-v3 95%/gate keeps no official status; the v3 full-set",
+        "Qwen3 score is diagnostic only and is not the A gate. B and len=1",
+        "were not scored. Live `α`/`γ` are unchanged.",
         "",
     ])
     return "\n".join(lines)
