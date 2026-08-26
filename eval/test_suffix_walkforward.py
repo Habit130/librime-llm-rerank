@@ -232,6 +232,27 @@ def _fixture_provider(query_vectors, event_vectors):
         default_event=(0.0, 1.0, 0.0, 0.0))
 
 
+class _SparseProvider:
+    """Candidate provider with explicit per-row unrepresentable vectors."""
+
+    def __init__(self, missing_events=(), missing_queries=()):
+        self._missing_events = set(missing_events)
+        self._missing_queries = set(missing_queries)
+
+    def vector_dimension(self):
+        return 4
+
+    def event_vector(self, event):
+        if event.event_id in self._missing_events:
+            return None
+        return _unit(1.0)
+
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        if (preceding_text, candidate) in self._missing_queries:
+            return None
+        return _unit(1.0)
+
+
 def _synthetic_with_split():
     """A synthetic snapshot with events on both sides of the cutoff.
 
@@ -321,6 +342,49 @@ class SplitSeamTest(unittest.TestCase):
             FrozenFacts(facts.db_path).events()[-1])
         self.assertTrue(any(event.event_id == "p1" for event in history)
                         or any(event.event_id == "p2" for event in history))
+
+
+class SparseVectorReplayTest(unittest.TestCase):
+    def _facts(self):
+        facts = SyntheticFacts()
+        facts.add_event("e1", "wo", "ctx1", "我", ("我", "握"),
+                        (100, 0), display_rank=1, display_page=1)
+        facts.add_event("e2", "wo", "ctx2", "握", ("我", "握"),
+                        (200, 0), display_rank=2, display_page=1)
+        self.addCleanup(facts.close)
+        return facts
+
+    def test_missing_history_event_vector_is_no_evidence(self):
+        facts = self._facts()
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        events = db.events()
+        replay = WalkForwardReplay(
+            db, CandidateVectorTable(
+                events, _SparseProvider(missing_events={"e1"})))
+
+        outcomes = replay.replay(OracleParams(
+            tau=0.0, k_evidence=8, half_life=float("inf"),
+            saturation_k=1.0), gamma=1.0)
+        by_id = {outcome.event_id: outcome for outcome in outcomes}
+        self.assertFalse(by_id["e2"].actionable)
+        self.assertEqual(by_id["e2"].kept_ids, ())
+
+    def test_missing_query_vector_is_no_evidence(self):
+        facts = self._facts()
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        events = db.events()
+        replay = WalkForwardReplay(
+            db, CandidateVectorTable(
+                events, _SparseProvider(missing_queries={("ctx2", "我")})))
+
+        outcomes = replay.replay(OracleParams(
+            tau=0.0, k_evidence=8, half_life=float("inf"),
+            saturation_k=1.0), gamma=1.0)
+        by_id = {outcome.event_id: outcome for outcome in outcomes}
+        self.assertFalse(by_id["e2"].actionable)
+        self.assertEqual(by_id["e2"].kept_ids, ())
 
 
 class TauCalibrationTest(unittest.TestCase):

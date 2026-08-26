@@ -479,6 +479,9 @@ The AC-159-v1 wiring onto the #77 seam:
 - **Payload**: `last64(preceding)+candidate`, no separator (ADR-0003 /
   #109 / #110).  L28 pools the candidate token span `[start, start+count)`
   via `candidate_span_mean` (whole-payload pooling is a contract failure).
+  A per-payload span fault omits only that event/query vector, records a
+  desensitized omission count, and continues; the omitted row contributes no
+  evidence and never becomes a whole-payload fallback.
 - **Query side**: Qwen3-emb uses the frozen instruction
   `Represent the candidate-conditioned query for semantic retrieval.` +
   newline + payload; BGE and L28 have none.  Document/history side: none.
@@ -494,10 +497,11 @@ The AC-159-v1 wiring onto the #77 seam:
   Missing snapshot -> environment blocker.  No suffix events past the
   cutoff -> **数据不足** (legal terminal).
 - **τ**: per route only from prefix query-level hard negatives (>= 200
-  queries, nearest-rank Q95/Q97.5/Q99/Q99.5); below that the route is
-  expected to violate the #158 calibration invariant.  AC-159 fails closed
-  instead of emitting `not_calibratable` or inventing a terminal; the
-  primitive calibration helper still exposes that state for model-free tests.
+  queries, nearest-rank Q95/Q97.5/Q99/Q99.5).  The facts-only prefix count
+  below 200 is an implementation fault.  After legal L28 omissions, however,
+  fewer than 200 representable prefix hard-negative queries makes only that
+  route `not_calibratable`; it leaves the shortlist while Qwen3-emb and BGE
+  continue.  No tau is invented.
 - **Grid**: H {8,32,128,512,inf} x K {8,16,32,64} x gamma {0.5,1,2,4} x k
   {1,3,7}, alpha=0 (AC-106-v2); no extra cells, no continuous optimizer.
 - **Denominator**: group-complete (saved competition size < 32); the

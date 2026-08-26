@@ -104,6 +104,10 @@ def _query_vectors_path(cache, route_id):
     return cache / ("%s.queries.jsonl" % route_id)
 
 
+def _omissions_path(cache, route_id):
+    return cache / ("%s.omissions.json" % route_id)
+
+
 def _identity_path(cache, route_id):
     return cache / ("%s.identity.json" % route_id)
 
@@ -146,6 +150,25 @@ def _write_vectors(path, vectors):
         for key, vector in vectors:
             handle.write(canonical_json({
                 "key": key, "vector": [float(v) for v in vector]}) + "\n")
+    tmp.replace(path)
+    return path
+
+
+def _write_omissions(path, *, route_id, event_rows, event_vectors,
+                     query_rows, query_vectors, reason_counts):
+    """Write desensitized per-route omission counts, never omitted keys."""
+    manifest = {
+        "route_id": route_id,
+        "event_rows": event_rows,
+        "event_vectors": event_vectors,
+        "event_omitted": event_rows - event_vectors,
+        "query_rows": query_rows,
+        "query_vectors": query_vectors,
+        "query_omitted": query_rows - query_vectors,
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     tmp.replace(path)
     return path
 
@@ -211,20 +234,31 @@ def _route_identity(route_id, args, cache):
 class _CachedProvider:
     """Model-free provider over precomputed route vectors (driver side)."""
 
-    def __init__(self, event_vectors, query_vectors, dimension):
+    def __init__(self, event_vectors, query_vectors, dimension,
+                 missing_events=(), missing_queries=(), omissions=None):
         self._events = event_vectors
         self._queries = query_vectors
         self._dimension = dimension
+        self._missing_events = set(missing_events)
+        self._missing_queries = set(missing_queries)
+        self._omissions = dict(omissions or {})
 
     def vector_dimension(self):
         return self._dimension
 
     def event_vector(self, event):
+        if event.event_id in self._missing_events:
+            return None
         return self._events[event.event_id]
 
     def query_vector_for_candidate(self, preceding_text, candidate):
         key = "%s\0%s" % (preceding_text, candidate)
+        if key in self._missing_queries:
+            return None
         return self._queries[key]
+
+    def omission_counts(self):
+        return dict(self._omissions)
 
 
 class _FixtureProvider:
@@ -259,17 +293,59 @@ class _FixtureProvider:
     def query_vector_for_candidate(self, preceding_text, candidate):
         return self._vector("query:%s\0%s" % (preceding_text, candidate))
 
+    @staticmethod
+    def omission_counts(event_rows, query_rows):
+        return {
+            "event_rows": event_rows,
+            "event_vectors": event_rows,
+            "event_omitted": 0,
+            "query_rows": query_rows,
+            "query_vectors": query_rows,
+            "query_omitted": 0,
+            "reason_counts": {},
+        }
+
 
 def _fixture_provider(events, route_id):
     del events
     return _FixtureProvider(route_id)
 
 
-def _load_route_vectors(cache, route_id, identity):
-    events = _read_vectors(_event_vectors_path(cache, route_id))
-    queries = _read_vectors(_query_vectors_path(cache, route_id))
+def _load_route_vectors(cache, route_id, identity, event_records, pairs):
+    event_vectors = _read_vectors(_event_vectors_path(cache, route_id))
+    query_vectors = _read_vectors(_query_vectors_path(cache, route_id))
+    manifest_path = _omissions_path(cache, route_id)
+    if not manifest_path.is_file():
+        raise EnvironmentBlocker(
+            "route omission manifest missing for %s" % route_id)
+    omissions = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if omissions.get("route_id") != route_id:
+        raise EnvironmentBlocker(
+            "route omission manifest identity drifted: %s" % route_id)
+    expected_events = {event.event_id for event in event_records}
+    expected_queries = {"%s\0%s" % pair for pair in pairs}
+    missing_events = expected_events - set(event_vectors)
+    missing_queries = expected_queries - set(query_vectors)
+    if route_id != L28_ROUTE_ID and (missing_events or missing_queries):
+        raise EnvironmentBlocker(
+            "non-L28 route has omitted vectors: %s" % route_id)
+    if omissions.get("event_omitted") != len(missing_events) or \
+            omissions.get("query_omitted") != len(missing_queries):
+        raise EnvironmentBlocker(
+            "route omission manifest does not match vectors: %s" % route_id)
+    if omissions.get("event_vectors") != len(event_vectors) or \
+            omissions.get("query_vectors") != len(query_vectors):
+        raise EnvironmentBlocker(
+            "route vector manifest does not match vectors: %s" % route_id)
+    if omissions.get("event_rows") != len(expected_events) or \
+            omissions.get("query_rows") != len(expected_queries):
+        raise EnvironmentBlocker(
+            "route omission manifest has wrong input counts: %s" % route_id)
     dimension = identity["vector_dimension"]
-    return _CachedProvider(events, queries, dimension)
+    return _CachedProvider(event_vectors, query_vectors, dimension,
+                           missing_events=missing_events,
+                           missing_queries=missing_queries,
+                           omissions=omissions)
 
 
 def parse_args(argv=None):
@@ -437,6 +513,7 @@ def _main_driver(args):
         tmp_path.replace(frozen_path)
 
         # -- per-route vector workers (exclusive GPU/MLX, one at a time) --
+        pairs = needed_query_pairs(facts, targets)
         providers = {}
         for route_id in ROUTE_IDS:
             if args.fixture:
@@ -448,7 +525,7 @@ def _main_driver(args):
                 _spawn(spawn_python, ["--score-route", route_id],
                        cache=cache, output=output, snapshot=snapshot_path)
                 provider = _load_route_vectors(
-                    cache, route_id, identities[route_id])
+                    cache, route_id, identities[route_id], events, pairs)
             providers[route_id] = provider
 
         # -- replay + calibration + grid -----------------------------------
@@ -459,7 +536,8 @@ def _main_driver(args):
             vectors = CandidateVectorTable(events, provider)
             replay = WalkForwardReplay(facts, vectors)
             tau_status = calibrate_tau(replay, prefix_targets)
-            if tau_status.get("state") != "calibratable":
+            if (tau_status.get("state") != "calibratable"
+                    and route_id != L28_ROUTE_ID):
                 raise ContractFailure(
                     "route %s calibration returned %s despite facts-only "
                     "count %d >= %d"
@@ -471,12 +549,17 @@ def _main_driver(args):
             data_by_route[route_id] = {
                 "prefix": data_counts(prefix_ref),
                 "suffix": data_counts(suffix_ref),
+                "omissions": (provider.omission_counts()
+                               if not args.fixture else
+                               _FixtureProvider.omission_counts(
+                                   len(events), len(pairs))),
             }
             margin_p10, _n = margin_base_prefix(prefix_ref)
             route_result = run_route(
                 replay, route_id, tau_status, data_by_route[route_id],
                 seed=args.seed, replicates=args.replicates,
                 max_cells=args.max_cells, margin_p10=margin_p10)
+            route_result["omissions"] = data_by_route[route_id]["omissions"]
             matrix.append(route_result)
         data = {
             "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
@@ -692,6 +775,12 @@ def _score_embedding_route(route_id, args):
                        zip((e.event_id for e in events), event_vectors))
         _write_vectors(_query_vectors_path(cache_dir, route_id),
                        zip(pair_keys, query_vectors))
+        _write_omissions(
+            _omissions_path(cache_dir, route_id),
+            route_id=route_id,
+            event_rows=len(events), event_vectors=len(event_vectors),
+            query_rows=len(pairs), query_vectors=len(query_vectors),
+            reason_counts={})
         print("route %s done: %d events, %d queries"
               % (route_id, len(events), len(pairs)), flush=True)
     finally:
@@ -702,6 +791,7 @@ def _score_embedding_route(route_id, args):
 def _score_l28_route(args):
     from hidden_state import _lazy_mlx, pool_candidate_hidden_states
     from representations import (CandidateRepresentationSpec,
+                                 CandidateSpanRepresentationError,
                                  candidate_tokenization_for)
     import numpy as np
 
@@ -767,19 +857,54 @@ def _score_l28_route(args):
         events = facts.events()
         targets = [e for e in events if not e.retracted]
         pairs = needed_query_pairs(facts, targets)
-        event_vectors = []
+        reason_counts = {}
+
+        def record_omission(error):
+            message = str(error)
+            if type(error).__name__ == "EmptyCandidateRepresentationError":
+                reason = "empty_candidate"
+            elif message == "candidate suffix mismatch":
+                reason = "suffix_mismatch"
+            elif message == "token straddles context/candidate boundary":
+                reason = "boundary_straddled"
+            else:
+                reason = "candidate_span"
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        event_rows = []
         for event in events:
-            event_vectors.append(l28_vector(
-                event.preceding_text, event.final_selection_text))
-        _write_vectors(_event_vectors_path(cache_dir, L28_ROUTE_ID),
-                       zip((e.event_id for e in events), event_vectors))
+            try:
+                vector = l28_vector(
+                    event.preceding_text, event.final_selection_text)
+            except CandidateSpanRepresentationError as error:
+                record_omission(error)
+                continue
+            event_rows.append((event.event_id, vector))
         query_rows = []
         for preceding, candidate in pairs:
-            query_rows.append(l28_vector(preceding, candidate))
+            try:
+                vector = l28_vector(preceding, candidate)
+            except CandidateSpanRepresentationError as error:
+                record_omission(error)
+                continue
+            query_rows.append(("%s\0%s" % (preceding, candidate), vector))
+        _write_vectors(_event_vectors_path(cache_dir, L28_ROUTE_ID),
+                       event_rows)
         _write_vectors(_query_vectors_path(cache_dir, L28_ROUTE_ID),
-                       zip(("%s\0%s" % pair for pair in pairs), query_rows))
-        print("route %s done: %d events, %d queries"
-              % (L28_ROUTE_ID, len(events), len(pairs)), flush=True)
+                       query_rows)
+        _write_omissions(
+            _omissions_path(cache_dir, L28_ROUTE_ID),
+            route_id=L28_ROUTE_ID,
+            event_rows=len(events), event_vectors=len(event_rows),
+            query_rows=len(pairs), query_vectors=len(query_rows),
+            reason_counts=reason_counts)
+        event_omitted = len(events) - len(event_rows)
+        query_omitted = len(pairs) - len(query_rows)
+        print("route %s done: %d/%d events, %d/%d queries; omitted "
+              "events=%d queries=%d"
+              % (L28_ROUTE_ID, len(event_rows), len(events),
+                 len(query_rows), len(pairs), event_omitted, query_omitted),
+              flush=True)
     finally:
         facts.close()
     return 0

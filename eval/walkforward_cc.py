@@ -251,29 +251,33 @@ class CandidateVectorTable:
         self._by_id = {event.event_id: event for event in events}
         self._provider = provider
         self._dimension = int(provider.vector_dimension())
-        self._events: Dict[str, Tuple[float, ...]] = {}
-        self._queries: Dict[Tuple[str, str], Tuple[float, ...]] = {}
+        self._events: Dict[str, Optional[Tuple[float, ...]]] = {}
+        self._queries: Dict[Tuple[str, str], Optional[Tuple[float, ...]]] = {}
 
     def event_vector(self, event_id):
-        if event_id not in self._events:
-            event = self._by_id.get(event_id)
-            if event is None:
-                raise SuffixWalkforwardError(
-                    "no vector source for event %s" % event_id)
-            self._events[event_id] = self._finite(
-                self._provider.event_vector(event), "event %s" % event_id)
+        if event_id in self._events:
+            return self._events[event_id]
+        event = self._by_id.get(event_id)
+        if event is None:
+            raise SuffixWalkforwardError(
+                "no vector source for event %s" % event_id)
+        self._events[event_id] = self._finite(
+            self._provider.event_vector(event), "event %s" % event_id)
         return self._events[event_id]
 
     def query_vector_for_candidate(self, preceding_text, candidate):
         key = (preceding_text, candidate)
-        if key not in self._queries:
-            self._queries[key] = self._finite(
-                self._provider.query_vector_for_candidate(
-                    preceding_text, candidate),
-                "query %r" % (key,))
+        if key in self._queries:
+            return self._queries[key]
+        self._queries[key] = self._finite(
+            self._provider.query_vector_for_candidate(
+                preceding_text, candidate),
+            "query %r" % (key,))
         return self._queries[key]
 
     def _finite(self, vector, label):
+        if vector is None:
+            return None
         vector = tuple(float(value) for value in vector)
         if not vector or len(vector) != self._dimension:
             raise SuffixWalkforwardError(
@@ -486,12 +490,19 @@ class WalkForwardReplay:
         outcomes = []
         for target in self.targets():
             history = self._same_key_active(target)
-            event_vectors = []
-            for h in history:
-                event_vectors.append(self._vectors.event_vector(h.event_id))
-            usage_ages = list(range(len(history) - 1, -1, -1))
-            selection_texts = [match_text(h.final_selection_text)
-                               for h in history]
+            representable_history = []
+            for history_index, history_event in enumerate(history):
+                event_vector = self._vectors.event_vector(
+                    history_event.event_id)
+                if event_vector is None:
+                    continue
+                representable_history.append(
+                    (history_index, history_event, event_vector))
+            event_vectors = [row[2] for row in representable_history]
+            usage_ages = [len(history) - index - 1
+                          for index, _event, _vector in representable_history]
+            selection_texts = [match_text(row[1].final_selection_text)
+                               for row in representable_history]
             # Only candidates that can match some same-key history event
             # need a query vector (others score 0 evidence; no invented
             # cosine).  The runner precomputes exactly this pair set.
@@ -505,10 +516,12 @@ class WalkForwardReplay:
                     continue
                 seen_templates.add(template)
                 if any(selected == template for selected in selection_texts):
+                    query_vector = self._vectors.query_vector_for_candidate(
+                        target.preceding_text, candidate)
+                    if query_vector is None:
+                        continue
                     candidate_indexes.append(index)
-                    query_vectors.append(
-                        self._vectors.query_vector_for_candidate(
-                            target.preceding_text, candidate))
+                    query_vectors.append(query_vector)
             s, kept_positions, kept_weights, kept_matches, total_mass = \
                 fast.run(candidate_indexes, query_vectors, event_vectors,
                          usage_ages, list(target.competition),
@@ -532,7 +545,7 @@ class WalkForwardReplay:
                 total_mass=total_mass,
                 candidate_count=len(target.competition),
                 selection_index=selection_index,
-                kept_ids=tuple(history[position].event_id
+                kept_ids=tuple(representable_history[position][1].event_id
                                for position in kept_positions),
                 kept_weights=tuple(float(v) for v in kept_weights),
                 kept_matches=tuple(int(m) for m in kept_matches),
