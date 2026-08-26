@@ -559,8 +559,9 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
             "(group-complete), never the persisted competition_complete "
             "bit (issue #159 body)",
             "d5 τ: per route only from prefix query-level hard negatives, "
-            ">= 200 queries, Q95/Q97.5/Q99/Q99.5; below 200 the route is "
-            "not_calibratable and leaves the shortlist (AC-159-4)",
+            ">= 200 queries, Q95/Q97.5/Q99/Q99.5; the #158 expected count "
+            "is a contract invariant, so a lower recomputation fails closed "
+            "rather than producing a legal terminal (AC-159-4)",
             "d6 grid: H {8,32,128,512,inf} x K {8,16,32,64} x gamma "
             "{0.5,1,2,4} x k {1,3,7}, alpha=0; no extra cells, no "
             "continuous optimizer (AC-159-4)",

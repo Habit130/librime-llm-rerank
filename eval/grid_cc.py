@@ -177,7 +177,7 @@ def data_counts(outcomes):
     }
 
 
-def facts_only_data_count(targets, actionable_note=None):
+def facts_only_data_count(targets):
     """Facts-only counts for a terminal that does not run a route replay.
 
     The runner uses this for fact-only terminal paths such as an empty
@@ -200,8 +200,6 @@ def facts_only_data_count(targets, actionable_note=None):
         "coverage": (len(group_complete) / len(targets)
                      if targets else 0.0),
     }
-    if actionable_note is not None:
-        result["actionable_note"] = actionable_note
     return result
 
 
@@ -392,10 +390,13 @@ def finite_h_gate(inf_cell, finite_cell, seed=BOOTSTRAP_SEED,
     inf_by_id = {o.event_id: o for o in inf_cell["_outcomes"]}
     finite_by_id = {o.event_id: o for o in finite_cell["_outcomes"]}
     union_ids = sorted(
-        {event_id for event_id, outcome in inf_by_id.items()
-         if not getattr(outcome, "in_prefix", False)}
-        | {event_id for event_id, outcome in finite_by_id.items()
-           if not getattr(outcome, "in_prefix", False)})
+        event_id for event_id in set(inf_by_id) & set(finite_by_id)
+        if not getattr(inf_by_id[event_id], "in_prefix", False)
+        and not getattr(finite_by_id[event_id], "in_prefix", False)
+        and (inf_by_id[event_id].group_complete
+             or finite_by_id[event_id].group_complete)
+        and (inf_by_id[event_id].actionable
+             or finite_by_id[event_id].actionable))
 
     def top1_value(outcome):
         if not outcome.actionable:

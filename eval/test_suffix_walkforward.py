@@ -502,11 +502,11 @@ class GridAndTerminalTest(unittest.TestCase):
     def test_finite_h_gate_uses_suffix_only(self):
         from walkforward_cc import EventOutcome
 
-        def outcome(event_id, in_prefix, scheme_rank):
+        def outcome(event_id, in_prefix, scheme_rank, group_complete=True):
             return EventOutcome(
                 event_id=event_id, hlc=(1, 0), key=("s", "c", "k"),
                 key_hash="k", confirmation_source="explicit_current",
-                competition_complete=True, group_complete=True,
+                competition_complete=True, group_complete=group_complete,
                 baseline_rank=1, scheme_rank=scheme_rank, actionable=True,
                 total_mass=1.0, candidate_count=2, selection_index=0,
                 kept_ids=("h",), kept_weights=(1.0,), kept_matches=(0,),
@@ -514,8 +514,10 @@ class GridAndTerminalTest(unittest.TestCase):
 
         gate = finite_h_gate(
             {"_outcomes": [outcome("prefix", True, 1),
+                           outcome("incomplete", False, 1, False),
                            outcome("suffix", False, 1)]},
             {"_outcomes": [outcome("prefix", True, 2),
+                           outcome("incomplete", False, 2, False),
                            outcome("suffix", False, 1)]})
         self.assertEqual(gate["union_events"], 1)
         self.assertEqual(gate["top1_diff"][0], 0.0)

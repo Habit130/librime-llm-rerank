@@ -495,8 +495,9 @@ The AC-159-v1 wiring onto the #77 seam:
   cutoff -> **数据不足** (legal terminal).
 - **τ**: per route only from prefix query-level hard negatives (>= 200
   queries, nearest-rank Q95/Q97.5/Q99/Q99.5); below that the route is
-  `not_calibratable` and leaves the shortlist — no τ is invented.
-  All three not_calibratable -> **无合格方案**.
+  expected to violate the #158 calibration invariant.  AC-159 fails closed
+  instead of emitting `not_calibratable` or inventing a terminal; the
+  primitive calibration helper still exposes that state for model-free tests.
 - **Grid**: H {8,32,128,512,inf} x K {8,16,32,64} x gamma {0.5,1,2,4} x k
   {1,3,7}, alpha=0 (AC-106-v2); no extra cells, no continuous optimizer.
 - **Denominator**: group-complete (saved competition size < 32); the
