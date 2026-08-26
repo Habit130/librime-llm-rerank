@@ -59,7 +59,7 @@ from walkforward_cc import (  # noqa: E402
 from calibration_cc import calibrate_tau, prefix_hard_negative_query_count  # noqa: E402
 from grid_cc import data_counts, facts_only_data_count, grid_manifest, run_route  # noqa: E402
 from shortlist_cc import assemble_shortlist  # noqa: E402
-from suffix_report import (build_report, verify_privacy,  # noqa: E402
+from suffix_report import (build_report, split_hashes, verify_privacy,  # noqa: E402
                            render_markdown)
 
 
@@ -80,6 +80,7 @@ REPORT_JSON_NAME = "suffix_walkforward_report.json"
 REPORT_MD_NAME = "SUFFIX_WALKFORWARD_REPORT.md"
 DEFAULT_ARTIFACT_DIR = (Path(__file__).resolve().parents[1] / ".local-work"
                         / "ac159-suffix-wf" / "artifacts")
+HISTORICAL_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
 
 
 class EnvironmentBlocker(Exception):
@@ -318,6 +319,12 @@ def _main_driver(args):
     cache = _cache_dir(args.cache if args.cache is not None
                        else (work_dir / "cache"))
     output = args.artifact_dir
+    historical = HISTORICAL_ARTIFACT_DIR.resolve()
+    output_resolved = output.resolve()
+    if output_resolved == historical or historical in output_resolved.parents:
+        raise EnvironmentBlocker(
+            "AC-157 artifact directory is historical and read-only: %s"
+            % output)
     output.mkdir(parents=True, exist_ok=True)
 
     code_sha = current_code_sha(require_clean=True)
@@ -413,7 +420,9 @@ def _main_driver(args):
                 % (hn_count, MIN_HARD_NEGATIVE_QUERIES))
 
         # -- freeze BEFORE any score --------------------------------------
-        freeze = _build_freeze(code_sha, snapshot, identities, args)
+        freeze = _build_freeze(
+            code_sha, snapshot, identities, args, prefix_targets,
+            suffix_targets)
         frozen_path = output / FREEZE_NAME
         if frozen_path.exists():
             existing = json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -500,12 +509,15 @@ def _reference_params():
                         saturation_k=1.0)
 
 
-def _build_freeze(code_sha, snapshot, identities, args):
+def _build_freeze(code_sha, snapshot, identities, args, prefix_targets,
+                  suffix_targets):
+    split = split_hashes(snapshot["path"], prefix_targets, suffix_targets)
     return {
         "contract": CONTRACT_ID,
         "code_sha": code_sha,
         "snapshot_sha256": snapshot["sha256"],
         "snapshot_source": snapshot.get("source", "claim_time_online_backup"),
+        "split": split,
         "grid_manifest": grid_manifest(args.replicates),
         "seed": args.seed,
         "routes": {route_id: identities[route_id]
