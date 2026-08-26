@@ -387,6 +387,29 @@ class SparseVectorReplayTest(unittest.TestCase):
         self.assertEqual(by_id["e2"].kept_ids, ())
 
 
+class L28OmissionClassificationTest(unittest.TestCase):
+    def test_only_candidate_span_faults_are_omissions(self):
+        from representations import (CandidateSpanRepresentationError,
+                                      EmptyCandidateRepresentationError,
+                                      RepresentationError)
+        from run_suffix_walkforward import _l28_omission_reason
+
+        self.assertEqual(
+            _l28_omission_reason(CandidateSpanRepresentationError(
+                "token straddles context/candidate boundary")),
+            "boundary_straddled")
+        self.assertEqual(
+            _l28_omission_reason(EmptyCandidateRepresentationError(
+                "empty candidate")),
+            "empty_candidate")
+        self.assertEqual(
+            _l28_omission_reason(RepresentationError(
+                "candidate suffix mismatch")),
+            "suffix_mismatch")
+        self.assertIsNone(_l28_omission_reason(RepresentationError(
+            "preceding_text must be a string")))
+
+
 class TauCalibrationTest(unittest.TestCase):
 
     def test_nearest_rank_quantiles(self):

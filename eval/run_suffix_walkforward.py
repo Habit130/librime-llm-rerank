@@ -49,6 +49,8 @@ if str(Path(__file__).resolve().parents[1] / "daemon") not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "daemon"))
 
 from public_layer_slicer import canonical_json, sha256_bytes  # noqa: E402
+from representations import (  # noqa: E402
+    CandidateSpanRepresentationError, RepresentationError)
 from snapshot import take_snapshot  # noqa: E402
 from walkforward_cc import (  # noqa: E402
     CONTRACT_ID, ENGINE_VERSION, FrozenFacts, PREFIX_HLC_MAX_INCLUSIVE,
@@ -171,6 +173,20 @@ def _write_omissions(path, *, route_id, event_rows, event_vectors,
     tmp.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def _l28_omission_reason(error):
+    """Return a safe omission category, or None for a true worker fault."""
+    if not isinstance(error, CandidateSpanRepresentationError) and \
+            str(error) != "candidate suffix mismatch":
+        return None
+    if type(error).__name__ == "EmptyCandidateRepresentationError":
+        return "empty_candidate"
+    if str(error) == "candidate suffix mismatch":
+        return "suffix_mismatch"
+    if str(error) == "token straddles context/candidate boundary":
+        return "boundary_straddled"
+    return "candidate_span"
 
 
 def _read_vectors(path):
@@ -655,8 +671,9 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
             "bit (issue #159 body)",
             "d5 τ: per route only from prefix query-level hard negatives, "
             ">= 200 queries, Q95/Q97.5/Q99/Q99.5; the #158 expected count "
-            "is a contract invariant, so a lower recomputation fails closed "
-            "rather than producing a legal terminal (AC-159-4)",
+            "is a facts-only contract invariant; after L28 omissions, only "
+            "that route may be not_calibratable and leave the shortlist, "
+            "while sibling routes continue (AC-159-4)",
             "d6 grid: H {8,32,128,512,inf} x K {8,16,32,64} x gamma "
             "{0.5,1,2,4} x k {1,3,7}, alpha=0; no extra cells, no "
             "continuous optimizer (AC-159-4)",
@@ -791,7 +808,6 @@ def _score_embedding_route(route_id, args):
 def _score_l28_route(args):
     from hidden_state import _lazy_mlx, pool_candidate_hidden_states
     from representations import (CandidateRepresentationSpec,
-                                 CandidateSpanRepresentationError,
                                  candidate_tokenization_for)
     import numpy as np
 
@@ -860,15 +876,9 @@ def _score_l28_route(args):
         reason_counts = {}
 
         def record_omission(error):
-            message = str(error)
-            if type(error).__name__ == "EmptyCandidateRepresentationError":
-                reason = "empty_candidate"
-            elif message == "candidate suffix mismatch":
-                reason = "suffix_mismatch"
-            elif message == "token straddles context/candidate boundary":
-                reason = "boundary_straddled"
-            else:
-                reason = "candidate_span"
+            reason = _l28_omission_reason(error)
+            if reason is None:
+                raise error
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
         event_rows = []
@@ -876,7 +886,7 @@ def _score_l28_route(args):
             try:
                 vector = l28_vector(
                     event.preceding_text, event.final_selection_text)
-            except CandidateSpanRepresentationError as error:
+            except RepresentationError as error:
                 record_omission(error)
                 continue
             event_rows.append((event.event_id, vector))
@@ -884,7 +894,7 @@ def _score_l28_route(args):
         for preceding, candidate in pairs:
             try:
                 vector = l28_vector(preceding, candidate)
-            except CandidateSpanRepresentationError as error:
+            except RepresentationError as error:
                 record_omission(error)
                 continue
             query_rows.append(("%s\0%s" % (preceding, candidate), vector))
