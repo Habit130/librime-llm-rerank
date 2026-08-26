@@ -39,6 +39,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -83,6 +84,11 @@ REPORT_MD_NAME = "SUFFIX_WALKFORWARD_REPORT.md"
 DEFAULT_ARTIFACT_DIR = (Path(__file__).resolve().parents[1] / ".local-work"
                         / "ac159-suffix-wf" / "artifacts")
 HISTORICAL_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
+# Git-committed mirror of the desensitized AC-159 report.  This is a NEW
+# path inside the repo; it never touches the AC-157 artifacts under
+# eval/suffix_walkforward/ (AC-159-v1 repair 2).
+COMMITTED_ARTIFACT_DIR = (Path(__file__).resolve().parent
+                          / "suffix_walkforward_ac159")
 
 
 class EnvironmentBlocker(Exception):
@@ -369,6 +375,8 @@ def parse_args(argv=None):
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--artifact-dir", type=Path,
                         default=DEFAULT_ARTIFACT_DIR)
+    parser.add_argument("--committed-artifact-dir", type=Path,
+                        default=COMMITTED_ARTIFACT_DIR)
     parser.add_argument("--cache", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None,
                         help="worker mode alias for --artifact-dir")
@@ -417,6 +425,13 @@ def _main_driver(args):
         raise EnvironmentBlocker(
             "AC-157 artifact directory is historical and read-only: %s"
             % output)
+    committed = args.committed_artifact_dir
+    committed_resolved = committed.resolve()
+    if committed_resolved == historical or \
+            historical in committed_resolved.parents:
+        raise EnvironmentBlocker(
+            "AC-157 artifact directory is historical and read-only: %s"
+            % committed)
     output.mkdir(parents=True, exist_ok=True)
 
     code_sha = current_code_sha(require_clean=True)
@@ -701,6 +716,13 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
         render_markdown(report), encoding="utf-8")
     print("report written: %s/%s" % (output, REPORT_JSON_NAME), flush=True)
     print("report sha256: %s" % report["report_sha256"], flush=True)
+    committed = args.committed_artifact_dir
+    committed.mkdir(parents=True, exist_ok=True)
+    for name in (FREEZE_NAME, REPORT_JSON_NAME, REPORT_MD_NAME):
+        source = output / name
+        if source.is_file():
+            shutil.copyfile(source, committed / name)
+    print("committed report mirror: %s" % committed, flush=True)
 
 
 def _score_embedding_route(route_id, args):

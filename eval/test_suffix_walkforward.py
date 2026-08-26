@@ -635,11 +635,14 @@ class TerminalAssemblyTest(unittest.TestCase):
             "delta_one_ok": True,
             "hard_gates": {
                 "pass": True,
+                "evaluated": True,
+                "unevaluated": [],
                 "safety_top1_ok": True, "safety_mrr_ok": True,
                 "mispromotion_point_ok": True, "mispromotion_ci_ok": True,
                 "pollution_point_ok": True, "pollution_ci_ok": True,
             },
-            "finite_h_gate": {"pass": True},
+            "finite_h_gate": {"pass": True, "evaluated": True,
+                              "union_events": 500},
             "metrics": {"top1": 0.73, "mrr": 0.81},
             "ci": {"top1_vs_baseline": (0.03, (0.01, 0.05))},
             "lift": {
@@ -705,6 +708,196 @@ class TerminalAssemblyTest(unittest.TestCase):
         self.assertEqual(
             decision["per_route"][0]["eliminated_by_reason"],
             {"prefix_not_selected": 1})
+
+    def _unevaluated_hard_cell(self, route_id):
+        record = self._passing_cell(route_id, False)
+        # The production regression this pins: every *_ok reads True while
+        # the gate never measured (empty denominator / None CI), yet the
+        # cell used to reach the shortlist.
+        record["hard_gates"] = {
+            "pass": False, "evaluated": False,
+            "unevaluated": ["mispromotion_ci", "pollution_ci"],
+            "safety_top1_ok": True, "safety_mrr_ok": True,
+            "mispromotion_point_ok": True, "mispromotion_ci_ok": True,
+            "pollution_point_ok": True, "pollution_ci_ok": True,
+        }
+        record["finite_h_gate"] = {"pass": False, "evaluated": False,
+                                   "union_events": 0}
+        return record
+
+    def test_unevaluated_hard_gates_cannot_pass(self):
+        """AC-159-v1 repair 2: an unevaluated suffix hard gate (empty
+        denominator / None CI) is never a pass, and with no measurable
+        operating cell the terminal is 数据不足, not 收窄声称."""
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "cells": [self._unevaluated_hard_cell(ROUTE_IDS[0])],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "数据不足")
+        self.assertEqual(decision["total_eligible_cells"], 0)
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 0)
+        reasons = decision["per_route"][0]["eliminated_by_reason"]
+        self.assertEqual(reasons, {
+            "hard_gates:not_evaluated:mispromotion_ci,pollution_ci": 1})
+        self.assertEqual(decision["live_gamma"], 0.0)
+
+    def test_vacuous_hard_pass_refused_by_gate_state(self):
+        """Even a record that still claims pass=True with unevaluated gates
+        is refused by cell_gate_state (the None-treat-as-pass regression is
+        impossible to reintroduce through the decision surface)."""
+        from shortlist_cc import cell_gate_state
+        record = self._passing_cell(ROUTE_IDS[0], False)
+        record["hard_gates"]["pass"] = True
+        record["hard_gates"]["evaluated"] = False
+        record["hard_gates"]["unevaluated"] = ["top1_vs_baseline"]
+        state = cell_gate_state(record)
+        self.assertFalse(state["pass"])
+        self.assertIn("not_evaluated", state["reason"])
+
+    def test_unevaluated_finite_h_gate_never_passes(self):
+        """A finite-H cell whose paired gate ran on an empty common
+        actionable union is not eligible; unmeasurable claim -> 数据不足."""
+        record = self._passing_cell(ROUTE_IDS[0], False)
+        record["finite_h_gate"] = {"pass": False, "evaluated": False,
+                                   "union_events": 0}
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "cells": [record],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "数据不足")
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 0)
+        self.assertIn("eliminated:finite_h_not_evaluated",
+                      decision["per_route"][0]["eliminated_by_reason"])
+
+    def test_finite_h_gate_empty_union_is_not_evaluated(self):
+        from walkforward_cc import EventOutcome
+
+        def outcome(event_id):
+            return EventOutcome(
+                event_id=event_id, hlc=(2, 0), key=("s", "c", "k"),
+                key_hash="k", confirmation_source="explicit_current",
+                competition_complete=True, group_complete=True,
+                baseline_rank=1, scheme_rank=1, actionable=False,
+                total_mass=1.0, candidate_count=2, selection_index=0,
+                kept_ids=("h",), kept_weights=(1.0,), kept_matches=(0,),
+                in_prefix=False)
+
+        gate = finite_h_gate({"_outcomes": [outcome("e1")]},
+                             {"_outcomes": [outcome("e1")]})
+        self.assertEqual(gate["union_events"], 0)
+        self.assertFalse(gate["evaluated"])
+        self.assertFalse(gate["pass"])
+
+    def test_mixed_measured_and_unmeasured_cells_keep_收窄声称(self):
+        """One measured passing operating cell makes the claim gates
+        evaluable; unmeasured sibling cells stay ineligible without
+        forcing 数据不足 (收窄声称 requires actually evaluated gates)."""
+        measured = self._passing_cell(ROUTE_IDS[0], False)
+        measured["selected"] = True
+        unmeasured = self._unevaluated_hard_cell(ROUTE_IDS[0])
+        unmeasured["selected"] = True
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "selection": {"mode": "prefix_only"},
+            "cells": [measured, unmeasured],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "收窄声称_shortlist")
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 1)
+        self.assertIn(
+            "hard_gates:not_evaluated:mispromotion_ci,pollution_ci",
+            decision["per_route"][0]["eliminated_by_reason"])
+
+    def test_数据不足_requires_claim_cells(self):
+        """With no claim cell at all (all eliminated) the terminal follows
+        the ordinary eligibility path, not 数据不足."""
+        eliminated = self._passing_cell(ROUTE_IDS[0], False)
+        eliminated["eliminated"] = "delta_one"
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "cells": [eliminated],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "无合格方案")
+
+
+class OperatingCellReplayGateTest(unittest.TestCase):
+    """AC-159-v1 repair 2, replay level: prefix can select a family while
+    the suffix claim set stays unmeasurable at the operating cell — the
+    real-snapshot dynamics (reference τ=0 actionable vs cell-τ empty)."""
+
+    def test_unmeasured_suffix_claim_is_数据不足(self):
+        facts = _synthetic_with_split()
+        self.addCleanup(facts.close)
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        events = db.events()
+        provider = _fixture_provider(
+            {
+                # Prefix candidates: near the matching history vectors so
+                # prefix selection has metrics at the cell tau.
+                ("前1", "我"): (0.99, 0.14, 0.0, 0.0),
+                ("前1", "握"): (0.14, 0.99, 0.0, 0.0),
+                ("前2", "握"): (0.14, 0.99, 0.0, 0.0),
+                ("前2", "我"): (0.99, 0.14, 0.0, 0.0),
+                ("前3", "我"): (0.99, 0.14, 0.0, 0.0),
+                ("前3", "握"): (0.14, 0.99, 0.0, 0.0),
+                # Suffix candidates: low but positive similarity to their
+                # history match — actionable at the reference tau=0, but
+                # below the operating-cell tau=0.9 so NO suffix event is
+                # actionable at the operating cell (real-snapshot shape).
+                ("后4", "握"): (0.0, 0.3, 0.954, 0.0),
+                ("后4", "我"): (0.3, 0.0, 0.954, 0.0),
+                ("后5", "我"): (0.3, 0.0, 0.954, 0.0),
+                ("后5", "握"): (0.0, 0.3, 0.954, 0.0),
+            },
+            {
+                ("luna_pinyin", "wo", "我"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "握"): (0.0, 1.0, 0.0, 0.0),
+            })
+        vectors = CandidateVectorTable(events, provider)
+        replay = WalkForwardReplay(db, vectors)
+        reference = replay.replay(_reference(), 0.0)
+        data = {"prefix": data_counts(
+            [o for o in reference if o.in_prefix]),
+            "suffix": data_counts(
+                [o for o in reference if not o.in_prefix])}
+        # The suffix claim set exists (group-complete, reference-actionable)
+        # so the global 数据不足 start gate does not fire.
+        self.assertEqual(data["suffix"]["group_complete"], 2)
+        self.assertEqual(data["suffix"]["actionable_group_complete"], 2)
+        result = run_route(
+            replay, ROUTE_IDS[0], {
+                "state": "calibratable",
+                "queries": 200,
+                "quantiles": {"0.95": 0.9, "0.975": 0.9,
+                              "0.99": 0.9, "0.995": 0.9},
+            }, data, seed=7, replicates=10000,
+            max_cells=5, margin_p10=1.0)
+        selected = [cell for cell in result["cells"]
+                    if cell.get("selected") and "eliminated" not in cell]
+        self.assertTrue(selected)
+        for cell in selected:
+            self.assertEqual(
+                cell["metrics"]["actionable_group_complete"], 0)
+            gates = cell["hard_gates"]
+            self.assertFalse(gates["evaluated"])
+            self.assertFalse(gates["pass"])
+            finite = cell.get("finite_h_gate")
+            if finite is not None:
+                self.assertFalse(finite["evaluated"])
+                self.assertFalse(finite["pass"])
+                self.assertEqual(finite["union_events"], 0)
+        decision = assemble_shortlist([result], data)
+        self.assertEqual(decision["outcome"], "数据不足")
+        self.assertEqual(decision["total_eligible_cells"], 0)
+
+
+def _reference():
+    return OracleParams(tau=0.0, k_evidence=8, half_life=float("inf"),
+                        saturation_k=1.0)
 
 
 class ReportPrivacyTest(unittest.TestCase):

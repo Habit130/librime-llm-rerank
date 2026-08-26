@@ -316,16 +316,38 @@ def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES,
             % (top1_point - baseline_point, top1_diff[1][0],
                mrr_diff[1][0]))
 
-    safety_top1_ok = (safety_top1[1][0] is None
-                      or safety_top1[1][0] >= SAFETY_TOP1_LOWER)
-    safety_mrr_ok = (safety_mrr[1][0] is None
-                     or safety_mrr[1][0] >= SAFETY_MRR_LOWER)
-    mp_point_ok = mp_rate is None or mp_rate <= MISPROMOTION_POINT
-    mp_ci_ok = mp_ci[1] is None or mp_ci[1] <= MISPROMOTION_CI_UPPER
-    poll_point_ok = majority is None or majority <= POLLUTION_POINT
-    poll_ci_ok = poll_ci[1] is None or poll_ci[1] <= POLLUTION_CI_UPPER
-    hard_pass = (safety_top1_ok and safety_mrr_ok and mp_point_ok
-                 and mp_ci_ok and poll_point_ok and poll_ci_ok)
+    # A gate whose denominator is empty (no events, or no paired scheme/
+    # baseline values) or whose CI is None is NOT evaluated and can never
+    # pass: "不得把未测准的声称写成通过" (AC-159-v1 repair 2).  Each gate
+    # carries its evaluated flag; hard_gates.evaluated is true iff every
+    # one of the six suffix hard gates measured on the claim set.
+    safety_top1_evaluated = safety_top1[1][0] is not None
+    safety_mrr_evaluated = safety_mrr[1][0] is not None
+    mp_point_evaluated = mp_rate is not None
+    mp_ci_evaluated = mp_ci[1] is not None
+    poll_point_evaluated = majority is not None
+    poll_ci_evaluated = poll_ci[1] is not None
+    safety_top1_ok = safety_top1_evaluated and \
+        safety_top1[1][0] >= SAFETY_TOP1_LOWER
+    safety_mrr_ok = safety_mrr_evaluated and \
+        safety_mrr[1][0] >= SAFETY_MRR_LOWER
+    mp_point_ok = mp_point_evaluated and mp_rate <= MISPROMOTION_POINT
+    mp_ci_ok = mp_ci_evaluated and mp_ci[1] <= MISPROMOTION_CI_UPPER
+    poll_point_ok = poll_point_evaluated and majority <= POLLUTION_POINT
+    poll_ci_ok = poll_ci_evaluated and poll_ci[1] <= POLLUTION_CI_UPPER
+    gate_checks = (
+        ("safety_top1", safety_top1_evaluated, safety_top1_ok),
+        ("safety_mrr", safety_mrr_evaluated, safety_mrr_ok),
+        ("mispromotion_point", mp_point_evaluated, mp_point_ok),
+        ("mispromotion_ci", mp_ci_evaluated, mp_ci_ok),
+        ("pollution_point", poll_point_evaluated, poll_point_ok),
+        ("pollution_ci", poll_ci_evaluated, poll_ci_ok),
+    )
+    hard_evaluated = all(evaluated for _name, evaluated, _ok in gate_checks)
+    hard_pass = hard_evaluated and all(
+        ok for _name, _evaluated, ok in gate_checks)
+    gate_states = [name for name, evaluated, _ok in gate_checks
+                   if not evaluated]
     return {
         "cell": cell,
         "prefix_metrics": prefix_metrics,
@@ -354,6 +376,8 @@ def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES,
             cell["gamma"], cell["saturation_k"], cell.get("margin_p10")),
         "hard_gates": {
             "pass": hard_pass,
+            "evaluated": hard_evaluated,
+            "unevaluated": gate_states,
             "safety_top1_ok": safety_top1_ok,
             "safety_mrr_ok": safety_mrr_ok,
             "mispromotion_point_ok": mp_point_ok,
@@ -460,13 +484,18 @@ def finite_h_gate(inf_cell, finite_cell, seed=BOOTSTRAP_SEED,
     misp_diff = diff_for(mispromotion_value)
     poll_diff = diff_for(majority_pollution_value)
 
-    top1_ok = top1_diff[1][0] is None or top1_diff[1][0] >= FINITE_H_TOP1_LOWER
-    misp_ok = (misp_diff[1][1] is None
-               or misp_diff[1][1] <= FINITE_H_MISPROMOTION_UPPER)
-    poll_ok = (poll_diff[1][1] is None
-               or poll_diff[1][1] <= FINITE_H_POLLUTION_UPPER)
+    # An empty common actionable union (or an all-degenerate diff) is NOT
+    # evaluated and can never pass: the finite-H claim gate is unmeasurable
+    # on that suffix (AC-159-v1 repair 2).
+    evaluated = (top1_diff[1][0] is not None
+                 and misp_diff[1][1] is not None
+                 and poll_diff[1][1] is not None)
+    top1_ok = evaluated and top1_diff[1][0] >= FINITE_H_TOP1_LOWER
+    misp_ok = evaluated and misp_diff[1][1] <= FINITE_H_MISPROMOTION_UPPER
+    poll_ok = evaluated and poll_diff[1][1] <= FINITE_H_POLLUTION_UPPER
     return {
         "pass": top1_ok and misp_ok and poll_ok,
+        "evaluated": evaluated,
         "union_events": len(union_ids),
         "top1_diff": top1_diff,
         "mispromotion_diff": misp_diff,
@@ -654,6 +683,7 @@ def _attach_finite_h_gates(cells, seed, replicates):
                                  seed=seed, replicates=replicates)
             finite_record["finite_h_gate"] = {
                 "pass": gate["pass"],
+                "evaluated": gate["evaluated"],
                 "union_events": gate["union_events"],
                 "top1_diff": gate["top1_diff"],
                 "mispromotion_diff": gate["mispromotion_diff"],

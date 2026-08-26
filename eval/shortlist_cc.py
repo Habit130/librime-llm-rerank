@@ -15,8 +15,11 @@ forms exactly one of the four frozen legal terminals:
    Δ₁ / finite-H family / safety / mispromotion / pollution eliminated
    every cell; H=inf alone is never a stand-in);
 4. **数据不足** — the suffix claim set holds no group-complete events (or
-   no suffix events past the cutoff): the contract claims cannot be
-   evaluated (legal terminal, never an implementation failure).
+   no suffix events past the cutoff), or the claim gates cannot be
+   evaluated at the operating cell (every selected cell has an empty
+   hard-gate / finite-H denominator or None CI): the contract claims
+   cannot be evaluated (legal terminal, never an implementation failure).
+   An unevaluated gate is never a pass.
 
 Gates (issue #159 body, on the suffix claim set; all on the group-complete
 denominator, size < 32):
@@ -59,9 +62,10 @@ def cell_gate_state(cell_record):
     """One cell's hard-gate state on the suffix claim set.
 
     A cell passes iff it ran (no eliminated marker), Δ₁ holds, all seven
-    hard gates pass, and the finite-H family rule is satisfied (finite-H
-    cells pass their own finite-H gate; H=inf cells require a passing
-    finite-H twin).
+    hard gates pass AND were evaluated (non-empty denominators / non-None
+    CIs: an unevaluated gate is never a pass), and the finite-H family
+    rule is satisfied (finite-H cells pass their own evaluated finite-H
+    gate; H=inf cells require a passing finite-H twin).
     """
     if "eliminated" in cell_record:
         return {"pass": False, "reason": "eliminated:%s" % cell_record["eliminated"]}
@@ -71,6 +75,12 @@ def cell_gate_state(cell_record):
     if not cell_record.get("delta_one_ok", False):
         return {"pass": False, "reason": "eliminated:delta_one"}
     hard = cell_record.get("hard_gates") or {}
+    unevaluated = sorted(hard.get("unevaluated") or [])
+    if not hard.get("evaluated", False) or unevaluated:
+        return {"pass": False,
+                "reason": "hard_gates:not_evaluated:%s"
+                % ",".join(unevaluated) if unevaluated
+                else "hard_gates:not_evaluated"}
     if not hard.get("pass", False):
         reasons = []
         if not hard.get("safety_top1_ok", True):
@@ -87,6 +97,8 @@ def cell_gate_state(cell_record):
             reasons.append("pollution_ci")
         return {"pass": False, "reason": "hard_gates:%s" % ",".join(reasons)}
     if not cell_record.get("finite_h_ok", False):
+        if cell_record.get("finite_h_not_evaluated"):
+            return {"pass": False, "reason": "eliminated:finite_h_not_evaluated"}
         return {"pass": False, "reason": "eliminated:finite_h_family"}
     return {"pass": True, "reason": "ok"}
 
@@ -96,7 +108,9 @@ def finite_h_family_map(cells):
 
     A family is ``ok`` iff at least one finite-H cell of it passed its
     finite-H gate (all three paired CIs).  An H=inf cell alone is never a
-    valid family (spec #43: "不得用 H=∞ 顶上").
+    valid family (spec #43: "不得用 H=∞ 顶上").  ``n_finite_evaluated``
+    counts finite-H twins whose gate actually evaluated on a non-empty
+    common actionable union (AC-159-v1 repair 2).
     """
     families = {}
     for record in cells:
@@ -107,14 +121,17 @@ def finite_h_family_map(cells):
                cell["k_evidence"], cell["gamma"], cell["saturation_k"])
         half_life = cell["half_life"]
         entry = families.setdefault(
-            key, {"ok": False, "has_inf": False, "n_finite_pass": 0})
+            key, {"ok": False, "has_inf": False, "n_finite_pass": 0,
+                  "n_finite_evaluated": 0})
         if half_life == float("inf"):
             entry["has_inf"] = True
             continue
         gate = record.get("finite_h_gate")
-        if gate is not None and gate.get("pass", False):
-            entry["n_finite_pass"] += 1
-            entry["ok"] = True
+        if gate is not None and gate.get("evaluated", False):
+            entry["n_finite_evaluated"] += 1
+            if gate.get("pass", False):
+                entry["n_finite_pass"] += 1
+                entry["ok"] = True
     return families
 
 
@@ -153,6 +170,8 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
     any_evaluated = False
     total_eligible = 0
     all_not_calibratable = True
+    claim_cells_exist = False
+    claims_evaluated = False
     for result in route_results:
         route_id = result["route_id"]
         tau = result.get("tau") or {}
@@ -183,15 +202,28 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
                    cell["k_evidence"], cell["gamma"], cell["saturation_k"])
             half_life = cell["half_life"]
             family = families.get(key)
+            hard = record.get("hard_gates") or {}
             if half_life == float("inf"):
                 # H=∞ alone is never a production stand-in (spec #43): the
-                # family needs at least one passing finite-H twin.
+                # family needs at least one passing finite-H twin (whose
+                # gate must have actually evaluated on the claim set).
                 finite_h_ok = bool(family and family["n_finite_pass"] > 0)
+                finite_h_not_evaluated = not bool(
+                    family and family["n_finite_evaluated"] > 0)
             else:
                 # A finite-H cell must pass its own finite-H gate.
                 gate = record.get("finite_h_gate")
-                finite_h_ok = bool(gate and gate.get("pass", False))
-            record = dict(record, finite_h_ok=finite_h_ok)
+                finite_h_ok = bool(gate and gate.get("evaluated", False)
+                                   and gate.get("pass", False))
+                finite_h_not_evaluated = bool(
+                    gate is None or not gate.get("evaluated", False))
+            record = dict(record, finite_h_ok=finite_h_ok,
+                          finite_h_not_evaluated=finite_h_not_evaluated)
+            # Every record reaching this point is a claim cell (selected
+            # when the prefix-selection seam is applied).
+            claim_cells_exist = True
+            if hard.get("evaluated", False) and not finite_h_not_evaluated:
+                claims_evaluated = True
             state = cell_gate_state(record)
             if state["pass"]:
                 eligible.append(record)
@@ -223,6 +255,28 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
             } for c in eligible],
         })
         total_eligible += len(eligible)
+
+    # 数据不足 (legal terminal): suffix events exist, but the claim gates
+    # cannot be evaluated at the operating cell — every selected claim
+    # cell has an empty hard-gate or finite-H denominator (None CI).  Such
+    # a claim is unmeasured: neither an exact nor a 收窄声称 shortlist may
+    # be emitted (AC-159-v1 repair 2).
+    if claim_cells_exist and not claims_evaluated:
+        return {
+            "outcome": TERMINAL_INSUFFICIENT,
+            "reason": ("suffix claim set holds %d group-complete / %d "
+                       "actionable group-complete events, but the claim "
+                       "gates could not be evaluated at the operating "
+                       "cell: every selected cell has an empty hard-gate "
+                       "or finite-H denominator (None CI)"
+                       % (suffix_data.get("group_complete", 0),
+                          suffix_data.get("actionable_group_complete", 0))),
+            "data": data,
+            "per_route": per_route,
+            "total_eligible_cells": 0,
+            "any_evaluated": any_evaluated,
+            "live_gamma": 0.0,
+        }
 
     # Legal terminal assembly (AC-159-V1).
     eligible_routes = [r for r in per_route if r["eligible_cells"] > 0]
