@@ -540,3 +540,39 @@ manifest, seed) written **before** any score, plus the desensitized report
 The vector cache and snapshot copies stay private under `.cache/` /
 `.local-work/`; reports never contain preceding text, candidate text or
 machine paths.
+
+## Prefix hard-negative query census (Habit130/squirrel#158, AC-158-v1)
+
+`prefix_hn_census.py` + `run_prefix_hn_census.py` run a **facts-only**
+census over the pinned #157 claim-time snapshot (byte-verified SHA-256 and
+identity; RISK-158-1):
+
+- **New cutoff** = max HLC among unretracted events in the snapshot,
+  inclusive (issue #158 body "新截止点 = #157 快照末端").  Every
+  unretracted event is in the new prefix; the in-snapshot suffix count is
+  0 by definition, not 数据不足.  The #77 prefix upper bound
+  `[1787065441087, 0]` is not reused.
+- **Primary count** = the frozen `prefix_hard_negative_query_count`
+  (`calibration_cc.py`) on those prefix targets (same key, HLC earlier,
+  unretracted, differing final selection, selection in the current
+  competition set); threshold stays 200.
+- **Terminals (exactly one)**: **可标定** (primary >= 200) |
+  **仍不可标定** (primary < 200).  可标定 only unlocks a later
+  walk-forward freeze contract; this ticket never starts walk-forward.
+- **Appendix**: a #77-wide count (no current-competition filter) is
+  diagnostic only and never chooses the terminal.
+- No model forward, no grid, no live `α`/`γ` change, no `~/Library/Rime`.
+
+```sh
+# model-free gate:
+python3 -m unittest eval.test_prefix_hn_census
+
+# one-shot census over the pinned snapshot (fail-closed on byte mismatch):
+python3 eval/run_prefix_hn_census.py \
+  --snapshot <pinned #157 snapshot copy> --artifact-dir eval/prefix_hn_census
+```
+
+Committed artifacts (`eval/prefix_hn_census/`) carry the freeze and the
+desensitized report: snapshot/split hashes, the numeric cutoff HLC pair,
+unretracted / group-complete / key counts, primary + appendix counts and
+the terminal — no 上文, no candidate text, no machine paths.
