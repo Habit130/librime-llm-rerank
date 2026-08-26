@@ -465,16 +465,16 @@ The decompiled table is produced read-only from the librime build tree:
     <librime>/build/bin/luna_pinyin.table.bin luna_pinyin.table.decompiled.txt
 ```
 
-## Candidate-conditioned suffix walk-forward (Habit130/squirrel#157, AC-157-v1)
+## Candidate-conditioned suffix walk-forward (Habit130/squirrel#159, AC-159-v1)
 
 `walkforward_cc.py` + `calibration_cc.py` + `grid_cc.py` + `shortlist_cc.py`
 + `suffix_report.py` + `run_suffix_walkforward.py` drive the exact
 walk-forward for the three frozen candidate-conditioned routes
 (`dedicated_qwen3_embedding_0_6b`, `qwen_l28_candidate_span_mean`,
 `dedicated_bge_m3`) over a **claim-time** read-only Online-Backup snapshot
-split at the frozen HLC cutoff `[1787065441087, 0]` (prefix inclusive).
+split at the frozen HLC cutoff `[1787667799562, 0]` (prefix inclusive).
 
-The AC-157-v1 wiring onto the #77 seam:
+The AC-159-v1 wiring onto the #77 seam:
 
 - **Payload**: `last64(preceding)+candidate`, no separator (ADR-0003 /
   #109 / #110).  L28 pools the candidate token span `[start, start+count)`
@@ -482,12 +482,13 @@ The AC-157-v1 wiring onto the #77 seam:
 - **Query side**: Qwen3-emb uses the frozen instruction
   `Represent the candidate-conditioned query for semantic retrieval.` +
   newline + payload; BGE and L28 have none.  Document/history side: none.
-- **Split**: prefix = `hlc <= [1787065441087, 0]` (τ calibration + grid
+- **Split**: prefix = `hlc <= [1787667799562, 0]` (τ calibration + grid
   selection); suffix = strictly later events, the claim set (quality and
-  safety gates only).  The replay memory still accumulates over the whole
-  snapshot — suffix targets see prefix history (exact HLC-causal
-  walk-forward).  Folding the suffix into development is a contract
-  failure.
+  safety gates only).  Prefix selection chooses the family by prefix top-1,
+  then MRR, then actionable count, retaining all H variants for the finite-H
+  gate.  The replay memory still accumulates over the whole snapshot — suffix
+  targets see prefix history (exact HLC-causal walk-forward).  Folding the
+  suffix into development is a contract failure.
 - **Snapshot**: a fresh Online Backup copy is taken at claim
   (`take_snapshot`); the #77/#155 prefix files are not a sufficient store.
   Missing snapshot -> environment blocker.  No suffix events past the
@@ -502,7 +503,7 @@ The AC-157-v1 wiring onto the #77 seam:
   persisted `competition_complete` bit is diagnostic only.  Shadow
   baseline: same events/set, alpha=0, gamma=0 (recorded confirmation
   position).
-- **Suffix gates** (claim set; issue #157 body): Δ₁ <= min(0.5,
+- **Suffix gates** (claim set; issue #159 body): Δ₁ <= min(0.5,
   P10(margin_base)) with margin_base from prefix baseline-correct events;
   finite-H vs H=inf on the common actionable union (top-1 CI lower >= -1pp,
   mispromotion upper <= +1pp, pollution upper <= +1pp; H=inf alone is never

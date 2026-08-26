@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Terminal-outcome assembly for the AC-157-v1 suffix shortlist (#157).
+"""Terminal-outcome assembly for the AC-159-v1 suffix shortlist (#159).
 
 Given the per-route suffix grid results and the split data state, this
-module applies the issue-#157 quoted gates on the **suffix claim set** and
+module applies the issue-#159 quoted gates on the **suffix claim set** and
 forms exactly one of the four frozen legal terminals:
 
 1. **exact shortlist** — at least one cell passes every gate including the
@@ -18,7 +18,7 @@ forms exactly one of the four frozen legal terminals:
    no suffix events past the cutoff): the contract claims cannot be
    evaluated (legal terminal, never an implementation failure).
 
-Gates (issue #157 body, on the suffix claim set; all on the group-complete
+Gates (issue #159 body, on the suffix claim set; all on the group-complete
 denominator, size < 32):
 
 - Δ₁ = gamma/(1+k) <= min(0.5, P10(margin_base)) with margin_base from the
@@ -123,8 +123,10 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
 
     ``route_results``: per-route records with ``route_id``, ``tau`` (the
     calibration status), ``cells`` (per-cell gate results) and ``data``
-    (the prefix/suffix split counts).  ``data`` carries the reference
-    split counts used for the 数据不足 check and the claim support check.
+    (the prefix/suffix split counts).  ``data`` carries the reference split
+    counts used for the 数据不足 check and the claim support check.  When a
+    route carries a ``prefix_only`` selection record, only its marked cells
+    can reach suffix claim gates.
     Public-B accuracy and the personal 2x2 r never enter this function.
     """
     if not route_results:
@@ -155,17 +157,26 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
         route_id = result["route_id"]
         tau = result.get("tau") or {}
         cells = result.get("cells") or []
-        groups = [c for c in cells if "eliminated" not in c]
-        any_evaluated = any_evaluated or bool(groups)
+        selection = result.get("selection")
+        selection_applied = (isinstance(selection, dict)
+                             and selection.get("mode") == "prefix_only")
+        evaluated = [c for c in cells if "eliminated" not in c]
+        claim_cells = ([c for c in evaluated if c.get("selected", False)]
+                       if selection_applied else evaluated)
+        any_evaluated = any_evaluated or bool(evaluated)
         if tau.get("state") == "calibratable":
             all_not_calibratable = False
-        families = finite_h_family_map(cells)
+        families = finite_h_family_map(claim_cells)
         eligible = []
         eliminated_reasons = {}
         for record in cells:
             if "eliminated" in record:
                 reason = "eliminated:%s" % record["eliminated"]
                 eliminated_reasons[reason] = eliminated_reasons.get(reason, 0) + 1
+                continue
+            if selection_applied and not record.get("selected", False):
+                eliminated_reasons["prefix_not_selected"] = \
+                    eliminated_reasons.get("prefix_not_selected", 0) + 1
                 continue
             cell = record["cell"]
             key = (cell["route_id"], cell.get("tau_quantile"),
@@ -192,7 +203,9 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
             "tau": tau,
             "eligible_cells": len(eligible),
             "eliminated_by_reason": eliminated_reasons,
-            "evaluated_cells": len(groups),
+            "evaluated_cells": len(evaluated),
+            "selected_cells": len(claim_cells),
+            "selection": selection,
             "eligible": [{
                 "route_id": c["cell"]["route_id"],
                 "half_life": c["cell"]["half_life"],
@@ -201,6 +214,7 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
                 "saturation_k": c["cell"]["saturation_k"],
                 "tau_quantile": c["cell"].get("tau_quantile"),
                 "tau": c["cell"].get("tau"),
+                "prefix_metrics": c.get("prefix_metrics"),
                 "metrics": c.get("metrics"),
                 "ci": c.get("ci"),
                 "hard_gates": c.get("hard_gates"),
@@ -210,13 +224,13 @@ def assemble_shortlist(route_results, data, seed=None, replicates=None):
         })
         total_eligible += len(eligible)
 
-    # Legal terminal assembly (AC-157-V1).
+    # Legal terminal assembly (AC-159-V1).
     eligible_routes = [r for r in per_route if r["eligible_cells"] > 0]
     if all_not_calibratable:
         outcome = TERMINAL_NO_QUALIFIED
         reason = ("all routes τ not_calibratable (prefix hard-negative "
                   "queries < 200); no τ is invented and the suffix gates "
-                  "cannot run (RISK-157-3)")
+                  "cannot run (AC-159-4)")
     elif not eligible_routes:
         outcome = TERMINAL_NO_QUALIFIED
         reason = ("no cell passes the full gate set on the suffix claim "

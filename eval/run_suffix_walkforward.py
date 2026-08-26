@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Suffix walk-forward runner (Habit130/squirrel#157, AC-157-v1).
+"""Suffix walk-forward runner (Habit130/squirrel#159, AC-159-v1).
 
 One-shot driver: takes a **new** read-only Online Backup / facts copy at
 claim (the #77/#155 prefix files are not a sufficient store), splits it at
-the frozen HLC cutoff `[1787065441087, 0]` (prefix inclusive), scores the
+the frozen HLC cutoff `[1787667799562, 0]` (prefix inclusive), scores the
 three frozen routes (`dedicated_qwen3_embedding_0_6b`,
 `qwen_l28_candidate_span_mean`, `dedicated_bge_m3`) into a private vector
 cache (one process per route in its own runtime: the embedding venv for the
 torch routes, the daemon venv for the MLX L28 route), runs the pre-declared
-grid on the prefix (τ + cells), applies the #157-quoted gates on the suffix
+grid on the prefix (τ + cells), applies the #159-quoted gates on the suffix
 claim set, and writes the desensitized freeze/report into the artifact dir.
 
 The freeze (identity: code SHA, snapshot/split hashes, route fingerprints,
@@ -17,7 +17,7 @@ or a freeze mismatch fails closed.  No live-store write, no daemon restart,
 no `~/Library/Rime` deploy; GPU/MLX is exclusive to this run
 (shared-state allocation of the issue).
 
-Terminals (issue #157 body, frozen): exact shortlist | 收窄声称 shortlist |
+Terminals (issue #159 body, frozen): exact shortlist | 收窄声称 shortlist |
 无合格方案 | 数据不足.  No ANN, no production winner, no live α/γ change;
 public-B accuracy and the personal 2x2 r never enter the decision.
 
@@ -53,6 +53,7 @@ from snapshot import take_snapshot  # noqa: E402
 from walkforward_cc import (  # noqa: E402
     CONTRACT_ID, ENGINE_VERSION, FrozenFacts, PREFIX_HLC_MAX_INCLUSIVE,
     ROUTE_IDS, L28_ROUTE_ID, BOOTSTRAP_SEED, BOOTSTRAP_REPLICATES,
+    MIN_HARD_NEGATIVE_QUERIES,
     CandidateVectorTable, WalkForwardReplay, needed_query_pairs,
     margin_base_prefix, prefix_suffix_split)
 from calibration_cc import calibrate_tau, prefix_hard_negative_query_count  # noqa: E402
@@ -82,6 +83,10 @@ DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
 
 class EnvironmentBlocker(Exception):
     """A required local model, runtime or snapshot is missing."""
+
+
+class ContractFailure(Exception):
+    """A frozen AC-159 invariant failed during the run."""
 
 
 def _cache_dir(cache):
@@ -225,7 +230,7 @@ class _FixtureProvider:
 
     Vectors are a pure function of the route id and the payload hash so the
     smoke run is reproducible without any model; the committed test suite
-    (not this path) is the real AC-157 gate.
+    (not this path) is the real AC-159 gate.
     """
 
     DIMENSION = 16
@@ -327,16 +332,18 @@ def _main_driver(args):
             "sha256": sha256_bytes(snapshot_path.read_bytes()),
             "identity": _open_meta(snapshot_path),
             "status": {"status_check": "skipped"},
+            "source": "provided_frozen_snapshot",
         }
         snapshot_path = snapshot["path"]
     else:
         if not os.path.isfile(args.live_db):
             raise EnvironmentBlocker(
                 "missing live facts store; a claim-time snapshot is "
-                "required (SN-157-1): %s" % args.live_db)
+                "required (SN-159-1): %s" % args.live_db)
         snapshot = take_snapshot(args.live_db, str(work_dir),
                                  status_cli=args.status_cli
                                  if os.path.isfile(args.status_cli) else None)
+        snapshot["source"] = "claim_time_online_backup"
         snapshot_path = snapshot["path"]
     print("snapshot sha256: %s" % snapshot["sha256"], flush=True)
 
@@ -352,12 +359,16 @@ def _main_driver(args):
                 "reason": ("snapshot has no events past the frozen cutoff "
                            "[%s,%s]: the suffix claim set is empty"
                            % PREFIX_HLC_MAX_INCLUSIVE),
-                "data": {},
+                "data": {
+                    "prefix": facts_only_data_count(prefix_targets),
+                    "suffix": facts_only_data_count(suffix_targets),
+                },
                 "per_route": [],
                 "total_eligible_cells": 0,
                 "live_gamma": 0.0,
             }
-            _write_report(snapshot, [], decision, {}, prefix_targets,
+            _write_report(snapshot, [], decision, {}, decision["data"],
+                          prefix_targets,
                           suffix_targets, code_sha, args, cache, output)
             return 0
 
@@ -389,14 +400,16 @@ def _main_driver(args):
             if identities[route_id]["route_id"] != route_id:
                 raise EnvironmentBlocker("identity drifted for %s" % route_id)
 
-        # -- facts-only not_calibratable pre-check (RISK-157-3) -----------
-        # The hard-negative query count is a pure fact of the prefix (which
-        # queries would have a differing-selection same-key history).  When
-        # it is below the frozen 200 for every route, all routes are
-        # provably not_calibratable BEFORE any model forward: the legal
-        # terminal is 无合格方案 and no GPU/MLX work is spent.
+        # -- facts-only calibration invariant (AC-159-4) ------------------
+        # The hard-negative query count is a pure fact of the prefix.  #158
+        # established that this new cutoff is calibratable; a lower count is
+        # an implementation fault, not a legal AC-159 terminal.
         hn_count = prefix_hard_negative_query_count(facts, prefix_targets)
-        all_not_calibratable = hn_count < 200
+        if hn_count < MIN_HARD_NEGATIVE_QUERIES:
+            raise ContractFailure(
+                "prefix hard-negative recomputation returned %d < %d; "
+                "AC-159 expects the #158-calibratable prefix"
+                % (hn_count, MIN_HARD_NEGATIVE_QUERIES))
 
         # -- freeze BEFORE any score --------------------------------------
         freeze = _build_freeze(code_sha, snapshot, identities, args)
@@ -415,46 +428,33 @@ def _main_driver(args):
 
         # -- per-route vector workers (exclusive GPU/MLX, one at a time) --
         providers = {}
-        if not all_not_calibratable or args.fixture:
-            for route_id in ROUTE_IDS:
-                if args.fixture:
-                    provider = _fixture_provider(events, route_id)
-                else:
-                    spawn_python = (args.embedding_python
-                                    if route_id != L28_ROUTE_ID
-                                    else args.daemon_python)
-                    _spawn(spawn_python, ["--score-route", route_id],
-                           cache=cache, output=output, snapshot=snapshot_path)
-                    provider = _load_route_vectors(
-                        cache, route_id, identities[route_id])
-                providers[route_id] = provider
+        for route_id in ROUTE_IDS:
+            if args.fixture:
+                provider = _fixture_provider(events, route_id)
+            else:
+                spawn_python = (args.embedding_python
+                                if route_id != L28_ROUTE_ID
+                                else args.daemon_python)
+                _spawn(spawn_python, ["--score-route", route_id],
+                       cache=cache, output=output, snapshot=snapshot_path)
+                provider = _load_route_vectors(
+                    cache, route_id, identities[route_id])
+            providers[route_id] = provider
 
         # -- replay + calibration + grid -----------------------------------
         matrix = []
         data_by_route = {}
-        tau_status_by_route = {}
         for route_id in ROUTE_IDS:
-            if all_not_calibratable and not args.fixture:
-                # Legal terminal (RISK-157-3): no τ can be calibrated from
-                # the prefix (< 200 hard-negative queries); no FX forward
-                # is spent and the route leaves the shortlist.
-                tau_status_by_route[route_id] = {
-                    "state": "not_calibratable",
-                    "queries": hn_count,
-                    "min_queries": 200,
-                    "prefix_count": len(prefix_targets),
-                }
-                route_result = run_route(
-                    None, route_id, tau_status_by_route[route_id],
-                    {"prefix": {}, "suffix": {}}, seed=args.seed,
-                    replicates=args.replicates)
-                matrix.append(route_result)
-                continue
             provider = providers[route_id]
             vectors = CandidateVectorTable(events, provider)
             replay = WalkForwardReplay(facts, vectors)
             tau_status = calibrate_tau(replay, prefix_targets)
-            tau_status_by_route[route_id] = tau_status
+            if tau_status.get("state") != "calibratable":
+                raise ContractFailure(
+                    "route %s calibration returned %s despite facts-only "
+                    "count %d >= %d"
+                    % (route_id, tau_status.get("state"), hn_count,
+                       MIN_HARD_NEGATIVE_QUERIES))
             reference = replay.replay(_reference_params(), 0.0)
             prefix_ref = [o for o in reference if o.in_prefix]
             suffix_ref = [o for o in reference if not o.in_prefix]
@@ -468,43 +468,11 @@ def _main_driver(args):
                 seed=args.seed, replicates=args.replicates,
                 max_cells=args.max_cells, margin_p10=margin_p10)
             matrix.append(route_result)
-        # Reference split data (route-independent facts) for the terminal.
-        if all_not_calibratable and not args.fixture:
-            # Deterministic legal terminal (RISK-157-3): every route is
-            # provably not_calibratable from the prefix, so no cell can be
-            # evaluated and no claim set interpretation applies.  The
-            # decision is 无合格方案 by construction, never 数据不足.
-            from shortlist_cc import TERMINAL_NO_QUALIFIED
-            data = {
-                "prefix": facts_only_data_count(prefix_targets),
-                "suffix": facts_only_data_count(suffix_targets),
-            }
-            decision = {
-                "outcome": TERMINAL_NO_QUALIFIED,
-                "reason": ("all routes τ not_calibratable (prefix "
-                           "hard-negative queries %d < 200); no τ is "
-                           "invented, no cell is evaluated and the suffix "
-                           "claim gates cannot run (RISK-157-3)" % hn_count),
-                "data": data,
-                "per_route": [{
-                    "route_id": route_result["route_id"],
-                    "tau": route_result["tau"],
-                    "eligible_cells": 0,
-                    "eliminated_by_reason": {"tau_not_calibratable":
-                                             len(route_result["cells"])},
-                    "evaluated_cells": 0,
-                    "eligible": [],
-                } for route_result in matrix],
-                "total_eligible_cells": 0,
-                "any_evaluated": False,
-                "live_gamma": 0.0,
-            }
-        else:
-            data = {
-                "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
-                "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
-            }
-            decision = assemble_shortlist(matrix, data)
+        data = {
+            "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
+            "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
+        }
+        decision = assemble_shortlist(matrix, data)
         if args.max_cells is not None:
             decision["partial_scan"] = True
         _write_report(snapshot, matrix, decision, data_by_route, data,
@@ -536,6 +504,7 @@ def _build_freeze(code_sha, snapshot, identities, args):
         "contract": CONTRACT_ID,
         "code_sha": code_sha,
         "snapshot_sha256": snapshot["sha256"],
+        "snapshot_source": snapshot.get("source", "claim_time_online_backup"),
         "grid_manifest": grid_manifest(args.replicates),
         "seed": args.seed,
         "routes": {route_id: identities[route_id]
@@ -568,45 +537,48 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
         live_gamma=0.0,
         report_notes=[
             "public-B accuracy (11953/14725) was never read into the "
-            "selection or the terminal decision (AC-157-5)",
+            "selection or the terminal decision (AC-159-6)",
             "the personal 2x2 r was never read into the selection, "
-            "tie-breaking or suffix-rank interpretation (AC-157-5)",
-            "live gamma is unchanged at 0 (AC-157-7)",
+            "tie-breaking or suffix-rank interpretation (AC-159-6)",
+            "live gamma is unchanged at 0 (AC-159-7)",
         ],
         decisions=[
             "d1 split: the snapshot is the claim-time Online Backup copy; "
-            "prefix = hlc <= [1787065441087,0] (inclusive), suffix = the "
+            "prefix = hlc <= [1787667799562,0] (inclusive), suffix = the "
             "claim set; selection uses the prefix only, claims use the "
-            "suffix only (AC-157-2)",
+            "suffix only (AC-159-2)",
             "d2 payload: last64(preceding)+candidate, no separator; the "
             "query side uses the frozen Qwen3-emb instruction only for "
             "dedicated_qwen3_embedding_0_6b; document/history side never "
-            "applies an instruction (AC-157-1)",
+            "applies an instruction (AC-159-1)",
             "d3 L28 pools the candidate token span [start, start+count) "
             "via candidate_span_mean; whole-payload pooling would be a "
-            "contract failure (AC-157-1)",
+            "contract failure (AC-159-1)",
             "d4 rank denominator: saved same-group competition size < 32 "
             "(group-complete), never the persisted competition_complete "
-            "bit (issue #157 body)",
+            "bit (issue #159 body)",
             "d5 τ: per route only from prefix query-level hard negatives, "
             ">= 200 queries, Q95/Q97.5/Q99/Q99.5; below 200 the route is "
-            "not_calibratable and leaves the shortlist (AC-157-3)",
+            "not_calibratable and leaves the shortlist (AC-159-4)",
             "d6 grid: H {8,32,128,512,inf} x K {8,16,32,64} x gamma "
             "{0.5,1,2,4} x k {1,3,7}, alpha=0; no extra cells, no "
-            "continuous optimizer (AC-157-3)",
+            "continuous optimizer (AC-159-4)",
             "d7 bootstrap: key-clustered (choice-problem key), fixed seed, "
             ">= 10000 replicates, 95% CI; differences paired per event "
-            "(issue #157 body)",
+            "(issue #159 body)",
             "d8 cross-route metrics use the common actionable union; an "
             "event without evidence for a route scores as that route's "
-            "shadow baseline (issue #157 body)",
+            "shadow baseline (issue #159 body)",
             "d9 Δ₁ = gamma/(1+k) <= min(0.5, P10(margin_base)) with "
             "margin_base from the prefix: real snapshots do not persist "
             "base scores, the engine records the reconstructed rank gap "
             "and enforces the hard cap",
-            "d10 terminals: exact shortlist / 收窄声称 shortlist / "
+            "d10 prefix selection: per route, select the family with the "
+            "best prefix top-1, then MRR, then actionable count; retain all "
+            "H variants so suffix gates cannot influence selection",
+            "d11 terminals: exact shortlist / 收窄声称 shortlist / "
             "无合格方案 / 数据不足; ties are reported, never broken by "
-            "model name; no ANN, no production winner (issue #157 body)",
+            "model name; no ANN, no production winner (issue #159 body)",
         ])
     verify_privacy(report)
     (output / REPORT_JSON_NAME).write_text(
@@ -840,6 +812,9 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except ContractFailure as error:
+        print("contract failure:", error, file=sys.stderr)
+        sys.exit(4)
     except EnvironmentBlocker as error:
         print("environment blocker:", error, file=sys.stderr)
         sys.exit(3)
