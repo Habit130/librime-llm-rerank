@@ -151,16 +151,21 @@ def census_counts(facts, prefix_targets, wide_targets=None):
 
     Returns the primary count (frozen definition), the #77-wide diagnostic
     appendix count and the data-state block (unretracted / group-complete /
-    keys; AC-158-3 + AC-158-4).
+    keys; AC-158-3 + AC-158-4).  Actionability is an AC-157 replay concept
+    and is not invented here.
     """
     primary = prefix_hard_negative_query_count(facts, prefix_targets)
     wide = wide_hard_negative_query_count(
         facts, wide_targets if wide_targets is not None else prefix_targets)
+    state = facts_only_data_count(prefix_targets)
+    data = {key: state[key]
+            for key in ("replayable", "group_complete", "keys",
+                        "explicit_indexed", "rank_gt1", "coverage")}
     return {
         "primary_count": primary,
         "threshold": MIN_HARD_NEGATIVE_QUERIES,
         "wide_77_diagnostic": wide,
-        "data": facts_only_data_count(prefix_targets),
+        "data": data,
     }
 
 
