@@ -525,16 +525,19 @@ python3 -m unittest eval.test_suffix_walkforward
 # one-shot real run (exclusive GPU/MLX; takes a fresh snapshot):
 python3 eval/run_suffix_walkforward.py \
   --work-dir <local snapshot+report dir> \
-  --artifact-dir eval/suffix_walkforward \
+  --artifact-dir .local-work/ac159-suffix-wf/artifacts \
   --embedding-python <repo>/.local-work/venv-embeddings/bin/python \
   --daemon-python <repo>/daemon/.venv/bin/python
 
 # reuse an existing claim-time snapshot for the rerun (identity must match):
 python3 eval/run_suffix_walkforward.py \
-  --snapshot <claim-time snapshot> --artifact-dir eval/suffix_walkforward ...
+  --snapshot <claim-time snapshot> \
+  --artifact-dir .local-work/ac159-suffix-wf/artifacts ...
 ```
 
-Committed artifacts (`eval/suffix_walkforward/`) carry the freeze
+AC-159 artifacts stay under the ignored `.local-work/ac159-suffix-wf/`
+directory so a failed attempt cannot overwrite the historical AC-157 files
+under `eval/suffix_walkforward/`.  A successful claim carries the freeze
 (contract, code SHA, snapshot/split hashes, route fingerprints, grid
 manifest, seed) written **before** any score, plus the desensitized report
 (counts, cell identities, CIs, gate states, terminal) and its SHA-256.

@@ -25,7 +25,7 @@ Usage:
 
     python3 eval/run_suffix_walkforward.py \
         --work-dir <local snapshot+report dir> \
-        --artifact-dir eval/suffix_walkforward \
+        --artifact-dir .local-work/ac159-suffix-wf/artifacts \
         --embedding-python <repo>/.local-work/venv-embeddings/bin/python \
         --daemon-python <repo>/daemon/.venv/bin/python \
         --qwen3-embedding-model <repo>/.local-work/models/Qwen3-Embedding-0.6B \
@@ -78,7 +78,8 @@ def _main_path(*parts):
 FREEZE_NAME = "suffix_walkforward_freeze.json"
 REPORT_JSON_NAME = "suffix_walkforward_report.json"
 REPORT_MD_NAME = "SUFFIX_WALKFORWARD_REPORT.md"
-DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
+DEFAULT_ARTIFACT_DIR = (Path(__file__).resolve().parents[1] / ".local-work"
+                        / "ac159-suffix-wf" / "artifacts")
 
 
 class EnvironmentBlocker(Exception):
