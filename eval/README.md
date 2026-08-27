@@ -540,12 +540,16 @@ python3 eval/run_suffix_walkforward.py \
   --artifact-dir .local-work/ac159-suffix-wf/artifacts ...
 ```
 
-AC-159 artifacts stay under the ignored `.local-work/ac159-suffix-wf/`
-directory so a failed attempt cannot overwrite the historical AC-157 files
-under `eval/suffix_walkforward/`.  A successful claim carries the freeze
-(contract, code SHA, snapshot/split hashes, route fingerprints, grid
-manifest, seed) written **before** any score, plus the desensitized report
-(counts, cell identities, CIs, gate states, terminal) and its SHA-256.
-The vector cache and snapshot copies stay private under `.cache/` /
-`.local-work/`; reports never contain preceding text, candidate text or
-machine paths.
+Private working data (claim-time snapshots, vector cache, working freeze
+and report copies) stay under the ignored `.local-work/ac159-suffix-wf/`
+directory.  The desensitized freeze and report are also mirrored to the
+tracked path `eval/suffix_walkforward_ac159/`; that mirror is the
+git-committed AC-159 artifact.  Historical AC-157 files under
+`eval/suffix_walkforward/` are left unchanged.  A successful claim carries
+the freeze (contract, code SHA, snapshot/split hashes, route fingerprints,
+grid manifest, seed) written **before** any score, plus the desensitized
+report (counts, cell identities, CIs, gate states, terminal) and its
+SHA-256.  Reports never contain preceding text, candidate text or machine
+paths.  Fixture or partial runs copy the same three files into
+`--committed-artifact-dir` (default `eval/suffix_walkforward_ac159/`)
+unless that flag is redirected away from the tracked mirror.
