@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desensitized suffix walk-forward report (Habit130/squirrel#157, AC-157-v1).
+"""Desensitized suffix walk-forward report (Habit130/squirrel#159, AC-159-v1).
 
 The report package carries only:
 
@@ -14,7 +14,7 @@ The report package carries only:
 - a privacy scan verdict.
 
 It never copies raw preceding text, candidate text, live facts or machine
-paths; only ids, hashes, numbers and counts (issue #157 body: "仓库只收脱敏
+paths; only ids, hashes, numbers and counts (issue #159 body: "仓库只收脱敏
 计数、单元格身份、指纹、快照/切分哈希、终态").  GitHub receives only the
 desensitized summary and the report-package hash.
 """
@@ -25,6 +25,10 @@ import platform
 import sys
 
 from public_layer_slicer import scan_privacy
+from walkforward_cc import CONTRACT_ID, PREFIX_HLC_MAX_INCLUSIVE
+
+
+SPLIT_HASH_VERSION = "ac159-split-v1"
 
 
 def _canonical_json(value):
@@ -47,19 +51,28 @@ def split_hashes(snapshot_path, prefix_events, suffix_events):
     hashes cover only event ids (desensitized identifiers), never raw text;
     they let a reviewer verify the exact split partition.
     """
+    prefix_ids = {event.event_id for event in prefix_events}
+    suffix_ids = {event.event_id for event in suffix_events}
+    if prefix_ids & suffix_ids:
+        raise ReportError("prefix/suffix split overlaps event ids")
+    if any(event.hlc > PREFIX_HLC_MAX_INCLUSIVE
+           for event in prefix_events):
+        raise ReportError("prefix contains an event after the cutoff")
+    if any(event.hlc <= PREFIX_HLC_MAX_INCLUSIVE
+           for event in suffix_events):
+        raise ReportError("suffix contains an event at or before the cutoff")
+
     def _hash(events):
         ids = sorted(event.event_id for event in events)
         digest = hashlib.sha256()
-        digest.update(b"ac157-split-v1\n")
+        digest.update((SPLIT_HASH_VERSION + "\n").encode("ascii"))
         for event_id in ids:
             digest.update(event_id.encode("utf-8"))
             digest.update(b"\0")
         return digest.hexdigest()
 
-    prefix_path = None
-    suffix_path = None
     return {
-        "cutoff_hlc": [1787065441087, 0],
+        "cutoff_hlc": list(PREFIX_HLC_MAX_INCLUSIVE),
         "prefix_event_count": len(prefix_events),
         "suffix_event_count": len(suffix_events),
         "prefix_sha256": _hash(prefix_events),
@@ -89,7 +102,7 @@ def build_report(*, engine_version, code_sha, snapshot, prefix_events,
                  margin_base, grid_manifest, seed, replicates,
                  public_b_unused=True, personal_r_unused=True,
                  live_gamma=0.0, report_notes=None, decisions=None):
-    """Assemble the desensitized report dict (AC-157-v1).
+    """Assemble the desensitized report dict (AC-159-v1).
 
     ``snapshot`` is the ``take_snapshot`` record; ``route_results`` the
     ``run_route`` records; ``decision`` the ``assemble_shortlist`` terminal
@@ -99,7 +112,7 @@ def build_report(*, engine_version, code_sha, snapshot, prefix_events,
         raise ReportError("snapshot record is required")
     identity = snapshot.get("identity") or {}
     report = {
-        "contract": "AC-157-v1",
+        "contract": CONTRACT_ID,
         "engine": {
             "version": engine_version,
             "program": "eval/walkforward_cc.py + calibration_cc/grid_cc/"
@@ -108,6 +121,7 @@ def build_report(*, engine_version, code_sha, snapshot, prefix_events,
         "code_sha": code_sha,
         "snapshot": {
             "sha256": snapshot["sha256"],
+            "source": snapshot.get("source", "claim_time_online_backup"),
             "history_id": identity.get("history_id"),
             "store_epoch": identity.get("store_epoch"),
             "status": {
@@ -118,7 +132,7 @@ def build_report(*, engine_version, code_sha, snapshot, prefix_events,
         "split": split_hashes(snapshot["path"], prefix_events,
                               suffix_events),
         "prefix_reference": {
-            # RISK-157-5: the claim-time snapshot's prefix may not
+            # The claim-time snapshot's prefix may not
             # byte-match the #77/#155 prefix after later retractions; the
             # report carries both the claim-time split and the prior
             # accepted pins (quoted, not re-verified).
@@ -166,7 +180,7 @@ def verify_privacy(report):
 
     Refuse delivery on any finding: the report carries desensitized counts,
     cell identities, fingerprints, snapshot/split hashes and the terminal
-    only (AC-157-6).
+    only (AC-159-7).
     """
     findings = scan_privacy(report)
     if findings:
@@ -177,7 +191,7 @@ def verify_privacy(report):
 def render_markdown(report):
     """A human-readable desensitized summary (no raw text)."""
     lines = [
-        "# Suffix Walk-Forward Report (AC-157-v1)",
+        "# Suffix Walk-Forward Report (AC-159-v1)",
         "",
         "- Engine: %s" % report["engine"]["version"],
         "- Code SHA: `%s`" % report["code_sha"],

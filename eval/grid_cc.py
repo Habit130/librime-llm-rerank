@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Pre-declared grid scan with suffix gates (Habit130/squirrel#157, AC-157-v1).
+"""Pre-declared grid scan with suffix gates (Habit130/squirrel#159, AC-159-v1).
 
-Candidate space (issue #157 body, frozen verbatim):
+ Candidate space (issue #159 body, frozen verbatim):
 
 - routes: exactly the three frozen candidate-conditioned routes
   (``dedicated_qwen3_embedding_0_6b``, ``qwen_l28_candidate_span_mean``,
@@ -17,9 +17,9 @@ Candidate space (issue #157 body, frozen verbatim):
 The replay memory accumulates over the whole snapshot (suffix targets see
 prefix history — the exact walk-forward); τ and grid *selection* run on the
 prefix, and the quality/safety gates run on the **suffix claim set** only
-(issue #157 body).  Public-B accuracy and the personal 2x2 r never enter.
+(issue #159 body).  Public-B accuracy and the personal 2x2 r never enter.
 
-Gates applied on the suffix claim set (issue #157 body, frozen):
+Gates applied on the suffix claim set (issue #159 body, frozen):
 
 1. **Δ₁ single-event boundary**: Δ₁ = gamma/(1+k) <= min(0.5,
    P10(margin_base)) where margin_base is from the prefix (events where the
@@ -48,19 +48,23 @@ Gates applied on the suffix claim set (issue #157 body, frozen):
 
 Bootstrap is key-clustered with a fixed seed and >= 10000 replicates
 (``bootstrap.py``); differences are paired per event.  Cells are
-deterministic and independent: each cell re-walks the replay.
+deterministic and independent: each cell re-walks the replay.  Prefix
+selection chooses the best pre-declared family by prefix top-1, then MRR,
+then actionable count; all H values in a selected family are retained for
+the suffix claim gates.
 
 No raw text is produced: cells carry route ids, parameter values, τ
 quantiles and numeric evidence only.
 """
 
 from bootstrap import bootstrap_rate, paired_difference
-from metrics import (mispromotion_events, mrr, pollution_distribution,
-                     pollution_mass, top1)
+from metrics import (baseline_top1, mispromotion_events, mrr,
+                     pollution_distribution, pollution_mass, top1)
 from walkforward_cc import (BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED,
-                            L28_POOLING_RULE, PAYLOAD_RULE,
+                            CONTRACT_ID, L28_POOLING_RULE, PAYLOAD_RULE,
                             QWEN3_EMB_QUERY_INSTRUCTION, DELTA_ONE_CAP,
-                            CI_LEVEL, delta_one)
+                            CI_LEVEL, PREFIX_HLC_MAX_INCLUSIVE, ROUTE_IDS,
+                            delta_one)
 
 
 class GridError(Exception):
@@ -73,7 +77,7 @@ K_EVIDENCE = (8, 16, 32, 64)
 GAMMAS = (0.5, 1.0, 2.0, 4.0)
 SATURATION_KS = (1, 3, 7)
 
-# AC-157-V1 hard-gate constants (issue #157 body, frozen).
+# AC-159-V1 hard-gate constants (issue #159 body, frozen).
 FINITE_H_TOP1_LOWER = -0.01        # top-1 CI lower >= -1pp
 FINITE_H_MISPROMOTION_UPPER = 0.01
 FINITE_H_POLLUTION_UPPER = 0.01
@@ -126,9 +130,12 @@ def delta_one_ok(gamma, saturation_k, margin_p10=None):
 
 
 def grid_manifest(replicates):
-    """The pre-declared grid manifest (frozen before metrics; AC-157-3)."""
+    """The pre-declared grid manifest (frozen before metrics; AC-159-4)."""
     return {
+        "contract": CONTRACT_ID,
         "declared_before_metrics": True,
+        "cutoff_hlc": list(PREFIX_HLC_MAX_INCLUSIVE),
+        "routes": list(ROUTE_IDS),
         "alpha": 0.0,
         "half_lives": [("inf" if h == float("inf") else h)
                        for h in HALF_LIVES],
@@ -139,12 +146,13 @@ def grid_manifest(replicates):
         "payload_rule": PAYLOAD_RULE,
         "qwen3_emb_query_instruction": QWEN3_EMB_QUERY_INSTRUCTION,
         "l28_pooling_rule": L28_POOLING_RULE,
+        "selection": "prefix_top1_then_mrr_then_actionable_count",
         "replicates": replicates,
     }
 
 
 def data_counts(outcomes):
-    """Data-state counts over the replayable outcomes (AC-157-V1).
+    """Data-state counts over the replayable outcomes (AC-159-V1).
 
     Returns the group-complete counts and the report-only strata
     (explicit_indexed / rank>1 / coverage / hard-negative pool) that are
@@ -170,14 +178,10 @@ def data_counts(outcomes):
 
 
 def facts_only_data_count(targets):
-    """Facts-only counts for the legal 无合格方案 terminal (RISK-157-3).
+    """Facts-only counts for a terminal that does not run a route replay.
 
-    When every route is provably `not_calibratable` from the prefix (fewer
-    than 200 hard-negative queries, a property of the facts alone), the
-    run reports the legal terminal without spending any FX forward; the
-    data-state block then carries the counts that are knowable from the
-    snapshot (replayable / group-complete / keys / strata).  Actionability
-    needs a replay, so it is not invented here.
+    The runner uses this for fact-only terminal paths such as an empty
+    suffix.  Actionability needs a replay, so it is not invented here.
     """
     group_complete = [t for t in targets if t.group_complete]
     keys = set(t.key_hash for t in group_complete)
@@ -185,7 +189,7 @@ def facts_only_data_count(targets):
                            if t.confirmation_source == "explicit_indexed")
     rank_gt1 = sum(1 for t in group_complete if (
         not (t.display_page == 1 and t.display_rank == 1)))
-    return {
+    result = {
         "replayable": len(targets),
         "group_complete": len(group_complete),
         "keys": len(keys),
@@ -195,15 +199,16 @@ def facts_only_data_count(targets):
         "actionable_keys": 0,
         "coverage": (len(group_complete) / len(targets)
                      if targets else 0.0),
-        "actionable_note": "not scored: no route calibratable from the "
-                           "prefix (RISK-157-3)",
     }
+    return result
 
 
-def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES):
-    """Run one grid cell; suffix gates + prefix selection metrics.
+def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES,
+             claim_gates=True):
+    """Run one grid cell's prefix selection and optional suffix claim gates.
 
-    Returns a dict with point estimates, bootstrap CIs (95%, key-clustered,
+    Returns a dict with prefix metrics and, when ``claim_gates`` is true,
+    suffix point estimates and bootstrap CIs (95%, key-clustered,
     fixed seed, >=10000 replicates), the per-gate pass state on the suffix
     claim set, and the cell's prefix selection metrics (the grid scan runs
     on the prefix; quality/safety gates on the suffix claim set only).
@@ -221,6 +226,22 @@ def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES)
     prefix = [o for o in outcomes if o.in_prefix]
     prefix_complete = [o for o in prefix if o.group_complete]
     prefix_actionable = [o for o in prefix_complete if o.actionable]
+
+    prefix_metrics = {
+        # Grid selection uses only this prefix block.  Suffix observations
+        # are intentionally absent when claim_gates is false.
+        "actionable_group_complete": len(prefix_actionable),
+        "group_complete": len(prefix_complete),
+        "top1": top1(prefix_actionable),
+        "baseline_top1": baseline_top1(prefix_actionable),
+        "mrr": mrr(prefix_actionable),
+    }
+    if not claim_gates:
+        return {
+            "cell": cell,
+            "prefix_metrics": prefix_metrics,
+            "_outcomes": outcomes,
+        }
 
     def top1_fn(o):
         if o.scheme_rank is None:
@@ -295,27 +316,41 @@ def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES)
             % (top1_point - baseline_point, top1_diff[1][0],
                mrr_diff[1][0]))
 
-    safety_top1_ok = (safety_top1[1][0] is None
-                      or safety_top1[1][0] >= SAFETY_TOP1_LOWER)
-    safety_mrr_ok = (safety_mrr[1][0] is None
-                     or safety_mrr[1][0] >= SAFETY_MRR_LOWER)
-    mp_point_ok = mp_rate is None or mp_rate <= MISPROMOTION_POINT
-    mp_ci_ok = mp_ci[1] is None or mp_ci[1] <= MISPROMOTION_CI_UPPER
-    poll_point_ok = majority is None or majority <= POLLUTION_POINT
-    poll_ci_ok = poll_ci[1] is None or poll_ci[1] <= POLLUTION_CI_UPPER
-    hard_pass = (safety_top1_ok and safety_mrr_ok and mp_point_ok
-                 and mp_ci_ok and poll_point_ok and poll_ci_ok)
+    # A gate whose denominator is empty (no events, or no paired scheme/
+    # baseline values) or whose CI is None is NOT evaluated and can never
+    # pass: "不得把未测准的声称写成通过" (AC-159-v1 repair 2).  Each gate
+    # carries its evaluated flag; hard_gates.evaluated is true iff every
+    # one of the six suffix hard gates measured on the claim set.
+    safety_top1_evaluated = safety_top1[1][0] is not None
+    safety_mrr_evaluated = safety_mrr[1][0] is not None
+    mp_point_evaluated = mp_rate is not None
+    mp_ci_evaluated = mp_ci[1] is not None
+    poll_point_evaluated = majority is not None
+    poll_ci_evaluated = poll_ci[1] is not None
+    safety_top1_ok = safety_top1_evaluated and \
+        safety_top1[1][0] >= SAFETY_TOP1_LOWER
+    safety_mrr_ok = safety_mrr_evaluated and \
+        safety_mrr[1][0] >= SAFETY_MRR_LOWER
+    mp_point_ok = mp_point_evaluated and mp_rate <= MISPROMOTION_POINT
+    mp_ci_ok = mp_ci_evaluated and mp_ci[1] <= MISPROMOTION_CI_UPPER
+    poll_point_ok = poll_point_evaluated and majority <= POLLUTION_POINT
+    poll_ci_ok = poll_ci_evaluated and poll_ci[1] <= POLLUTION_CI_UPPER
+    gate_checks = (
+        ("safety_top1", safety_top1_evaluated, safety_top1_ok),
+        ("safety_mrr", safety_mrr_evaluated, safety_mrr_ok),
+        ("mispromotion_point", mp_point_evaluated, mp_point_ok),
+        ("mispromotion_ci", mp_ci_evaluated, mp_ci_ok),
+        ("pollution_point", poll_point_evaluated, poll_point_ok),
+        ("pollution_ci", poll_ci_evaluated, poll_ci_ok),
+    )
+    hard_evaluated = all(evaluated for _name, evaluated, _ok in gate_checks)
+    hard_pass = hard_evaluated and all(
+        ok for _name, _evaluated, ok in gate_checks)
+    gate_states = [name for name, evaluated, _ok in gate_checks
+                   if not evaluated]
     return {
         "cell": cell,
-        "prefix_metrics": {
-            # The grid scan runs on the prefix (selection table).  Reported
-            # counts and points only; never gate the suffix claims.
-            "actionable_group_complete": len(prefix_actionable),
-            "group_complete": len(prefix_complete),
-            "top1": top1(prefix_actionable),
-            "baseline_top1": _baseline_point(prefix_actionable),
-            "mrr": mrr(prefix_actionable),
-        },
+        "prefix_metrics": prefix_metrics,
         "metrics": {
             "top1": top1_point,
             "baseline_top1": baseline_point,
@@ -341,6 +376,8 @@ def run_cell(replay, cell, seed=BOOTSTRAP_SEED, replicates=BOOTSTRAP_REPLICATES)
             cell["gamma"], cell["saturation_k"], cell.get("margin_p10")),
         "hard_gates": {
             "pass": hard_pass,
+            "evaluated": hard_evaluated,
+            "unevaluated": gate_states,
             "safety_top1_ok": safety_top1_ok,
             "safety_mrr_ok": safety_mrr_ok,
             "mispromotion_point_ok": mp_point_ok,
@@ -369,14 +406,21 @@ def finite_h_gate(inf_cell, finite_cell, seed=BOOTSTRAP_SEED,
     bound >= -1pp, mispromotion upper bound <= +1pp, majority-pollution
     upper bound <= +1pp.  The comparison runs on the common actionable
     union (events actionable for either cell); an event without evidence
-    for one cell scores as that cell's shadow baseline (issue #157 body:
+    for one cell scores as that cell's shadow baseline (issue #159 body:
     "无证据事件按该方案影子基线计分").
     """
     from collections import defaultdict
 
     inf_by_id = {o.event_id: o for o in inf_cell["_outcomes"]}
     finite_by_id = {o.event_id: o for o in finite_cell["_outcomes"]}
-    union_ids = sorted(set(inf_by_id) | set(finite_by_id))
+    union_ids = sorted(
+        event_id for event_id in set(inf_by_id) & set(finite_by_id)
+        if not getattr(inf_by_id[event_id], "in_prefix", False)
+        and not getattr(finite_by_id[event_id], "in_prefix", False)
+        and (inf_by_id[event_id].group_complete
+             or finite_by_id[event_id].group_complete)
+        and (inf_by_id[event_id].actionable
+             or finite_by_id[event_id].actionable))
 
     def top1_value(outcome):
         if not outcome.actionable:
@@ -440,17 +484,103 @@ def finite_h_gate(inf_cell, finite_cell, seed=BOOTSTRAP_SEED,
     misp_diff = diff_for(mispromotion_value)
     poll_diff = diff_for(majority_pollution_value)
 
-    top1_ok = top1_diff[1][0] is None or top1_diff[1][0] >= FINITE_H_TOP1_LOWER
-    misp_ok = (misp_diff[1][1] is None
-               or misp_diff[1][1] <= FINITE_H_MISPROMOTION_UPPER)
-    poll_ok = (poll_diff[1][1] is None
-               or poll_diff[1][1] <= FINITE_H_POLLUTION_UPPER)
+    # An empty common actionable union (or an all-degenerate diff) is NOT
+    # evaluated and can never pass: the finite-H claim gate is unmeasurable
+    # on that suffix (AC-159-v1 repair 2).
+    evaluated = (top1_diff[1][0] is not None
+                 and misp_diff[1][1] is not None
+                 and poll_diff[1][1] is not None)
+    top1_ok = evaluated and top1_diff[1][0] >= FINITE_H_TOP1_LOWER
+    misp_ok = evaluated and misp_diff[1][1] <= FINITE_H_MISPROMOTION_UPPER
+    poll_ok = evaluated and poll_diff[1][1] <= FINITE_H_POLLUTION_UPPER
     return {
         "pass": top1_ok and misp_ok and poll_ok,
+        "evaluated": evaluated,
         "union_events": len(union_ids),
         "top1_diff": top1_diff,
         "mispromotion_diff": misp_diff,
         "majority_pollution_diff": poll_diff,
+    }
+
+
+def _family_key(cell):
+    """The grid family whose H variants share one prefix selection."""
+    return (cell.get("tau_quantile"), cell["k_evidence"], cell["gamma"],
+            cell["saturation_k"])
+
+
+def _prefix_selection_score(record):
+    """Return the prefix-only score used to select a grid family.
+
+    Suffix gate fields are deliberately not read here.  ``None`` metrics mean
+    that the prefix cannot compare this cell; such a cell is not selected.
+    """
+    metrics = record.get("prefix_metrics") or {}
+    top1_value = metrics.get("top1")
+    mrr_value = metrics.get("mrr")
+    if top1_value is None and mrr_value is None:
+        return None
+    return (
+        float("-inf") if top1_value is None else top1_value,
+        float("-inf") if mrr_value is None else mrr_value,
+        metrics.get("actionable_group_complete", 0),
+    )
+
+
+def _family_identity(key):
+    return {
+        "tau_quantile": key[0],
+        "k_evidence": key[1],
+        "gamma": key[2],
+        "saturation_k": key[3],
+    }
+
+
+def select_prefix_cells(cells):
+    """Mark suffix-claim cells belonging to prefix-selected families.
+
+    The family decision is made from prefix top-1, MRR and actionable counts
+    only.  Keeping every H variant in the winning family is necessary for the
+    finite-H versus H=inf claim gate.  If the prefix has no reconstructable
+    metric, no cell is selected and no suffix claim is formed; a claim cannot
+    be rescued by suffix observations.
+    """
+    for record in cells:
+        record["selected"] = False
+
+    evaluated = [record for record in cells if "eliminated" not in record]
+    scored = []
+    for record in evaluated:
+        score = _prefix_selection_score(record)
+        if score is not None:
+            scored.append((record, score))
+
+    if not scored:
+        return {
+            "mode": "prefix_only",
+            "reason": "no_reconstructable_prefix_metric",
+            "selected_cells": 0,
+            "selected_families": [],
+        }
+
+    family_scores = {}
+    for record, score in scored:
+        family = _family_key(record["cell"])
+        family_scores[family] = max(family_scores.get(family, score), score)
+    best_score = max(family_scores.values())
+    selected_families = sorted(
+        family for family, score in family_scores.items()
+        if score == best_score)
+    selected_set = set(selected_families)
+    for record in evaluated:
+        record["selected"] = _family_key(record["cell"]) in selected_set
+    return {
+        "mode": "prefix_only",
+        "reason": "max_prefix_top1_mrr_actionable",
+        "selected_cells": sum(1 for record in evaluated
+                               if record["selected"]),
+        "selected_families": [_family_identity(family)
+                              for family in selected_families],
     }
 
 
@@ -459,11 +589,12 @@ def run_route(replay, route_id, tau_status, data, seed=BOOTSTRAP_SEED,
               margin_p10=None):
     """Run the whole grid for one route.
 
-    ``tau_status`` comes from the prefix calibration protocol (AC-157-V1;
+    ``tau_status`` comes from the prefix calibration protocol (AC-159-V1;
     ``calibration_cc.calibrate_tau``): ``not_calibratable`` -> no τ is
     invented and the route leaves the shortlist.  ``data`` is the split
-    data-state passed through for the report.  Returns the per-cell results
-    and the data state.
+    data-state passed through for the report.  Prefix metrics select the
+    winning family before ``shortlist_cc`` applies suffix claim gates.
+    Returns the per-cell results and the data state.
     """
     cells = []
     if tau_status.get("state") != "calibratable":
@@ -475,11 +606,17 @@ def run_route(replay, route_id, tau_status, data, seed=BOOTSTRAP_SEED,
             "tau": tau_status,
             "cells": cells,
             "data": data,
-            "selection": "not_run",
+            "selection": {
+                "mode": "prefix_only",
+                "reason": "tau_not_calibratable",
+                "selected_cells": 0,
+                "selected_families": [],
+            },
         }
         if max_cells is not None:
             result["partial_scan"] = True
         return result
+    partial_scan = False
     for quantile, tau_value in sorted(
             tau_status["quantiles"].items(), key=lambda item: float(item[0])):
         for cell in predeclared_cells(route_id):
@@ -488,34 +625,47 @@ def run_route(replay, route_id, tau_status, data, seed=BOOTSTRAP_SEED,
                                 margin_p10=margin_p10):
                 cells.append({"cell": cell, "eliminated": "delta_one"})
                 continue
-            cells.append(run_cell(replay, dict(cell, margin_p10=margin_p10),
-                                  seed=seed, replicates=replicates))
+            cells.append(run_cell(
+                replay, dict(cell, margin_p10=margin_p10), seed=seed,
+                replicates=replicates, claim_gates=False))
             if max_cells is not None and \
                     len([c for c in cells if "eliminated" not in c]) >= \
                     max_cells:
-                return {
-                    "route_id": route_id,
-                    "tau": tau_status,
-                    "cells": cells,
-                    "data": data,
-                    "selection": "not_run",
-                    "partial_scan": True,
-                }
-    # Finite-H family gates: attach to each finite-H cell.
+                partial_scan = True
+                break
+        if partial_scan:
+            break
+    # Select families from prefix metrics before calculating any suffix claim
+    # gate or bootstrap result.  Unselected records retain only prefix data.
+    selection = select_prefix_cells(cells)
+    for index, record in enumerate(cells):
+        if "eliminated" in record or not record.get("selected", False):
+            record.pop("_outcomes", None)
+            continue
+        claim_record = run_cell(
+            replay, record["cell"], seed=seed, replicates=replicates,
+            claim_gates=True)
+        claim_record["selected"] = True
+        claim_record["prefix_metrics"] = record["prefix_metrics"]
+        cells[index] = claim_record
+    # Finite-H family gates: attach to the selected suffix-claim cells only.
     _attach_finite_h_gates(cells, seed=seed, replicates=replicates)
     # Strip the internal per-cell outcome lists: the report digest carries
     # ids, numbers and cell identities only, never per-event outcomes.
     for record in cells:
         record.pop("_outcomes", None)
-    return {"route_id": route_id, "tau": tau_status, "cells": cells,
-            "data": data, "selection": "not_run"}
+    result = {"route_id": route_id, "tau": tau_status, "cells": cells,
+              "data": data, "selection": selection}
+    if partial_scan:
+        result["partial_scan"] = True
+    return result
 
 
 def _attach_finite_h_gates(cells, seed, replicates):
     finite = {}
     inf = {}
     for record in cells:
-        if "eliminated" in record:
+        if "eliminated" in record or "_outcomes" not in record:
             continue
         cell = record["cell"]
         key = (cell["tau_quantile"], cell["k_evidence"], cell["gamma"],
@@ -533,6 +683,7 @@ def _attach_finite_h_gates(cells, seed, replicates):
                                  seed=seed, replicates=replicates)
             finite_record["finite_h_gate"] = {
                 "pass": gate["pass"],
+                "evaluated": gate["evaluated"],
                 "union_events": gate["union_events"],
                 "top1_diff": gate["top1_diff"],
                 "mispromotion_diff": gate["mispromotion_diff"],
@@ -541,7 +692,7 @@ def _attach_finite_h_gates(cells, seed, replicates):
 
 
 def data_insufficient(suffix_counts):
-    """数据不足 terminal check (AC-157-V1, legal terminal).
+    """数据不足 terminal check (AC-159-V1, legal terminal).
 
     Suffix has no events past the cutoff (or no group-complete suffix
     events): the claim set cannot support the contract gates -> 数据不足,

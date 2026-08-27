@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """τ calibration for the candidate-conditioned suffix walk-forward
-(Habit130/squirrel#157, AC-157-v1).
+(Habit130/squirrel#159, AC-159-v1).
 
-Spec #43 τ clauses applied to the #157 frozen split:
+Spec #43 τ clauses applied to the #159 frozen split:
 
 - τ is produced **only from the development prefix** (events with
-  ``hlc <= [1787065441087, 0]``, inclusive) — never from the suffix claim
+  ``hlc <= [1787667799562, 0]``, inclusive) — never from the suffix claim
   set, which is reserved for the quality/safety gates (folding the suffix
   into development is a contract failure).
 - There is no fractional dev-prefix ratio here: the frozen HLC cutoff IS
-  the dev prefix of every route (issue #157 body).
+  the dev prefix of every route (issue #159 body).
 - For each query (prefix target event), a **query-level hard negative** is
   the maximum cosine, over the same-key active history events whose final
   selection differs from the query's final selection, of the retrieval
@@ -20,7 +20,7 @@ Spec #43 τ clauses applied to the #157 frozen split:
   candidate cannot contribute evidence and is not a hard negative.
 - Only after >= 200 such queries are accumulated may τ be calibrated.
   Below that the state is **not_calibratable** and NO τ value is invented:
-  the route leaves the shortlist (AC-157-3; RISK-157-3).  All three
+  the route leaves the shortlist (AC-159-4).  All three
   not_calibratable -> 无合格方案 (legal terminal).
 - τ is only scanned over the pre-declared quantiles Q95 / Q97.5 / Q99 /
   Q99.5 (nearest-rank, deterministic).
@@ -73,7 +73,11 @@ def query_hard_negative_cosines(replay, prefix_targets):
                 continue  # this event cannot support any current candidate
             query_vector = replay._vectors.query_vector_for_candidate(
                 target.preceding_text, target.competition[slot])
+            if query_vector is None:
+                continue
             event_vector = replay._vectors.event_vector(h.event_id)
+            if event_vector is None:
+                continue
             cosine = float(np.dot(np.asarray(query_vector, dtype=np.float64),
                                   np.asarray(event_vector,
                                              dtype=np.float64)))
@@ -92,7 +96,7 @@ def prefix_hard_negative_query_count(facts, prefix_targets):
     text matches one of the target's current-group candidates — the exact
     condition ``query_hard_negative_cosines`` uses, minus the cosine
     (which needs vectors).  This lets the driver decide not_calibratable /
-    terminal BEFORE any model forward (RISK-157-3), with the same count the
+    terminal BEFORE any model forward (AC-159-4), with the same count the
     calibration would report.
     """
     from walkforward_cc import WalkForwardReplay  # circular-safe local import
@@ -144,7 +148,7 @@ def calibrate_tau(replay, prefix_targets):
 
     ``state`` is "not_calibratable" when fewer than 200 queries carry a
     hard-negative history; no τ value is then invented (the caller must not
-    substitute a default; AC-157-3).
+  substitute a default; AC-159-4).
     """
     cosines = query_hard_negative_cosines(replay, prefix_targets)
     base = {

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Model-free gate for the AC-157-v1 candidate-conditioned suffix walk-forward.
+"""Model-free gate for the AC-159-v1 candidate-conditioned suffix walk-forward.
 
 Pins without loading any model:
 
-- AC157-1: exactly the three frozen routes; candidate-conditioned query
+- AC159-1: exactly the three frozen routes; candidate-conditioned query
   pairing (per-candidate query vectors, matched-event pairing) is
   bit-faithful to the canonical oracle's candidate branch; L28 span
   pooling contract stays with the frozen seam.
-- AC157-2: the frozen HLC split is respected: prefix includes
-  [1787065441087, 0], suffix is strictly later; selection uses prefix
+- AC159-2: the frozen HLC split is respected: prefix includes
+  [1787667799562, 0], suffix is strictly later; selection uses prefix
   outcomes only, claims use suffix outcomes only; memory still accumulates
   over the whole snapshot (suffix targets see prefix history).
-- AC157-3: the grid manifest is the frozen pre-declared space; τ uses only
+- AC159-4: the grid manifest is the frozen pre-declared space; τ uses only
   prefix query-level hard negatives (nearest-rank Q95/Q97.5/Q99/Q99.5);
   below 200 queries the route is ``not_calibratable`` and no τ is invented.
-- AC157-4: the legal terminals (exact shortlist / 收窄声称 shortlist /
+- AC159-5: the legal terminals (exact shortlist / 收窄声称 shortlist /
   无合格方案 / 数据不足) are emitted with the documented gates; the +3pp
   claim is refused when the suffix actionable group-complete sample cannot
   support it.
-- AC157-5: public-B accuracy and the personal 2x2 r never enter
+- AC159-6: public-B accuracy and the personal 2x2 r never enter
   decide_final (no such input exists in the decision surface).
-- AC157-6: reports pass the privacy scan and carry hashes, counts, cell
+- AC159-7: reports pass the privacy scan and carry hashes, counts, cell
   identities and the terminal only.
 
 The replay itself is exercised through a deterministic candidate-conditioned
@@ -51,7 +51,9 @@ from walkforward_cc import (  # noqa: E402
     prefix_suffix_split, delta_one)
 from calibration_cc import calibrate_tau, nearest_rank_quantile  # noqa: E402
 from shortlist_cc import assemble_shortlist  # noqa: E402
-from grid_cc import data_counts, grid_manifest, data_insufficient  # noqa: E402
+from grid_cc import (data_counts, grid_manifest, data_insufficient,
+                     finite_h_gate, run_route,
+                     select_prefix_cells)  # noqa: E402
 from suffix_report import build_report, render_markdown, verify_privacy  # noqa: E402
 
 
@@ -104,7 +106,7 @@ class FastOracleEquivalenceTest(unittest.TestCase):
 
     The engine's vectorized path must reproduce oracle.compute_evidence
     with per-candidate query vectors to floating-point precision over a
-    grid of tau / H / K / k and diverse match layouts (the AC-157-1
+    grid of tau / H / K / k and diverse match layouts (the AC-159-1
     AC-honored mirror of test_fast_oracle).
     """
 
@@ -206,7 +208,7 @@ class RouteAndPayloadContractTest(unittest.TestCase):
         ))
 
     def test_payload_and_instruction_constants(self):
-        # AC157-1: no separator; query instruction only for Qwen3-emb.
+        # AC159-1: no separator; query instruction only for Qwen3-emb.
         self.assertEqual(PAYLOAD_RULE, "last64(preceding)+candidate")
         self.assertEqual(
             QWEN3_EMB_QUERY_INSTRUCTION,
@@ -216,41 +218,67 @@ class RouteAndPayloadContractTest(unittest.TestCase):
         self.assertEqual(L28_POOLING_RULE, "candidate_span_mean")
 
     def test_frozen_split_hlc(self):
-        self.assertEqual(PREFIX_HLC_MAX_INCLUSIVE, (1787065441087, 0))
+        self.assertEqual(PREFIX_HLC_MAX_INCLUSIVE, (1787667799562, 0))
 
 
 def _fixture_provider(query_vectors, event_vectors):
     """A candidate-conditioned fixture provider (the #155-style seam)."""
     from evidence import CandidateFixtureRepresentationProvider
     return CandidateFixtureRepresentationProvider(
-        "fixture:ac157",
+        "fixture:ac159",
         query_vectors,
         event_vectors,
         default_query=(1.0, 0.0, 0.0, 0.0),
         default_event=(0.0, 1.0, 0.0, 0.0))
 
 
+class _SparseProvider:
+    """Candidate provider with explicit per-row unrepresentable vectors."""
+
+    def __init__(self, missing_events=(), missing_queries=()):
+        self._missing_events = set(missing_events)
+        self._missing_queries = set(missing_queries)
+
+    def vector_dimension(self):
+        return 4
+
+    def event_vector(self, event):
+        if event.event_id in self._missing_events:
+            return None
+        return _unit(1.0)
+
+    def query_vector_for_candidate(self, preceding_text, candidate):
+        if (preceding_text, candidate) in self._missing_queries:
+            return None
+        return _unit(1.0)
+
+
 def _synthetic_with_split():
     """A synthetic snapshot with events on both sides of the cutoff.
 
-    Prefix events hold hlc <= [1787065441087, 0]; suffix events are strictly
+    Prefix events hold hlc <= [1787667799562, 0]; suffix events are strictly
     later.  Vectors are chosen so same-key, different-selection history
     yields defined hard-negative cosines.
     """
     facts = SyntheticFacts()
+    cutoff = PREFIX_HLC_MAX_INCLUSIVE
     try:
         # Prefix: one key with a history chain (A then B) so a target has a
         # hard-negative history, plus suffix events on the same key.
         facts.add_event("p1", "wo", "前1", "我", ("我", "握"),
-                        (1787065441087, 0), display_rank=1, display_page=1)
+                        cutoff, display_rank=1, display_page=1)
         facts.add_event("p2", "wo", "前2", "握", ("我", "握"),
-                        (1787065441000, 0), display_rank=2, display_page=1)
+                        (cutoff[0] - 1000, cutoff[1]),
+                        display_rank=2, display_page=1)
         facts.add_event("p3", "wo", "前3", "我", ("我", "握"),
-                        (1787065440000, 0), display_rank=1, display_page=1)
+                        (cutoff[0] - 2000, cutoff[1]),
+                        display_rank=1, display_page=1)
         facts.add_event("s1", "wo", "后4", "握", ("我", "握"),
-                        (1787065442000, 0), display_rank=2, display_page=1)
+                        (cutoff[0] + 1000, cutoff[1]),
+                        display_rank=2, display_page=1)
         facts.add_event("s2", "wo", "后5", "我", ("我", "握"),
-                        (1787065443000, 0), display_rank=1, display_page=1)
+                        (cutoff[0] + 2000, cutoff[1]),
+                        display_rank=1, display_page=1)
         return facts
     except Exception:
         facts.close()
@@ -314,6 +342,72 @@ class SplitSeamTest(unittest.TestCase):
             FrozenFacts(facts.db_path).events()[-1])
         self.assertTrue(any(event.event_id == "p1" for event in history)
                         or any(event.event_id == "p2" for event in history))
+
+
+class SparseVectorReplayTest(unittest.TestCase):
+    def _facts(self):
+        facts = SyntheticFacts()
+        facts.add_event("e1", "wo", "ctx1", "我", ("我", "握"),
+                        (100, 0), display_rank=1, display_page=1)
+        facts.add_event("e2", "wo", "ctx2", "握", ("我", "握"),
+                        (200, 0), display_rank=2, display_page=1)
+        self.addCleanup(facts.close)
+        return facts
+
+    def test_missing_history_event_vector_is_no_evidence(self):
+        facts = self._facts()
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        events = db.events()
+        replay = WalkForwardReplay(
+            db, CandidateVectorTable(
+                events, _SparseProvider(missing_events={"e1"})))
+
+        outcomes = replay.replay(OracleParams(
+            tau=0.0, k_evidence=8, half_life=float("inf"),
+            saturation_k=1.0), gamma=1.0)
+        by_id = {outcome.event_id: outcome for outcome in outcomes}
+        self.assertFalse(by_id["e2"].actionable)
+        self.assertEqual(by_id["e2"].kept_ids, ())
+
+    def test_missing_query_vector_is_no_evidence(self):
+        facts = self._facts()
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        events = db.events()
+        replay = WalkForwardReplay(
+            db, CandidateVectorTable(
+                events, _SparseProvider(missing_queries={("ctx2", "我")})))
+
+        outcomes = replay.replay(OracleParams(
+            tau=0.0, k_evidence=8, half_life=float("inf"),
+            saturation_k=1.0), gamma=1.0)
+        by_id = {outcome.event_id: outcome for outcome in outcomes}
+        self.assertFalse(by_id["e2"].actionable)
+        self.assertEqual(by_id["e2"].kept_ids, ())
+
+
+class L28OmissionClassificationTest(unittest.TestCase):
+    def test_only_candidate_span_faults_are_omissions(self):
+        from representations import (CandidateSpanRepresentationError,
+                                      EmptyCandidateRepresentationError,
+                                      RepresentationError)
+        from run_suffix_walkforward import _l28_omission_reason
+
+        self.assertEqual(
+            _l28_omission_reason(CandidateSpanRepresentationError(
+                "token straddles context/candidate boundary")),
+            "boundary_straddled")
+        self.assertEqual(
+            _l28_omission_reason(EmptyCandidateRepresentationError(
+                "empty candidate")),
+            "empty_candidate")
+        self.assertEqual(
+            _l28_omission_reason(RepresentationError(
+                "candidate suffix mismatch")),
+            "suffix_mismatch")
+        self.assertIsNone(_l28_omission_reason(RepresentationError(
+            "preceding_text must be a string")))
 
 
 class TauCalibrationTest(unittest.TestCase):
@@ -387,6 +481,9 @@ class GridAndTerminalTest(unittest.TestCase):
 
     def test_predeclared_grid_manifest(self):
         manifest = grid_manifest(replicates=10000)
+        self.assertEqual(manifest["contract"], "AC-159-v1")
+        self.assertEqual(manifest["cutoff_hlc"], [1787667799562, 0])
+        self.assertEqual(manifest["routes"], list(ROUTE_IDS))
         self.assertEqual(manifest["declared_before_metrics"], True)
         self.assertEqual(manifest["alpha"], 0.0)
         self.assertEqual(
@@ -436,10 +533,86 @@ class GridAndTerminalTest(unittest.TestCase):
         self.assertNotIn("public_b", parameter_names)
         self.assertNotIn("personal_r", parameter_names)
 
+    def test_prefix_selection_ignores_suffix_gate_fields(self):
+        """Grid-family selection cannot read suffix claim observations."""
+        def cell(half_life, top1, suffix_pass, k_evidence=8):
+            return {
+                "cell": {
+                    "route_id": ROUTE_IDS[0], "half_life": half_life,
+                    "k_evidence": k_evidence, "gamma": 0.5,
+                    "saturation_k": 1,
+                    "tau_quantile": "0.95", "tau": 0.5,
+                },
+                "prefix_metrics": {
+                    "top1": top1, "mrr": 0.8,
+                    "actionable_group_complete": 100,
+                },
+                "hard_gates": {"pass": suffix_pass},
+            }
+
+        cells = [cell(8, 0.9, False), cell(float("inf"), 0.9, True),
+                 cell(8, 0.8, True, k_evidence=16)]
+        selection = select_prefix_cells(cells)
+        self.assertEqual(selection["reason"],
+                         "max_prefix_top1_mrr_actionable")
+        self.assertEqual([record["selected"] for record in cells],
+                         [True, True, False])
+
+    def test_route_runs_suffix_gates_after_prefix_selection(self):
+        facts = _synthetic_with_split()
+        self.addCleanup(facts.close)
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        provider = _fixture_provider(
+            {("后4", "我"): _unit(0.85), ("后4", "握"): _unit(0.2)},
+            {("luna_pinyin", "wo", "我"): _unit(1.0),
+             ("luna_pinyin", "wo", "握"): _unit(0.0)})
+        replay = WalkForwardReplay(
+            db, CandidateVectorTable(db.events(), provider))
+        result = run_route(
+            replay, ROUTE_IDS[0], {
+                "state": "calibratable",
+                "queries": 200,
+                "quantiles": {"0.95": 0.3, "0.975": 0.3,
+                              "0.99": 0.3, "0.995": 0.3},
+            }, {"prefix": {}, "suffix": {}}, seed=7, replicates=10000,
+            max_cells=5, margin_p10=1.0)
+        self.assertEqual(result["selection"]["mode"], "prefix_only")
+        selected = [cell for cell in result["cells"]
+                    if cell.get("selected")]
+        unselected = [cell for cell in result["cells"]
+                      if "eliminated" not in cell and not cell.get("selected")]
+        self.assertTrue(selected)
+        self.assertTrue(all("metrics" in cell for cell in selected))
+        self.assertTrue(all("metrics" not in cell for cell in unselected))
+
+    def test_finite_h_gate_uses_suffix_only(self):
+        from walkforward_cc import EventOutcome
+
+        def outcome(event_id, in_prefix, scheme_rank, group_complete=True):
+            return EventOutcome(
+                event_id=event_id, hlc=(1, 0), key=("s", "c", "k"),
+                key_hash="k", confirmation_source="explicit_current",
+                competition_complete=True, group_complete=group_complete,
+                baseline_rank=1, scheme_rank=scheme_rank, actionable=True,
+                total_mass=1.0, candidate_count=2, selection_index=0,
+                kept_ids=("h",), kept_weights=(1.0,), kept_matches=(0,),
+                in_prefix=in_prefix)
+
+        gate = finite_h_gate(
+            {"_outcomes": [outcome("prefix", True, 1),
+                           outcome("incomplete", False, 1, False),
+                           outcome("suffix", False, 1)]},
+            {"_outcomes": [outcome("prefix", True, 2),
+                           outcome("incomplete", False, 2, False),
+                           outcome("suffix", False, 1)]})
+        self.assertEqual(gate["union_events"], 1)
+        self.assertEqual(gate["top1_diff"][0], 0.0)
+
 
 class TerminalAssemblyTest(unittest.TestCase):
-    """AC157-4: the terminal is one of the four legal states and follows
-    the #157-quoted gate assembly rules (decide_final inputs only)."""
+    """AC159-5: the terminal is one of the four legal states and follows
+    the #159-quoted gate assembly rules (decide_final inputs only)."""
 
     def _data(self, suffix_gc=1200, suffix_actionable=1100):
         return {
@@ -462,11 +635,14 @@ class TerminalAssemblyTest(unittest.TestCase):
             "delta_one_ok": True,
             "hard_gates": {
                 "pass": True,
+                "evaluated": True,
+                "unevaluated": [],
                 "safety_top1_ok": True, "safety_mrr_ok": True,
                 "mispromotion_point_ok": True, "mispromotion_ci_ok": True,
                 "pollution_point_ok": True, "pollution_ci_ok": True,
             },
-            "finite_h_gate": {"pass": True},
+            "finite_h_gate": {"pass": True, "evaluated": True,
+                              "union_events": 500},
             "metrics": {"top1": 0.73, "mrr": 0.81},
             "ci": {"top1_vs_baseline": (0.03, (0.01, 0.05))},
             "lift": {
@@ -510,6 +686,218 @@ class TerminalAssemblyTest(unittest.TestCase):
         }], self._data(suffix_actionable=150))
         self.assertEqual(decision["outcome"], "收窄声称_shortlist")
         self.assertEqual(decision["per_route"][0]["eligible_cells"], 1)
+
+    def test_suffix_claims_only_use_prefix_selected_cells(self):
+        finite = self._passing_cell(ROUTE_IDS[0], True)
+        finite["selected"] = True
+        infinite = self._passing_cell(ROUTE_IDS[0], True)
+        infinite["cell"]["half_life"] = float("inf")
+        infinite["selected"] = True
+        unselected = self._passing_cell(ROUTE_IDS[0], True)
+        unselected["cell"]["k_evidence"] = 16
+        unselected["selected"] = False
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "selection": {"mode": "prefix_only"},
+            "cells": [finite, infinite, unselected],
+        }], self._data())
+        self.assertEqual(decision["outcome"], "exact_shortlist")
+        self.assertEqual(decision["per_route"][0]["selected_cells"], 2)
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 2)
+        self.assertEqual(
+            decision["per_route"][0]["eliminated_by_reason"],
+            {"prefix_not_selected": 1})
+
+    def _unevaluated_hard_cell(self, route_id):
+        record = self._passing_cell(route_id, False)
+        # The production regression this pins: every *_ok reads True while
+        # the gate never measured (empty denominator / None CI), yet the
+        # cell used to reach the shortlist.
+        record["hard_gates"] = {
+            "pass": False, "evaluated": False,
+            "unevaluated": ["mispromotion_ci", "pollution_ci"],
+            "safety_top1_ok": True, "safety_mrr_ok": True,
+            "mispromotion_point_ok": True, "mispromotion_ci_ok": True,
+            "pollution_point_ok": True, "pollution_ci_ok": True,
+        }
+        record["finite_h_gate"] = {"pass": False, "evaluated": False,
+                                   "union_events": 0}
+        return record
+
+    def test_unevaluated_hard_gates_cannot_pass(self):
+        """AC-159-v1 repair 2: an unevaluated suffix hard gate (empty
+        denominator / None CI) is never a pass, and with no measurable
+        operating cell the terminal is 数据不足, not 收窄声称."""
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "cells": [self._unevaluated_hard_cell(ROUTE_IDS[0])],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "数据不足")
+        self.assertEqual(decision["total_eligible_cells"], 0)
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 0)
+        reasons = decision["per_route"][0]["eliminated_by_reason"]
+        self.assertEqual(reasons, {
+            "hard_gates:not_evaluated:mispromotion_ci,pollution_ci": 1})
+        self.assertEqual(decision["live_gamma"], 0.0)
+
+    def test_vacuous_hard_pass_refused_by_gate_state(self):
+        """Even a record that still claims pass=True with unevaluated gates
+        is refused by cell_gate_state (the None-treat-as-pass regression is
+        impossible to reintroduce through the decision surface)."""
+        from shortlist_cc import cell_gate_state
+        record = self._passing_cell(ROUTE_IDS[0], False)
+        record["hard_gates"]["pass"] = True
+        record["hard_gates"]["evaluated"] = False
+        record["hard_gates"]["unevaluated"] = ["top1_vs_baseline"]
+        state = cell_gate_state(record)
+        self.assertFalse(state["pass"])
+        self.assertIn("not_evaluated", state["reason"])
+
+    def test_unevaluated_finite_h_gate_never_passes(self):
+        """A finite-H cell whose paired gate ran on an empty common
+        actionable union is not eligible; unmeasurable claim -> 数据不足."""
+        record = self._passing_cell(ROUTE_IDS[0], False)
+        record["finite_h_gate"] = {"pass": False, "evaluated": False,
+                                   "union_events": 0}
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "cells": [record],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "数据不足")
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 0)
+        self.assertIn("eliminated:finite_h_not_evaluated",
+                      decision["per_route"][0]["eliminated_by_reason"])
+
+    def test_finite_h_gate_empty_union_is_not_evaluated(self):
+        from walkforward_cc import EventOutcome
+
+        def outcome(event_id):
+            return EventOutcome(
+                event_id=event_id, hlc=(2, 0), key=("s", "c", "k"),
+                key_hash="k", confirmation_source="explicit_current",
+                competition_complete=True, group_complete=True,
+                baseline_rank=1, scheme_rank=1, actionable=False,
+                total_mass=1.0, candidate_count=2, selection_index=0,
+                kept_ids=("h",), kept_weights=(1.0,), kept_matches=(0,),
+                in_prefix=False)
+
+        gate = finite_h_gate({"_outcomes": [outcome("e1")]},
+                             {"_outcomes": [outcome("e1")]})
+        self.assertEqual(gate["union_events"], 0)
+        self.assertFalse(gate["evaluated"])
+        self.assertFalse(gate["pass"])
+
+    def test_mixed_measured_and_unmeasured_cells_keep_收窄声称(self):
+        """One measured passing operating cell makes the claim gates
+        evaluable; unmeasured sibling cells stay ineligible without
+        forcing 数据不足 (收窄声称 requires actually evaluated gates)."""
+        measured = self._passing_cell(ROUTE_IDS[0], False)
+        measured["selected"] = True
+        unmeasured = self._unevaluated_hard_cell(ROUTE_IDS[0])
+        unmeasured["selected"] = True
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "selection": {"mode": "prefix_only"},
+            "cells": [measured, unmeasured],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "收窄声称_shortlist")
+        self.assertEqual(decision["per_route"][0]["eligible_cells"], 1)
+        self.assertIn(
+            "hard_gates:not_evaluated:mispromotion_ci,pollution_ci",
+            decision["per_route"][0]["eliminated_by_reason"])
+
+    def test_数据不足_requires_claim_cells(self):
+        """With no claim cell at all (all eliminated) the terminal follows
+        the ordinary eligibility path, not 数据不足."""
+        eliminated = self._passing_cell(ROUTE_IDS[0], False)
+        eliminated["eliminated"] = "delta_one"
+        decision = assemble_shortlist([{
+            "route_id": ROUTE_IDS[0],
+            "tau": {"state": "calibratable"},
+            "cells": [eliminated],
+        }], self._data(suffix_gc=22, suffix_actionable=13))
+        self.assertEqual(decision["outcome"], "无合格方案")
+
+
+class OperatingCellReplayGateTest(unittest.TestCase):
+    """AC-159-v1 repair 2, replay level: prefix can select a family while
+    the suffix claim set stays unmeasurable at the operating cell — the
+    real-snapshot dynamics (reference τ=0 actionable vs cell-τ empty)."""
+
+    def test_unmeasured_suffix_claim_is_数据不足(self):
+        facts = _synthetic_with_split()
+        self.addCleanup(facts.close)
+        db = FrozenFacts(facts.db_path)
+        self.addCleanup(db.close)
+        events = db.events()
+        provider = _fixture_provider(
+            {
+                # Prefix candidates: near the matching history vectors so
+                # prefix selection has metrics at the cell tau.
+                ("前1", "我"): (0.99, 0.14, 0.0, 0.0),
+                ("前1", "握"): (0.14, 0.99, 0.0, 0.0),
+                ("前2", "握"): (0.14, 0.99, 0.0, 0.0),
+                ("前2", "我"): (0.99, 0.14, 0.0, 0.0),
+                ("前3", "我"): (0.99, 0.14, 0.0, 0.0),
+                ("前3", "握"): (0.14, 0.99, 0.0, 0.0),
+                # Suffix candidates: low but positive similarity to their
+                # history match — actionable at the reference tau=0, but
+                # below the operating-cell tau=0.9 so NO suffix event is
+                # actionable at the operating cell (real-snapshot shape).
+                ("后4", "握"): (0.0, 0.3, 0.954, 0.0),
+                ("后4", "我"): (0.3, 0.0, 0.954, 0.0),
+                ("后5", "我"): (0.3, 0.0, 0.954, 0.0),
+                ("后5", "握"): (0.0, 0.3, 0.954, 0.0),
+            },
+            {
+                ("luna_pinyin", "wo", "我"): (1.0, 0.0, 0.0, 0.0),
+                ("luna_pinyin", "wo", "握"): (0.0, 1.0, 0.0, 0.0),
+            })
+        vectors = CandidateVectorTable(events, provider)
+        replay = WalkForwardReplay(db, vectors)
+        reference = replay.replay(_reference(), 0.0)
+        data = {"prefix": data_counts(
+            [o for o in reference if o.in_prefix]),
+            "suffix": data_counts(
+                [o for o in reference if not o.in_prefix])}
+        # The suffix claim set exists (group-complete, reference-actionable)
+        # so the global 数据不足 start gate does not fire.
+        self.assertEqual(data["suffix"]["group_complete"], 2)
+        self.assertEqual(data["suffix"]["actionable_group_complete"], 2)
+        result = run_route(
+            replay, ROUTE_IDS[0], {
+                "state": "calibratable",
+                "queries": 200,
+                "quantiles": {"0.95": 0.9, "0.975": 0.9,
+                              "0.99": 0.9, "0.995": 0.9},
+            }, data, seed=7, replicates=10000,
+            max_cells=5, margin_p10=1.0)
+        selected = [cell for cell in result["cells"]
+                    if cell.get("selected") and "eliminated" not in cell]
+        self.assertTrue(selected)
+        for cell in selected:
+            self.assertEqual(
+                cell["metrics"]["actionable_group_complete"], 0)
+            gates = cell["hard_gates"]
+            self.assertFalse(gates["evaluated"])
+            self.assertFalse(gates["pass"])
+            finite = cell.get("finite_h_gate")
+            if finite is not None:
+                self.assertFalse(finite["evaluated"])
+                self.assertFalse(finite["pass"])
+                self.assertEqual(finite["union_events"], 0)
+        decision = assemble_shortlist([result], data)
+        self.assertEqual(decision["outcome"], "数据不足")
+        self.assertEqual(decision["total_eligible_cells"], 0)
+
+
+def _reference():
+    return OracleParams(tau=0.0, k_evidence=8, half_life=float("inf"),
+                        saturation_k=1.0)
 
 
 class ReportPrivacyTest(unittest.TestCase):
@@ -558,8 +946,11 @@ class ReportPrivacyTest(unittest.TestCase):
             public_b_unused=True,
             personal_r_unused=True,
             live_gamma=0.0,
-            report_notes=["ac157 test"],
+            report_notes=["ac159 test"],
         )
+        self.assertEqual(report["contract"], "AC-159-v1")
+        self.assertEqual(report["split"]["cutoff_hlc"],
+                         [1787667799562, 0])
         return report
 
     def test_report_privacy_scan_passes(self):
@@ -579,8 +970,8 @@ class ReportPrivacyTest(unittest.TestCase):
 class ContractIdentityTest(unittest.TestCase):
 
     def test_contract_id(self):
-        self.assertEqual(CONTRACT_ID, "AC-157-v1")
-        self.assertEqual(ENGINE_VERSION, "suffix-walkforward-v1")
+        self.assertEqual(CONTRACT_ID, "AC-159-v1")
+        self.assertEqual(ENGINE_VERSION, "suffix-walkforward-v2")
 
 
 if __name__ == "__main__":

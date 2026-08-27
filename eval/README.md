@@ -465,44 +465,50 @@ The decompiled table is produced read-only from the librime build tree:
     <librime>/build/bin/luna_pinyin.table.bin luna_pinyin.table.decompiled.txt
 ```
 
-## Candidate-conditioned suffix walk-forward (Habit130/squirrel#157, AC-157-v1)
+## Candidate-conditioned suffix walk-forward (Habit130/squirrel#159, AC-159-v1)
 
 `walkforward_cc.py` + `calibration_cc.py` + `grid_cc.py` + `shortlist_cc.py`
 + `suffix_report.py` + `run_suffix_walkforward.py` drive the exact
 walk-forward for the three frozen candidate-conditioned routes
 (`dedicated_qwen3_embedding_0_6b`, `qwen_l28_candidate_span_mean`,
 `dedicated_bge_m3`) over a **claim-time** read-only Online-Backup snapshot
-split at the frozen HLC cutoff `[1787065441087, 0]` (prefix inclusive).
+split at the frozen HLC cutoff `[1787667799562, 0]` (prefix inclusive).
 
-The AC-157-v1 wiring onto the #77 seam:
+The AC-159-v1 wiring onto the #77 seam:
 
 - **Payload**: `last64(preceding)+candidate`, no separator (ADR-0003 /
   #109 / #110).  L28 pools the candidate token span `[start, start+count)`
   via `candidate_span_mean` (whole-payload pooling is a contract failure).
+  A per-payload span fault omits only that event/query vector, records a
+  desensitized omission count, and continues; the omitted row contributes no
+  evidence and never becomes a whole-payload fallback.
 - **Query side**: Qwen3-emb uses the frozen instruction
   `Represent the candidate-conditioned query for semantic retrieval.` +
   newline + payload; BGE and L28 have none.  Document/history side: none.
-- **Split**: prefix = `hlc <= [1787065441087, 0]` (τ calibration + grid
+- **Split**: prefix = `hlc <= [1787667799562, 0]` (τ calibration + grid
   selection); suffix = strictly later events, the claim set (quality and
-  safety gates only).  The replay memory still accumulates over the whole
-  snapshot — suffix targets see prefix history (exact HLC-causal
-  walk-forward).  Folding the suffix into development is a contract
-  failure.
+  safety gates only).  Prefix selection chooses the family by prefix top-1,
+  then MRR, then actionable count, retaining all H variants for the finite-H
+  gate.  The replay memory still accumulates over the whole snapshot — suffix
+  targets see prefix history (exact HLC-causal walk-forward).  Folding the
+  suffix into development is a contract failure.
 - **Snapshot**: a fresh Online Backup copy is taken at claim
   (`take_snapshot`); the #77/#155 prefix files are not a sufficient store.
   Missing snapshot -> environment blocker.  No suffix events past the
   cutoff -> **数据不足** (legal terminal).
 - **τ**: per route only from prefix query-level hard negatives (>= 200
-  queries, nearest-rank Q95/Q97.5/Q99/Q99.5); below that the route is
-  `not_calibratable` and leaves the shortlist — no τ is invented.
-  All three not_calibratable -> **无合格方案**.
+  queries, nearest-rank Q95/Q97.5/Q99/Q99.5).  The facts-only prefix count
+  below 200 is an implementation fault.  After legal L28 omissions, however,
+  fewer than 200 representable prefix hard-negative queries makes only that
+  route `not_calibratable`; it leaves the shortlist while Qwen3-emb and BGE
+  continue.  No tau is invented.
 - **Grid**: H {8,32,128,512,inf} x K {8,16,32,64} x gamma {0.5,1,2,4} x k
   {1,3,7}, alpha=0 (AC-106-v2); no extra cells, no continuous optimizer.
 - **Denominator**: group-complete (saved competition size < 32); the
   persisted `competition_complete` bit is diagnostic only.  Shadow
   baseline: same events/set, alpha=0, gamma=0 (recorded confirmation
   position).
-- **Suffix gates** (claim set; issue #157 body): Δ₁ <= min(0.5,
+- **Suffix gates** (claim set; issue #159 body): Δ₁ <= min(0.5,
   P10(margin_base)) with margin_base from prefix baseline-correct events;
   finite-H vs H=inf on the common actionable union (top-1 CI lower >= -1pp,
   mispromotion upper <= +1pp, pollution upper <= +1pp; H=inf alone is never
@@ -524,22 +530,29 @@ python3 -m unittest eval.test_suffix_walkforward
 # one-shot real run (exclusive GPU/MLX; takes a fresh snapshot):
 python3 eval/run_suffix_walkforward.py \
   --work-dir <local snapshot+report dir> \
-  --artifact-dir eval/suffix_walkforward \
+  --artifact-dir .local-work/ac159-suffix-wf/artifacts \
   --embedding-python <repo>/.local-work/venv-embeddings/bin/python \
   --daemon-python <repo>/daemon/.venv/bin/python
 
 # reuse an existing claim-time snapshot for the rerun (identity must match):
 python3 eval/run_suffix_walkforward.py \
-  --snapshot <claim-time snapshot> --artifact-dir eval/suffix_walkforward ...
+  --snapshot <claim-time snapshot> \
+  --artifact-dir .local-work/ac159-suffix-wf/artifacts ...
 ```
 
-Committed artifacts (`eval/suffix_walkforward/`) carry the freeze
-(contract, code SHA, snapshot/split hashes, route fingerprints, grid
-manifest, seed) written **before** any score, plus the desensitized report
-(counts, cell identities, CIs, gate states, terminal) and its SHA-256.
-The vector cache and snapshot copies stay private under `.cache/` /
-`.local-work/`; reports never contain preceding text, candidate text or
-machine paths.
+Private working data (claim-time snapshots, vector cache, working freeze
+and report copies) stay under the ignored `.local-work/ac159-suffix-wf/`
+directory.  The desensitized freeze and report are also mirrored to the
+tracked path `eval/suffix_walkforward_ac159/`; that mirror is the
+git-committed AC-159 artifact.  Historical AC-157 files under
+`eval/suffix_walkforward/` are left unchanged.  A successful claim carries
+the freeze (contract, code SHA, snapshot/split hashes, route fingerprints,
+grid manifest, seed) written **before** any score, plus the desensitized
+report (counts, cell identities, CIs, gate states, terminal) and its
+SHA-256.  Reports never contain preceding text, candidate text or machine
+paths.  Fixture or partial runs copy the same three files into
+`--committed-artifact-dir` (default `eval/suffix_walkforward_ac159/`)
+unless that flag is redirected away from the tracked mirror.
 
 ## Prefix hard-negative query census (Habit130/squirrel#158, AC-158-v1)
 

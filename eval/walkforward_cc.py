@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Candidate-conditioned suffix walk-forward engine (Habit130/squirrel#157, AC-157-v1).
+"""Candidate-conditioned suffix walk-forward engine (Habit130/squirrel#159, AC-159-v1).
 
-The exact walk-forward (wiring onto the #77 seam; AC-157-v1 "wiring" is not
+The exact walk-forward (wiring onto the #77 seam; AC-159-v1 "wiring" is not
 frozen, this module is that wiring) drives the three frozen routes
 (``dedicated_qwen3_embedding_0_6b``, ``qwen_l28_candidate_span_mean``,
 ``dedicated_bge_m3``) over a claim-time read-only Online-Backup snapshot
-split at the frozen HLC cutoff ``[1787065441087, 0]``:
+split at the frozen HLC cutoff ``[1787667799562, 0]``:
 
 - **Payload** (all routes): ``last64(preceding) + candidate``, no separator
   (ADR-0003 / #109 / #110).  L28 pools the candidate token span
@@ -16,18 +16,18 @@ split at the frozen HLC cutoff ``[1787065441087, 0]``:
   ``Represent the candidate-conditioned query for semantic retrieval.`` +
   newline + payload; BGE none; L28 none.  **Document/history side**: no
   instruction (the provider seam owns this too).
-- **Split**: events with ``hlc <= [1787065441087, 0]`` = development prefix
+- **Split**: events with ``hlc <= [1787667799562, 0]`` = development prefix
   (τ calibration + grid selection only); strictly later events = the suffix
   claim set (quality/safety gates only).  Folding the suffix into
   development is a contract failure.
 - **Snapshot**: a fresh read-only Online Backup / facts copy is taken at
-  claim (SN-157-1; the #77/#155 prefix files cannot be the only store).
+  claim (SN-159-1; the #77/#155 prefix files cannot be the only store).
   Missing snapshot -> environment blocker.  No suffix events past the
   cutoff -> **数据不足** (legal terminal, not an implementation failure;
-  RISK-157-2).
+  RISK-159-1).
 - **τ**: per route only from prefix query-level hard negatives (>= 200
   queries, Q95/Q97.5/Q99/Q99.5); below that ``not_calibratable`` and the
-  route leaves the shortlist; no τ is invented (AC-157-3; RISK-157-3).
+  route leaves the shortlist; no τ is invented (AC-159-4).
 - **Grid**: H in {8,32,128,512,inf}; K_evidence in {8,16,32,64}; gamma in
   {0.5,1,2,4}; k in {1,3,7}; alpha = 0 (AC-106-v2).  No extra cells, no
   continuous optimizer.
@@ -38,7 +38,7 @@ split at the frozen HLC cutoff ``[1787065441087, 0]``:
   without evidence for a route's scheme scores as that route's shadow
   baseline.
 - **Public-B accuracy (11953/14725) and the personal 2x2 r never enter
-  decide_final, tie-breaking or suffix-rank interpretation** (AC-157-5).
+  decide_final, tie-breaking or suffix-rank interpretation** (AC-159-6).
 
 Strict-HLC walk-forward semantics are preserved from the #77 seam: score
 first, then add to memory; the target's own whole commit is excluded;
@@ -58,20 +58,20 @@ import numpy as np
 
 from oracle import OracleParams, match_text
 
-# Engine identity (AC-157-v1 contract).
-CONTRACT_ID = "AC-157-v1"
-ENGINE_VERSION = "suffix-walkforward-v1"
-# Frozen HLC split (issue #157 body): prefix inclusive; suffix = strictly
+# Engine identity (AC-159-v1 contract).
+CONTRACT_ID = "AC-159-v1"
+ENGINE_VERSION = "suffix-walkforward-v2"
+# Frozen HLC split (issue #159 body): prefix inclusive; suffix = strictly
 # later.  Events are ordered by (hlc, event_id).
-PREFIX_HLC_MAX_INCLUSIVE = (1787065441087, 0)
-# The three frozen routes (issue #157 body).
+PREFIX_HLC_MAX_INCLUSIVE = (1787667799562, 0)
+# The three frozen routes (issue #159 body).
 ROUTE_IDS = (
     "dedicated_qwen3_embedding_0_6b",
     "qwen_l28_candidate_span_mean",
     "dedicated_bge_m3",
 )
 L28_ROUTE_ID = "qwen_l28_candidate_span_mean"
-# Payload / instruction contract (AC-157-1; the adapter seam mirrors these,
+# Payload / instruction contract (AC-159-1; the adapter seam mirrors these,
 # they are recorded in the freeze/report as the frozen identities).
 PAYLOAD_RULE = "last64(preceding)+candidate"
 QWEN3_EMB_QUERY_INSTRUCTION = (
@@ -90,7 +90,7 @@ GROUP_COMPLETE_N = 32
 # Δ₁ category cap; the P10(margin_base) term is computed from the prefix
 # where the shadow baseline already ranked the selection first.
 DELTA_ONE_CAP = 0.5
-# Bootstrap contract (AC-157-v1): key-clustered, fixed seed, >= 10000.
+# Bootstrap contract (AC-159-v1): key-clustered, fixed seed, >= 10000.
 BOOTSTRAP_SEED = 20260817
 BOOTSTRAP_REPLICATES = 10000
 CI_LEVEL = 0.95
@@ -251,29 +251,33 @@ class CandidateVectorTable:
         self._by_id = {event.event_id: event for event in events}
         self._provider = provider
         self._dimension = int(provider.vector_dimension())
-        self._events: Dict[str, Tuple[float, ...]] = {}
-        self._queries: Dict[Tuple[str, str], Tuple[float, ...]] = {}
+        self._events: Dict[str, Optional[Tuple[float, ...]]] = {}
+        self._queries: Dict[Tuple[str, str], Optional[Tuple[float, ...]]] = {}
 
     def event_vector(self, event_id):
-        if event_id not in self._events:
-            event = self._by_id.get(event_id)
-            if event is None:
-                raise SuffixWalkforwardError(
-                    "no vector source for event %s" % event_id)
-            self._events[event_id] = self._finite(
-                self._provider.event_vector(event), "event %s" % event_id)
+        if event_id in self._events:
+            return self._events[event_id]
+        event = self._by_id.get(event_id)
+        if event is None:
+            raise SuffixWalkforwardError(
+                "no vector source for event %s" % event_id)
+        self._events[event_id] = self._finite(
+            self._provider.event_vector(event), "event %s" % event_id)
         return self._events[event_id]
 
     def query_vector_for_candidate(self, preceding_text, candidate):
         key = (preceding_text, candidate)
-        if key not in self._queries:
-            self._queries[key] = self._finite(
-                self._provider.query_vector_for_candidate(
-                    preceding_text, candidate),
-                "query %r" % (key,))
+        if key in self._queries:
+            return self._queries[key]
+        self._queries[key] = self._finite(
+            self._provider.query_vector_for_candidate(
+                preceding_text, candidate),
+            "query %r" % (key,))
         return self._queries[key]
 
     def _finite(self, vector, label):
+        if vector is None:
+            return None
         vector = tuple(float(value) for value in vector)
         if not vector or len(vector) != self._dimension:
             raise SuffixWalkforwardError(
@@ -427,7 +431,7 @@ class WalkForwardReplay:
     never backfill.  The split is applied to the *target set* (targets are
     tagged prefix/suffix by HLC); memory accumulates over the whole
     snapshot, so suffix targets see prefix history — the exact walk-forward
-    (issue #157 body: "只按 HLC 因果回放验收").
+    (issue #159 body: "只按 HLC 因果回放验收").
     """
 
     def __init__(self, facts, vectors):
@@ -486,12 +490,19 @@ class WalkForwardReplay:
         outcomes = []
         for target in self.targets():
             history = self._same_key_active(target)
-            event_vectors = []
-            for h in history:
-                event_vectors.append(self._vectors.event_vector(h.event_id))
-            usage_ages = list(range(len(history) - 1, -1, -1))
-            selection_texts = [match_text(h.final_selection_text)
-                               for h in history]
+            representable_history = []
+            for history_index, history_event in enumerate(history):
+                event_vector = self._vectors.event_vector(
+                    history_event.event_id)
+                if event_vector is None:
+                    continue
+                representable_history.append(
+                    (history_index, history_event, event_vector))
+            event_vectors = [row[2] for row in representable_history]
+            usage_ages = [len(history) - index - 1
+                          for index, _event, _vector in representable_history]
+            selection_texts = [match_text(row[1].final_selection_text)
+                               for row in representable_history]
             # Only candidates that can match some same-key history event
             # need a query vector (others score 0 evidence; no invented
             # cosine).  The runner precomputes exactly this pair set.
@@ -505,10 +516,12 @@ class WalkForwardReplay:
                     continue
                 seen_templates.add(template)
                 if any(selected == template for selected in selection_texts):
+                    query_vector = self._vectors.query_vector_for_candidate(
+                        target.preceding_text, candidate)
+                    if query_vector is None:
+                        continue
                     candidate_indexes.append(index)
-                    query_vectors.append(
-                        self._vectors.query_vector_for_candidate(
-                            target.preceding_text, candidate))
+                    query_vectors.append(query_vector)
             s, kept_positions, kept_weights, kept_matches, total_mass = \
                 fast.run(candidate_indexes, query_vectors, event_vectors,
                          usage_ages, list(target.competition),
@@ -532,7 +545,7 @@ class WalkForwardReplay:
                 total_mass=total_mass,
                 candidate_count=len(target.competition),
                 selection_index=selection_index,
-                kept_ids=tuple(history[position].event_id
+                kept_ids=tuple(representable_history[position][1].event_id
                                for position in kept_positions),
                 kept_weights=tuple(float(v) for v in kept_weights),
                 kept_matches=tuple(int(m) for m in kept_matches),
@@ -659,7 +672,7 @@ def needed_query_pairs(facts, targets=None):
 
 
 def margin_base_prefix(prefix_outcomes):
-    """P10(margin_base) over the prefix (AC-157-v1).
+    """P10(margin_base) over the prefix (AC-159-v1).
 
     margin_base events = prefix events where the shadow baseline already
     ranked the final selection first; the base margin is the positive

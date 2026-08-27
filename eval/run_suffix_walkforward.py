@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Suffix walk-forward runner (Habit130/squirrel#157, AC-157-v1).
+"""Suffix walk-forward runner (Habit130/squirrel#159, AC-159-v1).
 
 One-shot driver: takes a **new** read-only Online Backup / facts copy at
 claim (the #77/#155 prefix files are not a sufficient store), splits it at
-the frozen HLC cutoff `[1787065441087, 0]` (prefix inclusive), scores the
+the frozen HLC cutoff `[1787667799562, 0]` (prefix inclusive), scores the
 three frozen routes (`dedicated_qwen3_embedding_0_6b`,
 `qwen_l28_candidate_span_mean`, `dedicated_bge_m3`) into a private vector
 cache (one process per route in its own runtime: the embedding venv for the
 torch routes, the daemon venv for the MLX L28 route), runs the pre-declared
-grid on the prefix (τ + cells), applies the #157-quoted gates on the suffix
+grid on the prefix (τ + cells), applies the #159-quoted gates on the suffix
 claim set, and writes the desensitized freeze/report into the artifact dir.
 
 The freeze (identity: code SHA, snapshot/split hashes, route fingerprints,
@@ -17,7 +17,7 @@ or a freeze mismatch fails closed.  No live-store write, no daemon restart,
 no `~/Library/Rime` deploy; GPU/MLX is exclusive to this run
 (shared-state allocation of the issue).
 
-Terminals (issue #157 body, frozen): exact shortlist | 收窄声称 shortlist |
+Terminals (issue #159 body, frozen): exact shortlist | 收窄声称 shortlist |
 无合格方案 | 数据不足.  No ANN, no production winner, no live α/γ change;
 public-B accuracy and the personal 2x2 r never enter the decision.
 
@@ -25,7 +25,7 @@ Usage:
 
     python3 eval/run_suffix_walkforward.py \
         --work-dir <local snapshot+report dir> \
-        --artifact-dir eval/suffix_walkforward \
+        --artifact-dir .local-work/ac159-suffix-wf/artifacts \
         --embedding-python <repo>/.local-work/venv-embeddings/bin/python \
         --daemon-python <repo>/daemon/.venv/bin/python \
         --qwen3-embedding-model <repo>/.local-work/models/Qwen3-Embedding-0.6B \
@@ -39,6 +39,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,16 +50,19 @@ if str(Path(__file__).resolve().parents[1] / "daemon") not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "daemon"))
 
 from public_layer_slicer import canonical_json, sha256_bytes  # noqa: E402
+from representations import (  # noqa: E402
+    CandidateSpanRepresentationError, RepresentationError)
 from snapshot import take_snapshot  # noqa: E402
 from walkforward_cc import (  # noqa: E402
     CONTRACT_ID, ENGINE_VERSION, FrozenFacts, PREFIX_HLC_MAX_INCLUSIVE,
     ROUTE_IDS, L28_ROUTE_ID, BOOTSTRAP_SEED, BOOTSTRAP_REPLICATES,
+    MIN_HARD_NEGATIVE_QUERIES,
     CandidateVectorTable, WalkForwardReplay, needed_query_pairs,
     margin_base_prefix, prefix_suffix_split)
 from calibration_cc import calibrate_tau, prefix_hard_negative_query_count  # noqa: E402
 from grid_cc import data_counts, facts_only_data_count, grid_manifest, run_route  # noqa: E402
 from shortlist_cc import assemble_shortlist  # noqa: E402
-from suffix_report import (build_report, verify_privacy,  # noqa: E402
+from suffix_report import (build_report, split_hashes, verify_privacy,  # noqa: E402
                            render_markdown)
 
 
@@ -77,11 +81,22 @@ def _main_path(*parts):
 FREEZE_NAME = "suffix_walkforward_freeze.json"
 REPORT_JSON_NAME = "suffix_walkforward_report.json"
 REPORT_MD_NAME = "SUFFIX_WALKFORWARD_REPORT.md"
-DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
+DEFAULT_ARTIFACT_DIR = (Path(__file__).resolve().parents[1] / ".local-work"
+                        / "ac159-suffix-wf" / "artifacts")
+HISTORICAL_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
+# Git-committed mirror of the desensitized AC-159 report.  This is a NEW
+# path inside the repo; it never touches the AC-157 artifacts under
+# eval/suffix_walkforward/ (AC-159-v1 repair 2).
+COMMITTED_ARTIFACT_DIR = (Path(__file__).resolve().parent
+                          / "suffix_walkforward_ac159")
 
 
 class EnvironmentBlocker(Exception):
     """A required local model, runtime or snapshot is missing."""
+
+
+class ContractFailure(Exception):
+    """A frozen AC-159 invariant failed during the run."""
 
 
 def _cache_dir(cache):
@@ -95,6 +110,10 @@ def _event_vectors_path(cache, route_id):
 
 def _query_vectors_path(cache, route_id):
     return cache / ("%s.queries.jsonl" % route_id)
+
+
+def _omissions_path(cache, route_id):
+    return cache / ("%s.omissions.json" % route_id)
 
 
 def _identity_path(cache, route_id):
@@ -141,6 +160,39 @@ def _write_vectors(path, vectors):
                 "key": key, "vector": [float(v) for v in vector]}) + "\n")
     tmp.replace(path)
     return path
+
+
+def _write_omissions(path, *, route_id, event_rows, event_vectors,
+                     query_rows, query_vectors, reason_counts):
+    """Write desensitized per-route omission counts, never omitted keys."""
+    manifest = {
+        "route_id": route_id,
+        "event_rows": event_rows,
+        "event_vectors": event_vectors,
+        "event_omitted": event_rows - event_vectors,
+        "query_rows": query_rows,
+        "query_vectors": query_vectors,
+        "query_omitted": query_rows - query_vectors,
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def _l28_omission_reason(error):
+    """Return a safe omission category, or None for a true worker fault."""
+    if not isinstance(error, CandidateSpanRepresentationError) and \
+            str(error) != "candidate suffix mismatch":
+        return None
+    if type(error).__name__ == "EmptyCandidateRepresentationError":
+        return "empty_candidate"
+    if str(error) == "candidate suffix mismatch":
+        return "suffix_mismatch"
+    if str(error) == "token straddles context/candidate boundary":
+        return "boundary_straddled"
+    return "candidate_span"
 
 
 def _read_vectors(path):
@@ -204,20 +256,31 @@ def _route_identity(route_id, args, cache):
 class _CachedProvider:
     """Model-free provider over precomputed route vectors (driver side)."""
 
-    def __init__(self, event_vectors, query_vectors, dimension):
+    def __init__(self, event_vectors, query_vectors, dimension,
+                 missing_events=(), missing_queries=(), omissions=None):
         self._events = event_vectors
         self._queries = query_vectors
         self._dimension = dimension
+        self._missing_events = set(missing_events)
+        self._missing_queries = set(missing_queries)
+        self._omissions = dict(omissions or {})
 
     def vector_dimension(self):
         return self._dimension
 
     def event_vector(self, event):
+        if event.event_id in self._missing_events:
+            return None
         return self._events[event.event_id]
 
     def query_vector_for_candidate(self, preceding_text, candidate):
         key = "%s\0%s" % (preceding_text, candidate)
+        if key in self._missing_queries:
+            return None
         return self._queries[key]
+
+    def omission_counts(self):
+        return dict(self._omissions)
 
 
 class _FixtureProvider:
@@ -225,7 +288,7 @@ class _FixtureProvider:
 
     Vectors are a pure function of the route id and the payload hash so the
     smoke run is reproducible without any model; the committed test suite
-    (not this path) is the real AC-157 gate.
+    (not this path) is the real AC-159 gate.
     """
 
     DIMENSION = 16
@@ -252,17 +315,59 @@ class _FixtureProvider:
     def query_vector_for_candidate(self, preceding_text, candidate):
         return self._vector("query:%s\0%s" % (preceding_text, candidate))
 
+    @staticmethod
+    def omission_counts(event_rows, query_rows):
+        return {
+            "event_rows": event_rows,
+            "event_vectors": event_rows,
+            "event_omitted": 0,
+            "query_rows": query_rows,
+            "query_vectors": query_rows,
+            "query_omitted": 0,
+            "reason_counts": {},
+        }
+
 
 def _fixture_provider(events, route_id):
     del events
     return _FixtureProvider(route_id)
 
 
-def _load_route_vectors(cache, route_id, identity):
-    events = _read_vectors(_event_vectors_path(cache, route_id))
-    queries = _read_vectors(_query_vectors_path(cache, route_id))
+def _load_route_vectors(cache, route_id, identity, event_records, pairs):
+    event_vectors = _read_vectors(_event_vectors_path(cache, route_id))
+    query_vectors = _read_vectors(_query_vectors_path(cache, route_id))
+    manifest_path = _omissions_path(cache, route_id)
+    if not manifest_path.is_file():
+        raise EnvironmentBlocker(
+            "route omission manifest missing for %s" % route_id)
+    omissions = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if omissions.get("route_id") != route_id:
+        raise EnvironmentBlocker(
+            "route omission manifest identity drifted: %s" % route_id)
+    expected_events = {event.event_id for event in event_records}
+    expected_queries = {"%s\0%s" % pair for pair in pairs}
+    missing_events = expected_events - set(event_vectors)
+    missing_queries = expected_queries - set(query_vectors)
+    if route_id != L28_ROUTE_ID and (missing_events or missing_queries):
+        raise EnvironmentBlocker(
+            "non-L28 route has omitted vectors: %s" % route_id)
+    if omissions.get("event_omitted") != len(missing_events) or \
+            omissions.get("query_omitted") != len(missing_queries):
+        raise EnvironmentBlocker(
+            "route omission manifest does not match vectors: %s" % route_id)
+    if omissions.get("event_vectors") != len(event_vectors) or \
+            omissions.get("query_vectors") != len(query_vectors):
+        raise EnvironmentBlocker(
+            "route vector manifest does not match vectors: %s" % route_id)
+    if omissions.get("event_rows") != len(expected_events) or \
+            omissions.get("query_rows") != len(expected_queries):
+        raise EnvironmentBlocker(
+            "route omission manifest has wrong input counts: %s" % route_id)
     dimension = identity["vector_dimension"]
-    return _CachedProvider(events, queries, dimension)
+    return _CachedProvider(event_vectors, query_vectors, dimension,
+                           missing_events=missing_events,
+                           missing_queries=missing_queries,
+                           omissions=omissions)
 
 
 def parse_args(argv=None):
@@ -270,6 +375,8 @@ def parse_args(argv=None):
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--artifact-dir", type=Path,
                         default=DEFAULT_ARTIFACT_DIR)
+    parser.add_argument("--committed-artifact-dir", type=Path,
+                        default=COMMITTED_ARTIFACT_DIR)
     parser.add_argument("--cache", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None,
                         help="worker mode alias for --artifact-dir")
@@ -312,6 +419,19 @@ def _main_driver(args):
     cache = _cache_dir(args.cache if args.cache is not None
                        else (work_dir / "cache"))
     output = args.artifact_dir
+    historical = HISTORICAL_ARTIFACT_DIR.resolve()
+    output_resolved = output.resolve()
+    if output_resolved == historical or historical in output_resolved.parents:
+        raise EnvironmentBlocker(
+            "AC-157 artifact directory is historical and read-only: %s"
+            % output)
+    committed = args.committed_artifact_dir
+    committed_resolved = committed.resolve()
+    if committed_resolved == historical or \
+            historical in committed_resolved.parents:
+        raise EnvironmentBlocker(
+            "AC-157 artifact directory is historical and read-only: %s"
+            % committed)
     output.mkdir(parents=True, exist_ok=True)
 
     code_sha = current_code_sha(require_clean=True)
@@ -327,16 +447,18 @@ def _main_driver(args):
             "sha256": sha256_bytes(snapshot_path.read_bytes()),
             "identity": _open_meta(snapshot_path),
             "status": {"status_check": "skipped"},
+            "source": "provided_frozen_snapshot",
         }
         snapshot_path = snapshot["path"]
     else:
         if not os.path.isfile(args.live_db):
             raise EnvironmentBlocker(
                 "missing live facts store; a claim-time snapshot is "
-                "required (SN-157-1): %s" % args.live_db)
+                "required (SN-159-1): %s" % args.live_db)
         snapshot = take_snapshot(args.live_db, str(work_dir),
                                  status_cli=args.status_cli
                                  if os.path.isfile(args.status_cli) else None)
+        snapshot["source"] = "claim_time_online_backup"
         snapshot_path = snapshot["path"]
     print("snapshot sha256: %s" % snapshot["sha256"], flush=True)
 
@@ -352,12 +474,16 @@ def _main_driver(args):
                 "reason": ("snapshot has no events past the frozen cutoff "
                            "[%s,%s]: the suffix claim set is empty"
                            % PREFIX_HLC_MAX_INCLUSIVE),
-                "data": {},
+                "data": {
+                    "prefix": facts_only_data_count(prefix_targets),
+                    "suffix": facts_only_data_count(suffix_targets),
+                },
                 "per_route": [],
                 "total_eligible_cells": 0,
                 "live_gamma": 0.0,
             }
-            _write_report(snapshot, [], decision, {}, prefix_targets,
+            _write_report(snapshot, [], decision, {}, decision["data"],
+                          prefix_targets,
                           suffix_targets, code_sha, args, cache, output)
             return 0
 
@@ -389,17 +515,21 @@ def _main_driver(args):
             if identities[route_id]["route_id"] != route_id:
                 raise EnvironmentBlocker("identity drifted for %s" % route_id)
 
-        # -- facts-only not_calibratable pre-check (RISK-157-3) -----------
-        # The hard-negative query count is a pure fact of the prefix (which
-        # queries would have a differing-selection same-key history).  When
-        # it is below the frozen 200 for every route, all routes are
-        # provably not_calibratable BEFORE any model forward: the legal
-        # terminal is 无合格方案 and no GPU/MLX work is spent.
+        # -- facts-only calibration invariant (AC-159-4) ------------------
+        # The hard-negative query count is a pure fact of the prefix.  #158
+        # established that this new cutoff is calibratable; a lower count is
+        # an implementation fault, not a legal AC-159 terminal.
         hn_count = prefix_hard_negative_query_count(facts, prefix_targets)
-        all_not_calibratable = hn_count < 200
+        if hn_count < MIN_HARD_NEGATIVE_QUERIES:
+            raise ContractFailure(
+                "prefix hard-negative recomputation returned %d < %d; "
+                "AC-159 expects the #158-calibratable prefix"
+                % (hn_count, MIN_HARD_NEGATIVE_QUERIES))
 
         # -- freeze BEFORE any score --------------------------------------
-        freeze = _build_freeze(code_sha, snapshot, identities, args)
+        freeze = _build_freeze(
+            code_sha, snapshot, identities, args, prefix_targets,
+            suffix_targets)
         frozen_path = output / FREEZE_NAME
         if frozen_path.exists():
             existing = json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -414,97 +544,59 @@ def _main_driver(args):
         tmp_path.replace(frozen_path)
 
         # -- per-route vector workers (exclusive GPU/MLX, one at a time) --
+        pairs = needed_query_pairs(facts, targets)
         providers = {}
-        if not all_not_calibratable or args.fixture:
-            for route_id in ROUTE_IDS:
-                if args.fixture:
-                    provider = _fixture_provider(events, route_id)
-                else:
-                    spawn_python = (args.embedding_python
-                                    if route_id != L28_ROUTE_ID
-                                    else args.daemon_python)
-                    _spawn(spawn_python, ["--score-route", route_id],
-                           cache=cache, output=output, snapshot=snapshot_path)
-                    provider = _load_route_vectors(
-                        cache, route_id, identities[route_id])
-                providers[route_id] = provider
+        for route_id in ROUTE_IDS:
+            if args.fixture:
+                provider = _fixture_provider(events, route_id)
+            else:
+                spawn_python = (args.embedding_python
+                                if route_id != L28_ROUTE_ID
+                                else args.daemon_python)
+                _spawn(spawn_python, ["--score-route", route_id],
+                       cache=cache, output=output, snapshot=snapshot_path)
+                provider = _load_route_vectors(
+                    cache, route_id, identities[route_id], events, pairs)
+            providers[route_id] = provider
 
         # -- replay + calibration + grid -----------------------------------
         matrix = []
         data_by_route = {}
-        tau_status_by_route = {}
         for route_id in ROUTE_IDS:
-            if all_not_calibratable and not args.fixture:
-                # Legal terminal (RISK-157-3): no τ can be calibrated from
-                # the prefix (< 200 hard-negative queries); no FX forward
-                # is spent and the route leaves the shortlist.
-                tau_status_by_route[route_id] = {
-                    "state": "not_calibratable",
-                    "queries": hn_count,
-                    "min_queries": 200,
-                    "prefix_count": len(prefix_targets),
-                }
-                route_result = run_route(
-                    None, route_id, tau_status_by_route[route_id],
-                    {"prefix": {}, "suffix": {}}, seed=args.seed,
-                    replicates=args.replicates)
-                matrix.append(route_result)
-                continue
             provider = providers[route_id]
             vectors = CandidateVectorTable(events, provider)
             replay = WalkForwardReplay(facts, vectors)
             tau_status = calibrate_tau(replay, prefix_targets)
-            tau_status_by_route[route_id] = tau_status
+            if (tau_status.get("state") != "calibratable"
+                    and route_id != L28_ROUTE_ID):
+                raise ContractFailure(
+                    "route %s calibration returned %s despite facts-only "
+                    "count %d >= %d"
+                    % (route_id, tau_status.get("state"), hn_count,
+                       MIN_HARD_NEGATIVE_QUERIES))
             reference = replay.replay(_reference_params(), 0.0)
             prefix_ref = [o for o in reference if o.in_prefix]
             suffix_ref = [o for o in reference if not o.in_prefix]
             data_by_route[route_id] = {
                 "prefix": data_counts(prefix_ref),
                 "suffix": data_counts(suffix_ref),
+                "omissions": (provider.omission_counts()
+                               if not args.fixture else
+                               _FixtureProvider.omission_counts(
+                                   len(events), len(pairs))),
             }
             margin_p10, _n = margin_base_prefix(prefix_ref)
             route_result = run_route(
                 replay, route_id, tau_status, data_by_route[route_id],
                 seed=args.seed, replicates=args.replicates,
                 max_cells=args.max_cells, margin_p10=margin_p10)
+            route_result["omissions"] = data_by_route[route_id]["omissions"]
             matrix.append(route_result)
-        # Reference split data (route-independent facts) for the terminal.
-        if all_not_calibratable and not args.fixture:
-            # Deterministic legal terminal (RISK-157-3): every route is
-            # provably not_calibratable from the prefix, so no cell can be
-            # evaluated and no claim set interpretation applies.  The
-            # decision is 无合格方案 by construction, never 数据不足.
-            from shortlist_cc import TERMINAL_NO_QUALIFIED
-            data = {
-                "prefix": facts_only_data_count(prefix_targets),
-                "suffix": facts_only_data_count(suffix_targets),
-            }
-            decision = {
-                "outcome": TERMINAL_NO_QUALIFIED,
-                "reason": ("all routes τ not_calibratable (prefix "
-                           "hard-negative queries %d < 200); no τ is "
-                           "invented, no cell is evaluated and the suffix "
-                           "claim gates cannot run (RISK-157-3)" % hn_count),
-                "data": data,
-                "per_route": [{
-                    "route_id": route_result["route_id"],
-                    "tau": route_result["tau"],
-                    "eligible_cells": 0,
-                    "eliminated_by_reason": {"tau_not_calibratable":
-                                             len(route_result["cells"])},
-                    "evaluated_cells": 0,
-                    "eligible": [],
-                } for route_result in matrix],
-                "total_eligible_cells": 0,
-                "any_evaluated": False,
-                "live_gamma": 0.0,
-            }
-        else:
-            data = {
-                "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
-                "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
-            }
-            decision = assemble_shortlist(matrix, data)
+        data = {
+            "prefix": data_by_route[ROUTE_IDS[0]]["prefix"],
+            "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
+        }
+        decision = assemble_shortlist(matrix, data)
         if args.max_cells is not None:
             decision["partial_scan"] = True
         _write_report(snapshot, matrix, decision, data_by_route, data,
@@ -531,11 +623,15 @@ def _reference_params():
                         saturation_k=1.0)
 
 
-def _build_freeze(code_sha, snapshot, identities, args):
+def _build_freeze(code_sha, snapshot, identities, args, prefix_targets,
+                  suffix_targets):
+    split = split_hashes(snapshot["path"], prefix_targets, suffix_targets)
     return {
         "contract": CONTRACT_ID,
         "code_sha": code_sha,
         "snapshot_sha256": snapshot["sha256"],
+        "snapshot_source": snapshot.get("source", "claim_time_online_backup"),
+        "split": split,
         "grid_manifest": grid_manifest(args.replicates),
         "seed": args.seed,
         "routes": {route_id: identities[route_id]
@@ -568,45 +664,50 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
         live_gamma=0.0,
         report_notes=[
             "public-B accuracy (11953/14725) was never read into the "
-            "selection or the terminal decision (AC-157-5)",
+            "selection or the terminal decision (AC-159-6)",
             "the personal 2x2 r was never read into the selection, "
-            "tie-breaking or suffix-rank interpretation (AC-157-5)",
-            "live gamma is unchanged at 0 (AC-157-7)",
+            "tie-breaking or suffix-rank interpretation (AC-159-6)",
+            "live gamma is unchanged at 0 (AC-159-7)",
         ],
         decisions=[
             "d1 split: the snapshot is the claim-time Online Backup copy; "
-            "prefix = hlc <= [1787065441087,0] (inclusive), suffix = the "
+            "prefix = hlc <= [1787667799562,0] (inclusive), suffix = the "
             "claim set; selection uses the prefix only, claims use the "
-            "suffix only (AC-157-2)",
+            "suffix only (AC-159-2)",
             "d2 payload: last64(preceding)+candidate, no separator; the "
             "query side uses the frozen Qwen3-emb instruction only for "
             "dedicated_qwen3_embedding_0_6b; document/history side never "
-            "applies an instruction (AC-157-1)",
+            "applies an instruction (AC-159-1)",
             "d3 L28 pools the candidate token span [start, start+count) "
             "via candidate_span_mean; whole-payload pooling would be a "
-            "contract failure (AC-157-1)",
+            "contract failure (AC-159-1)",
             "d4 rank denominator: saved same-group competition size < 32 "
             "(group-complete), never the persisted competition_complete "
-            "bit (issue #157 body)",
+            "bit (issue #159 body)",
             "d5 τ: per route only from prefix query-level hard negatives, "
-            ">= 200 queries, Q95/Q97.5/Q99/Q99.5; below 200 the route is "
-            "not_calibratable and leaves the shortlist (AC-157-3)",
+            ">= 200 queries, Q95/Q97.5/Q99/Q99.5; the #158 expected count "
+            "is a facts-only contract invariant; after L28 omissions, only "
+            "that route may be not_calibratable and leave the shortlist, "
+            "while sibling routes continue (AC-159-4)",
             "d6 grid: H {8,32,128,512,inf} x K {8,16,32,64} x gamma "
             "{0.5,1,2,4} x k {1,3,7}, alpha=0; no extra cells, no "
-            "continuous optimizer (AC-157-3)",
+            "continuous optimizer (AC-159-4)",
             "d7 bootstrap: key-clustered (choice-problem key), fixed seed, "
             ">= 10000 replicates, 95% CI; differences paired per event "
-            "(issue #157 body)",
+            "(issue #159 body)",
             "d8 cross-route metrics use the common actionable union; an "
             "event without evidence for a route scores as that route's "
-            "shadow baseline (issue #157 body)",
+            "shadow baseline (issue #159 body)",
             "d9 Δ₁ = gamma/(1+k) <= min(0.5, P10(margin_base)) with "
             "margin_base from the prefix: real snapshots do not persist "
             "base scores, the engine records the reconstructed rank gap "
             "and enforces the hard cap",
-            "d10 terminals: exact shortlist / 收窄声称 shortlist / "
+            "d10 prefix selection: per route, select the family with the "
+            "best prefix top-1, then MRR, then actionable count; retain all "
+            "H variants so suffix gates cannot influence selection",
+            "d11 terminals: exact shortlist / 收窄声称 shortlist / "
             "无合格方案 / 数据不足; ties are reported, never broken by "
-            "model name; no ANN, no production winner (issue #157 body)",
+            "model name; no ANN, no production winner (issue #159 body)",
         ])
     verify_privacy(report)
     (output / REPORT_JSON_NAME).write_text(
@@ -615,6 +716,13 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
         render_markdown(report), encoding="utf-8")
     print("report written: %s/%s" % (output, REPORT_JSON_NAME), flush=True)
     print("report sha256: %s" % report["report_sha256"], flush=True)
+    committed = args.committed_artifact_dir
+    committed.mkdir(parents=True, exist_ok=True)
+    for name in (FREEZE_NAME, REPORT_JSON_NAME, REPORT_MD_NAME):
+        source = output / name
+        if source.is_file():
+            shutil.copyfile(source, committed / name)
+    print("committed report mirror: %s" % committed, flush=True)
 
 
 def _score_embedding_route(route_id, args):
@@ -706,6 +814,12 @@ def _score_embedding_route(route_id, args):
                        zip((e.event_id for e in events), event_vectors))
         _write_vectors(_query_vectors_path(cache_dir, route_id),
                        zip(pair_keys, query_vectors))
+        _write_omissions(
+            _omissions_path(cache_dir, route_id),
+            route_id=route_id,
+            event_rows=len(events), event_vectors=len(event_vectors),
+            query_rows=len(pairs), query_vectors=len(query_vectors),
+            reason_counts={})
         print("route %s done: %d events, %d queries"
               % (route_id, len(events), len(pairs)), flush=True)
     finally:
@@ -781,19 +895,48 @@ def _score_l28_route(args):
         events = facts.events()
         targets = [e for e in events if not e.retracted]
         pairs = needed_query_pairs(facts, targets)
-        event_vectors = []
+        reason_counts = {}
+
+        def record_omission(error):
+            reason = _l28_omission_reason(error)
+            if reason is None:
+                raise error
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        event_rows = []
         for event in events:
-            event_vectors.append(l28_vector(
-                event.preceding_text, event.final_selection_text))
-        _write_vectors(_event_vectors_path(cache_dir, L28_ROUTE_ID),
-                       zip((e.event_id for e in events), event_vectors))
+            try:
+                vector = l28_vector(
+                    event.preceding_text, event.final_selection_text)
+            except RepresentationError as error:
+                record_omission(error)
+                continue
+            event_rows.append((event.event_id, vector))
         query_rows = []
         for preceding, candidate in pairs:
-            query_rows.append(l28_vector(preceding, candidate))
+            try:
+                vector = l28_vector(preceding, candidate)
+            except RepresentationError as error:
+                record_omission(error)
+                continue
+            query_rows.append(("%s\0%s" % (preceding, candidate), vector))
+        _write_vectors(_event_vectors_path(cache_dir, L28_ROUTE_ID),
+                       event_rows)
         _write_vectors(_query_vectors_path(cache_dir, L28_ROUTE_ID),
-                       zip(("%s\0%s" % pair for pair in pairs), query_rows))
-        print("route %s done: %d events, %d queries"
-              % (L28_ROUTE_ID, len(events), len(pairs)), flush=True)
+                       query_rows)
+        _write_omissions(
+            _omissions_path(cache_dir, L28_ROUTE_ID),
+            route_id=L28_ROUTE_ID,
+            event_rows=len(events), event_vectors=len(event_rows),
+            query_rows=len(pairs), query_vectors=len(query_rows),
+            reason_counts=reason_counts)
+        event_omitted = len(events) - len(event_rows)
+        query_omitted = len(pairs) - len(query_rows)
+        print("route %s done: %d/%d events, %d/%d queries; omitted "
+              "events=%d queries=%d"
+              % (L28_ROUTE_ID, len(event_rows), len(events),
+                 len(query_rows), len(pairs), event_omitted, query_omitted),
+              flush=True)
     finally:
         facts.close()
     return 0
@@ -840,6 +983,9 @@ def main(argv=None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except ContractFailure as error:
+        print("contract failure:", error, file=sys.stderr)
+        sys.exit(4)
     except EnvironmentBlocker as error:
         print("environment blocker:", error, file=sys.stderr)
         sys.exit(3)
