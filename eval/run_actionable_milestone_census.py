@@ -208,8 +208,12 @@ def _main_driver(args):
                     "missing Qwen3-Embedding model: %s"
                     % args.qwen3_embedding_model)
             # The identity worker runs in the embedding venv (dependency
-            # versions come from that interpreter, exactly as AC-159).
-            _spawn(args.embedding_python, ["--identity", ROUTE_ID],
+            # versions come from that interpreter, exactly as AC-159); the
+            # requested model path is forwarded so the fingerprint always
+            # matches the model the census validates and scores.
+            _spawn(args.embedding_python,
+                   ["--identity", ROUTE_ID,
+                    "--qwen3-embedding-model", str(args.qwen3_embedding_model)],
                    cache=cache, output=output)
             identities = {ROUTE_ID: json.loads(
                 _identity_path(cache, ROUTE_ID).read_text(
@@ -245,7 +249,9 @@ def _main_driver(args):
         if args.fixture:
             provider = _fixture_provider(events, ROUTE_ID)
         else:
-            _spawn(args.embedding_python, ["--score-route", ROUTE_ID],
+            _spawn(args.embedding_python,
+                   ["--score-route", ROUTE_ID,
+                    "--qwen3-embedding-model", str(args.qwen3_embedding_model)],
                    cache=cache, output=output, snapshot=str(snapshot_path))
             provider = _load_route_vectors(
                 cache, ROUTE_ID, identities[ROUTE_ID], events, pairs)
