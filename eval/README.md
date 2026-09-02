@@ -589,3 +589,67 @@ Committed artifacts (`eval/prefix_hn_census/`) carry the freeze and the
 desensitized report: snapshot/split hashes, the numeric cutoff HLC pair,
 unretracted / group-complete / key counts, primary + appendix counts and
 the terminal — no 上文, no candidate text, no machine paths.
+
+## Actionable milestone census (Habit130/squirrel#162, AC-162-v1)
+
+`actionable_milestone_census.py` + `run_actionable_milestone_census.py` run
+a lightweight, read-only census that determines whether the AC-159 fixed
+split has reached the predeclared milestone of 3000 actionable
+group-complete events, using the **same reference-route semantics** that
+produced the accepted AC-159 `2537 + 13 = 2550` count:
+
+- **Snapshot**: one fresh read-only SQLite Online Backup at real-run claim
+  (`take_snapshot`); the live semantic-memory store is never written and
+  the status continuity check runs when the status CLI is available.
+- **Route**: exactly `dedicated_qwen3_embedding_0_6b` — payload
+  `last64(preceding)+candidate`, the frozen English query instruction on
+  the query side only, no event-side instruction, same candidate
+  normalization, strict-HLC history, same-commit exclusion and as-of
+  retraction semantics as AC-159.  The census replays through the AC-159
+  seam (`walkforward_cc.WalkForwardReplay`) with the AC-159 worker
+  (`run_suffix_walkforward.py --identity / --score-route`) for the vectors.
+- **Reference parameters**: `tau=0`, `K_evidence=8`, `H=inf`,
+  `saturation_k=1`, `gamma=0`.  `actionable` stays `any(s > 0)`; gamma zero
+  preserves the shadow order but does not redefine actionability.
+- **Cutoff**: frozen at `[1787667799562, 0]` — prefix inclusive, suffix
+  strictly later.  Never moved to the new snapshot maximum, never folded
+  into prefix (regression-tested).
+- **Group-complete**: saved same-group competition size `< 32`; the
+  persisted `competition_complete` bit is diagnostic only.
+- **Counts**: prefix, suffix and total replayable, group-complete,
+  actionable group-complete and actionable-key counts.
+- **Terminals (exactly one)**: `reached_3000` iff total actionable
+  group-complete `>= 3000`, else `pending_3000` with the exact remaining
+  count `3000 - total`.  Neither terminal starts the full walk-forward or
+  changes live behavior.  Count drift vs the accepted AC-159 values is
+  expected on a fresh snapshot and is reported, never forced.
+
+No L28/BGE route, no τ calibration, no parameter grid, no bootstrap, no
+quality/safety gate, no shortlist, no ANN, no deployment and no live
+`α`/`γ`/evidence change.
+
+```sh
+# model-free gate:
+python3 -m unittest eval.test_actionable_milestone_census
+
+# one-shot real census (exclusive Qwen3-Embedding runtime/GPU; takes one
+# fresh read-only Online Backup at claim):
+python3 eval/run_actionable_milestone_census.py \
+  --work-dir <repo>/.local-work/ac162-actionable-census/work \
+  --artifact-dir <repo>/.local-work/ac162-actionable-census/artifacts
+
+# reuse an existing frozen snapshot for a rerun (identity must match):
+python3 eval/run_actionable_milestone_census.py --snapshot <path> ...
+```
+
+Private working data (claim-time snapshot, vector cache, working freeze and
+report copies) stays under the ignored `.local-work/ac162-actionable-census/`
+directory.  The desensitized freeze and report are mirrored to the tracked
+path `eval/actionable_milestone_census/`; that mirror is the git-committed
+AC-162 artifact and is a **new** path that never overwrites
+`eval/suffix_walkforward/` (AC-157) or `eval/suffix_walkforward_ac159/`
+(AC-159).  The freeze (contract, code SHA, snapshot SHA-256 and
+history_id/store_epoch, route fingerprint, cutoff, reference parameters,
+split hashes) is written **before** any score; reports and freezes never
+contain preceding text, candidate text, facts, vectors or machine paths
+(privacy-scanned).
