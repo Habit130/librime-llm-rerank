@@ -41,14 +41,14 @@ if str(Path(__file__).resolve().parents[1] / "daemon") not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "daemon"))
 
 from actionable_milestone_census import (  # noqa: E402
-    CONTRACT_ID, ENGINE_VERSION, ROUTE_ID, build_freeze, build_report,
-    census_outcomes, legal_terminal, public_report, render_markdown,
-    split_census_counts, verify_privacy)
+    CONTRACT_ID, ENGINE_VERSION, ROUTE_ID, CensusError, PrivacyViolation,
+    build_freeze, build_report, census_outcomes, legal_terminal,
+    public_report, render_markdown, split_census_counts, verify_privacy)
 from public_layer_slicer import canonical_json  # noqa: E402
-from snapshot import take_snapshot  # noqa: E402
+from snapshot import SnapshotError, take_snapshot  # noqa: E402
 from walkforward_cc import (  # noqa: E402
-    FrozenFacts, PREFIX_HLC_MAX_INCLUSIVE, needed_query_pairs,
-    prefix_suffix_split)
+    FrozenFacts, PREFIX_HLC_MAX_INCLUSIVE, SuffixWalkforwardError,
+    needed_query_pairs, prefix_suffix_split)
 from run_suffix_walkforward import (  # noqa: E402  (AC-159 worker seam)
     EnvironmentBlocker, MAIN_REPO, _FixtureProvider, _fixture_provider,
     _identity_path, _load_route_vectors, _spawn)
@@ -354,6 +354,14 @@ def main(argv=None) -> int:
         print("contract failure:", error, file=sys.stderr)
         return 4
     except EnvironmentBlocker as error:
+        print("environment blocker:", error, file=sys.stderr)
+        return 3
+    except (SnapshotError, CensusError, PrivacyViolation,
+            SuffixWalkforwardError) as error:
+        # RISK-CENSUS3000-3: an inconsistent Online Backup, a privacy
+        # violation or any census/engine input fault is an execution-
+        # environment blocker on the documented channel (exit 3), never a
+        # raw traceback; nothing is delivered either way (fail closed).
         print("environment blocker:", error, file=sys.stderr)
         return 3
 

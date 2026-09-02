@@ -758,6 +758,29 @@ class DriverFixtureEndToEndTest(unittest.TestCase):
                 "--work-dir", tempfile.mkdtemp(prefix="ac162_missing_")])
         self.assertEqual(status, 3)
 
+    def test_driver_routes_census_faults_to_blocker_channel(self):
+        """RISK-CENSUS3000-3: a census input fault (here a snapshot whose
+        meta lacks store_epoch -> build_freeze fails) exits as the
+        environment-blocker channel, not a raw traceback."""
+        facts = SyntheticFacts()
+        self.addCleanup(facts.close)
+        facts.connection.execute("DELETE FROM meta WHERE key='store_epoch'")
+        facts.connection.commit()
+        temp = tempfile.mkdtemp(prefix="ac162_blocker_")
+        self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
+        with mock.patch.object(census_runner, "current_code_sha",
+                               return_value="b" * 40):
+            status = census_runner.main([
+                "--fixture", "--snapshot", facts.db_path,
+                "--work-dir", temp, "--artifact-dir", temp,
+                "--committed-artifact-dir", temp])
+        self.assertEqual(status, 3)
+        # Nothing was delivered (fail closed): no freeze/report/markdown.
+        delivered = [name for name in os.listdir(temp)
+                     if name.endswith((".json", ".md"))
+                     and not os.path.isdir(os.path.join(temp, name))]
+        self.assertEqual(delivered, [])
+
 
 def _file_sha256(path):
     import hashlib
