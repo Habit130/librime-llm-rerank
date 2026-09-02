@@ -2,7 +2,7 @@
 
 - Engine: actionable-milestone-census-v1
 - Contract: AC-162-v1
-- Code SHA: `cf7559deba197dc4d633b366b37fbe28b5fb0fe9`
+- Code SHA: `c817a86cd3fe0479155066c556ce3da92647278c`
 - Snapshot SHA-256: `111517b4548ad97cb73c801a3099076d70f90afc36bf94eb13f3fd1121cd94f5`
 - Snapshot identity: history `dc3ffbf1a21957e0bb4ceed535c9df56` / epoch `8407bd6b456ba5c5a526b4b95951bac3`
 - Route: `dedicated_qwen3_embedding_0_6b`
@@ -90,4 +90,4 @@
 - d5 split: prefix = hlc <= [1787667799562,0] inclusive, suffix = strictly later; the cutoff is never moved to the new snapshot maximum (CENSUS3000-5)
 - d6 terminal: reached_3000 iff total actionable group-complete >= 3000, else pending_3000 with the exact remaining count; the walk-forward is not started by this census (CENSUS3000-4)
 
-Report SHA-256: `817e29dcf43323c0bb131ef0d647fd21f254f7dd4a999600e05b0cb69c1f563d`
+Report SHA-256: `78489993b52d14c6de8024cbe125b0396e168e2c341ab8f2097c0ff86466d893`
