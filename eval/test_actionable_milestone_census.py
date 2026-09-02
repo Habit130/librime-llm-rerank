@@ -798,6 +798,46 @@ class DriverFixtureEndToEndTest(unittest.TestCase):
                 "--committed-artifact-dir", temp])
         self.assertEqual(status, 3)
 
+    def test_stale_reports_cleared_when_rebinding_freeze(self):
+        """A stale-code rerun that later fails must not leave the old
+        report/json/markdown beside the new freeze (Codex P2)."""
+        facts = _synthetic_with_split()
+        self.addCleanup(facts.close)
+        temp = tempfile.mkdtemp(prefix="ac162_stale_")
+        self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
+        work = os.path.join(temp, "work")
+        artifact = os.path.join(temp, "artifacts")
+        committed = os.path.join(temp, "committed")
+        base = ["--fixture", "--snapshot", facts.db_path,
+                "--work-dir", work, "--artifact-dir", artifact,
+                "--committed-artifact-dir", committed]
+        # First successful run under code "b"*40.
+        with mock.patch.object(census_runner, "current_code_sha",
+                               return_value="b" * 40):
+            self.assertEqual(census_runner.main(base), 0)
+        for name in ("actionable_milestone_census_freeze.json",
+                     "actionable_milestone_census_report.json",
+                     "ACTIONABLE_MILESTONE_CENSUS_REPORT.md"):
+            self.assertTrue(os.path.isfile(os.path.join(artifact, name)))
+        # Rebind under a NEW code whose scoring worker fails after the
+        # replacement freeze was written.
+        with mock.patch.object(census_runner, "current_code_sha",
+                               return_value="d" * 40), \
+                mock.patch.object(
+                    census_runner, "_fixture_provider",
+                    side_effect=census_runner.EnvironmentBlocker(
+                        "scoring failed")):
+            status = census_runner.main(base)
+        self.assertEqual(status, 3)
+        # The stale report files are gone; only the new freeze remains.
+        leftover = sorted(name for name in os.listdir(artifact))
+        self.assertEqual(leftover,
+                         ["actionable_milestone_census_freeze.json"])
+        new_freeze = json.load(open(os.path.join(
+            artifact, "actionable_milestone_census_freeze.json"),
+            encoding="utf-8"))
+        self.assertEqual(new_freeze["code_sha"], "d" * 40)
+
 
 def _file_sha256(path):
     import hashlib

@@ -236,10 +236,17 @@ def _main_driver(args):
             existing = json.loads(frozen_path.read_text(encoding="utf-8"))
             if existing.get("code_sha") != code_sha:
                 frozen_path.unlink()  # stale code -> rebuild
+                _clear_stale_reports(output)
             elif existing != freeze:
                 raise EnvironmentBlocker(
                     "existing freeze does not match the reconstituted "
                     "identity (code/snapshot/route drift)")
+        else:
+            # No freeze but leftover report files can only be stale (a
+            # report without its matching freeze is never a complete
+            # result); clear them so a failed rerun cannot present the
+            # old terminal/counts beside a new freeze (Codex P2).
+            _clear_stale_reports(output)
         tmp_path = frozen_path.with_suffix(frozen_path.suffix + ".tmp")
         tmp_path.write_text(canonical_json(freeze) + "\n", encoding="utf-8")
         tmp_path.replace(frozen_path)
@@ -345,6 +352,17 @@ def _file_sha256(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _clear_stale_reports(output):
+    """Remove stale report json/markdown from an artifact dir.
+
+    A report without its matching freeze can never be a complete result;
+    removing it before publishing a replacement freeze keeps a failed
+    rerun from presenting an old terminal/counts beside a new freeze.
+    """
+    for name in (REPORT_JSON_NAME, REPORT_MD_NAME):
+        (output / name).unlink(missing_ok=True)
 
 
 def main(argv=None) -> int:
