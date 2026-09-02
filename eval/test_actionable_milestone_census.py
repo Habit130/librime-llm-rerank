@@ -781,6 +781,23 @@ class DriverFixtureEndToEndTest(unittest.TestCase):
                      and not os.path.isdir(os.path.join(temp, name))]
         self.assertEqual(delivered, [])
 
+    def test_driver_malformed_snapshot_is_blocker_not_traceback(self):
+        """A --snapshot file that is not SQLite (meta read raises
+        sqlite3.DatabaseError) must exit via the blocker channel too."""
+        malformed = os.path.join(
+            tempfile.mkdtemp(prefix="ac162_bad_"), "bad.sqlite3")
+        with open(malformed, "w", encoding="utf-8") as handle:
+            handle.write("this is not a sqlite database")
+        temp = tempfile.mkdtemp(prefix="ac162_bad_work_")
+        self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
+        with mock.patch.object(census_runner, "current_code_sha",
+                               return_value="b" * 40):
+            status = census_runner.main([
+                "--fixture", "--snapshot", malformed,
+                "--work-dir", temp, "--artifact-dir", temp,
+                "--committed-artifact-dir", temp])
+        self.assertEqual(status, 3)
+
 
 def _file_sha256(path):
     import hashlib

@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -357,8 +358,10 @@ def main(argv=None) -> int:
         print("environment blocker:", error, file=sys.stderr)
         return 3
     except (SnapshotError, CensusError, PrivacyViolation,
-            SuffixWalkforwardError) as error:
-        # RISK-CENSUS3000-3: an inconsistent Online Backup, a privacy
+            SuffixWalkforwardError, sqlite3.DatabaseError) as error:
+        # RISK-CENSUS3000-3: an inconsistent Online Backup (including a
+        # malformed/non-SQLite --snapshot file, whose meta read raises
+        # sqlite3.DatabaseError before FrozenFacts validates it), a privacy
         # violation or any census/engine input fault is an execution-
         # environment blocker on the documented channel (exit 3), never a
         # raw traceback; nothing is delivered either way (fail closed).
