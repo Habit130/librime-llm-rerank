@@ -84,14 +84,22 @@ def isolate_readonly_snapshot(source, dest_dir):
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / SNAPSHOT_COPY_NAME
+
+    def _unlink_sidecars(path):
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(path) + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o644)
+                sidecar.unlink()
+
     if source.resolve() == dest.resolve():
-        os.chmod(dest, 0o444)
+        _unlink_sidecars(dest)
         return dest
     if dest.exists():
         os.chmod(dest, 0o644)
         dest.unlink()
+    _unlink_sidecars(dest)
     shutil.copyfile(str(source), str(dest))
-    os.chmod(dest, 0o444)
     return dest
 
 

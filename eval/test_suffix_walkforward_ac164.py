@@ -125,7 +125,8 @@ class IdentityPinTest(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
         dest = isolate_readonly_snapshot(facts.db_path, temp)
         self.assertTrue(dest.is_file())
-        self.assertFalse(dest.with_name(dest.name + "-wal").exists())
+        self.assertFalse(Path(str(dest) + "-wal").exists())
+        self.assertFalse(Path(str(dest) + "-shm").exists())
         self.assertEqual(file_sha256(dest), file_sha256(facts.db_path))
 
     def test_isolate_same_path_does_not_delete_source(self):
