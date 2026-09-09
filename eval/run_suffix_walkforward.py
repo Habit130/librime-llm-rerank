@@ -450,15 +450,21 @@ def _apply_delivery_defaults(args):
 
 
 def _route_cache_ready(cache, route_id, identity, event_records, pairs):
-    identity_path = _identity_path(cache, route_id)
-    if not identity_path.is_file():
+    needed = (
+        _identity_path(cache, route_id),
+        _event_vectors_path(cache, route_id),
+        _query_vectors_path(cache, route_id),
+        _omissions_path(cache, route_id),
+    )
+    if not all(path.is_file() for path in needed):
         return False
-    stored = json.loads(identity_path.read_text(encoding="utf-8"))
+    stored = json.loads(needed[0].read_text(encoding="utf-8"))
     if stored != identity:
         return False
     try:
         _load_route_vectors(cache, route_id, identity, event_records, pairs)
-    except EnvironmentBlocker:
+    except (EnvironmentBlocker, OSError, json.JSONDecodeError, KeyError,
+            ValueError):
         return False
     return True
 

@@ -273,6 +273,20 @@ class TerminalAndDecisionSurfaceTest(unittest.TestCase):
         self.assertNotIn("r", names)
 
 
+class RouteCacheReadyTest(unittest.TestCase):
+
+    def test_identity_without_vectors_is_not_ready(self):
+        temp = tempfile.mkdtemp(prefix="ac164_cache_")
+        self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
+        cache = Path(temp)
+        route_id = ROUTE_IDS[1]
+        identity = {"route_id": route_id, "vector_dimension": 4}
+        (cache / ("%s.identity.json" % route_id)).write_text(
+            json.dumps(identity), encoding="utf-8")
+        self.assertFalse(wf_runner._route_cache_ready(
+            cache, route_id, identity, [], []))
+
+
 class HistoricalPathTest(unittest.TestCase):
 
     def test_historical_dirs_are_read_only(self):
