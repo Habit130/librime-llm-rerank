@@ -191,7 +191,8 @@ def verify_privacy(report):
 def render_markdown(report):
     """A human-readable desensitized summary (no raw text)."""
     lines = [
-        "# Suffix Walk-Forward Report (AC-159-v1)",
+        "# Suffix Walk-Forward Report (%s)" % report.get(
+            "contract", CONTRACT_ID),
         "",
         "- Engine: %s" % report["engine"]["version"],
         "- Code SHA: `%s`" % report["code_sha"],

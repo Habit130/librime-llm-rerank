@@ -653,3 +653,59 @@ history_id/store_epoch, route fingerprint, cutoff, reference parameters,
 split hashes) is written **before** any score; reports and freezes never
 contain preceding text, candidate text, facts, vectors or machine paths
 (privacy-scanned).
+
+## 3000-milestone exact suffix walk-forward (Habit130/squirrel#164, AC-164-v1)
+
+`suffix_walkforward_ac164.py` + `run_suffix_walkforward_ac164.py` rerun the
+accepted AC-159 three-route exact walk-forward on the **immutable AC-162
+milestone snapshot**.  The engine, grid, gates and terminals stay on the
+AC-159 seam (`walkforward_cc` / `calibration_cc` / `grid_cc` /
+`shortlist_cc` / `run_suffix_walkforward.py --delivery ac164`).
+
+- **Snapshot**: the preserved AC-162 bytes with SHA-256
+  `111517b4548ad97cb73c801a3099076d70f90afc36bf94eb13f3fd1121cd94f5`,
+  history ID `dc3ffbf1a21957e0bb4ceed535c9df56` and store epoch
+  `8407bd6b456ba5c5a526b4b95951bac3`.  The driver copies those bytes
+  read-only (no WAL/SHM) and fail-closes on any other digest.  A later live
+  backup is refused; `--snapshot` is required.
+- **Split**: frozen cutoff `[1787667799562, 0]` — prefix inclusive for τ
+  calibration and family selection (`4844` events,
+  `e50349a8630a9505c667569bde93c5bbfc9b1206d28c51d0ec5c80d96bb201a1`);
+  suffix strictly later for claim gates only (`3901` events,
+  `9a7dd8b9444a397431a6c0212cfa2379dcfdac5f5a1cefc7150a1324cf3bb7a2`).
+- **Entry cross-check**: Qwen3 reference-route actionable group-complete
+  must remain prefix `2537`, suffix `2370`, total `4907`, with actionable
+  keys `421` / `479` / `611`.  A mismatch is a snapshot or implementation
+  failure; the cutoff is never moved.
+- **Routes**: exactly `dedicated_qwen3_embedding_0_6b`,
+  `qwen_l28_candidate_span_mean`, `dedicated_bge_m3`.  Payload
+  `last64(preceding)+candidate` with no separator.  Qwen3-Embedding uses
+  the frozen English query instruction on the query side only.  L28 uses
+  `candidate_tokenization_for` then sliced `candidate_span_mean`; a legal
+  per-payload span fault omits that vector, counts it without private text,
+  and does not stop sibling routes.
+- **Grid / terminals**: alpha `0`; τ Q95/Q97.5/Q99/Q99.5 from prefix
+  hard negatives; `H {8,32,128,512,inf}` × `K {8,16,32,64}` ×
+  `gamma {0.5,1,2,4}` × `k {1,3,7}`; clustered bootstrap seed `20260817`
+  and `10000` replicates.  Exactly one legal terminal:
+  `exact_shortlist` / `收窄声称_shortlist` / `无合格方案` / `数据不足`.
+  Public-B accuracy and personal 2x2 `r` never enter.  Live alpha/gamma
+  stay `0`.
+
+```sh
+# model-free gate:
+python3 -m unittest eval.test_suffix_walkforward_ac164
+
+# one-shot real run (exclusive GPU/MLX; preserved snapshot only):
+python3 eval/run_suffix_walkforward_ac164.py \
+  --snapshot <isolated AC-162 snapshot copy> \
+  --work-dir <repo>/.local-work/ac164-3000-walkforward/work \
+  --artifact-dir <repo>/.local-work/ac164-3000-walkforward/artifacts
+```
+
+Private working data stays under the ignored
+`.local-work/ac164-3000-walkforward/` directory.  The desensitized freeze
+and report are mirrored to the new tracked path
+`eval/suffix_walkforward_ac164/`.  That path never overwrites
+`eval/suffix_walkforward/` (AC-157), `eval/suffix_walkforward_ac159/`
+(AC-159) or `eval/actionable_milestone_census/` (AC-162).
