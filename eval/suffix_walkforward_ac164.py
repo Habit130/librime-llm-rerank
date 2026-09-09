@@ -69,8 +69,9 @@ def file_sha256(path):
 
 
 def open_meta(path):
-    conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    conn = sqlite3.connect(path, timeout=2.0)
     try:
+        conn.execute("PRAGMA query_only = 1")
         return dict(conn.execute("SELECT key, value FROM meta"))
     finally:
         conn.close()
