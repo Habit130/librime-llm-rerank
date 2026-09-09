@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +127,18 @@ class IdentityPinTest(unittest.TestCase):
         self.assertTrue(dest.is_file())
         self.assertFalse(dest.with_name(dest.name + "-wal").exists())
         self.assertEqual(file_sha256(dest), file_sha256(facts.db_path))
+
+    def test_isolate_same_path_does_not_delete_source(self):
+        facts = _synthetic_with_split()
+        self.addCleanup(facts.close)
+        temp = tempfile.mkdtemp(prefix="ac164_iso_same_")
+        self.addCleanup(lambda: shutil.rmtree(temp, ignore_errors=True))
+        dest = Path(temp) / "facts-snapshot-ac162.sqlite3"
+        shutil.copyfile(facts.db_path, dest)
+        same = isolate_readonly_snapshot(dest, temp)
+        self.assertEqual(same.resolve(), dest.resolve())
+        self.assertTrue(same.is_file())
+        self.assertEqual(file_sha256(same), file_sha256(facts.db_path))
 
 
 class SplitAndCensusTest(unittest.TestCase):

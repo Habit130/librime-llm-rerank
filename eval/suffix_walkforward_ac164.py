@@ -84,6 +84,9 @@ def isolate_readonly_snapshot(source, dest_dir):
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / SNAPSHOT_COPY_NAME
+    if source.resolve() == dest.resolve():
+        os.chmod(dest, 0o444)
+        return dest
     if dest.exists():
         os.chmod(dest, 0o644)
         dest.unlink()
