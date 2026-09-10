@@ -64,6 +64,15 @@ from grid_cc import data_counts, facts_only_data_count, grid_manifest, run_route
 from shortlist_cc import assemble_shortlist  # noqa: E402
 from suffix_report import (build_report, split_hashes, verify_privacy,  # noqa: E402
                            render_markdown)
+from suffix_walkforward_ac164 import (  # noqa: E402
+    Ac164Error, annotate_freeze as ac164_annotate_freeze,
+    annotate_report as ac164_annotate_report,
+    assert_entry_census as ac164_assert_entry_census,
+    assert_legal_terminal as ac164_assert_legal_terminal,
+    bind_preserved_snapshot as ac164_bind_snapshot,
+    ensure_not_historical as ac164_ensure_not_historical,
+    entry_census_from_counts as ac164_entry_census,
+    isolate_readonly_snapshot as ac164_isolate_snapshot)
 
 
 # Machine-bound defaults follow the AC-155 precedent: runtimes, models and
@@ -89,6 +98,12 @@ HISTORICAL_ARTIFACT_DIR = Path(__file__).resolve().parent / "suffix_walkforward"
 # eval/suffix_walkforward/ (AC-159-v1 repair 2).
 COMMITTED_ARTIFACT_DIR = (Path(__file__).resolve().parent
                           / "suffix_walkforward_ac159")
+COMMITTED_ARTIFACT_DIR_AC164 = (Path(__file__).resolve().parent
+                                / "suffix_walkforward_ac164")
+DEFAULT_ARTIFACT_DIR_AC164 = (MAIN_REPO / ".local-work"
+                              / "ac164-3000-walkforward" / "artifacts")
+DEFAULT_WORK_DIR_AC164 = (MAIN_REPO / ".local-work"
+                          / "ac164-3000-walkforward" / "work")
 
 
 class EnvironmentBlocker(Exception):
@@ -128,7 +143,8 @@ def current_code_sha(*, require_clean):
         return sha
     dirty = subprocess.check_output(["git", "status", "--porcelain"],
                                     cwd=str(repo), text=True)
-    ignored = (".cache/", "suffix_walkforward/", ".local-work/",
+    ignored = (".cache/", "suffix_walkforward/",
+               "suffix_walkforward_ac164/", ".local-work/",
                "__pycache__", ".venv")
     leftover = [line for line in dirty.splitlines()
                 if not any(marker in line for marker in ignored)]
@@ -373,10 +389,8 @@ def _load_route_vectors(cache, route_id, identity, event_records, pairs):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, default=None)
-    parser.add_argument("--artifact-dir", type=Path,
-                        default=DEFAULT_ARTIFACT_DIR)
-    parser.add_argument("--committed-artifact-dir", type=Path,
-                        default=COMMITTED_ARTIFACT_DIR)
+    parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument("--committed-artifact-dir", type=Path, default=None)
     parser.add_argument("--cache", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None,
                         help="worker mode alias for --artifact-dir")
@@ -404,6 +418,10 @@ def parse_args(argv=None):
                         help="model-free smoke run: synthetic deterministic "
                              "vectors, no model workers (driver wiring only; "
                              "the committed test suite is the real gate)")
+    parser.add_argument("--delivery", choices=("ac159", "ac164"),
+                        default="ac159",
+                        help="ac164 binds the preserved AC-162 snapshot and "
+                             "writes eval/suffix_walkforward_ac164/")
     # Worker modes (spawned by the driver).
     parser.add_argument("--identity", type=str, choices=ROUTE_IDS,
                         default=None)
@@ -412,32 +430,92 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def _apply_delivery_defaults(args):
+    if args.delivery == "ac164":
+        if args.work_dir is None:
+            args.work_dir = DEFAULT_WORK_DIR_AC164
+        if args.artifact_dir is None:
+            args.artifact_dir = DEFAULT_ARTIFACT_DIR_AC164
+        if args.committed_artifact_dir is None:
+            args.committed_artifact_dir = COMMITTED_ARTIFACT_DIR_AC164
+        return args
+    if args.work_dir is None:
+        args.work_dir = (Path(__file__).resolve().parents[1]
+                         / ".local-work" / "suffix-wf")
+    if args.artifact_dir is None:
+        args.artifact_dir = DEFAULT_ARTIFACT_DIR
+    if args.committed_artifact_dir is None:
+        args.committed_artifact_dir = COMMITTED_ARTIFACT_DIR
+    return args
+
+
+def _route_cache_ready(cache, route_id, identity, event_records, pairs):
+    needed = (
+        _identity_path(cache, route_id),
+        _event_vectors_path(cache, route_id),
+        _query_vectors_path(cache, route_id),
+        _omissions_path(cache, route_id),
+    )
+    if not all(path.is_file() for path in needed):
+        return False
+    stored = json.loads(needed[0].read_text(encoding="utf-8"))
+    if stored != identity:
+        return False
+    try:
+        _load_route_vectors(cache, route_id, identity, event_records, pairs)
+    except (EnvironmentBlocker, OSError, json.JSONDecodeError, KeyError,
+            ValueError):
+        return False
+    return True
+
+
 def _main_driver(args):
-    work_dir = args.work_dir or (Path(__file__).resolve().parents[1]
-                                 / ".local-work" / "suffix-wf")
+    args = _apply_delivery_defaults(args)
+    work_dir = args.work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     cache = _cache_dir(args.cache if args.cache is not None
                        else (work_dir / "cache"))
     output = args.artifact_dir
-    historical = HISTORICAL_ARTIFACT_DIR.resolve()
-    output_resolved = output.resolve()
-    if output_resolved == historical or historical in output_resolved.parents:
-        raise EnvironmentBlocker(
-            "AC-157 artifact directory is historical and read-only: %s"
-            % output)
+    eval_dir = Path(__file__).resolve().parent
+    if args.delivery == "ac164":
+        try:
+            ac164_ensure_not_historical(output, eval_dir, "artifact")
+            ac164_ensure_not_historical(
+                args.committed_artifact_dir, eval_dir, "committed artifact")
+        except Ac164Error as error:
+            raise EnvironmentBlocker(str(error))
+    else:
+        historical = HISTORICAL_ARTIFACT_DIR.resolve()
+        output_resolved = output.resolve()
+        if output_resolved == historical or historical in output_resolved.parents:
+            raise EnvironmentBlocker(
+                "AC-157 artifact directory is historical and read-only: %s"
+                % output)
+        committed_resolved = args.committed_artifact_dir.resolve()
+        if committed_resolved == historical or \
+                historical in committed_resolved.parents:
+            raise EnvironmentBlocker(
+                "AC-157 artifact directory is historical and read-only: %s"
+                % args.committed_artifact_dir)
     committed = args.committed_artifact_dir
-    committed_resolved = committed.resolve()
-    if committed_resolved == historical or \
-            historical in committed_resolved.parents:
-        raise EnvironmentBlocker(
-            "AC-157 artifact directory is historical and read-only: %s"
-            % committed)
     output.mkdir(parents=True, exist_ok=True)
 
     code_sha = current_code_sha(require_clean=True)
 
-    # -- frozen snapshot (new Online Backup copy at claim) ----------------
-    if args.snapshot:
+    # -- frozen snapshot --------------------------------------------------
+    if args.delivery == "ac164":
+        if not args.snapshot:
+            raise EnvironmentBlocker(
+                "AC-164 requires --snapshot of the preserved AC-162 "
+                "snapshot; refuse a live backup")
+        try:
+            isolated = ac164_isolate_snapshot(args.snapshot, work_dir)
+            snapshot = ac164_bind_snapshot(
+                isolated, fixture=args.fixture)
+        except Ac164Error as error:
+            raise ContractFailure(str(error))
+        snapshot_path = snapshot["path"]
+    elif args.snapshot:
         snapshot_path = Path(args.snapshot)
         if not snapshot_path.is_file():
             raise EnvironmentBlocker(
@@ -468,6 +546,10 @@ def _main_driver(args):
         targets = [e for e in events if not e.retracted]
         prefix_targets, suffix_targets = prefix_suffix_split(targets)
         if not suffix_targets:
+            if args.delivery == "ac164" and not args.fixture:
+                raise ContractFailure(
+                    "preserved AC-162 snapshot has no suffix events; "
+                    "identity or split failure")
             # 数据不足 (legal terminal): no suffix events past the cutoff.
             decision = {
                 "outcome": "数据不足",
@@ -520,7 +602,7 @@ def _main_driver(args):
         # established that this new cutoff is calibratable; a lower count is
         # an implementation fault, not a legal AC-159 terminal.
         hn_count = prefix_hard_negative_query_count(facts, prefix_targets)
-        if hn_count < MIN_HARD_NEGATIVE_QUERIES:
+        if hn_count < MIN_HARD_NEGATIVE_QUERIES and not args.fixture:
             raise ContractFailure(
                 "prefix hard-negative recomputation returned %d < %d; "
                 "AC-159 expects the #158-calibratable prefix"
@@ -530,6 +612,13 @@ def _main_driver(args):
         freeze = _build_freeze(
             code_sha, snapshot, identities, args, prefix_targets,
             suffix_targets)
+        if args.delivery == "ac164":
+            try:
+                freeze = ac164_annotate_freeze(
+                    freeze, snapshot, prefix_targets, suffix_targets,
+                    fixture=args.fixture)
+            except Ac164Error as error:
+                raise ContractFailure(str(error))
         frozen_path = output / FREEZE_NAME
         if frozen_path.exists():
             existing = json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -549,6 +638,11 @@ def _main_driver(args):
         for route_id in ROUTE_IDS:
             if args.fixture:
                 provider = _fixture_provider(events, route_id)
+            elif _route_cache_ready(
+                    cache, route_id, identities[route_id], events, pairs):
+                print("reusing cached vectors for %s" % route_id, flush=True)
+                provider = _load_route_vectors(
+                    cache, route_id, identities[route_id], events, pairs)
             else:
                 spawn_python = (args.embedding_python
                                 if route_id != L28_ROUTE_ID
@@ -568,7 +662,8 @@ def _main_driver(args):
             replay = WalkForwardReplay(facts, vectors)
             tau_status = calibrate_tau(replay, prefix_targets)
             if (tau_status.get("state") != "calibratable"
-                    and route_id != L28_ROUTE_ID):
+                    and route_id != L28_ROUTE_ID
+                    and not args.fixture):
                 raise ContractFailure(
                     "route %s calibration returned %s despite facts-only "
                     "count %d >= %d"
@@ -580,11 +675,21 @@ def _main_driver(args):
             data_by_route[route_id] = {
                 "prefix": data_counts(prefix_ref),
                 "suffix": data_counts(suffix_ref),
+                "total": data_counts(reference),
                 "omissions": (provider.omission_counts()
                                if not args.fixture else
                                _FixtureProvider.omission_counts(
                                    len(events), len(pairs))),
             }
+            if (args.delivery == "ac164" and not args.fixture
+                    and route_id == ROUTE_IDS[0]):
+                try:
+                    ac164_assert_entry_census(
+                        data_by_route[route_id]["prefix"],
+                        data_by_route[route_id]["suffix"],
+                        data_by_route[route_id]["total"])
+                except Ac164Error as error:
+                    raise ContractFailure(str(error))
             margin_p10, _n = margin_base_prefix(prefix_ref)
             route_result = run_route(
                 replay, route_id, tau_status, data_by_route[route_id],
@@ -597,6 +702,11 @@ def _main_driver(args):
             "suffix": data_by_route[ROUTE_IDS[0]]["suffix"],
         }
         decision = assemble_shortlist(matrix, data)
+        if args.delivery == "ac164":
+            try:
+                ac164_assert_legal_terminal(decision)
+            except Ac164Error as error:
+                raise ContractFailure(str(error))
         if args.max_cells is not None:
             decision["partial_scan"] = True
         _write_report(snapshot, matrix, decision, data_by_route, data,
@@ -709,6 +819,24 @@ def _write_report(snapshot, matrix, decision, data_by_route, data,
             "无合格方案 / 数据不足; ties are reported, never broken by "
             "model name; no ANN, no production winner (issue #159 body)",
         ])
+    if args.delivery == "ac164":
+        freeze_path = output / FREEZE_NAME
+        if freeze_path.is_file() and ROUTE_IDS[0] in data_by_route:
+            freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+            qwen = data_by_route[ROUTE_IDS[0]]
+            actual = ac164_entry_census(
+                qwen["prefix"], qwen["suffix"],
+                qwen.get("total") or {
+                    "actionable_group_complete": (
+                        qwen["prefix"]["actionable_group_complete"]
+                        + qwen["suffix"]["actionable_group_complete"]),
+                    "actionable_keys": None,
+                })
+            try:
+                report = ac164_annotate_report(
+                    report, freeze, actual, fixture=args.fixture)
+            except Ac164Error as error:
+                raise ContractFailure(str(error))
     verify_privacy(report)
     (output / REPORT_JSON_NAME).write_text(
         canonical_json(report) + "\n", encoding="utf-8")
@@ -964,28 +1092,28 @@ def _freeze_snapshot_path(args):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    if args.identity:
-        cache = _cache_dir(args.cache if args.cache is not None
-                           else (Path(__file__).resolve().parents[1] /
-                                 ".local-work" / "suffix-wf" / "cache"))
-        identity = _route_identity(args.identity, args, cache)
-        _identity_path(cache, args.identity).write_text(
-            canonical_json(identity) + "\n", encoding="utf-8")
-        print(canonical_json(identity), flush=True)
-        return 0
-    if args.score_route:
-        if args.score_route == L28_ROUTE_ID:
-            return _score_l28_route(args)
-        return _score_embedding_route(args.score_route, args)
-    return _main_driver(args)
+    try:
+        if args.identity:
+            cache = _cache_dir(args.cache if args.cache is not None
+                               else (Path(__file__).resolve().parents[1] /
+                                     ".local-work" / "suffix-wf" / "cache"))
+            identity = _route_identity(args.identity, args, cache)
+            _identity_path(cache, args.identity).write_text(
+                canonical_json(identity) + "\n", encoding="utf-8")
+            print(canonical_json(identity), flush=True)
+            return 0
+        if args.score_route:
+            if args.score_route == L28_ROUTE_ID:
+                return _score_l28_route(args)
+            return _score_embedding_route(args.score_route, args)
+        return _main_driver(args)
+    except (ContractFailure, Ac164Error) as error:
+        print("contract failure:", error, file=sys.stderr)
+        return 4
+    except EnvironmentBlocker as error:
+        print("environment blocker:", error, file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except ContractFailure as error:
-        print("contract failure:", error, file=sys.stderr)
-        sys.exit(4)
-    except EnvironmentBlocker as error:
-        print("environment blocker:", error, file=sys.stderr)
-        sys.exit(3)
+    sys.exit(main())
