@@ -765,6 +765,42 @@ class RebuildSpec:
             lock = locks[derived_root] = _DerivedBuilderLock(derived_root)
         return lock
 
+    def _rebuild_usearch_sidecar(self, record):
+        from publish import read_active_manifest
+        derived_root = record["parameters"]["derived_root"]
+        manifest, reason = read_active_manifest(derived_root)
+        if manifest is None or reason is not None:
+            raise OperationBlocked(
+                REFUSE_INDEX_ONLY_UNHEALTHY_BASE, phase="staging",
+                remediation="active generation is not readable",
+                cause=None)
+        generation_id = manifest["generation_id"]
+        published = os.path.join(derived_root, "generations", generation_id)
+        try:
+            generation = open_generation(published)
+        except Exception as error:  # noqa: BLE001 - unhealthy FP32
+            raise OperationBlocked(
+                REFUSE_INDEX_ONLY_UNHEALTHY_BASE, phase="staging",
+                remediation="the active FP32 / metadata / projection are "
+                            "not healthy-compatible",
+                cause=str(error))
+        backend = generation.retrieval_backend
+        if backend != "usearch-hnsw":
+            return
+        identity = generation.identity()
+        params = identity.get("retrieval_params") or {
+            "connectivity": 16, "expansion_add": 128}
+        fingerprint = generation.index_fingerprint
+        from ann import AnnError, rebuild_ann_from_generation
+        try:
+            rebuild_ann_from_generation(
+                generation, derived_root, generation_id, params, fingerprint)
+        except AnnError as error:
+            raise OperationBlocked(
+                error.code, phase="staging",
+                remediation="rebuild ANN from healthy FP32 failed",
+                cause=error.message)
+
     def _index_only_sidecar_ready(self, record):
         """The --index-only allow branch requires a REAL, non-empty ANN
         sidecar for the active generation (never a fabricated index)."""
@@ -811,13 +847,11 @@ class RebuildSpec:
             # no rollback rotation (AC68-1 / SCN-68-1).
             return {"advance": True}
         if normalized["mode"] == MODE_INDEX_ONLY:
-            # --index-only rebuilds ONLY the ANN sidecar (a future #78/#79
-            # backend); the FP32 / metadata / projection generation
-            # container is untouched -- there is nothing to stage or
-            # publish.  The preflight already verified the healthy base and
-            # the real sidecar; this step re-verifies the sidecar is a
-            # REAL, non-empty file (never a fabricated ANN, RISK-68-1) and
-            # the outcome records the index rebuild condition.
+            # --index-only rebuilds ONLY the ANN sidecar; the FP32 /
+            # metadata / projection generation container is untouched.
+            # Exact-only envelopes keep the historical no-op once a real
+            # sidecar marker exists.  A usearch generation rebuilds the
+            # sidecar from healthy FP32 without rerunning the model.
             if not self._index_only_sidecar_ready(record):
                 raise OperationBlocked(
                     "index_only_sidecar_missing", phase="staging",
@@ -825,6 +859,7 @@ class RebuildSpec:
                                 "non-empty file; there is no index to "
                                 "rebuild",
                     cause=None)
+            self._rebuild_usearch_sidecar(record)
             return {"advance": True}
         derived_root = normalized["derived_root"]
         machine = self._machine_for(record)

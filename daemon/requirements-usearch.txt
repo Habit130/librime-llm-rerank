@@ -1,0 +1,6 @@
+# Optional ANN runtime for AC-78 USearch qualification. Not required for
+# model-free gates (those use BruteForceIndex). Install into the project
+# embeddings venv, never as a global package:
+#   .local-work/venv-embeddings/bin/python -m pip install -r daemon/requirements-usearch.txt
+usearch>=2.16,<3
+numpy>=2.0,<3

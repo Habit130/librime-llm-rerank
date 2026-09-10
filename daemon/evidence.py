@@ -64,6 +64,7 @@ from oracle import (FactReader, OracleError, OracleParams, OracleQuery,
 BACKEND_ORACLE = "exact"
 BACKEND_ACCELERATE = "accelerate-cblas-sgemv"
 BACKEND_MLX = "mlx-exact-matmul"
+BACKEND_USEARCH = "usearch-hnsw"
 
 EVIDENCE_KIND = "evidence"
 EVIDENCE_PROTOCOL_VERSION = 2
@@ -122,7 +123,8 @@ def format_identity_double(value):
     return format(quantized, ".6g")
 
 
-def compose_config_identity(representation_id, params, gamma):
+def compose_config_identity(representation_id, params, gamma,
+                            overfetch=None, query_search=None):
     """Canonical evidence config identity (AC61-1 "配置身份").
 
     Covers the representation seam id and every oracle/gamma parameter that
@@ -130,6 +132,10 @@ def compose_config_identity(representation_id, params, gamma):
     different identity, and the daemon serves exactly the identity it was
     configured with. Every double is ingested into the six-significant-digit
     domain before the string is composed.
+
+    ANN query identity (spec #43): overfetch and query-search belong here,
+    not in index_fingerprint.  Omitted for the exact path so existing
+    identities stay byte-identical with the C++ plugin.
     """
     if not representation_id or not isinstance(representation_id, str):
         raise EvidenceError("config_identity",
@@ -138,7 +144,7 @@ def compose_config_identity(representation_id, params, gamma):
         raise EvidenceError("config_identity", "params must be OracleParams")
     if not isinstance(gamma, (int, float)) or not math.isfinite(gamma):
         raise EvidenceError("config_identity", "gamma must be finite")
-    return "%s:repr=%s:tau=%s:kev=%s:H=%s:sat=%s:gamma=%s" % (
+    identity = "%s:repr=%s:tau=%s:kev=%s:H=%s:sat=%s:gamma=%s" % (
         EVIDENCE_CONFIG_ID_VERSION,
         representation_id,
         format_identity_double(params.tau),
@@ -147,6 +153,18 @@ def compose_config_identity(representation_id, params, gamma):
         format_identity_double(params.saturation_k),
         format_identity_double(gamma),
     )
+    if overfetch is None and query_search is None:
+        return identity
+    if overfetch is None or query_search is None:
+        raise EvidenceError(
+            "config_identity",
+            "overfetch and query_search must be set together")
+    if not isinstance(overfetch, int) or overfetch < 1:
+        raise EvidenceError("config_identity", "overfetch must be a positive int")
+    if not isinstance(query_search, int) or query_search < 1:
+        raise EvidenceError("config_identity",
+                            "query_search must be a positive int")
+    return "%s:overfetch=%s:qs=%s" % (identity, overfetch, query_search)
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +424,8 @@ class EvidenceService:
     """
 
     def __init__(self, facts_root, params, provider, gamma, machine=None,
-                 retrieval_backend=BACKEND_ORACLE, trace_store=None):
+                 retrieval_backend=BACKEND_ORACLE, trace_store=None,
+                 ann_index=None, overfetch=None, query_search=None):
         if not facts_root:
             raise EvidenceError("evidence_unavailable", "facts root missing")
         if not isinstance(params, OracleParams):
@@ -418,10 +437,19 @@ class EvidenceService:
         if not isinstance(gamma, (int, float)) or not math.isfinite(gamma):
             raise EvidenceError("evidence_unavailable", "gamma must be finite")
         if retrieval_backend not in (BACKEND_ORACLE, BACKEND_ACCELERATE,
-                                     BACKEND_MLX):
+                                     BACKEND_MLX, BACKEND_USEARCH):
             raise EvidenceError(
                 "evidence_unavailable",
                 "unsupported retrieval_backend %r" % (retrieval_backend,))
+        if retrieval_backend == BACKEND_USEARCH:
+            if overfetch is None or query_search is None:
+                raise EvidenceError(
+                    "evidence_unavailable",
+                    "usearch backend requires overfetch and query_search")
+            if ann_index is None and machine is None:
+                raise EvidenceError(
+                    "evidence_unavailable",
+                    "usearch backend requires an ANN index")
         self._facts_root = facts_root
         self._params = params
         self._provider = provider
@@ -429,8 +457,12 @@ class EvidenceService:
         self._machine = machine
         self._retrieval_backend = retrieval_backend
         self._trace_store = trace_store
+        self._ann_index = ann_index
+        self._overfetch = overfetch
+        self._query_search = query_search
         self._config_identity = compose_config_identity(
-            provider.representation_id(), params, gamma)
+            provider.representation_id(), params, gamma,
+            overfetch=overfetch, query_search=query_search)
 
     def config_identity(self):
         """The identity the daemon currently serves.
@@ -444,8 +476,9 @@ class EvidenceService:
         """
         if self._machine is not None:
             representation_id = self._machine.snapshot_representation_id()
-            return compose_config_identity(representation_id, self._params,
-                                           self._gamma)
+            return compose_config_identity(
+                representation_id, self._params, self._gamma,
+                overfetch=self._overfetch, query_search=self._query_search)
         return self._config_identity
 
     def _db_path(self):
@@ -496,6 +529,51 @@ class EvidenceService:
                     "mlx_fault",
                     "MLX backend unavailable: %s" % error) from error
         return None
+
+    def _run_retrieval(self, reader, query, vector_for, snapshot=None):
+        if self._retrieval_backend == BACKEND_USEARCH:
+            return self._run_ann(reader, query, vector_for, snapshot)
+        engine = None
+        if snapshot is not None:
+            engine = self._cosine_engine(snapshot)
+        return compute_evidence(reader, self._params, query, vector_for,
+                                cosine_engine=engine)
+
+    def _run_ann(self, reader, query, vector_for, snapshot):
+        from ann import AnnError, compute_ann_evidence
+        index = self._ann_index
+        if index is None:
+            raise EvidenceError("ann_fault", "ANN index is not loaded")
+        delta_ids = ()
+        if snapshot is not None:
+            generation_backend = None
+            try:
+                generation_backend = snapshot.retrieval_backend()
+            except Exception:  # noqa: BLE001 - snapshot without backend
+                generation_backend = None
+            if generation_backend not in (None, BACKEND_ORACLE, BACKEND_USEARCH):
+                raise EvidenceError(
+                    "backend_mismatch",
+                    "usearch cannot serve generation backend %r"
+                    % (generation_backend,))
+            try:
+                base_ids = set(index.event_ids())
+                delta_ids = tuple(
+                    event_id for event_id in snapshot.event_ids()
+                    if event_id not in base_ids)
+            except Exception as error:  # noqa: BLE001 - fail closed
+                raise EvidenceError(
+                    "ann_fault", "ANN delta merge failed: %s" % error
+                ) from error
+        try:
+            return compute_ann_evidence(
+                reader, self._params, query, vector_for, index,
+                self._overfetch, query_search=self._query_search,
+                delta_ids=delta_ids)
+        except AnnError as error:
+            raise EvidenceError(error.code, error.message) from error
+        except OracleError:
+            raise
 
     @staticmethod
     def _oracle_query(source, request):
@@ -553,10 +631,8 @@ class EvidenceService:
             ) from error
         reader = snapshot.reader()
         try:
-            engine = self._cosine_engine(snapshot)
-            result = compute_evidence(reader, self._params, query,
-                                      snapshot.vector_for,
-                                      cosine_engine=engine)
+            result = self._run_retrieval(reader, query, snapshot.vector_for,
+                                         snapshot=snapshot)
         except OracleError as error:
             raise EvidenceError("oracle_fault", str(error)) from error
         except EvidenceError:
@@ -912,16 +988,14 @@ class EvidenceService:
                         % (event_id, error)) from error
 
             started = time.monotonic()
-            result = compute_evidence(reader, self._params, query,
-                                      vector_for)
-            # The oracle already filled result.latency_ms with its stage
-            # timings (#74 segmented latency); the wall-clock oracle_ms here
-            # would clobber them, so it stays local.
+            result = self._run_retrieval(reader, query, vector_for)
             oracle_ms = (time.monotonic() - started) * 1000.0
             object.__setattr__(result, "latency_ms", dict(
                 result.latency_ms, oracle_ms=oracle_ms))
         except OracleError as error:
             raise EvidenceError("oracle_fault", str(error)) from error
+        except EvidenceError:
+            raise
         finally:
             reader.close()
 
@@ -977,8 +1051,8 @@ def build_evidence_service_from_config(facts_root, config, machine=None,
         query_vectors (exact preceding text -> vector),
         event_vectors (schema_id|canonical_segment_input|final_selection -> vector),
         default_query, default_event,
-        retrieval_backend ("exact", "accelerate-cblas-sgemv" or
-        "mlx-exact-matmul"; default "exact" -- the #71 oracle path)
+         retrieval_backend ("exact", "accelerate-cblas-sgemv",
+         "mlx-exact-matmul" or "usearch-hnsw"; default "exact")
 
     ``machine`` (#63) is an optional prebuilt delta state machine; when
     present, every served request is gated through its published query
@@ -1010,10 +1084,19 @@ def build_evidence_service_from_config(facts_root, config, machine=None,
     params = OracleParams(tau=tau, k_evidence=k_evidence,
                           half_life=half_life, saturation_k=saturation_k)
     provider = _provider_from_config(config, representation_id)
+    overfetch = config.get("overfetch")
+    query_search = config.get("query_search")
+    if overfetch is not None:
+        overfetch = int(overfetch)
+    if query_search is not None:
+        query_search = int(query_search)
     return EvidenceService(facts_root, params, provider, gamma,
                            machine=machine,
                            retrieval_backend=retrieval_backend,
-                           trace_store=trace_store)
+                           trace_store=trace_store,
+                           ann_index=config.get("ann_index"),
+                           overfetch=overfetch,
+                           query_search=query_search)
 
 
 def _provider_from_config(config, representation_id):
@@ -1044,11 +1127,19 @@ def _provider_from_config(config, representation_id):
             default_event=config.get("default_event") or
             (0.0, 1.0, 0.0, 0.0),
         )
+    if kind == "bge_m3":
+        from embeddings import BGEM3RepresentationProvider
+        model_path = config.get("bge_model_path")
+        if not model_path:
+            raise EvidenceError(
+                "evidence_unavailable",
+                "bge_m3 provider requires bge_model_path")
+        return BGEM3RepresentationProvider(model_path=model_path)
     if kind != "fixture":
         raise EvidenceError(
             "evidence_unavailable",
-            "unknown provider_kind %r (expected fixture, candidate_fixture "
-            "or seed_vectors)"
+            "unknown provider_kind %r (expected fixture, candidate_fixture, "
+            "seed_vectors or bge_m3)"
             % kind)
     query_vectors = config.get("query_vectors") or {}
     event_vectors = config.get("event_vectors") or {}

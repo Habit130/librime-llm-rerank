@@ -977,10 +977,10 @@ squirrel-semantic-memory rebuild --wait               # observe only
 - **--index-only** — allowed only when a healthy compatible FP32 + metadata
   + projection exist AND a real ANN sidecar is present; otherwise an
   EXPLICIT refusal (`no_ann_sidecar` / `index_only_*`), never a silent
-  upgrade to full (AC68-3, RISK-68-1).  In the exact-only envelope the
-  refusal is expected until #78/#79 land a real ANN backend; the allow
-  branch (only reachable with an injected real sidecar) re-verifies the
-  sidecar is a readable non-empty file before recording the outcome.
+  upgrade to full (AC68-3, RISK-68-1).  Exact-only generations keep the
+  historical no-op once a sidecar marker exists.  A `usearch-hnsw`
+  generation rebuilds the sidecar from healthy FP32 without rerunning the
+  model (Squirrel#78).  Unhealthy FP32 still refuses.
 - **--retry <build_id>** — continues an existing blocked/incomplete staging;
   blocked builds never auto-retry (AC68-5).
 - **--restart** — discards the current staging, then rebuilds from scratch

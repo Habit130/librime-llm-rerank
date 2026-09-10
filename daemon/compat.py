@@ -15,9 +15,11 @@ layer, pooling, truncation, normalization, dimension), ``vector_format_version``
 retraction, choice-problem keys, HLC metadata interpretation) and
 ``index_fingerprint`` (content digest of retrieval backend + metric + build
 params + library version + serialization ABI).  The query-config identity
-(H / gamma / k / tau / K_evidence / overfetch / ef_search) stays on the
+(H / gamma / k / tau / K_evidence / overfetch / query-search) stays on the
 evidence config seam (``compose_config_identity``, #61): a query-parameter-only
-change is an explicit matrix no-op, never a base rebuild (AC66-6).
+change is an explicit matrix no-op, never a base rebuild (AC66-6).  ANN
+HNSW *build* parameters (connectivity / expansion_add) belong in
+``index_fingerprint``; overfetch and query-search do not.
 
 The matrix (spec "版本兼容矩阵"):
 
@@ -129,6 +131,7 @@ REFUSE_UNKNOWN_IDENTITY = "unknown_identity"
 EXACT_BACKEND = "exact"
 ACCELERATE_BACKEND = "accelerate-cblas-sgemv"
 MLX_BACKEND = "mlx-exact-matmul"
+USEARCH_BACKEND = "usearch-hnsw"
 EXACT_METRIC = "cosine"
 # The exact-only envelope has no ANN library; the "library version" is the
 # version of the in-tree exact retrieval implementation that interprets the
@@ -141,6 +144,7 @@ EXACT_METRIC = "cosine"
 EXACT_LIBRARY_VERSION = "oracle-exact-v1"
 ACCELERATE_LIBRARY_VERSION = "accelerate-vecLib-cblas-sgemv-v1"
 MLX_LIBRARY_VERSION = "mlx-core-matmul-v1"
+USEARCH_LIBRARY_VERSION = "usearch-hnsw-v1"
 # The serialization ABI of the canonical vector file: row-major little-endian
 # FP32, no header (dimension/rows live in the manifest).
 FP32_ROW_MAJOR_LE = "fp32-row-major-little-endian"
@@ -149,13 +153,15 @@ INDEX_FINGERPRINT_PREFIX = "index-fingerprint-v1"
 # The supported retrieval backends the daemon can load (all exact, all
 # cosine over the same canonical FP32 file).  A generation whose manifest
 # names anything else is refused on reopen (SCN-66-12).
-SUPPORTED_BACKENDS = (EXACT_BACKEND, ACCELERATE_BACKEND, MLX_BACKEND)
+SUPPORTED_BACKENDS = (EXACT_BACKEND, ACCELERATE_BACKEND, MLX_BACKEND,
+                      USEARCH_BACKEND)
 
 # Library/ABI versions per backend, for the index fingerprint payload.
 _LIBRARY_VERSION_BY_BACKEND = {
     EXACT_BACKEND: EXACT_LIBRARY_VERSION,
     ACCELERATE_BACKEND: ACCELERATE_LIBRARY_VERSION,
     MLX_BACKEND: MLX_LIBRARY_VERSION,
+    USEARCH_BACKEND: USEARCH_LIBRARY_VERSION,
 }
 
 # ---------------------------------------------------------------------------
@@ -178,11 +184,10 @@ def compose_index_fingerprint(backend=EXACT_BACKEND, metric=EXACT_METRIC,
     """Content digest of the retrieval index identity (spec: index_fingerprint
     = 检索后端 + 距离度量 + 构建参数 + 库版本 + 序列化 ABI; 不是裸的 "exact").
 
-    ANN build parameters (ef_search, M, overfetch, ...) belong HERE, not in the
-    generation identity's query layer: changing any component -- including an
-    ANN build param, when one is configured -- yields a different fingerprint,
-    which the matrix then treats as an index-only change (no model re-run in
-    this envelope; AC66-6).
+    ANN *build* parameters (connectivity / expansion_add) belong HERE.
+    Query-time overfetch and query-search belong on compose_config_identity,
+    never in this fingerprint: changing a build param yields a different
+    fingerprint and an index-only rebuild from healthy FP32 (AC66-6 / #78).
     """
     payload = _canonical_json({
         "backend": backend,

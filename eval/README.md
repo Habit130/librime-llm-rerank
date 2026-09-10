@@ -709,3 +709,37 @@ and report are mirrored to the new tracked path
 `eval/suffix_walkforward_ac164/`.  That path never overwrites
 `eval/suffix_walkforward/` (AC-157), `eval/suffix_walkforward_ac159/`
 (AC-159) or `eval/actionable_milestone_census/` (AC-162).
+
+## USearch ANN qualification (Habit130/squirrel#78, AC-78-v1)
+
+`usearch_ann.py` + `run_usearch_ann_qualification.py` qualify one USearch
+HNSW index against the accepted AC-164 BGE-M3 shortlist.  Quality
+parameters stay frozen.  Live `α`/`γ` stay 0.  Qwen3 and L28 are not
+loaded.  Legal terminals: `usearch_qualified` | `usearch_disqualified`.
+
+Identity layering (spec #43): HNSW *build* parameters
+(`connectivity` / `expansion_add`) enter `index_fingerprint`.  Query
+`overfetch` (`max(32, m·K_evidence)` with `m∈{2,4,8}`) and
+`query_search` enter `compose_config_identity`.  ANN overfetch is
+FP32-reranked and merged with the exact delta; cosine top-K is never
+ground truth.  Index/identity faults fail closed with original-window
+passthrough; the exact path is not a semantic fallback.
+
+```sh
+python3 -m unittest eval.test_usearch_ann daemon.test_ann
+python3 eval/run_usearch_ann_qualification.py --fixture
+
+# real run (exclusive BGE-M3 / GPU / quiet machine):
+.local-work/venv-embeddings/bin/python -m pip install -r daemon/requirements-usearch.txt
+.local-work/venv-embeddings/bin/python eval/run_usearch_ann_qualification.py \
+  --snapshot <isolated AC-162 snapshot copy> \
+  --work-dir <repo>/.local-work/ac78-usearch-ann/work \
+  --artifact-dir <repo>/.local-work/ac78-usearch-ann/artifacts \
+  --cache <repo>/.local-work/ac164-3000-walkforward/work/cache \
+  --bge-model <repo>/.local-work/models/BGE-M3
+```
+
+Private snapshot/vectors/indexes stay under ignored
+`.local-work/ac78-usearch-ann/`.  The desensitized freeze and report are
+mirrored to the new tracked path `eval/usearch_ann_qualification/`.  That
+path never overwrites AC-157/159/162/164 artifacts.
