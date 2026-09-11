@@ -2547,6 +2547,14 @@ def _build_provider_from_config(config, representation_id=None):
         if kind == "seed_vectors":
             from seed_vectors import build_seed_provider_from_config
             return build_seed_provider_from_config(config)
+        if kind == "bge_m3":
+            from embeddings import BGEM3RepresentationProvider
+            model_path = config.get("bge_model_path")
+            if not model_path:
+                raise EvidenceError(
+                    "evidence_unavailable",
+                    "bge_m3 provider requires bge_model_path")
+            return BGEM3RepresentationProvider(model_path=model_path)
         if kind == "candidate_fixture":
             return CandidateFixtureRepresentationProvider(
                 representation_id,
@@ -2560,8 +2568,8 @@ def _build_provider_from_config(config, representation_id=None):
         if kind != "fixture":
             raise EvidenceError(
                 "evidence_unavailable",
-                "unknown provider_kind %r (expected fixture, candidate_fixture "
-                "or seed_vectors)"
+                "unknown provider_kind %r (expected fixture, candidate_fixture, "
+                "seed_vectors or bge_m3)"
                 % kind)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}
