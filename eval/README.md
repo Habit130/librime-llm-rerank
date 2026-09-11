@@ -756,3 +756,55 @@ Private snapshot/vectors/indexes stay under ignored
 `.local-work/ac78-usearch-ann/`.  The desensitized freeze and report are
 mirrored to the new tracked path `eval/usearch_ann_qualification/`.  That
 path never overwrites AC-157/159/162/164 artifacts.
+
+## hnswlib ANN qualification (Habit130/squirrel#79, AC-79-v1)
+
+`hnswlib_ann.py` + `run_hnswlib_ann_qualification.py` qualify one hnswlib
+HNSW index against the same accepted AC-164 BGE-M3 shortlist used by #78.
+Quality parameters stay frozen.  Live `α`/`γ` stay 0.  Qwen3 and L28 are
+not loaded.  Legal terminals: `hnswlib_qualified` | `hnswlib_disqualified`.
+#78 `usearch_disqualified` is cited as context only; USearch
+recall/latency/RSS/disk numbers are not this ticket's evidence.
+
+Identity layering (spec #43): HNSW *build* parameters (`M` /
+`ef_construction`) enter `index_fingerprint`.  Query `overfetch`
+(`max(32, m·K_evidence)` with `m∈{2,4,8}`) and `query_search` (`ef`)
+enter `compose_config_identity`.  ANN overfetch is FP32-reranked and
+merged with the exact delta; cosine top-K is never ground truth.
+Index/identity faults fail closed with original-window passthrough; the
+exact path is not a semantic fallback.
+
+```sh
+python3 -m unittest eval.test_hnswlib_ann daemon.test_hnswlib_ann
+python3 eval/run_hnswlib_ann_qualification.py --fixture
+
+# real run (exclusive BGE-M3 / GPU / quiet machine):
+.local-work/venv-embeddings/bin/python -m pip install -r daemon/requirements-hnswlib.txt
+.local-work/venv-embeddings/bin/python eval/run_hnswlib_ann_qualification.py \
+  --snapshot <isolated AC-162 snapshot copy> \
+  --work-dir <repo>/.local-work/ac79-hnswlib-ann/work \
+  --artifact-dir <repo>/.local-work/ac79-hnswlib-ann/artifacts \
+  --cache <repo>/.local-work/ac164-3000-walkforward/work/cache \
+  --bge-model <repo>/.local-work/models/BGE-M3 \
+  --phase qualify
+.local-work/venv-embeddings/bin/python eval/run_hnswlib_ann_qualification.py \
+  --work-dir <repo>/.local-work/ac79-hnswlib-ann/work \
+  --artifact-dir <repo>/.local-work/ac79-hnswlib-ann/artifacts \
+  --bge-model <repo>/.local-work/models/BGE-M3 \
+  --phase 100k
+```
+
+`--phase 100k` builds a hnswlib sidecar from cached BGE event vectors,
+runs the isolated sidecar lifecycle (`eval/hnswlib_ann_lifecycle.py`),
+then times both 100k fixtures through `eval/ac79_evidence_daemon.py`
+(`EvidenceService` IPC, warm BGE, paired `γ=0` EvidenceService control,
+first catch-up after a commit, 10k replay, concurrent rebuild). Disk
+figures are walked bytes, not `n*(id+4*1024)` estimates. FastService,
+`_Zero`, brute-force fallback, and USearch timings cannot satisfy
+ANN79-7.
+
+Private snapshot/vectors/indexes stay under ignored
+`.local-work/ac79-hnswlib-ann/`.  The desensitized freeze and report are
+mirrored to the new tracked path `eval/hnswlib_ann_qualification/`.  That
+path never overwrites `eval/usearch_ann_qualification/` or
+AC-157/159/162/164 artifacts.

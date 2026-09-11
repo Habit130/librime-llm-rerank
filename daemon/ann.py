@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""USearch ANN retrieval path (Habit130/squirrel#78, AC-78-v1).
+"""ANN retrieval path (USearch #78, hnswlib #79).
 
 Approximate neighbor retrieval only.  The exact oracle in ``oracle.py``
 remains ground truth: same-key active events, cosine → r_i → d_i → a_i,
@@ -31,6 +31,11 @@ USEARCH_METRIC = "cos"
 USEARCH_DTYPE = "f32"
 USEARCH_LIBRARY_VERSION = "usearch-hnsw-v1"
 USEARCH_SERIALIZATION_ABI = "usearch-index-v1-arm64"
+HNSWLIB_BACKEND = "hnswlib-hnsw"
+HNSWLIB_METRIC = "cosine"
+HNSWLIB_DTYPE = "f32"
+HNSWLIB_LIBRARY_VERSION = "hnswlib-hnsw-v1"
+HNSWLIB_SERIALIZATION_ABI = "hnswlib-index-v1-arm64"
 OVERFETCH_MULTIPLIERS = (2, 4, 8)
 OVERFETCH_FLOOR = 32
 ANN_SIDECAR_NAME = "index.ann"
@@ -45,6 +50,13 @@ BUILD_PRESETS = (
     {"preset_id": "m32-e128", "connectivity": 32, "expansion_add": 128},
 )
 QUERY_SEARCH_VALUES = (16, 32, 64, 128)
+HNSWLIB_BUILD_PRESETS = (
+    {"preset_id": "m8-efc100", "M": 8, "ef_construction": 100},
+    {"preset_id": "m16-efc200", "M": 16, "ef_construction": 200},
+    {"preset_id": "m16-efc400", "M": 16, "ef_construction": 400},
+    {"preset_id": "m32-efc200", "M": 32, "ef_construction": 200},
+)
+HNSWLIB_QUERY_SEARCH_VALUES = (32, 64, 128, 256)
 
 
 class AnnError(Exception):
@@ -78,6 +90,30 @@ def compose_usearch_build_params(preset):
         "connectivity": int(preset["connectivity"]),
         "expansion_add": int(preset["expansion_add"]),
     }
+
+
+def hnswlib_library_version():
+    try:
+        import hnswlib
+    except ImportError:
+        return HNSWLIB_LIBRARY_VERSION
+    package = getattr(hnswlib, "__version__", "unknown")
+    return "%s+hnswlib-%s" % (HNSWLIB_LIBRARY_VERSION, package)
+
+
+def compose_hnswlib_build_params(preset):
+    return {
+        "M": int(preset["M"]),
+        "ef_construction": int(preset["ef_construction"]),
+    }
+
+
+def _infer_ann_backend(build_params, backend=None):
+    if backend:
+        return backend
+    if build_params and "M" in build_params:
+        return HNSWLIB_BACKEND
+    return USEARCH_BACKEND
 
 
 def _canonical_json(value):
@@ -329,6 +365,139 @@ class USearchIndex(NeighborIndex):
         return cls(loaded, ids, dimension, build_params, query_search), meta
 
 
+class HnswlibIndex(NeighborIndex):
+    """hnswlib HNSW sidecar bound to one FP32 generation."""
+
+    def __init__(self, index, ids, dimension, build_params, query_search=None):
+        self._index = index
+        self._ids = tuple(ids)
+        self._id_of_key = {index_key: event_id
+                           for index_key, event_id in enumerate(self._ids)}
+        self._dimension = dimension
+        self._build_params = dict(build_params)
+        self._query_search = query_search
+
+    def event_ids(self):
+        return self._ids
+
+    def dimension(self):
+        return self._dimension
+
+    def _ensure_capacity(self, needed):
+        current_max = int(self._index.get_max_elements())
+        if needed <= current_max:
+            return
+        grown = max(needed, current_max * 2, 1024)
+        try:
+            self._index.resize_index(grown)
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise AnnError("ann_index",
+                           "hnswlib resize failed: %s" % error) from error
+
+    def add(self, event_id, vector):
+        vector = _as_float_vector(vector, "ann vector")
+        if len(vector) != self._dimension:
+            raise AnnError("ann_index", "vector dimension mismatch")
+        key = len(self._ids)
+        self._ensure_capacity(key + 1)
+        try:
+            import numpy
+            self._index.add_items(
+                numpy.asarray([vector], dtype=numpy.float32),
+                numpy.asarray([key], dtype=numpy.int64))
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise AnnError("ann_index",
+                           "hnswlib add failed: %s" % error) from error
+        self._id_of_key[key] = event_id
+        self._ids = self._ids + (event_id,)
+
+    def search(self, query_vector, count, query_search=None):
+        if count < 1:
+            return []
+        if not self._ids:
+            return []
+        query = _as_float_vector(query_vector, "ann query")
+        if len(query) != self._dimension:
+            raise AnnError("ann_index", "query dimension mismatch")
+        expansion = (query_search if query_search is not None
+                     else self._query_search)
+        k = min(int(count), len(self._ids))
+        if k < 1:
+            return []
+        try:
+            import numpy
+            if expansion is not None:
+                self._index.set_ef(max(int(expansion), k))
+            labels, _distances = self._index.knn_query(
+                numpy.asarray(query, dtype=numpy.float32), k=k)
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise AnnError("ann_index",
+                           "hnswlib search failed: %s" % error) from error
+        out = []
+        if labels is None:
+            return out
+        flat = numpy.asarray(labels).reshape(-1)
+        for key in flat:
+            event_id = self._id_of_key.get(int(key))
+            if event_id is not None:
+                out.append(event_id)
+        return out[:count]
+
+    def save(self, directory, meta):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        tmp = directory + ".tmp-%s" % os.getpid()
+        if os.path.exists(tmp):
+            shutil.rmtree(tmp)
+        os.makedirs(tmp, mode=0o700)
+        try:
+            self._index.save_index(os.path.join(tmp, ANN_SIDECAR_NAME))
+            _atomic_write_json(os.path.join(tmp, ANN_KEYS_NAME),
+                               list(self._ids))
+            _atomic_write_json(os.path.join(tmp, ANN_META_NAME), meta)
+            _replace_directory(tmp, directory)
+        finally:
+            if os.path.exists(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    @classmethod
+    def build(cls, ids, vectors, dimension, build_params, query_search=None):
+        hnsw_index = _make_hnswlib_index(
+            dimension, build_params, query_search,
+            max_elements=max(len(ids), 1024))
+        if ids:
+            import numpy
+            matrix = numpy.asarray(vectors, dtype=numpy.float32)
+            keys = numpy.arange(len(ids), dtype=numpy.int64)
+            hnsw_index.add_items(matrix, keys)
+        return cls(hnsw_index, ids, dimension, build_params, query_search)
+
+    @classmethod
+    def load(cls, directory, query_search=None):
+        meta = _read_json(os.path.join(directory, ANN_META_NAME))
+        _validate_hnswlib_meta(meta)
+        ids = _read_json(os.path.join(directory, ANN_KEYS_NAME))
+        if not isinstance(ids, list):
+            raise AnnError("ann_identity", "ANN key list is not a list")
+        path = os.path.join(directory, ANN_SIDECAR_NAME)
+        dimension = int(meta["dimension"])
+        build_params = dict(meta.get("build_params") or {})
+        try:
+            loaded = _make_hnswlib_index(
+                dimension, build_params, query_search,
+                max_elements=max(len(ids), 1024), initialize=False)
+            loaded.load_index(path, max_elements=max(len(ids), 1024))
+        except Exception as error:  # noqa: BLE001 - fail closed
+            raise AnnError("ann_index",
+                           "hnswlib load failed: %s" % error) from error
+        if query_search is not None:
+            try:
+                loaded.set_ef(int(query_search))
+            except Exception as error:  # noqa: BLE001
+                raise AnnError("ann_index",
+                               "hnswlib set_ef failed: %s" % error) from error
+        return cls(loaded, ids, dimension, build_params, query_search), meta
+
+
 def _make_usearch_index(dimension, build_params, query_search):
     try:
         from usearch.index import Index
@@ -351,6 +520,30 @@ def _make_usearch_index(dimension, build_params, query_search):
                        "usearch index construct failed: %s" % error) from error
 
 
+def _make_hnswlib_index(dimension, build_params, query_search,
+                        max_elements=1024, initialize=True):
+    try:
+        import hnswlib
+    except ImportError as error:
+        raise AnnError("ann_unavailable",
+                       "hnswlib is not installed") from error
+    try:
+        index = hnswlib.Index(space=HNSWLIB_METRIC, dim=int(dimension))
+        if initialize:
+            index.init_index(
+                max_elements=max(int(max_elements), 1),
+                ef_construction=int(build_params["ef_construction"]),
+                M=int(build_params["M"]))
+        if query_search is not None:
+            index.set_ef(int(query_search))
+        return index
+    except AnnError:
+        raise
+    except Exception as error:  # noqa: BLE001 - fail closed
+        raise AnnError("ann_index",
+                       "hnswlib index construct failed: %s" % error) from error
+
+
 def _validate_usearch_meta(meta):
     if not isinstance(meta, dict):
         raise AnnError("ann_identity", "ANN meta is not an object")
@@ -371,6 +564,29 @@ def _validate_usearch_meta(meta):
         raise AnnError("ann_identity", "ANN dimension missing")
 
 
+def _validate_hnswlib_meta(meta):
+    if not isinstance(meta, dict):
+        raise AnnError("ann_identity", "ANN meta is not an object")
+    if meta.get("backend") != HNSWLIB_BACKEND:
+        raise AnnError("ann_identity", "unknown ANN backend")
+    if meta.get("metric") != HNSWLIB_METRIC:
+        raise AnnError("ann_identity", "unknown ANN metric")
+    if meta.get("dtype") != HNSWLIB_DTYPE:
+        raise AnnError("ann_identity", "unknown ANN dtype")
+    if meta.get("serialization_abi") != HNSWLIB_SERIALIZATION_ABI:
+        raise AnnError("ann_identity", "unknown ANN serialization ABI")
+    fingerprint = meta.get("index_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.startswith(
+            "index-fingerprint-v1:"):
+        raise AnnError("ann_identity", "unknown ANN index fingerprint")
+    dimension = meta.get("dimension")
+    if not isinstance(dimension, int) or dimension < 1:
+        raise AnnError("ann_identity", "ANN dimension missing")
+    params = meta.get("build_params") or {}
+    if "M" not in params or "ef_construction" not in params:
+        raise AnnError("ann_identity", "hnswlib build params missing")
+
+
 def load_ann_sidecar(directory, expected_fingerprint=None,
                      expected_generation_id=None, query_search=None):
     meta_path = os.path.join(directory, ANN_META_NAME)
@@ -386,15 +602,22 @@ def load_ann_sidecar(directory, expected_fingerprint=None,
         raise AnnError("ann_identity", "mixed-generation ANN refuse")
     if backend == "brute-force":
         return BruteForceIndex.load(directory)
-    if backend != USEARCH_BACKEND:
-        raise AnnError("ann_identity", "unknown ANN backend")
-    return USearchIndex.load(directory, query_search=query_search)
+    if backend == USEARCH_BACKEND:
+        return USearchIndex.load(directory, query_search=query_search)
+    if backend == HNSWLIB_BACKEND:
+        return HnswlibIndex.load(directory, query_search=query_search)
+    raise AnnError("ann_identity", "unknown ANN backend")
 
 
-def build_ann_from_fp32(generation, build_params, query_search=None):
+def build_ann_from_fp32(generation, build_params, query_search=None,
+                        backend=None):
     ids = list(generation.event_ids())
     vectors = [generation.event_vector(event_id) for event_id in ids]
     dimension = generation.vector_dimension
+    backend = _infer_ann_backend(build_params, backend)
+    if backend == HNSWLIB_BACKEND:
+        return HnswlibIndex.build(ids, vectors, dimension, build_params,
+                                  query_search=query_search)
     return USearchIndex.build(ids, vectors, dimension, build_params,
                               query_search=query_search)
 
@@ -406,7 +629,8 @@ def publish_ann_sidecar(index, derived_root, generation_id, meta):
 
 
 def rebuild_ann_from_generation(generation, derived_root, generation_id,
-                                build_params, fingerprint, query_search=None):
+                                build_params, fingerprint, query_search=None,
+                                backend=None):
     try:
         generation.event_ids()
         generation.event_vector(generation.event_ids()[0]) if generation.event_ids() else None
@@ -414,23 +638,41 @@ def rebuild_ann_from_generation(generation, derived_root, generation_id,
         raise AnnError("unhealthy_fp32",
                        "cannot rebuild ANN from unhealthy FP32: %s"
                        % error) from error
-    index = build_ann_from_fp32(generation, build_params, query_search)
-    meta = {
-        "backend": USEARCH_BACKEND,
-        "metric": USEARCH_METRIC,
-        "dtype": USEARCH_DTYPE,
-        "dimension": generation.vector_dimension,
-        "library_version": usearch_library_version(),
-        "serialization_abi": USEARCH_SERIALIZATION_ABI,
-        "build_params": compose_usearch_build_params(
-            {"connectivity": build_params["connectivity"],
-             "expansion_add": build_params["expansion_add"]}),
-        "index_fingerprint": fingerprint,
-        "generation_id": generation_id,
-        "event_count": len(index.event_ids()),
-        "event_ids_sha256": _sha256_hex(
-            "\0".join(index.event_ids()).encode("utf-8")),
-    }
+    backend = _infer_ann_backend(build_params, backend)
+    index = build_ann_from_fp32(generation, build_params, query_search,
+                                backend=backend)
+    if backend == HNSWLIB_BACKEND:
+        meta = {
+            "backend": HNSWLIB_BACKEND,
+            "metric": HNSWLIB_METRIC,
+            "dtype": HNSWLIB_DTYPE,
+            "dimension": generation.vector_dimension,
+            "library_version": hnswlib_library_version(),
+            "serialization_abi": HNSWLIB_SERIALIZATION_ABI,
+            "build_params": compose_hnswlib_build_params(build_params),
+            "index_fingerprint": fingerprint,
+            "generation_id": generation_id,
+            "event_count": len(index.event_ids()),
+            "event_ids_sha256": _sha256_hex(
+                "\0".join(index.event_ids()).encode("utf-8")),
+        }
+    else:
+        meta = {
+            "backend": USEARCH_BACKEND,
+            "metric": USEARCH_METRIC,
+            "dtype": USEARCH_DTYPE,
+            "dimension": generation.vector_dimension,
+            "library_version": usearch_library_version(),
+            "serialization_abi": USEARCH_SERIALIZATION_ABI,
+            "build_params": compose_usearch_build_params(
+                {"connectivity": build_params["connectivity"],
+                 "expansion_add": build_params["expansion_add"]}),
+            "index_fingerprint": fingerprint,
+            "generation_id": generation_id,
+            "event_count": len(index.event_ids()),
+            "event_ids_sha256": _sha256_hex(
+                "\0".join(index.event_ids()).encode("utf-8")),
+        }
     publish_ann_sidecar(index, derived_root, generation_id, meta)
     return index, meta
 
