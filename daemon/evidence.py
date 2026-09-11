@@ -65,6 +65,8 @@ BACKEND_ORACLE = "exact"
 BACKEND_ACCELERATE = "accelerate-cblas-sgemv"
 BACKEND_MLX = "mlx-exact-matmul"
 BACKEND_USEARCH = "usearch-hnsw"
+BACKEND_HNSWLIB = "hnswlib-hnsw"
+ANN_BACKENDS = (BACKEND_USEARCH, BACKEND_HNSWLIB)
 
 EVIDENCE_KIND = "evidence"
 EVIDENCE_PROTOCOL_VERSION = 2
@@ -437,19 +439,20 @@ class EvidenceService:
         if not isinstance(gamma, (int, float)) or not math.isfinite(gamma):
             raise EvidenceError("evidence_unavailable", "gamma must be finite")
         if retrieval_backend not in (BACKEND_ORACLE, BACKEND_ACCELERATE,
-                                     BACKEND_MLX, BACKEND_USEARCH):
+                                     BACKEND_MLX, BACKEND_USEARCH,
+                                     BACKEND_HNSWLIB):
             raise EvidenceError(
                 "evidence_unavailable",
                 "unsupported retrieval_backend %r" % (retrieval_backend,))
-        if retrieval_backend == BACKEND_USEARCH:
+        if retrieval_backend in ANN_BACKENDS:
             if overfetch is None or query_search is None:
                 raise EvidenceError(
                     "evidence_unavailable",
-                    "usearch backend requires overfetch and query_search")
+                    "ANN backend requires overfetch and query_search")
             if ann_index is None and machine is None:
                 raise EvidenceError(
                     "evidence_unavailable",
-                    "usearch backend requires an ANN index")
+                    "ANN backend requires an ANN index")
         self._facts_root = facts_root
         self._params = params
         self._provider = provider
@@ -531,7 +534,7 @@ class EvidenceService:
         return None
 
     def _run_retrieval(self, reader, query, vector_for, snapshot=None):
-        if self._retrieval_backend == BACKEND_USEARCH:
+        if self._retrieval_backend in ANN_BACKENDS:
             return self._run_ann(reader, query, vector_for, snapshot)
         engine = None
         if snapshot is not None:
@@ -551,10 +554,11 @@ class EvidenceService:
                 generation_backend = snapshot.retrieval_backend()
             except Exception:  # noqa: BLE001 - snapshot without backend
                 generation_backend = None
-            if generation_backend not in (None, BACKEND_ORACLE, BACKEND_USEARCH):
+            if generation_backend not in (
+                    None, BACKEND_ORACLE, BACKEND_USEARCH, BACKEND_HNSWLIB):
                 raise EvidenceError(
                     "backend_mismatch",
-                    "usearch cannot serve generation backend %r"
+                    "ANN cannot serve generation backend %r"
                     % (generation_backend,))
             try:
                 base_ids = set(index.event_ids())
@@ -1052,7 +1056,7 @@ def build_evidence_service_from_config(facts_root, config, machine=None,
         event_vectors (schema_id|canonical_segment_input|final_selection -> vector),
         default_query, default_event,
          retrieval_backend ("exact", "accelerate-cblas-sgemv",
-         "mlx-exact-matmul" or "usearch-hnsw"; default "exact")
+         "mlx-exact-matmul", "usearch-hnsw" or "hnswlib-hnsw"; default "exact")
 
     ``machine`` (#63) is an optional prebuilt delta state machine; when
     present, every served request is gated through its published query

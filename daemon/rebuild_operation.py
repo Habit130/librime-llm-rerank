@@ -785,16 +785,21 @@ class RebuildSpec:
                             "not healthy-compatible",
                 cause=str(error))
         backend = generation.retrieval_backend
-        if backend != "usearch-hnsw":
+        if backend not in ("usearch-hnsw", "hnswlib-hnsw"):
             return
         identity = generation.identity()
-        params = identity.get("retrieval_params") or {
-            "connectivity": 16, "expansion_add": 128}
+        if backend == "hnswlib-hnsw":
+            params = identity.get("retrieval_params") or {
+                "M": 16, "ef_construction": 200}
+        else:
+            params = identity.get("retrieval_params") or {
+                "connectivity": 16, "expansion_add": 128}
         fingerprint = generation.index_fingerprint
         from ann import AnnError, rebuild_ann_from_generation
         try:
             rebuild_ann_from_generation(
-                generation, derived_root, generation_id, params, fingerprint)
+                generation, derived_root, generation_id, params, fingerprint,
+                backend=backend)
         except AnnError as error:
             raise OperationBlocked(
                 error.code, phase="staging",

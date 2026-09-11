@@ -41,7 +41,8 @@ python3 -m venv .venv-embeddings
 ```
 
 Do not use `daemon/.venv` for these dependencies. No live config, C++ schema,
-or winner selection is part of this adapter. AC-78 may load BGE-M3 alone in
-an isolated work root for USearch qualification (`docs/usearch-ann.md`);
-that path still does not enable live evidence. The frozen v2 benchmark
-remains deferred and is not imported or run here.
+or winner selection is part of this adapter. AC-78 / AC-79 may load BGE-M3
+alone in an isolated work root for USearch or hnswlib qualification
+(`docs/usearch-ann.md`, `docs/hnswlib-ann.md`); those paths still do not
+enable live evidence. The frozen v2 benchmark remains deferred and is not
+imported or run here.

@@ -1,0 +1,6 @@
+# Optional ANN runtime for AC-79 hnswlib qualification. Not required for
+# model-free gates (those use BruteForceIndex). Install into the project
+# embeddings venv, never as a global package:
+#   .local-work/venv-embeddings/bin/python -m pip install -r daemon/requirements-hnswlib.txt
+hnswlib>=0.8,<1
+numpy>=2.0,<3
