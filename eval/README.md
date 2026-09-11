@@ -808,3 +808,37 @@ Private snapshot/vectors/indexes stay under ignored
 mirrored to the new tracked path `eval/hnswlib_ann_qualification/`.  That
 path never overwrites `eval/usearch_ann_qualification/` or
 AC-157/159/162/164 artifacts.
+
+## Production configuration lock (Habit130/squirrel#80, AC-80-v1)
+
+`production_config_lock.py` + `run_production_config_lock.py` apply the
+frozen production-complete gates to **already accepted** second-stage
+artifacts.  The freeze binds snapshot/report hashes, elimination rules
+and backends **before** the lock decision.  No walk-forward, ANN, 100k
+or model rerun.  Live `α`/`γ`/evidence stay 0.  #81 is not started.
+
+A cell×backend survives only when every named gate is an evaluated Pass:
+quality/safety/pollution/finite-H, claimable `+3pp`, retrieval
+equivalence for that backend, and that backend’s latency/memory/disk.
+Unmeasured or unclaimable lift never Passes.  AC-71 is not a production
+exact hot-path Pass.  Bound terminals are not re-litigated: AC-164
+`收窄声称_shortlist`, AC-72/73 `不合格`, AC-78 `usearch_disqualified`,
+AC-79 `hnswlib_disqualified`.
+
+Legal terminals: `unique_lock` | `无合格配置`.  Either may Pass this
+contract.  An empty survivor set is `无合格配置`: live `γ` stays 0,
+prospective confirmation is `not_opened`, and the next approved
+milestone wait is recorded.  `unique_lock` is the only terminal that may
+record a real next-HLC.
+
+```sh
+python3 -m unittest eval.test_production_config_lock
+python3 eval/run_production_config_lock.py \
+  --artifact-dir <repo>/.local-work/ac80-production-lock/artifacts \
+  --committed-artifact-dir eval/production_config_lock
+```
+
+Private copies stay under ignored `.local-work/ac80-production-lock/`.
+The desensitized freeze, manifest and report are mirrored to the new
+tracked path `eval/production_config_lock/`.  That path never overwrites
+AC-157/159/162/164/78/79 artifacts.
