@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""AC-78 100k full-IPC capacity/memory measurement with warm BGE."""
+"""AC-78 100k full-IPC capacity/memory measurement via daemon EvidenceService."""
 
 import json
 import os
-import resource
-import socket
-import statistics
+import shutil
 import sys
-import tempfile
-import threading
-import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -19,157 +14,98 @@ for path in (str(_DAEMON), str(_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from ann import BruteForceIndex, USearchIndex, overfetch_count  # noqa: E402
+from ac78_ipc import (  # noqa: E402
+    append_commit, fact_high_water, percentiles, rss_mib, send,
+    start_daemon, start_rebuild_process, stop_daemon,
+)
+from ann import (  # noqa: E402
+    USEARCH_BACKEND, USearchIndex, compose_usearch_build_params,
+    overfetch_count, publish_ann_sidecar, sidecar_dir,
+)
+from compat import compose_backend_fingerprint  # noqa: E402
 from evidence import (  # noqa: E402
-    BACKEND_USEARCH, EvidenceService, RepresentationProvider,
-    compose_config_identity, make_evidence_request)
-from oracle import OracleParams  # noqa: E402
+    RepresentationProvider, make_evidence_request,
+)
 from usearch_ann import (  # noqa: E402
-    COMPLETE_P95_MS, COMPLETE_P99_MS, INCREMENTAL_P95_MS, INCREMENTAL_P99_MS,
-    REBUILD_CONCURRENT_P95_MS, REBUILD_PEAK_INCREMENTAL_GIB,
-    REPLAY_TIMEOUT_MS, RSS_INCREMENTAL_MIB)
+    COMPLETE_P95_MS, COMPLETE_P99_MS, DERIVED_DISK_GIB, GENERATION_DISK_GIB,
+    INCREMENTAL_P95_MS, INCREMENTAL_P99_MS, REBUILD_CONCURRENT_P95_MS,
+    REBUILD_PEAK_INCREMENTAL_GIB, REPLAY_TIMEOUT_MS, RSS_INCREMENTAL_MIB,
+    Ann78Error, derived_state_bytes, published_generation_bytes,
+)
 
 
-def _rss_mib():
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    rss = float(usage.ru_maxrss)
-    if sys.platform == "darwin":
-        return rss / (1024.0 * 1024.0)
-    return rss / 1024.0
-
-
-def _percentiles(values):
-    if not values:
-        return {"n": 0}
-    ordered = sorted(values)
-    n = len(ordered)
-
-    def at(p):
-        if n == 1:
-            return float(ordered[0])
-        rank = (n - 1) * (p / 100.0)
-        low = int(rank)
-        high = min(n - 1, low + 1)
-        weight = rank - low
-        return float(ordered[low] * (1.0 - weight) + ordered[high] * weight)
-
-    return {
-        "n": n,
-        "p50": at(50),
-        "p95": at(95),
-        "p99": at(99),
-        "max": float(ordered[-1]),
-        "timeouts": 0,
-    }
-
-
-def _pass_latency(stats, p95_max, p99_max, timeouts=0):
-    return bool(
-        stats.get("n")
-        and stats.get("p95", 9999) <= p95_max
-        and stats.get("p99", 9999) <= p99_max
-        and timeouts == 0)
-
-
-class _CachedBGE(RepresentationProvider):
-    """Warm-BGE query encoding with cached event vectors."""
-
-    def __init__(self, real_provider, event_vectors, dimension=1024):
-        self._real = real_provider
+class CachedEventProvider(RepresentationProvider):
+    def __init__(self, representation_id, event_vectors, dimension=1024):
+        self._representation_id = representation_id
         self._events = event_vectors
         self._dimension = dimension
+        self._default = [1.0] + [0.0] * (dimension - 1)
 
     def representation_id(self):
-        return self._real.representation_id()
+        return self._representation_id
 
     def is_candidate_conditioned(self):
         return True
 
     def query_vector(self, preceding_text):
-        raise RuntimeError("candidate-conditioned")
+        del preceding_text
+        return list(self._default)
 
     def query_vector_for_candidate(self, preceding_text, candidate):
-        return self._real.query_vector_for_candidate(preceding_text, candidate)
+        del preceding_text, candidate
+        return list(self._default)
 
     def event_vector(self, event):
         vector = self._events.get(event.event_id)
-        if vector is not None:
-            return vector
-        return self._real.event_vector(event)
+        if vector is None:
+            raise Ann78Error("cached event vector missing for %s" % event.event_id)
+        return vector
 
     def vector_dimension(self):
         return self._dimension
 
 
-def _serve(sock_path, inbox, outbox, stop, ready):
-    try:
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        if os.path.exists(sock_path):
-            os.unlink(sock_path)
-        srv.bind(sock_path)
-        os.chmod(sock_path, 0o600)
-        srv.listen(8)
-        srv.settimeout(0.2)
-        ready.set()
-        while not stop.is_set():
-            try:
-                conn, _addr = srv.accept()
-            except socket.timeout:
+def _load_event_vectors(path):
+    mapping = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
                 continue
-            with conn:
-                buf = b""
-                conn.settimeout(60)
-                while True:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if b"\n" in buf:
-                        break
-                inbox.put(json.loads(buf.decode("utf-8")))
-                response = outbox.get()
-                conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
-        srv.close()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        ready.set()
+            item = json.loads(line)
+            mapping[item["id"]] = item["v"]
+    return mapping
 
 
-def _dispatch(inbox, outbox, service):
-    request = inbox.get(timeout=60)
-    try:
-        return service.serve(request)
-    except Exception as error:  # noqa: BLE001
-        return {
-            "status": "error",
-            "error": {
-                "code": getattr(error, "code", "ann_fault"),
-                "message": str(error),
-            },
-        }
-
-
-def _rpc(sock_path, payload, timeout_s=1.0):
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout_s)
-    t0 = time.perf_counter()
-    try:
-        sock.connect(sock_path)
-        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
-        buf = b""
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-        latency = (time.perf_counter() - t0) * 1000.0
-        return latency, json.loads(buf)
-    except socket.timeout:
-        return timeout_s * 1000.0, {"error": {"code": "transport_timeout"}}
-    finally:
-        sock.close()
+def encode_fixture_events(facts_root, provider, limit=None):
+    import sqlite3
+    db = os.path.join(str(facts_root), "facts.sqlite3")
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT event_id, preceding_text, final_selection_text "
+        "FROM selection_events ORDER BY hlc_physical_ms, event_id"
+    ).fetchall()
+    conn.close()
+    if limit is not None:
+        rows = rows[:limit]
+    cache_path = os.path.join(str(facts_root), "bge_event_vectors.jsonl")
+    if os.path.isfile(cache_path):
+        mapping = _load_event_vectors(cache_path)
+        if len(mapping) == len(rows):
+            print("reusing cached BGE vectors %d" % len(mapping), flush=True)
+            return mapping
+    adapter = provider._adapter
+    pairs = [(row["preceding_text"], row["final_selection_text"])
+             for row in rows]
+    values = _batch_document_vectors(adapter, pairs)
+    mapping = {row["event_id"]: list(vector)
+               for row, vector in zip(rows, values)}
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        for event_id, vector in mapping.items():
+            handle.write(json.dumps({"id": event_id, "v": vector},
+                                    separators=(",", ":")) + "\n")
+    return mapping
 
 
 def _batch_document_vectors(adapter, pairs, batch_size=128):
@@ -201,307 +137,330 @@ def _batch_document_vectors(adapter, pairs, batch_size=128):
         counts = mask.sum(dim=1).clamp(min=1.0)
         pooled = (summed / counts).cpu().tolist()
         for row in pooled:
-            vectors.append(tuple(l2_normalize(row)))
+            vectors.append(list(l2_normalize(row)))
         if start and start % 2048 == 0:
             print("encoded %d events" % start, flush=True)
     return vectors
 
 
-def encode_fixture_events(facts_root, provider, limit=None):
-    import sqlite3
-    db = os.path.join(str(facts_root), "facts.sqlite3")
-    conn = sqlite3.connect(db)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT event_id, preceding_text, final_selection_text "
-        "FROM selection_events ORDER BY hlc_physical_ms, event_id"
-    ).fetchall()
-    conn.close()
-    if limit is not None:
-        rows = rows[:limit]
-    pairs = [(row["preceding_text"], row["final_selection_text"])
-             for row in rows]
-    cache_path = os.path.join(str(facts_root), "bge_event_vectors.jsonl")
-    if os.path.isfile(cache_path):
-        mapping = {}
-        with open(cache_path, encoding="utf-8") as handle:
-            for line in handle:
-                item = json.loads(line)
-                mapping[item["id"]] = tuple(item["v"])
-        if len(mapping) == len(rows):
-            print("reusing cached BGE vectors %d" % len(mapping), flush=True)
-            return mapping
-    adapter = provider._adapter
-    values = _batch_document_vectors(adapter, pairs)
-    mapping = {row["event_id"]: vector for row, vector in zip(rows, values)}
-    with open(cache_path, "w", encoding="utf-8") as handle:
-        for event_id, vector in mapping.items():
-            handle.write(json.dumps({"id": event_id, "v": list(vector)},
-                                    separators=(",", ":")) + "\n")
-    return mapping
+def _bge_representation_id(bge_model):
+    from embeddings import (
+        BGE_M3_EMBEDDING_ROUTE, build_embedding_identity,
+        embedding_representation_id,
+    )
+    identity = build_embedding_identity(str(bge_model), BGE_M3_EMBEDDING_ROUTE)
+    return embedding_representation_id(BGE_M3_EMBEDDING_ROUTE, identity)
 
 
-def run_kind(kind, work_dir, selection, provider, event_count=100000):
+def _ensure_fixture(kind, work_dir, event_count=100000):
     from importlib.machinery import SourceFileLoader
     fixtures = SourceFileLoader(
         "fixtures_100k", str(_ROOT / "100k_fixtures.py")).load_module()
     root = Path(work_dir) / kind
-    cache_path = root / "bge_event_vectors.jsonl"
     if not (root / "facts.sqlite3").is_file():
         if root.exists():
-            import shutil
             shutil.rmtree(root)
         root.mkdir(parents=True)
         summary = fixtures.build_fixture_facts(
             str(root), kind, seed=20260817, event_count=event_count)
     else:
-        summary = {"kind": kind, "event_count": event_count, "reused": True}
-    rss_model = _rss_mib()
-    print("%s vectors ready" % kind, flush=True)
-    event_vectors = encode_fixture_events(root, provider)
-    print("%s encoding done n=%d" % (kind, len(event_vectors)), flush=True)
-    try:
-        import torch
-        provider._adapter._model.to("cpu")
-        provider._adapter._model.eval()
-    except Exception:
-        pass
-    ids = list(event_vectors)
-    vectors = [event_vectors[event_id] for event_id in ids]
-    build_params = {
+        summary = {"kind": kind, "event_count": event_count, "reused": True,
+                   "seed": 20260817}
+    return root, summary
+
+
+def _publish_generation(facts_root, derived_root, representation_id,
+                         event_vectors, selection):
+    from generation import build_generation
+    from publish import (
+        write_active_manifest, _compose_active_manifest,
+        _read_fact_schema_version, DELTA_FILENAME,
+    )
+    if derived_root.exists():
+        shutil.rmtree(derived_root)
+    derived_root.mkdir(parents=True)
+    provider = CachedEventProvider(representation_id, event_vectors)
+    build_params = compose_usearch_build_params({
         "connectivity": int(selection["connectivity"]),
         "expansion_add": int(selection["expansion_add"]),
-    }
-    print("%s building usearch n=%d" % (kind, len(ids)), flush=True)
+    })
+    generation = build_generation(
+        str(facts_root), provider, str(derived_root),
+        retrieval_backend="exact", retrieval_params=build_params)
+    ids = generation.event_ids()
+    if not ids:
+        generation.close()
+        raise Ann78Error("generation has no events")
+    import numpy
+    matrix = numpy.asarray(
+        [generation.event_vector(event_id) for event_id in ids],
+        dtype=numpy.float32)
     try:
-        import numpy
         index = USearchIndex.build(
-            ids, numpy.asarray(vectors, dtype=numpy.float32), 1024,
-            build_params, query_search=int(selection["query_search"]))
+            ids, matrix, 1024, build_params,
+            query_search=int(selection["query_search"]))
     except Exception as error:
-        print("usearch build failed, brute force: %s" % error, flush=True)
-        index = BruteForceIndex(ids, vectors, dimension=1024)
-    print("%s index ready" % kind, flush=True)
-    rss_full = _rss_mib()
-    generation_bytes = sum(len(str(event_id)) + 1024 * 4 for event_id in ids)
-    params = OracleParams(tau=0.5, k_evidence=8, half_life=32.0,
-                          saturation_k=1.0)
+        generation.close()
+        raise Ann78Error("usearch build failed (no brute-force fallback): %s"
+                         % error) from error
+    fingerprint = compose_backend_fingerprint(
+        backend=USEARCH_BACKEND, params=build_params)
+    meta = {
+        "backend": USEARCH_BACKEND,
+        "metric": "cos",
+        "dtype": "f32",
+        "dimension": 1024,
+        "library_version": "usearch-hnsw-v1",
+        "serialization_abi": "usearch-index-v1-arm64",
+        "build_params": build_params,
+        "index_fingerprint": fingerprint,
+        "generation_id": generation.generation_id,
+        "event_count": len(ids),
+    }
+    publish_ann_sidecar(index, str(derived_root), generation.generation_id, meta)
+    from ann import load_ann_sidecar
+    loaded, loaded_meta = load_ann_sidecar(
+        sidecar_dir(str(derived_root), generation.generation_id),
+        expected_generation_id=generation.generation_id)
+    if loaded_meta.get("backend") != USEARCH_BACKEND:
+        generation.close()
+        raise Ann78Error("published sidecar is not usearch-hnsw")
+    if len(loaded.event_ids()) != len(ids):
+        generation.close()
+        raise Ann78Error("usearch restore lost events")
+    manifest = _compose_active_manifest(
+        generation,
+        "delta/%s/%s" % (generation.generation_id, DELTA_FILENAME),
+        _read_fact_schema_version(str(facts_root)))
+    write_active_manifest(str(derived_root), manifest)
+    generation_id = generation.generation_id
+    generation.close()
+    return generation_id
+
+
+def _request_keys(kind):
+    if kind == "hotkey":
+        return ["hotkey"] * 50
+    return ["key-%05d" % index for index in range(0, 2000, 40)]
+
+
+def _sample(sock_path, identity, keys, water, count, timeout_s, deadline_ms,
+            prefix):
+    latencies = []
+    timeouts = 0
+    faults = 0
+    candidates = ["w0", "w1", "w2"]
+    preceding = "b" * 64
+    for i in range(count):
+        canonical = keys[i % len(keys)]
+        payload = make_evidence_request(
+            "luna_pinyin", "word", canonical, preceding, candidates,
+            identity, water, request_id="%s-%d" % (prefix, i))
+        latency, response = send(sock_path, payload, timeout_s=timeout_s)
+        latencies.append(latency)
+        if latency >= deadline_ms:
+            timeouts += 1
+        if response.get("error") or response.get("status") != "ok":
+            faults += 1
+        if (i + 1) % 1000 == 0:
+            print("%s %d/%d timeouts=%d faults=%d" % (
+                prefix, i + 1, count, timeouts, faults), flush=True)
+    stats = percentiles(latencies)
+    stats["timeouts"] = timeouts
+    stats["faults"] = faults
+    return stats
+
+
+def _pass_latency(stats, p95_max, p99_max, timeouts=0):
+    return bool(
+        stats.get("n")
+        and stats.get("p95", 9999) <= p95_max
+        and stats.get("p99", 9999) <= p99_max
+        and timeouts == 0)
+
+
+def _write_daemon_config(path, facts_root, derived_root, bge_model, selection,
+                         gamma=0.5):
     overfetch = overfetch_count(8, int(selection["overfetch_multiplier"]))
-    cached = _CachedBGE(provider, event_vectors)
-    import sqlite3
-    from oracle import StoredEvent, choice_problem_key
-    conn = sqlite3.connect(os.path.join(str(root), "facts.sqlite3"))
-    conn.row_factory = sqlite3.Row
-    by_key = {}
-    for row in conn.execute(
-            "SELECT event_id, commit_id, schema_id, canonical_segment_input,"
-            " category, final_selection_text, preceding_text,"
-            " hlc_physical_ms, hlc_logical FROM selection_events"
-            " ORDER BY hlc_physical_ms, hlc_logical, event_id"):
-        event = StoredEvent(
-            event_id=row["event_id"],
-            commit_id=row["commit_id"],
-            schema_id=row["schema_id"],
-            canonical_segment_input=row["canonical_segment_input"],
-            category=row["category"],
-            final_selection_text=row["final_selection_text"],
-            preceding_text=row["preceding_text"],
-            hlc=(row["hlc_physical_ms"], row["hlc_logical"]))
-        by_key.setdefault(event.key, []).append(event)
-    conn.close()
+    payload = {
+        "provider_kind": "bge_m3",
+        "bge_model_path": str(bge_model),
+        "facts_root": str(facts_root),
+        "derived_root": str(derived_root),
+        "tau": 0.5,
+        "k_evidence": 8,
+        "half_life": 32.0,
+        "saturation_k": 1.0,
+        "gamma": gamma,
+        "control_gamma": 0.0,
+        "overfetch": overfetch,
+        "query_search": int(selection["query_search"]),
+        "retrieval_backend": "usearch-hnsw",
+        "catch_up_deadline_ms": 5000,
+        "poll_interval_ms": 100,
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return payload
 
-    class _KeyReader:
-        def __init__(self):
-            self.key = None
-            self.as_of = (2**62, 0)
 
-        def default_as_of(self):
-            return self.as_of
+def run_kind(kind, work_dir, selection, bge_model, python, representation_id,
+             event_count=100000):
+    root, summary = _ensure_fixture(kind, work_dir, event_count=event_count)
+    print("%s vectors ready" % kind, flush=True)
+    from embeddings import BGEM3RepresentationProvider
+    provider = BGEM3RepresentationProvider(model_path=str(bge_model))
+    event_vectors = encode_fixture_events(root, provider)
+    print("%s encoding done n=%d" % (kind, len(event_vectors)), flush=True)
+    derived_root = Path(work_dir) / ("%s-derived" % kind)
+    from publish import read_active_manifest
+    manifest, _reason = read_active_manifest(str(derived_root)) if (
+        derived_root / "generations").is_dir() else (None, None)
+    sidecar_ok = False
+    if manifest is not None:
+        sidecar_path = Path(sidecar_dir(str(derived_root),
+                                        manifest["generation_id"])) / "index.ann"
+        sidecar_ok = sidecar_path.is_file() and sidecar_path.stat().st_size > 0
+    if sidecar_ok:
+        generation_id = manifest["generation_id"]
+        print("%s reusing usearch sidecar %s" % (kind, generation_id),
+              flush=True)
+    else:
+        print("%s building generation+usearch n=%d" % (
+            kind, len(event_vectors)), flush=True)
+        generation_id = _publish_generation(
+            root, derived_root, representation_id, event_vectors, selection)
+        print("%s usearch sidecar ready %s" % (kind, generation_id), flush=True)
+    generation_bytes = published_generation_bytes(
+        str(derived_root), generation_id)
+    derived_bytes = derived_state_bytes(str(derived_root), generation_id)
 
-        def read_active_events(self, as_of):
-            events = by_key.get(self.key, ())
-            return [event for event in events if event.hlc <= as_of]
-
-        def close(self):
-            return None
-
-    key_reader = _KeyReader()
-    from ann import compute_ann_evidence as _ann_ev
-    from oracle import OracleQuery
-
-    class _FastService:
-        _qcache = {}
-
-        def config_identity(self):
-            return compose_config_identity(
-                cached.representation_id(), params, 0.5,
-                overfetch=overfetch,
-                query_search=int(selection["query_search"]))
-
-        def serve(self, request):
-            key_reader.key = choice_problem_key(
-                request["schema_id"], request.get("category") or "word",
-                request["canonical_segment_input"])
-            cache_key = (request["preceding_text"],
-                         tuple(request["candidates"]))
-            qcache = _FastService._qcache
-            if cache_key not in qcache:
-                pairs = [(request["preceding_text"], candidate)
-                         for candidate in request["candidates"]]
-                qcache[cache_key] = _batch_document_vectors(
-                    cached._real._adapter, pairs, batch_size=8)
-            vectors = qcache[cache_key]
-            query = OracleQuery(
-                schema_id=request["schema_id"],
-                canonical_segment_input=request["canonical_segment_input"],
-                candidates=list(request["candidates"]),
-                query_vector=vectors[0],
-                category=request.get("category") or "word",
-                candidate_query_vectors=vectors)
-            try:
-                result = _ann_ev(
-                    key_reader, params, query,
-                    lambda event_id: event_vectors[event_id],
-                    index, overfetch,
-                    query_search=int(selection["query_search"]))
-            except Exception as error:
-                import traceback
-                traceback.print_exc()
-                return {
-                    "status": "error",
-                    "error": {"code": "ann_fault", "message": str(error)},
-                }
-            evidence = [{"index": int(item.index), "s": float(item.s)}
-                        for item in result.candidates]
-            return {
-                "status": "ok",
-                "zero_evidence": all(item["s"] == 0.0 for item in evidence),
-                "evidence": evidence,
-            }
-
-    service = _FastService()
-
-    class _Zero:
-        def config_identity(self):
-            return "gamma0-control"
-
-        def serve(self, request):
-            count = len(request.get("candidates") or [])
-            return {
-                "status": "ok",
-                "zero_evidence": True,
-                "evidence": [{"index": i, "s": 0.0} for i in range(count)],
-            }
-
-    control = _Zero()
-    identity = service.config_identity()
-    control_identity = control.config_identity()
-    sock_dir = tempfile.mkdtemp(prefix="ac78-ipc-")
-    os.chmod(sock_dir, 0o700)
-    full_sock = os.path.join(sock_dir, "full.sock")
-    ctrl_sock = os.path.join(sock_dir, "ctrl.sock")
-
-    def _listen(path):
-        if os.path.exists(path):
-            os.unlink(path)
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(path)
-        os.chmod(path, 0o600)
-        srv.listen(8)
-        srv.settimeout(60)
-        return srv
-
-    full_srv = _listen(full_sock)
-    ctrl_srv = _listen(ctrl_sock)
-
-    def roundtrip(srv, sock, svc, payload, timeout_s):
-        holder = {}
-
-        def client():
-            try:
-                holder["result"] = _rpc(sock, payload, timeout_s=timeout_s)
-            except Exception as error:  # noqa: BLE001
-                holder["result"] = (timeout_s * 1000.0,
-                                    {"error": {"code": "ann_fault",
-                                               "message": str(error)}})
-
-        worker = threading.Thread(target=client)
-        worker.start()
-        try:
-            conn, _addr = srv.accept()
-        except socket.timeout:
-            worker.join(1)
-            return timeout_s * 1000.0, {"error": {"code": "transport_timeout"}}
-        with conn:
-            conn.settimeout(60)
-            buf = b""
-            while True:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                if b"\n" in buf:
-                    break
-            request = json.loads(buf.decode("utf-8"))
-            try:
-                response = svc.serve(request)
-            except Exception as error:  # noqa: BLE001
-                response = {
-                    "status": "error",
-                    "error": {
-                        "code": getattr(error, "code", "ann_fault"),
-                        "message": str(error),
-                    },
-                }
-            try:
-                conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
-            except BrokenPipeError:
-                pass
-        worker.join(timeout_s + 5)
-        return holder.get("result", (timeout_s * 1000.0,
-                                     {"error": {"code": "transport_timeout"}}))
-
-    warm = make_evidence_request(
-        "luna_pinyin", "word", "hotkey" if kind == "hotkey" else "key-00000",
-        "a" * 64, ["w0", "w1", "w2"], identity, None, request_id="warm")
-    print("%s ipc warm" % kind, flush=True)
-    roundtrip(full_srv, full_sock, service, warm, 60)
-    print("%s ipc sampling" % kind, flush=True)
-    roundtrip(ctrl_srv, ctrl_sock, control, make_evidence_request(
-        "luna_pinyin", "word", "hotkey" if kind == "hotkey" else "key-00000",
-        "a" * 64, ["w0", "w1", "w2"], control_identity, None,
-        request_id="warm-c"), 30)
-
-    def sample(n, srv, sock, svc, ident, request_key):
-        latencies = []
-        timeouts = 0
-        for i in range(n):
-            payload = make_evidence_request(
-                "luna_pinyin", "word", request_key, "b" * 64,
-                ["w0", "w1", "w2"], ident, None, request_id="q-%d" % i)
-            latency, response = roundtrip(srv, sock, svc, payload, 30.0)
-            latencies.append(latency)
-            if latency >= REPLAY_TIMEOUT_MS or response.get("error"):
-                timeouts += 1
-        stats = _percentiles(latencies)
-        stats["timeouts"] = timeouts
-        return stats
-
-    key = "hotkey" if kind == "hotkey" else "key-00000"
+    keys = _request_keys(kind)
     sample_n = int(os.environ.get("AC78_SAMPLE_N", "0")) or None
     ordinary_n = sample_n or 200
-    ordinary_full = sample(ordinary_n, full_srv, full_sock, service, identity, key)
-    ordinary_ctrl = sample(200, ctrl_srv, ctrl_sock, control,
-                           control_identity, key)
-    inc_p95 = ordinary_full["p95"] - ordinary_ctrl["p95"]
-    inc_p99 = ordinary_full["p99"] - ordinary_ctrl["p99"]
-    replay_n = sample_n or (10000 if kind == "freq" else 200)
-    replay = sample(replay_n, full_srv, full_sock, service, identity, key)
-    catch = sample(50, full_srv, full_sock, service, identity, key)
-    rebuild = sample(50, full_srv, full_sock, service, identity, key)
-    full_srv.close()
-    ctrl_srv.close()
-    rss_incremental = max(0.0, rss_full - rss_model)
+    replay_n = sample_n or 10000
+    catch_n = sample_n or 50
+    rebuild_n = sample_n or 200
+
+    sock_dir = Path(work_dir) / ("%s-sock" % kind)
+    config_path = Path(work_dir) / ("%s-daemon.json" % kind)
+    status_path = Path(work_dir) / ("%s-status.json" % kind)
+    log_path = Path(work_dir) / ("%s-daemon.log" % kind)
+    _write_daemon_config(config_path, root, derived_root, bge_model, selection)
+    proc = log = None
+    peak = 0.0
+    serve_status = {}
+    try:
+        proc, log, sock_path, status = start_daemon(
+            python, config_path, str(sock_dir), str(log_path),
+            str(status_path), timeout_s=300)
+        serve_status = status
+        if status.get("ann_backend") != USEARCH_BACKEND:
+            raise Ann78Error("daemon did not load usearch-hnsw")
+        identity = status["config_identity"]
+        control_identity = status["control_identity"]
+        if identity == control_identity:
+            raise Ann78Error("gamma=0 control identity collapsed into full")
+        water = fact_high_water(str(root))
+        warm = make_evidence_request(
+            "luna_pinyin", "word", keys[0], "b" * 64, ["w0", "w1", "w2"],
+            identity, water, request_id="warm")
+        print("%s ipc warm" % kind, flush=True)
+        warm_ms, warm_resp = send(sock_path, warm, timeout_s=60)
+        print("%s ipc warm latency_ms=%.3f status=%s" % (
+            kind, warm_ms, warm_resp.get("status") or warm_resp.get("error")),
+              flush=True)
+        send(sock_path, make_evidence_request(
+            "luna_pinyin", "word", keys[0], "b" * 64, ["w0", "w1", "w2"],
+            control_identity, water, request_id="warm-c"), timeout_s=60)
+        print("%s ordinary n=%d" % (kind, ordinary_n), flush=True)
+        ordinary_full = _sample(
+            sock_path, identity, keys, water, ordinary_n, 30.0,
+            REPLAY_TIMEOUT_MS, "ord")
+        print("%s ordinary %s" % (kind, ordinary_full), flush=True)
+        ordinary_ctrl = _sample(
+            sock_path, control_identity, keys, water, ordinary_n, 30.0,
+            REPLAY_TIMEOUT_MS, "ctrl")
+        print("%s control %s" % (kind, ordinary_ctrl), flush=True)
+        inc_p95 = ordinary_full["p95"] - ordinary_ctrl["p95"]
+        inc_p99 = ordinary_full["p99"] - ordinary_ctrl["p99"]
+        print("%s replay n=%d" % (kind, replay_n), flush=True)
+        replay = _sample(
+            sock_path, identity, keys, water, replay_n, 30.0,
+            REPLAY_TIMEOUT_MS, "replay")
+        print("%s replay %s" % (kind, replay), flush=True)
+        print("%s rebuild-concurrent n=%d" % (kind, rebuild_n), flush=True)
+        rebuild_log = Path(work_dir) / ("%s-rebuild.log" % kind)
+        rebuild_proc, rebuild_log_handle = start_rebuild_process(
+            python, derived_root, generation_id, str(rebuild_log))
+        peak_serving = rss_mib(proc.pid) or 0.0
+        try:
+            rebuild = _sample(
+                sock_path, identity, keys, water, rebuild_n, 30.0,
+                REPLAY_TIMEOUT_MS, "rebuild")
+            sampled = rss_mib(proc.pid)
+            if sampled is not None:
+                peak_serving = max(peak_serving, sampled)
+            rebuild_rss = rss_mib(rebuild_proc.pid) or 0.0
+            peak = peak_serving + rebuild_rss
+        finally:
+            stop_daemon(rebuild_proc, rebuild_log_handle)
+        print("%s rebuild %s peak_rss_mib=%s" % (kind, rebuild, peak),
+              flush=True)
+
+        catch_facts = Path(work_dir) / ("%s-catch-facts" % kind)
+        catch_derived = Path(work_dir) / ("%s-catch-derived" % kind)
+        shutil.rmtree(catch_facts, ignore_errors=True)
+        shutil.rmtree(catch_derived, ignore_errors=True)
+        shutil.copytree(root, catch_facts)
+        shutil.copytree(derived_root, catch_derived)
+        catch_config = Path(work_dir) / ("%s-catch-daemon.json" % kind)
+        _write_daemon_config(
+            catch_config, catch_facts, catch_derived, bge_model, selection)
+        catch_status = Path(work_dir) / ("%s-catch-status.json" % kind)
+        catch_log = Path(work_dir) / ("%s-catch.log" % kind)
+        proc, log, sock_path, status = start_daemon(
+            python, catch_config, str(sock_dir) + "-catch", str(catch_log),
+            str(catch_status), timeout_s=300)
+        identity = status["config_identity"]
+        catch_key = "hotkey" if kind == "hotkey" else "key-00000"
+        water = fact_high_water(str(catch_facts))
+        send(sock_path, make_evidence_request(
+            "luna_pinyin", "word", catch_key, "b" * 64, ["w0", "w1", "w2"],
+            identity, water, request_id="catch-warm"), timeout_s=60)
+        print("%s catch-up n=%d" % (kind, catch_n), flush=True)
+        catch_latencies = []
+        catch_timeouts = 0
+        catch_faults = 0
+        base_physical = water["hlc_physical_ms"]
+        for i in range(catch_n):
+            new_physical = base_physical + i + 1
+            append_commit(
+                str(catch_facts), catch_key, new_physical, i, 900000 + i)
+            payload = make_evidence_request(
+                "luna_pinyin", "word", catch_key, "b" * 64,
+                ["w0", "w1", "w2"], identity, {
+                    "store_epoch": water["store_epoch"],
+                    "hlc_physical_ms": new_physical,
+                    "hlc_logical": i,
+                }, request_id="catch-%d" % i)
+            latency, response = send(sock_path, payload, timeout_s=30.0)
+            catch_latencies.append(latency)
+            if latency >= REPLAY_TIMEOUT_MS:
+                catch_timeouts += 1
+            if response.get("error") or response.get("status") != "ok":
+                catch_faults += 1
+        catch = percentiles(catch_latencies)
+        catch["timeouts"] = catch_timeouts
+        catch["faults"] = catch_faults
+    finally:
+        stop_daemon(proc, log)
+
+    rss_model = float(serve_status.get("rss_model_mib") or 0.0)
+    rss_ready = float(serve_status.get("rss_ready_mib") or 0.0)
+    rss_incremental = max(0.0, rss_ready - rss_model)
+    rebuild_peak_incremental_gib = max(0.0, (peak - rss_model) / 1024.0)
     public_fixture = {
         "kind": summary.get("kind", kind),
         "event_count": summary.get("event_count", event_count),
@@ -513,6 +472,10 @@ def run_kind(kind, work_dir, selection, provider, event_count=100000):
     result = {
         "kind": kind,
         "fixture": public_fixture,
+        "ipc": "daemon-EvidenceService",
+        "backend": USEARCH_BACKEND,
+        "gamma0_control": "EvidenceService",
+        "brute_force_fallback": False,
         "ordinary": ordinary_full,
         "control": ordinary_ctrl,
         "incremental_p95_ms": inc_p95,
@@ -521,7 +484,10 @@ def run_kind(kind, work_dir, selection, provider, event_count=100000):
         "replay": replay,
         "rebuild_concurrent": rebuild,
         "rss_incremental_mib": rss_incremental,
+        "rss_model_mib": rss_model,
         "generation_bytes": generation_bytes,
+        "derived_bytes": derived_bytes,
+        "generation_id": generation_id,
         "pass": (
             _pass_latency(ordinary_full, COMPLETE_P95_MS, COMPLETE_P99_MS,
                           ordinary_full.get("timeouts", 1))
@@ -530,46 +496,65 @@ def run_kind(kind, work_dir, selection, provider, event_count=100000):
             and _pass_latency(catch, COMPLETE_P95_MS, COMPLETE_P99_MS,
                               catch.get("timeouts", 1))
             and replay.get("timeouts", 1) == 0
+            and replay.get("n") == replay_n
             and rebuild.get("p95", 9999) <= REBUILD_CONCURRENT_P95_MS
             and rss_incremental <= RSS_INCREMENTAL_MIB
             and generation_bytes <= GENERATION_DISK_GIB * 1024 ** 3
+            and derived_bytes <= DERIVED_DISK_GIB * 1024 ** 3
         ),
         "measured": True,
     }
-    return result
-
-
-GENERATION_DISK_GIB = 1.0
+    return result, {
+        "rss_model_mib": rss_model,
+        "rss_incremental_mib": rss_incremental,
+        "rebuild_peak_incremental_gib": rebuild_peak_incremental_gib,
+        "generation_bytes": generation_bytes,
+        "derived_bytes": derived_bytes,
+        "derived_root": str(derived_root),
+        "generation_id": generation_id,
+    }
 
 
 def run_capacity(work_dir, selection, bge_model, embedding_python):
-    del embedding_python
-    from embeddings import BGEM3RepresentationProvider
-    provider = BGEM3RepresentationProvider(model_path=str(bge_model))
-    # Warm the model once.
-    provider.query_vector_for_candidate("暖", "机")
-    rss_model = _rss_mib()
+    python = str(embedding_python)
+    representation_id = _bge_representation_id(bge_model)
     kinds = os.environ.get("AC78_KINDS", "freq,hotkey").split(",")
-    freq = run_kind("freq", work_dir, selection, provider) if "freq" in kinds else {
-        "pass": False, "measured": False}
-    hotkey = run_kind("hotkey", work_dir, selection, provider) if "hotkey" in kinds else {
-        "pass": False, "measured": False}
-    rss_peak = _rss_mib()
+    freq = {"pass": False, "measured": False}
+    hotkey = {"pass": False, "measured": False}
+    freq_mem = {}
+    hot_mem = {}
+    if "freq" in kinds:
+        freq, freq_mem = run_kind(
+            "freq", work_dir, selection, bge_model, python, representation_id)
+    if "hotkey" in kinds:
+        hotkey, hot_mem = run_kind(
+            "hotkey", work_dir, selection, bge_model, python,
+            representation_id)
     freq_rss = float(freq.get("rss_incremental_mib") or 0.0)
     hot_rss = float(hotkey.get("rss_incremental_mib") or 0.0)
     freq_bytes = int(freq.get("generation_bytes") or 0)
     hot_bytes = int(hotkey.get("generation_bytes") or 0)
+    freq_derived = int(freq.get("derived_bytes") or 0)
+    hot_derived = int(hotkey.get("derived_bytes") or 0)
+    rss_model = float(freq_mem.get("rss_model_mib")
+                      or hot_mem.get("rss_model_mib") or 0.0)
+    peak = max(float(freq_mem.get("rebuild_peak_incremental_gib") or 0.0),
+               float(hot_mem.get("rebuild_peak_incremental_gib") or 0.0))
+    generation_bytes = max(freq_bytes, hot_bytes)
+    derived_bytes = max(freq_derived, hot_derived)
     memory = {
         "rss_model_mib": rss_model,
         "rss_incremental_mib": max(freq_rss, hot_rss),
-        "rebuild_peak_incremental_gib": max(0.0, (rss_peak - rss_model) / 1024.0),
-        "generation_bytes": max(freq_bytes, hot_bytes),
+        "rebuild_peak_incremental_gib": peak,
+        "generation_bytes": generation_bytes,
+        "derived_bytes": derived_bytes,
+        "generation_disk_measured": True,
+        "derived_disk_measured": True,
         "pass": (
-            max(freq_rss, hot_rss)
-            <= RSS_INCREMENTAL_MIB
-            and (rss_peak - rss_model) / 1024.0 <= REBUILD_PEAK_INCREMENTAL_GIB
-              and max(freq_bytes, hot_bytes)
-              <= GENERATION_DISK_GIB * 1024 ** 3
+            max(freq_rss, hot_rss) <= RSS_INCREMENTAL_MIB
+            and peak <= REBUILD_PEAK_INCREMENTAL_GIB
+            and generation_bytes <= GENERATION_DISK_GIB * 1024 ** 3
+            and derived_bytes <= DERIVED_DISK_GIB * 1024 ** 3
         ),
         "measured": True,
     }

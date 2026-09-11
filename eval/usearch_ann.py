@@ -447,10 +447,46 @@ def render_markdown(report):
         "",
         canonical_json(report.get("memory") or {}),
         "",
-        "- Report SHA-256: `%s`" % report["report_sha256"],
+        "## Lifecycle",
         "",
+        canonical_json(report.get("lifecycle") or {}),
+        "",
+        "- Report SHA-256: `%s`" % report["report_sha256"],
     ])
     return "\n".join(lines) + "\n"
+
+
+def directory_bytes(path):
+    total = 0
+    if not path or not os.path.isdir(path):
+        return 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            file_path = os.path.join(root, name)
+            try:
+                total += os.path.getsize(file_path)
+            except OSError:
+                continue
+    return total
+
+
+def published_generation_bytes(derived_root, generation_id):
+    if not derived_root or not generation_id:
+        return 0
+    return directory_bytes(os.path.join(derived_root, "generations",
+                                        generation_id)) + directory_bytes(
+        os.path.join(derived_root, "index", generation_id))
+
+
+def derived_state_bytes(derived_root, generation_id, rollback_id=None):
+    if not derived_root:
+        return 0
+    total = published_generation_bytes(derived_root, generation_id)
+    if rollback_id:
+        total += published_generation_bytes(derived_root, rollback_id)
+    for name in ("staging", "delta"):
+        total += directory_bytes(os.path.join(derived_root, name))
+    return total
 
 
 def committed_artifact_dir():

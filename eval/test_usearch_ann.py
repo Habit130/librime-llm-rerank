@@ -20,9 +20,10 @@ from suffix_walkforward_ac164 import (  # noqa: E402
 from usearch_ann import (  # noqa: E402
     AC164_REPORT_SHA256, CONTRACT_ID, LEGAL_TERMINALS, ROUTE_ID,
     Ann78Error, assert_freeze_closed, build_freeze, build_report,
-    cell_identity, decide_terminal, is_finite_h, load_shortlist_cells,
-    query_recall, render_markdown, scheme_order, select_preset,
-    summarize_cell_queries, verify_privacy)
+    cell_identity, decide_terminal, directory_bytes, is_finite_h,
+    load_shortlist_cells, published_generation_bytes, query_recall,
+    render_markdown, scheme_order, select_preset, summarize_cell_queries,
+    verify_privacy)
 from public_layer_slicer import sha256_bytes  # noqa: E402
 
 
@@ -179,7 +180,10 @@ class MetricsTest(unittest.TestCase):
         self.assertIn("report_sha256", report)
         markdown = render_markdown(report)
         self.assertIn("usearch_disqualified", markdown)
+        self.assertIn("## Lifecycle", markdown)
         self.assertNotIn("/Users/", markdown)
+        self.assertTrue(markdown.endswith("\n"))
+        self.assertFalse(markdown.endswith("\n\n"))
 
 
 class FixtureRunnerTest(unittest.TestCase):
@@ -201,6 +205,38 @@ class FixtureRunnerTest(unittest.TestCase):
         report = json.loads(report_path.read_text(encoding="utf-8"))
         self.assertEqual(0.0, report["live_gamma"])
         self.assertFalse(report["live_evidence"])
+        markdown = (artifacts / "USEARCH_ANN_REPORT.md").read_text(
+            encoding="utf-8")
+        self.assertTrue(markdown.endswith("\n"))
+        self.assertFalse(markdown.endswith("\n\n"))
+
+
+class HarnessContractTest(unittest.TestCase):
+
+    def test_100k_harness_uses_daemon_evidence_service(self):
+        text = Path(_ROOT, "usearch_ann_100k.py").read_text(encoding="utf-8")
+        self.assertNotIn("class _FastService", text)
+        self.assertNotIn("class _Zero", text)
+        self.assertNotIn("BruteForceIndex", text)
+        self.assertIn("daemon-EvidenceService", text)
+        self.assertIn("gamma0_control", text)
+        daemon = Path(_ROOT, "ac78_evidence_daemon.py").read_text(
+            encoding="utf-8")
+        self.assertIn("build_evidence_service_from_config", daemon)
+        self.assertIn("usearch-hnsw", daemon)
+        self.assertIn("control_gamma", daemon)
+
+    def test_generation_disk_walks_fp32_and_ann(self):
+        tmp = tempfile.mkdtemp(prefix="ac78-disk-")
+        gen = Path(tmp) / "generations" / "g1"
+        ann = Path(tmp) / "index" / "g1"
+        gen.mkdir(parents=True)
+        ann.mkdir(parents=True)
+        (gen / "vectors.fp32").write_bytes(b"x" * 100)
+        (gen / "metadata.json").write_bytes(b"y" * 20)
+        (ann / "index.ann").write_bytes(b"z" * 30)
+        self.assertEqual(150, published_generation_bytes(tmp, "g1"))
+        self.assertEqual(150, directory_bytes(tmp))
 
 
 if __name__ == "__main__":

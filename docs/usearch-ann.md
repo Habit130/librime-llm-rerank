@@ -46,3 +46,12 @@ from healthy FP32. Index-only on unhealthy FP32 refuses.
 `usearch_qualified` or `usearch_disqualified`. Either may Pass the
 measurement contract. Unmeasured gates never pass. Kernel-only or
 seed-vector timings cannot satisfy ANN78-7.
+
+ANN78-7 times complete evidence IPC: `eval/ac78_evidence_daemon.py`
+serves `EvidenceService` over a unix socket with BGE already warm and
+the USearch sidecar loaded. The paired `γ=0` control is a second
+`EvidenceService` in that same daemon, not a client stub. Catch-up
+appends a real commit then measures the next request. Replay is 10k
+requests on both fixtures. A usearch build failure is a fault; there
+is no `BruteForceIndex` fallback. ANN78-8 walks published generation
+bytes (FP32 + metadata + ANN sidecar) and `active+rollback+staging+delta`.

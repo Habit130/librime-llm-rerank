@@ -736,8 +736,21 @@ python3 eval/run_usearch_ann_qualification.py --fixture
   --work-dir <repo>/.local-work/ac78-usearch-ann/work \
   --artifact-dir <repo>/.local-work/ac78-usearch-ann/artifacts \
   --cache <repo>/.local-work/ac164-3000-walkforward/work/cache \
-  --bge-model <repo>/.local-work/models/BGE-M3
+  --bge-model <repo>/.local-work/models/BGE-M3 \
+  --phase qualify
+.local-work/venv-embeddings/bin/python eval/run_usearch_ann_qualification.py \
+  --work-dir <repo>/.local-work/ac78-usearch-ann/work \
+  --artifact-dir <repo>/.local-work/ac78-usearch-ann/artifacts \
+  --bge-model <repo>/.local-work/models/BGE-M3 \
+  --phase 100k
 ```
+
+`--phase 100k` builds a USearch sidecar from cached BGE event vectors,
+runs the isolated sidecar lifecycle (`eval/usearch_ann_lifecycle.py`),
+then times both 100k fixtures through `eval/ac78_evidence_daemon.py`
+(`EvidenceService` IPC, warm BGE, paired `γ=0` EvidenceService control,
+first catch-up after a commit, 10k replay, concurrent rebuild). Disk
+figures are walked bytes, not `n*(id+4*1024)` estimates.
 
 Private snapshot/vectors/indexes stay under ignored
 `.local-work/ac78-usearch-ann/`.  The desensitized freeze and report are

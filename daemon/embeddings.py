@@ -464,6 +464,12 @@ class DedicatedEmbeddingAdapter:
             raise EmbeddingInferenceError("attention mask shape mismatch")
         return [int(item) for item in value]
 
+    def _model_device(self):
+        try:
+            return next(self._model.parameters()).device
+        except (StopIteration, AttributeError, TypeError):
+            return None
+
     def _forward(self, text):
         self.load()
         self._validate_identity()
@@ -473,6 +479,12 @@ class DedicatedEmbeddingAdapter:
             input_ids = encoded.get("input_ids")
             if input_ids is None:
                 raise EmbeddingInferenceError("tokenizer returned no input ids")
+            device = self._model_device()
+            if device is not None:
+                encoded = {
+                    key: value.to(device) if hasattr(value, "to") else value
+                    for key, value in encoded.items()
+                }
             hidden = self._model(**encoded)
             hidden = (hidden.get("last_hidden_state")
                       if isinstance(hidden, dict)
@@ -531,6 +543,7 @@ class DedicatedEmbeddingRepresentationProvider(RepresentationProvider):
         if not isinstance(adapter, DedicatedEmbeddingAdapter):
             raise EmbeddingIdentityError("provider requires an embedding adapter")
         self._adapter = adapter
+        self._query_cache = {}
 
     def representation_id(self):
         return self._adapter.representation_id
@@ -544,7 +557,12 @@ class DedicatedEmbeddingRepresentationProvider(RepresentationProvider):
             "candidate-conditioned embedding requires a candidate")
 
     def query_vector_for_candidate(self, preceding_text, candidate):
-        return self._forward(self._adapter.query, preceding_text, candidate)
+        key = (preceding_text, candidate)
+        cached = self._query_cache.get(key)
+        if cached is None:
+            cached = self._forward(self._adapter.query, preceding_text, candidate)
+            self._query_cache[key] = cached
+        return cached
 
     def event_vector(self, event):
         return self.event_vector_for_candidate(event, event.final_selection_text)

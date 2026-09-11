@@ -362,16 +362,17 @@ def run_real(work_dir, artifact_dir, snapshot, cache, committed_dir,
             "suffix_passing": sum(1 for cell in suffix_cells if cell.get("pass")),
         }
     from usearch_ann_100k import run_capacity
+    from usearch_ann_lifecycle import run_lifecycle
     capacity, memory = run_capacity(
         work_dir / "100k", selection, bge_model, embedding_python)
-    lifecycle = {
-        "pass": True,
-        "catch_up": True,
-        "mixed_generation_refuse": True,
-        "note": "unit tests plus isolated sidecar publish in daemon/test_ann.py",
-    }
+    freq_derived = work_dir / "100k" / "freq-derived"
+    lifecycle = run_lifecycle(
+        work_dir / "lifecycle", selection, embedding_python,
+        qualification_derived=str(freq_derived)
+        if freq_derived.is_dir() else None)
     measured = (all(item.get("measured") for item in capacity.values())
                 and memory.get("measured")
+                and lifecycle.get("measured")
                 and all(cell.get("evaluated") for cell in suffix_cells))
     if not measured:
         raise Ann78Error("unmeasured gates never pass")
@@ -410,17 +411,18 @@ def finish_100k(work_dir, artifact_dir, committed_dir, bge_model,
     selection = saved["selection"]
     suffix_cells = saved["suffix_cells"]
     from usearch_ann_100k import run_capacity
+    from usearch_ann_lifecycle import run_lifecycle
     capacity, memory = run_capacity(
         work_dir / "100k", selection, bge_model, embedding_python)
-    lifecycle = {
-        "pass": True,
-        "catch_up": True,
-        "mixed_generation_refuse": True,
-        "note": "unit tests plus isolated sidecar publish in daemon/test_ann.py",
-    }
+    freq_derived = work_dir / "100k" / "freq-derived"
+    lifecycle = run_lifecycle(
+        work_dir / "lifecycle", selection, embedding_python,
+        qualification_derived=str(freq_derived)
+        if freq_derived.is_dir() else None)
     measured = (capacity["freq"].get("measured") and
                 capacity["hotkey"].get("measured") and
                 memory.get("measured") and
+                lifecycle.get("measured") and
                 all(cell.get("evaluated") for cell in suffix_cells))
     if not measured:
         raise Ann78Error("unmeasured gates never pass")
