@@ -1070,7 +1070,11 @@ def build_evidence_service_from_config(facts_root, config, machine=None,
     recorded identity-only, unchanged successes aggregate only.
     """
     try:
-        representation_id = config["representation_id"]
+        kind = config.get("provider_kind", "fixture")
+        if kind == "bge_m3":
+            representation_id = config.get("representation_id")
+        else:
+            representation_id = config["representation_id"]
         tau = float(config.get("tau", DEFAULT_TAU))
         k_evidence = int(config.get("k_evidence", DEFAULT_K_EVIDENCE))
         half_life = float(config.get("half_life", DEFAULT_HALF_LIFE))
@@ -1106,7 +1110,7 @@ def build_evidence_service_from_config(facts_root, config, machine=None,
 def _provider_from_config(config, representation_id):
     """Construct the representation provider behind the config seam.
 
-    Two provider kinds are supported:
+    Supported provider kinds:
 
     - ``provider_kind: "fixture"`` (default): the existing
       FixtureRepresentationProvider with explicit query/event vector maps
@@ -1116,6 +1120,9 @@ def _provider_from_config(config, representation_id):
     - ``provider_kind: "seed_vectors"``: the #71 capacity-fixture provider,
       deterministic fixed-seed vectors for the 100k-event fixtures (see
       seed_vectors.py).  The seed and dimension come from the config.
+    - ``provider_kind: "bge_m3"``: the online BGE-M3 dense adapter. Identity
+      comes from the local model/tokenizer digests; a configured
+      ``representation_id`` that disagrees fails closed.
     """
     kind = config.get("provider_kind", "fixture")
     if kind == "seed_vectors":
@@ -1132,13 +1139,9 @@ def _provider_from_config(config, representation_id):
             (0.0, 1.0, 0.0, 0.0),
         )
     if kind == "bge_m3":
-        from embeddings import BGEM3RepresentationProvider
-        model_path = config.get("bge_model_path")
-        if not model_path:
-            raise EvidenceError(
-                "evidence_unavailable",
-                "bge_m3 provider requires bge_model_path")
-        return BGEM3RepresentationProvider(model_path=model_path)
+        from embeddings import build_bge_m3_provider_from_config
+        return build_bge_m3_provider_from_config(
+            config, expected_representation_id=representation_id)
     if kind != "fixture":
         raise EvidenceError(
             "evidence_unavailable",

@@ -266,3 +266,11 @@ and `retarget()` — the runtime seam for "新 desired fingerprint 可以取消�
 - The publish itself is delivered (#65): the publish lock, the staging's own
   delta checkpoint, the active manifest and the pointer swap are documented
   in `docs/publish-atomic.md`.
+
+## BGE desired provider (Squirrel#168)
+
+`_build_desired_provider` accepts `provider_kind: bge_m3` with
+`bge_model_path`, matching evidence and delta. The desired representation id
+must equal the provider-computed BGE identity or be omitted so the provider
+fills it. A mismatch fails closed. Live evidence is not enabled; see
+`docs/personal-bge-experiment-runtime.md`.

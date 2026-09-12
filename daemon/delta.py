@@ -2494,7 +2494,13 @@ def build_delta_machine_from_config(facts_root, config, builder_lock=None,
                 raise ValueError("active_generation_id must be a non-empty "
                                  "string")
             generation_id = active_generation_id
-        representation_id = config["representation_id"]
+        if (config.get("provider_kind") == "bge_m3"
+                and not config.get("representation_id")):
+            from embeddings import build_bge_m3_provider_from_config
+            representation_id = build_bge_m3_provider_from_config(
+                config).representation_id()
+        else:
+            representation_id = config["representation_id"]
         if (not representation_id or not isinstance(representation_id, str)):
             raise ValueError("representation_id must be a non-empty string")
         if active_representation_id is not None:
@@ -2548,13 +2554,9 @@ def _build_provider_from_config(config, representation_id=None):
             from seed_vectors import build_seed_provider_from_config
             return build_seed_provider_from_config(config)
         if kind == "bge_m3":
-            from embeddings import BGEM3RepresentationProvider
-            model_path = config.get("bge_model_path")
-            if not model_path:
-                raise EvidenceError(
-                    "evidence_unavailable",
-                    "bge_m3 provider requires bge_model_path")
-            return BGEM3RepresentationProvider(model_path=model_path)
+            from embeddings import build_bge_m3_provider_from_config
+            return build_bge_m3_provider_from_config(
+                config, expected_representation_id=representation_id)
         if kind == "candidate_fixture":
             return CandidateFixtureRepresentationProvider(
                 representation_id,

@@ -1457,7 +1457,13 @@ def build_staging_machine_from_config(facts_root, config, builder_lock=None,
                 raise ValueError("active_generation_id must be a non-empty "
                                  "string")
             generation_id = active_generation_id
-        active_representation_id_value = config["representation_id"]
+        if (config.get("provider_kind") == "bge_m3"
+                and not config.get("representation_id")):
+            from embeddings import build_bge_m3_provider_from_config
+            active_representation_id_value = (
+                build_bge_m3_provider_from_config(config).representation_id())
+        else:
+            active_representation_id_value = config["representation_id"]
         if (not active_representation_id_value or not isinstance(
                 active_representation_id_value, str)):
             raise ValueError("representation_id must be a non-empty string")
@@ -1553,11 +1559,16 @@ def _build_desired_provider(config, desired_representation_id, seed=None):
                 default_event=config.get("default_event") or
                 (0.0, 1.0, 0.0, 0.0),
             )
+        if kind == "bge_m3":
+            from embeddings import build_bge_m3_provider_from_config
+            return build_bge_m3_provider_from_config(
+                config,
+                expected_representation_id=desired_representation_id)
         if kind != "fixture":
             raise EvidenceError(
                 "evidence_unavailable",
-                "unknown provider_kind %r (expected fixture, candidate_fixture "
-                "or seed_vectors)"
+                "unknown provider_kind %r (expected fixture, candidate_fixture, "
+                "seed_vectors or bge_m3)"
                 % kind)
         query_vectors = config.get("query_vectors") or {}
         event_vectors = config.get("event_vectors") or {}

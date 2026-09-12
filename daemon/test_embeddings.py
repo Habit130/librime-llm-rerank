@@ -16,6 +16,7 @@ from embeddings import (
     BGE_M3_EMBEDDING_ROUTE,
     EMBEDDING_OUTPUT_DIMENSION,
     EMBEDDING_VECTOR_FORMAT,
+    QUERY_CACHE_LIMIT,
     EmbeddingError,
     EmbeddingFixtureRepresentationProvider,
     EmbeddingIdentityError,
@@ -26,6 +27,7 @@ from embeddings import (
     QWEN3_QUERY_INSTRUCTION,
     Qwen3EmbeddingAdapter,
     BGEM3EmbeddingAdapter,
+    BGEM3RepresentationProvider,
     _reset_model_registry_for_tests,
     embedding_fixture_vector,
     embedding_representation_id,
@@ -191,6 +193,21 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaises(ModelProcessConflictError):
             other.query("上文", "候选")
 
+    def test_query_cache_is_bounded(self):
+        axis = embedding_fixture_vector(0)
+        _model, _tokenizer, loader = self.make_model(
+            rows(axis, axis), model_type="xlm-roberta")
+        provider = BGEM3RepresentationProvider(
+            identity=fixture_embedding_identity(BGE_M3_EMBEDDING_ROUTE),
+            loader=loader,
+        )
+        for index in range(QUERY_CACHE_LIMIT + 10):
+            provider.query_vector_for_candidate("上文%d" % index, "候选")
+        self.assertLessEqual(len(provider._query_cache), QUERY_CACHE_LIMIT)
+        self.assertNotIn(("上文0", "候选"), provider._query_cache)
+        newest = ("上文%d" % (QUERY_CACHE_LIMIT + 9), "候选")
+        self.assertIn(newest, provider._query_cache)
+
     def test_loader_fault_never_returns_a_vector(self):
         for adapter_type, route in (
                 (Qwen3EmbeddingAdapter, QWEN3_EMBEDDING_ROUTE),
@@ -263,6 +280,37 @@ class IdentityFaultTest(unittest.TestCase):
         with self.assertRaises(EmbeddingIdentityError):
             adapter.query("上文", "候选")
         self.assertFalse(tokenizer.calls)
+
+    def test_unchanged_files_skip_hot_path_rehash(self):
+        from embeddings import build_embedding_identity
+        from embeddings import embedding_dependency_versions
+        import embeddings as embeddings_module
+
+        identity = build_embedding_identity(
+            self.root, QWEN3_EMBEDDING_ROUTE,
+            dependency_versions=embedding_dependency_versions(),
+        )
+        model = FakeModel(rows(embedding_fixture_vector(0),
+                               embedding_fixture_vector(0)))
+        model.config.model_type = "qwen3"
+        tokenizer = FakeTokenizer()
+        adapter = Qwen3EmbeddingAdapter(
+            model_path=self.root,
+            identity=identity,
+            loader=lambda: (model, tokenizer),
+        )
+        adapter.query("上文", "候选")
+
+        def boom(_path):
+            raise AssertionError("hot-path rehash")
+
+        original = embeddings_module._file_digest
+        embeddings_module._file_digest = boom
+        try:
+            adapter.query("上文", "候选")
+        finally:
+            embeddings_module._file_digest = original
+        self.assertEqual(2, len(tokenizer.calls))
 
 
 if __name__ == "__main__":

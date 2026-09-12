@@ -16,6 +16,7 @@ import json
 import math
 import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from importlib import metadata
 
@@ -31,6 +32,7 @@ EMBEDDING_REPRESENTATION_ID_VERSION = "dedicated-embedding-repr-v1"
 EMBEDDING_OUTPUT_DIMENSION = 1024
 EMBEDDING_VECTOR_FORMAT = "fp32-l2"
 EMBEDDING_METRIC = "cosine"
+QUERY_CACHE_LIMIT = 256
 QWEN3_QUERY_INSTRUCTION = (
     "Represent the candidate-conditioned query for semantic retrieval."
 )
@@ -140,6 +142,20 @@ def _file_digest(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _file_set_stat_fingerprint(directory, predicate):
+    if not os.path.isdir(directory):
+        raise EmbeddingIdentityError("model directory is missing")
+    entries = []
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            path = os.path.join(root, name)
+            relative = os.path.relpath(path, directory)
+            if os.path.isfile(path) and predicate(relative):
+                stat = os.lstat(path)
+                entries.append((relative, stat.st_size, stat.st_mtime_ns))
+    return tuple(sorted(entries))
 
 
 def _digest_files(directory, predicate):
@@ -348,16 +364,26 @@ class DedicatedEmbeddingAdapter:
                            if model_path is not None else None)
         self._expected_identity = identity
         self._identity = identity
+        self._identity_fingerprint = None
         self._loader = loader
         self._model = None
         self._tokenizer = None
         self._loaded_identity = None
+
+    def _stat_fingerprint(self):
+        if self.model_path is None:
+            return None
+        return (
+            _file_set_stat_fingerprint(self.model_path, _model_file),
+            _file_set_stat_fingerprint(self.model_path, _tokenizer_file),
+        )
 
     @property
     def identity(self):
         if self._identity is None:
             self._identity = build_embedding_identity(
                 self.model_path, self.route)
+            self._identity_fingerprint = self._stat_fingerprint()
         return self._identity
 
     @property
@@ -371,6 +397,11 @@ class DedicatedEmbeddingAdapter:
     def _current_identity(self):
         if self.model_path is None:
             return self.identity
+        fingerprint = self._stat_fingerprint()
+        if (self._identity is not None
+                and self._identity_fingerprint is not None
+                and fingerprint == self._identity_fingerprint):
+            return self._identity
         return build_embedding_identity(self.model_path, self.route)
 
     def _validate_identity(self):
@@ -378,6 +409,8 @@ class DedicatedEmbeddingAdapter:
         if current != self.identity:
             raise EmbeddingIdentityError(
                 "embedding model identity changed before inference")
+        if self.model_path is not None:
+            self._identity_fingerprint = self._stat_fingerprint()
 
     def _default_loader(self):
         try:
@@ -543,7 +576,8 @@ class DedicatedEmbeddingRepresentationProvider(RepresentationProvider):
         if not isinstance(adapter, DedicatedEmbeddingAdapter):
             raise EmbeddingIdentityError("provider requires an embedding adapter")
         self._adapter = adapter
-        self._query_cache = {}
+        self._query_cache = OrderedDict()
+        self._query_cache_limit = QUERY_CACHE_LIMIT
 
     def representation_id(self):
         return self._adapter.representation_id
@@ -559,9 +593,13 @@ class DedicatedEmbeddingRepresentationProvider(RepresentationProvider):
     def query_vector_for_candidate(self, preceding_text, candidate):
         key = (preceding_text, candidate)
         cached = self._query_cache.get(key)
-        if cached is None:
-            cached = self._forward(self._adapter.query, preceding_text, candidate)
-            self._query_cache[key] = cached
+        if cached is not None:
+            self._query_cache.move_to_end(key)
+            return cached
+        cached = self._forward(self._adapter.query, preceding_text, candidate)
+        self._query_cache[key] = cached
+        while len(self._query_cache) > self._query_cache_limit:
+            self._query_cache.popitem(last=False)
         return cached
 
     def event_vector(self, event):
@@ -605,6 +643,26 @@ class BGEM3RepresentationProvider(DedicatedEmbeddingRepresentationProvider):
 
     def __init__(self, model_path=None, identity=None, loader=None):
         super().__init__(BGEM3EmbeddingAdapter(model_path, identity, loader))
+
+
+def build_bge_m3_provider_from_config(config, expected_representation_id=None):
+    """Build the online BGE provider and fail closed on identity mismatch."""
+    model_path = config.get("bge_model_path")
+    if not model_path:
+        raise EvidenceError(
+            "evidence_unavailable",
+            "bge_m3 provider requires bge_model_path")
+    try:
+        provider = BGEM3RepresentationProvider(model_path=model_path)
+        actual = provider.representation_id()
+    except EmbeddingError as error:
+        raise EvidenceError("evidence_unavailable", str(error)) from error
+    if (expected_representation_id
+            and expected_representation_id != actual):
+        raise EvidenceError(
+            "representation_fault",
+            "configured representation identity does not match BGE provider")
+    return provider
 
 
 def embedding_fixture_vector(axis):
