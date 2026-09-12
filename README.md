@@ -74,6 +74,13 @@ most one heavyweight embedding model; load, inference, and identity faults
 fail closed. See `docs/dedicated-embedding-adapters.md` for the isolated
 `.venv-embeddings` setup and the deferred v2 boundary.
 
+Squirrel#168 closes the staging `bge_m3` desired-provider gap so builder,
+delta, evidence, and active generation share one BGE representation
+identity for `personal-bge-experiment-v1`. Launch, isolated work dir, exact
+backend, 200 ms deadline, window 32, and fail-closed fallback are in
+`docs/personal-bge-experiment-runtime.md`. That loop does not enable live
+evidence and does not claim hot-path latency.
+
 ## Fact Maintenance
 
 The semantic-memory fact root contains an owner-only `maintenance.lock`. Fact
@@ -510,8 +517,9 @@ plugin's declared fact high-water (`store_epoch` + max change HLC).
   oracle behind an injectable `RepresentationProvider` seam (the #62
   generation hook). `FixtureRepresentationProvider` is the injected,
   deterministic, model-free implementation used by the daemon tests and the
-  end-to-end gate; #62 plugs a real hidden-state provider behind the same
-  interface.
+  end-to-end gate. `provider_kind: bge_m3` is the #168 online BGE adapter
+  (`docs/personal-bge-experiment-runtime.md`); it does not enable live
+  evidence.
 - Success responses carry `status: "ok"` plus a per-candidate `s` array and
   an explicit `zero_evidence` flag. Zero evidence (empty store, no same-key
   events, nothing above the threshold, nothing matching the current group)

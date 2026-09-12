@@ -40,9 +40,13 @@ python3 -m venv .venv-embeddings
 .venv-embeddings/bin/python -m pip install -r daemon/requirements-embeddings.txt
 ```
 
-Do not use `daemon/.venv` for these dependencies. No live config, C++ schema,
-or winner selection is part of this adapter. AC-78 / AC-79 may load BGE-M3
-alone in an isolated work root for USearch or hnswlib qualification
-(`docs/usearch-ann.md`, `docs/hnswlib-ann.md`); those paths still do not
-enable live evidence. The frozen v2 benchmark remains deferred and is not
-imported or run here.
+The #168 personal BGE online loop uses
+`.local-work/ac168-bge-runtime/venv` from the same requirements file. See
+`docs/personal-bge-experiment-runtime.md`. Do not use `daemon/.venv` for
+these dependencies. No live config, C++ schema, or winner selection is part
+of this adapter. AC-78 / AC-79 may load BGE-M3 alone in an isolated work
+root for USearch or hnswlib qualification (`docs/usearch-ann.md`,
+`docs/hnswlib-ann.md`); those paths still do not enable live evidence.
+`provider_kind: bge_m3` on the daemon evidence/staging/delta seam is the
+#168 exact online loop, not an ANN qualification runner. The frozen v2
+benchmark remains deferred and is not imported or run here.

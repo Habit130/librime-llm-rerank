@@ -11,7 +11,10 @@ The AC-78 runner may load exactly one heavyweight model,
 with no instruction, dense mean pooling, FP32 L2, 1024-d. Qwen3 and L28
 are not imported. Live schema and live facts are not opened.
 
-Provider kind `bge_m3` on the evidence config seam is qualification-only.
+Provider kind `bge_m3` on this ANN qualification runner remains
+qualification-only. The daemon exact-path `bge_m3` provider used by
+Squirrel#168 is documented in `docs/personal-bge-experiment-runtime.md`
+and still does not enable live evidence.
 
 ## Identity layers
 

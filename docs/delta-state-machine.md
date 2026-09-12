@@ -231,3 +231,12 @@ C++ store, which also runs WAL). The fixture's `-wal`/`-shm` sidecars are
 materialized before the machine reads (the original `mode=ro` connections
 could not create them; the AC-65-v1 repair's plain `query_only=ON` opens
 can, and the materialization is kept as harmless belt-and-braces).
+
+## BGE provider (Squirrel#168)
+
+`provider_kind: bge_m3` on the delta config seam uses the same
+`BGEM3RepresentationProvider` as evidence and staging. The active
+generation identity must match that provider. Incremental catch-up embeds
+only new events; a restart loads the checkpoint without re-encoding
+history. See `docs/personal-bge-experiment-runtime.md`. Live evidence is
+not enabled.
