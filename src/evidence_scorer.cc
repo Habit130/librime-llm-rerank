@@ -411,6 +411,7 @@ bool EvidenceScorer::ScoreGroup(const GroupRequest& request,
   static std::atomic<uint64_t> next_request{0};
   const string request_id = "llm-evidence-v1:" + std::to_string(getpid()) +
                             ":" + std::to_string(next_request++);
+  set_last_request_id(request_id);
   string response;
   if (!SendRequest(request, request_id, remaining_deadline_ms, &response)) {
     LogEvidenceFailure("transport_failed", "score",

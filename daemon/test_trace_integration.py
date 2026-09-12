@@ -185,6 +185,16 @@ class TraceIntegrationTest(unittest.TestCase):
                           "config_identity", "fact_high_water", "status",
                           "zero_evidence", "evidence", "query_point"})
 
+    def test_computed_order_change_is_unknown_until_client_ack(self):
+        response = self.call(request_id="evidence-int-apply",
+                             trial=trial(base_scores=[1.0, 0.1]))
+        self.assertEqual("ok", response["status"])
+        self.assertEqual("unknown",
+                         self.store.apply_state_for("evidence-int-apply"))
+        self.store.record_apply_ack(["evidence-int-apply"], "applied")
+        self.assertEqual("applied",
+                         self.store.apply_state_for("evidence-int-apply"))
+
 
 if __name__ == "__main__":
     unittest.main()

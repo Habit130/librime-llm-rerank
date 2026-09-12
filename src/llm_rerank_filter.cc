@@ -22,6 +22,7 @@
 #include <rime/commit_history.h>
 #include <rime/gear/translator_commons.h>
 
+#include "apply_outcome.h"
 #include "evidence_scorer.h"
 #include "fact_store.h"
 #include "llm_rerank_filter.h"
@@ -185,6 +186,9 @@ class LlmRerankTranslation : public PrefetchTranslation {
   bool RerankWindow(const vector<an<Candidate>>& buffer,
                     bool truncated,
                     CandidateQueue* out);
+  void RecordApply(const string& apply_state,
+                   const string& plan_identity,
+                   const vector<string>& request_ids);
 
   an<Scorer> scorer_;
   an<EvidenceScorer> evidence_scorer_;
@@ -269,6 +273,7 @@ bool LlmRerankTranslation::Replenish() {
   bool reranked = false;
   if (!scorer_) {
     LogWindowFailure("scoring_unavailable", "score", buffer.size());
+    RecordApply(kApplyStateFallback, "", {});
   } else {
     reranked = RerankWindow(buffer, truncated, &result);
   }
@@ -301,8 +306,10 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
                       config, scoring_policy_, candidates, truncated);
   if (!plan.identity || !plan.groups) {
     LogWindowFailure("invalid_plan", "plan", buffer.size());
+    RecordApply(kApplyStateFallback, "", {});
     return false;
   }
+  vector<string> request_ids;
   vector<size_t> scored_indexes;
   vector<an<Candidate>> scored_candidates;
   vector<string> texts;
@@ -321,6 +328,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   if (!scorer_->ScoreBatch(request, scored_candidates, &batch_scores) ||
       batch_scores.size() != scored_candidates.size()) {
     LogWindowFailure("batch_scoring_failed", "score", buffer.size());
+    RecordApply(kApplyStateFallback, *plan.identity, request_ids);
     return false;
   }
   vector<ScoreComponents> scores(buffer.size());
@@ -340,6 +348,7 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   if (evidence_active_) {
     if (!evidence_scorer_) {
       LogWindowFailure("evidence_unavailable", "evidence", buffer.size());
+      RecordApply(kApplyStateFallback, *plan.identity, request_ids);
       return false;
     }
     EvidenceScorer::FactHighWater high_water;
@@ -367,14 +376,22 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       }
       vector<double> group_evidence;
       const int remaining = RemainingDeadlineMs(window_deadline, now_);
+      const string request_id_before = evidence_scorer_->last_request_id();
       if (remaining <= 0 ||
           !evidence_scorer_->ScoreGroup(evidence_request, &group_evidence,
                                         remaining) ||
           group_evidence.size() != group.candidate_indexes->size()) {
+        const string failed_id = evidence_scorer_->last_request_id();
+        if (!failed_id.empty() && failed_id != request_id_before)
+          request_ids.push_back(failed_id);
         LogWindowFailure("evidence_scoring_failed", "evidence",
                          buffer.size());
+        RecordApply(kApplyStateFallback, *plan.identity, request_ids);
         return false;
       }
+      const string request_id = evidence_scorer_->last_request_id();
+      if (!request_id.empty() && request_id != request_id_before)
+        request_ids.push_back(request_id);
       for (size_t i = 0; i < group.candidate_indexes->size(); ++i)
         scores[(*group.candidate_indexes)[i]].retrieval_evidence =
             group_evidence[i];
@@ -395,12 +412,29 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   vector<size_t> emission_order;
   if (!ReplayRerankPlan(plan, result, &emission_order)) {
     LogWindowFailure("replay_validation_failed", "replay", buffer.size());
+    RecordApply(kApplyStateFallback, *plan.identity, request_ids);
     return false;
   }
 
+  RecordApply(kApplyStateApplied, *plan.identity, request_ids);
   for (size_t index : emission_order)
     out->push_back(buffer[index]);
   return true;
+}
+
+void LlmRerankTranslation::RecordApply(const string& apply_state,
+                                       const string& plan_identity,
+                                       const vector<string>& request_ids) {
+  WindowApplyRecord record;
+  record.segment_start = segment_start_;
+  record.plan_identity = plan_identity;
+  if (scoring_policy_.retrieval_policy_id)
+    record.config_identity = *scoring_policy_.retrieval_policy_id;
+  record.request_ids = request_ids;
+  record.apply_state = apply_state;
+  if (recorder_session_)
+    recorder_session_->PushApplyRecord(record);
+  AppendClientApplyRecord(facts_root_, record);
 }
 
 static bool HasNonAscii(const string& text) {

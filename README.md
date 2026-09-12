@@ -560,9 +560,17 @@ only:
 
 The plugin declares its γ=0 base scores in the additive `trial` envelope of
 each evidence request; the daemon replays the shadow and final emit orders
-from those numbers.  Traces, errors, annotations and status never contain
-上文, candidate text or embeddings — event IDs, request IDs, hashes and
-numbers only (the store refuses non-ASCII identity bytes outright).
+from those numbers.  That replay is **computed** order, not proof of
+display.  The client records the actual emission as `applied` (the plan
+order was shown), `fallback` (the whole original window was shown), or
+leaves `unknown` when no acknowledgment arrives.  A later-group failure or
+timeout after a server trace is not successful application.  Existing rows
+without an apply field stay unknown and are not backfilled.  Traces, errors,
+annotations and status never contain 上文, candidate text or embeddings —
+event IDs, request IDs, hashes and numbers only (the store refuses
+non-ASCII identity bytes outright). History is bounded; overflow increments
+`dropped_traces` / `apply_loss` instead of silent success. Absence of a
+complaint is not a correct-label oracle.
 
 CLI verbs (on `squirrel-semantic-memory`):
 
@@ -573,9 +581,14 @@ squirrel-semantic-memory alarm dismiss <alarm_id> [--reason <text>]
 ```
 
 `annotate` records a user-confirmed mispromotion by request/event ID only
-(never private facts) and refuses unknown IDs.  Exit **alarms** are advisory
-and only ever suggest rollback to `γ=0`; they never write config or any
-switch.  Sliding windows, pinned: 3 user-confirmed mispromotions in any
+(never private facts) and refuses unknown IDs.  The annotation copies the
+client `apply_state` and config identity when they exist; missing ack is
+`unknown`, not success.  Live evidence stays off until an explicit later
+activation.  To stop evidence without deleting recording or facts, set
+`llm_rerank/evidence_enabled: false` and leave `recording_enabled: true`.
+That does not auto-tune, clear facts, or enable evidence.  Exit **alarms**
+are advisory and only ever suggest rollback to `γ=0`; they never write
+config or any switch.  Sliding windows, pinned: 3 user-confirmed mispromotions in any
 consecutive 100 complete-comparable requests (完整可比较组: a complete
 rerank group that can be shadow-compared; stored as the historical wire
 key `trial.actionable`, do not migrate traces).  This is not CONTEXT.md

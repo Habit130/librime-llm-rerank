@@ -89,10 +89,27 @@ void RecorderSession::PushSnapshot(CompetitionSnapshot snapshot) {
 
 void RecorderSession::ClearSnapshots() {
   snapshots.clear();
+  apply_records.clear();
 }
 
 void RecorderSession::DropPending() {
   pending.clear();
+}
+
+void RecorderSession::PushApplyRecord(WindowApplyRecord record) {
+  apply_records[record.segment_start] = std::move(record);
+}
+
+void RecorderSession::ClearApplyRecords() {
+  apply_records.clear();
+}
+
+const WindowApplyRecord* RecorderSession::LatestApplyRecord(
+    size_t segment_start) const {
+  auto it = apply_records.find(segment_start);
+  if (it == apply_records.end())
+    return nullptr;
+  return &it->second;
 }
 
 void RecorderSession::ReplacePending(PendingEvent event) {

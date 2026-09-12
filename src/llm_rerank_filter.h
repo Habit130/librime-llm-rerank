@@ -112,6 +112,9 @@ class LlmRerankFilter : public Filter {
   void set_input(const string& input) { input_ = input; }
   void set_preceding_text(const string& text) { preceding_text_ = text; }
   void set_last_word(const string& text) { last_word_ = text; }
+  void set_recorder_session(std::shared_ptr<RecorderSession> session) {
+    recorder_session_ = std::move(session);
+  }
 
  private:
   void OnCommit(Context* ctx);

@@ -26,8 +26,10 @@
 #include <rime/translation.h>
 #include <rime/gear/translator_commons.h>
 
+#include "apply_outcome.h"
 #include "llm_rerank_filter.h"
 #include "llm_scorer.h"
+#include "recorder_session.h"
 
 using namespace rime;
 
@@ -768,6 +770,10 @@ class FakeEvidenceScorer : public EvidenceScorer {
                   int remaining_deadline_ms) override {
     remainings.push_back(remaining_deadline_ms);
     requests.push_back(request);
+    set_last_request_id("fake-evidence-" +
+                        std::to_string(next_request_id_++));
+    if (fail_after_ > 0 && static_cast<int>(requests.size()) > fail_after_)
+      return false;
     if (fail_)
       return false;
     auto it = scripted_.find(request.canonical_segment_input);
@@ -784,9 +790,13 @@ class FakeEvidenceScorer : public EvidenceScorer {
   }
 
   bool fail_ = false;
+  int fail_after_ = 0;
   map<string, vector<double>> scripted_;
   vector<GroupRequest> requests;
   vector<int> remainings;
+
+ private:
+  uint64_t next_request_id_ = 1;
 };
 
 static const EvidenceScorer::GroupRequest* FindGroupRequest(
@@ -806,8 +816,10 @@ static path EvidenceFactsRoot() {
           std::to_string(sequence++));
 }
 
-static LlmRerankFilter MakeEvidenceFilter(an<FakeEvidenceScorer> evidence,
-                                          double gamma = 2.0) {
+static LlmRerankFilter MakeEvidenceFilter(
+    an<FakeEvidenceScorer> evidence,
+    double gamma = 2.0,
+    std::shared_ptr<RecorderSession> session = nullptr) {
   Ticket ticket;
   ticket.name_space = "llm_rerank";
   LlmRerankFilter filter(ticket);
@@ -821,6 +833,8 @@ static LlmRerankFilter MakeEvidenceFilter(an<FakeEvidenceScorer> evidence,
   filter.set_gamma(gamma);
   filter.set_schema_id("test");
   filter.set_input("abcdef");
+  if (session)
+    filter.set_recorder_session(session);
   return filter;
 }
 
@@ -1369,6 +1383,86 @@ TEST(LlmScorerTest, EmptyBatchReturnsNoScores) {
   EXPECT_TRUE(
       scorer.ScoreBatch({"plan", "mean-token-lm-v1", "", {}}, {}, &scores));
   EXPECT_TRUE(scores.empty());
+}
+
+TEST(EvidenceApplyTest, AppliedRecordsClientAppliedNotComputed) {
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.0, 0.5};
+  auto session = std::make_shared<RecorderSession>("test", 5, "1234567890");
+  auto filter = MakeEvidenceFilter(evidence, 10.0, session);
+  EXPECT_EQ((vector<string>{"乙", "甲"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 3.0),
+                                                 MakePhrase("table", 0, 2, "乙", 1.0),
+                                             })));
+  const WindowApplyRecord* apply = session->LatestApplyRecord(0);
+  ASSERT_NE(nullptr, apply);
+  EXPECT_EQ(kApplyStateApplied, apply->apply_state);
+  ASSERT_EQ(1u, apply->request_ids.size());
+  EXPECT_EQ("fake-evidence-1", apply->request_ids[0]);
+}
+
+TEST(EvidenceApplyTest, LaterGroupFailureIsFallbackNotApplied) {
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.5, 0.0};
+  evidence->scripted_["cd"] = {0.0, 0.0};
+  evidence->fail_after_ = 1;
+  auto session = std::make_shared<RecorderSession>("test", 5, "1234567890");
+  auto filter = MakeEvidenceFilter(evidence, 10.0, session);
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 1.0),
+                                                 MakePhrase("table", 0, 2, "乙", 3.0),
+                                                 MakePhrase("table", 2, 4, "丙", 5.0),
+                                                 MakePhrase("table", 2, 4, "丁", 4.0),
+                                             })));
+  const WindowApplyRecord* apply = session->LatestApplyRecord(0);
+  ASSERT_NE(nullptr, apply);
+  EXPECT_EQ(kApplyStateFallback, apply->apply_state);
+  EXPECT_FALSE(apply->request_ids.empty());
+}
+
+TEST(EvidenceApplyTest, TimeoutIsFallbackNotApplied) {
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.5, 0.0};
+  evidence->scripted_["cd"] = {0.0, 0.0};
+  auto session = std::make_shared<RecorderSession>("test", 5, "1234567890");
+  auto filter = MakeEvidenceFilter(evidence, 10.0, session);
+  const auto t0 = std::chrono::steady_clock::now();
+  int ticks = 0;
+  filter.set_deadline_ms(200);
+  filter.set_now([&] {
+    ++ticks;
+    if (ticks <= 2)
+      return t0;
+    return t0 + std::chrono::milliseconds(200);
+  });
+  EXPECT_EQ((vector<string>{"甲", "乙", "丙", "丁"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 1.0),
+                                                 MakePhrase("table", 0, 2, "乙", 3.0),
+                                                 MakePhrase("table", 2, 4, "丙", 5.0),
+                                                 MakePhrase("table", 2, 4, "丁", 4.0),
+                                             })));
+  const WindowApplyRecord* apply = session->LatestApplyRecord(0);
+  ASSERT_NE(nullptr, apply);
+  EXPECT_EQ(kApplyStateFallback, apply->apply_state);
+}
+
+TEST(EvidenceApplyTest, ObservationWriteFailureDoesNotChangeEmission) {
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.0, 0.5};
+  auto session = std::make_shared<RecorderSession>("test", 5, "1234567890");
+  auto filter = MakeEvidenceFilter(evidence, 10.0, session);
+  filter.set_facts_root(path("/tmp/llm-rerank-apply-missing-root/nope"));
+  EXPECT_EQ((vector<string>{"乙", "甲"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 3.0),
+                                                 MakePhrase("table", 0, 2, "乙", 1.0),
+                                             })));
+  const WindowApplyRecord* apply = session->LatestApplyRecord(0);
+  ASSERT_NE(nullptr, apply);
+  EXPECT_EQ(kApplyStateApplied, apply->apply_state);
 }
 
 // Spawned-writer mode of ConcurrentWritersBothPersistAtomically (see

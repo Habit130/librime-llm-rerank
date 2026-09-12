@@ -121,7 +121,44 @@ AC168_BGE_MODEL=/absolute/path/to/local/BGE-M3 \
   daemon/integration_bge_online_memory.py
 ```
 
-C++ `llm_rerank_test` is unchanged: `HitChangesWithinGroupOrder`,
-`TimeoutPassesThroughWholeWindow`, and
-`ExhaustedWindowDeadlineSkipsLaterGroup` remain the filter emission and
-later-group passthrough proof.
+C++ `llm_rerank_test` covers filter emission and later-group passthrough
+(`HitChangesWithinGroupOrder`, `TimeoutPassesThroughWholeWindow`,
+`ExhaustedWindowDeadlineSkipsLaterGroup`) plus apply/fallback correlation
+(`EvidenceApplyTest`).
+
+## Applied vs computed (Squirrel#169)
+
+Daemon traces record **computed** order (γ=0 shadow vs served evidence).
+That is not displayed order. The client writes an identity-only
+`traces/client_apply.jsonl` line after it actually emits a window:
+
+| State | Meaning |
+| --- | --- |
+| `computed` | Daemon plan/trace exists. Not a display claim. |
+| `applied` | Client emitted the plan order. |
+| `fallback` | Client emitted the whole original window. |
+| `unknown` | Missing acknowledgment, missing field, or legacy row. |
+
+A server trace plus later-group failure or timeout is never successful
+application. First ack wins. Legacy rows without `ack_eligible` stay
+unknown and are not backfilled. Live evidence is not enabled by this
+delivery.
+
+### Report a bad promotion
+
+Use request/event IDs only (never paste 上文, candidate text, or vectors):
+
+```sh
+squirrel-semantic-memory annotate mispromotion --request-id <ID> [--event-id <ID>]
+```
+
+The annotation stores `apply_state` and `config_identity` when known.
+`status --json` reports `applied` / `fallback` / `unknown` with explicit
+denominators. No complaint is not a correct-label oracle.
+
+### Stop evidence without deleting recording or facts
+
+Set `llm_rerank/evidence_enabled: false`. Keep `recording_enabled: true` if
+selection events should continue. This does not clear facts, rebuild
+generations, auto-tune, or activate live evidence. Recording stop, evidence
+stop, fact clear, and generation rebuild remain distinct operations.

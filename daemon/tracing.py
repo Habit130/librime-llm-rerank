@@ -53,6 +53,24 @@ AGGREGATES_VERSION = 1
 ANNOTATIONS_VERSION = 1
 ALARMS_VERSION = 1
 INDEX_VERSION = 1
+APPLY_INDEX_VERSION = 1
+CLIENT_APPLY_FILENAME = "client_apply.jsonl"
+APPLY_INDEX_FILENAME = "apply_index.json"
+
+# Client apply/fallback acknowledgment. Missing or malformed fields fail
+# closed as unknown. "computed" is the daemon plan existing; it is not an
+# apply_state and never proves display.
+APPLY_STATE_APPLIED = "applied"
+APPLY_STATE_FALLBACK = "fallback"
+APPLY_STATE_UNKNOWN = "unknown"
+ACK_APPLY_STATES = (APPLY_STATE_APPLIED, APPLY_STATE_FALLBACK)
+KNOWN_APPLY_STATES = (APPLY_STATE_APPLIED, APPLY_STATE_FALLBACK,
+                      APPLY_STATE_UNKNOWN)
+
+# Bounded local history. Overflow increments dropped_traces / apply_loss
+# rather than silently dropping evidence of loss.
+MAX_TRACES = 1024
+MAX_APPLY_ENTRIES = 1024
 
 FILE_MODE = 0o600
 DIR_MODE = 0o700
@@ -212,9 +230,15 @@ class TraceStore:
         Always updates the rolling aggregates; writes a full trace only for
         order changes and faults; evaluates alarms after each write.
         Returns the fired alarms list (possibly empty).
+
+        A newly recorded request is computed, not displayed: apply_state
+        starts as unknown and stays unknown until a client apply/fallback
+        ack arrives. Existing rows without an apply field never become
+        applied.
         """
         with self._lock:
             now_iso = _now_iso()
+            self._ingest_client_apply_locked()
             trace_id = None
             if trace_payload is not None:
                 trace_id = trace_payload.get("trace_id")
@@ -223,9 +247,15 @@ class TraceStore:
                 trace_payload["trace_id"] = trace_id
                 trace_payload["trace_version"] = TRACE_VERSION
                 trace_payload.setdefault("recorded_at", now_iso)
+                trace_payload.setdefault("apply_state", APPLY_STATE_UNKNOWN)
                 self._validate_trace_payload(trace_payload)
                 self._write_trace(trace_id, trace_payload)
                 self._index_trace(trace_id, request_meta, outcome, now_iso)
+                self._enforce_trace_bound_locked(now_iso)
+            computed_kind = (
+                "order_change" if (outcome == "ok" and trace_id is not None)
+                else ("ok" if outcome == "ok" else outcome))
+            self._remember_computed_locked(request_meta, computed_kind, now_iso)
             self._update_aggregates(request_meta, outcome, latency_segments,
                                     trace_id is not None, now_iso)
             return self._evaluate_alarms(request_meta, now_iso)
@@ -260,6 +290,47 @@ class TraceStore:
             raise TracingError(
                 "trace_contains_non_ascii: %s" % error) from error
 
+    def record_apply_ack(self, request_ids, apply_state, plan_identity=None,
+                         config_identity=None):
+        """Record the client's actual emission outcome.
+
+        ``apply_state`` must be applied or fallback. Missing ack stays
+        unknown. Rows without ack_eligible (legacy history) are not
+        rewritten. First ack wins. Returns a desensitized result dict, or
+        None when the ack itself is invalid.
+        """
+        if apply_state not in ACK_APPLY_STATES:
+            return None
+        if not isinstance(request_ids, (list, tuple)):
+            return None
+        safe_ids = []
+        for request_id in request_ids:
+            safe = _safe_name(request_id)
+            if safe is None:
+                return None
+            safe_ids.append(safe)
+        if plan_identity is not None and _safe_name(plan_identity) is None:
+            return None
+        if config_identity is not None and _safe_name(config_identity) is None:
+            return None
+        with self._lock:
+            self._ingest_client_apply_locked()
+            return self._apply_ack_locked(
+                safe_ids, apply_state, plan_identity, config_identity)
+
+    def apply_state_for(self, request_id):
+        """Fail closed: missing, malformed, or ineligible fields are unknown."""
+        if _safe_name(request_id) is None:
+            return APPLY_STATE_UNKNOWN
+        with self._lock:
+            self._ingest_client_apply_locked()
+            return self._apply_state_locked(request_id)
+
+    def apply_index(self):
+        with self._lock:
+            self._ingest_client_apply_locked()
+            return self._read_apply_index()
+
     def record_annotation(self, request_id, event_id=None, annotator=None):
         """Record a user-confirmed mispromotion by identity only.
 
@@ -273,6 +344,7 @@ class TraceStore:
         if event_id is not None and _safe_name(event_id) is None:
             return None
         with self._lock:
+            self._ingest_client_apply_locked()
             index = self._read_index()
             entry = index.get(request_id)
             if entry is None or not isinstance(entry, dict):
@@ -291,6 +363,13 @@ class TraceStore:
                         {"complete_comparable": True,
                          "request_id": request_id},
                         _now_iso())
+            apply_entry = self._read_apply_index().get(request_id)
+            apply_state = self._apply_state_locked(request_id)
+            config_identity = None
+            plan_identity = None
+            if isinstance(apply_entry, dict):
+                config_identity = apply_entry.get("config_identity")
+                plan_identity = apply_entry.get("plan_identity")
             record = {
                 "annotation_id": "ann-%s" % (len(annotations.get(
                     "annotations", [])) + 1),
@@ -300,6 +379,9 @@ class TraceStore:
                 "kind": "mispromotion",
                 "event_id": event_id,
                 "annotator": annotator,
+                "apply_state": apply_state,
+                "config_identity": config_identity,
+                "plan_identity": plan_identity,
             }
             annotations.setdefault("annotations", []).append(record)
             annotations["version"] = ANNOTATIONS_VERSION
@@ -344,26 +426,31 @@ class TraceStore:
 
     def list_traces(self):
         """Identity-only trace summaries for `status` (never trace bodies)."""
-        index = self._read_index()
-        result = []
-        for request_id, entry in sorted(index.items()):
-            if request_id in ("version", "updated_at") or not isinstance(
-                    entry, dict) or not entry.get("trace_id"):
-                continue
-            summary = {
-                "request_id": request_id,
-                "trace_id": entry.get("trace_id"),
-                "kind": entry.get("kind"),
-                "recorded_at": entry.get("recorded_at"),
-            }
-            for key in ("schema_id", "category"):
-                if entry.get(key):
-                    summary[key] = entry[key]
-            result.append(summary)
-        return result
+        with self._lock:
+            self._ingest_client_apply_locked()
+            index = self._read_index()
+            result = []
+            for request_id, entry in sorted(index.items()):
+                if request_id in ("version", "updated_at") or not isinstance(
+                        entry, dict) or not entry.get("trace_id"):
+                    continue
+                summary = {
+                    "request_id": request_id,
+                    "trace_id": entry.get("trace_id"),
+                    "kind": entry.get("kind"),
+                    "recorded_at": entry.get("recorded_at"),
+                    "apply_state": self._apply_state_locked(request_id),
+                }
+                for key in ("schema_id", "category"):
+                    if entry.get(key):
+                        summary[key] = entry[key]
+                result.append(summary)
+            return result
 
     def aggregates(self):
-        return self._read_aggregates()
+        with self._lock:
+            self._ingest_client_apply_locked()
+            return self._read_aggregates()
 
     def annotations(self):
         return self._read_annotations().get("annotations", [])
@@ -480,7 +567,24 @@ class TraceStore:
                 "recent_actionable": [],
                 "recent_outcomes": [],
                 "recent_full_latencies": [],
+                # Apply/fallback correlation (Squirrel#169). Missing fields
+                # fail closed as unknown; denominators are explicit.
+                "computed": 0,
+                "applied": 0,
+                "fallback": 0,
+                "unknown": 0,
+                "no_change_applied": 0,
+                "order_changes_applied": 0,
+                "dropped_traces": 0,
+                "apply_loss": 0,
+                "denominators": {
+                    "computed": 0,
+                    "apply_outcomes": 0,
+                    "applied_shadow": 0,
+                    "timing": 0,
+                },
             }
+        self._ensure_apply_aggregate_keys(value)
         return value
 
     def _update_aggregates(self, request_meta, outcome, latency_segments,
@@ -528,6 +632,7 @@ class TraceStore:
             segment["sum_ms"] = segment.get("sum_ms", 0.0) + value
             segment["max_ms"] = max(segment.get("max_ms", 0.0), value)
         aggregates["updated_at"] = now_iso
+        self._refresh_apply_aggregates_locked(aggregates)
         _write_owner_file(os.path.join(self._dir, "aggregates.json"),
                           aggregates)
 
@@ -538,6 +643,286 @@ class TraceStore:
                 histogram[str(bucket)] += 1
                 return
         histogram[str(LATENCY_BUCKETS_MS[-1])] += 1
+
+    # ------------------------------------------------------------------
+    # Apply / fallback correlation (Squirrel#169)
+    # ------------------------------------------------------------------
+
+    def _read_apply_index(self):
+        value = _read_json(os.path.join(self._dir, APPLY_INDEX_FILENAME), {})
+        if not isinstance(value, dict):
+            return {}
+        return value
+
+    def _write_apply_index(self, index):
+        index["version"] = APPLY_INDEX_VERSION
+        index["updated_at"] = _now_iso()
+        _write_owner_file(os.path.join(self._dir, APPLY_INDEX_FILENAME), index)
+
+    def _apply_state_locked(self, request_id):
+        entry = self._read_apply_index().get(request_id)
+        if not isinstance(entry, dict):
+            return APPLY_STATE_UNKNOWN
+        state = entry.get("apply_state")
+        if state not in KNOWN_APPLY_STATES:
+            return APPLY_STATE_UNKNOWN
+        return state
+
+    def _remember_computed_locked(self, request_meta, kind, now_iso):
+        request_id = _safe_name(request_meta.get("request_id"))
+        if request_id is None:
+            self._bump_apply_loss_locked()
+            return
+        index = self._read_apply_index()
+        existing = index.get(request_id)
+        if isinstance(existing, dict) and existing.get("ack_eligible") is False:
+            # Legacy history: never rewrite.
+            return
+        if isinstance(existing, dict) and existing.get("apply_state") in (
+                APPLY_STATE_APPLIED, APPLY_STATE_FALLBACK):
+            return
+        entry = {
+            "apply_state": APPLY_STATE_UNKNOWN,
+            "ack_eligible": True,
+            "computed": True,
+            "recorded_at": now_iso,
+            "kind": kind,
+        }
+        for key in ("plan_identity", "config_identity"):
+            value = request_meta.get(key)
+            if value is None:
+                continue
+            if _safe_name(value) is None:
+                self._bump_apply_loss_locked()
+                return
+            entry[key] = value
+        if request_meta.get("complete_comparable"):
+            entry["complete_comparable"] = True
+        if isinstance(existing, dict) and existing.get("acked_at"):
+            entry["acked_at"] = existing["acked_at"]
+            entry["apply_state"] = existing.get("apply_state",
+                                                APPLY_STATE_UNKNOWN)
+        index[request_id] = entry
+        self._bound_apply_index_locked(index)
+        self._write_apply_index(index)
+
+    def _apply_ack_locked(self, request_ids, apply_state, plan_identity,
+                          config_identity):
+        index = self._read_apply_index()
+        updated = 0
+        unknown = 0
+        now_iso = _now_iso()
+        for request_id in request_ids:
+            entry = index.get(request_id)
+            if not isinstance(entry, dict) or not entry.get("ack_eligible"):
+                unknown += 1
+                continue
+            current = entry.get("apply_state")
+            if current in ACK_APPLY_STATES:
+                if current == apply_state:
+                    updated += 1
+                continue
+            if (plan_identity and entry.get("plan_identity")
+                    and entry.get("plan_identity") != plan_identity):
+                unknown += 1
+                continue
+            if (config_identity and entry.get("config_identity")
+                    and entry.get("config_identity") != config_identity):
+                unknown += 1
+                continue
+            entry["apply_state"] = apply_state
+            entry["acked_at"] = now_iso
+            if plan_identity:
+                entry["plan_identity"] = plan_identity
+            if config_identity:
+                entry["config_identity"] = config_identity
+            index[request_id] = entry
+            updated += 1
+        self._write_apply_index(index)
+        aggregates = self._read_aggregates()
+        self._refresh_apply_aggregates_locked(aggregates)
+        _write_owner_file(os.path.join(self._dir, "aggregates.json"),
+                          aggregates)
+        return {
+            "updated": updated,
+            "unknown": unknown,
+            "apply_state": apply_state,
+        }
+
+    def _ingest_client_apply_locked(self):
+        path = os.path.join(self._dir, CLIENT_APPLY_FILENAME)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                self._bump_apply_loss_locked()
+                continue
+            if not isinstance(record, dict):
+                self._bump_apply_loss_locked()
+                continue
+            try:
+                serialized = json.dumps(record, ensure_ascii=False)
+                serialized.encode("ascii")
+            except (UnicodeEncodeError, TypeError, ValueError):
+                self._bump_apply_loss_locked()
+                continue
+            apply_state = record.get("apply_state")
+            if apply_state not in ACK_APPLY_STATES:
+                self._bump_apply_loss_locked()
+                continue
+            request_ids = record.get("request_ids")
+            if not isinstance(request_ids, list) or not request_ids:
+                single = record.get("request_id")
+                request_ids = [single] if single else []
+            safe_ids = []
+            valid = True
+            for request_id in request_ids:
+                safe = _safe_name(request_id)
+                if safe is None:
+                    valid = False
+                    break
+                safe_ids.append(safe)
+            if not valid or not safe_ids:
+                self._bump_apply_loss_locked()
+                continue
+            plan_identity = record.get("plan_identity")
+            config_identity = record.get("config_identity")
+            if plan_identity is not None and _safe_name(plan_identity) is None:
+                self._bump_apply_loss_locked()
+                continue
+            if (config_identity is not None
+                    and _safe_name(config_identity) is None):
+                self._bump_apply_loss_locked()
+                continue
+            self._apply_ack_locked(
+                safe_ids, apply_state, plan_identity, config_identity)
+
+    def _bound_apply_index_locked(self, index):
+        entries = []
+        for key, value in list(index.items()):
+            if key in ("version", "updated_at") or not isinstance(value, dict):
+                continue
+            entries.append((key, value))
+        overflow = len(entries) - MAX_APPLY_ENTRIES
+        if overflow <= 0:
+            return
+        entries.sort(key=lambda item: item[1].get("recorded_at") or "")
+        dropped = 0
+        for key, _value in entries[:overflow]:
+            del index[key]
+            dropped += 1
+        if dropped:
+            aggregates = self._read_aggregates()
+            aggregates["apply_loss"] = aggregates.get("apply_loss", 0) + dropped
+            _write_owner_file(os.path.join(self._dir, "aggregates.json"),
+                              aggregates)
+
+    def _enforce_trace_bound_locked(self, now_iso):
+        if not os.path.isdir(self._dir):
+            return
+        traces = []
+        for name in os.listdir(self._dir):
+            if not name.startswith("trace-") or not name.endswith(".json"):
+                continue
+            path = os.path.join(self._dir, name)
+            traces.append(path)
+        overflow = len(traces) - MAX_TRACES
+        if overflow <= 0:
+            return
+        traces.sort(key=lambda path: os.path.getmtime(path))
+        dropped = 0
+        for path in traces[:overflow]:
+            try:
+                os.unlink(path)
+                dropped += 1
+            except OSError:
+                self._bump_apply_loss_locked()
+        if dropped:
+            aggregates = self._read_aggregates()
+            aggregates["dropped_traces"] = (
+                aggregates.get("dropped_traces", 0) + dropped)
+            aggregates["updated_at"] = now_iso
+            _write_owner_file(os.path.join(self._dir, "aggregates.json"),
+                              aggregates)
+
+    def _bump_apply_loss_locked(self):
+        aggregates = self._read_aggregates()
+        aggregates["apply_loss"] = aggregates.get("apply_loss", 0) + 1
+        _write_owner_file(os.path.join(self._dir, "aggregates.json"),
+                          aggregates)
+
+    @staticmethod
+    def _ensure_apply_aggregate_keys(aggregates):
+        aggregates.setdefault("computed", 0)
+        aggregates.setdefault("applied", 0)
+        aggregates.setdefault("fallback", 0)
+        aggregates.setdefault("unknown", 0)
+        aggregates.setdefault("no_change_applied", 0)
+        aggregates.setdefault("order_changes_applied", 0)
+        aggregates.setdefault("dropped_traces", 0)
+        aggregates.setdefault("apply_loss", 0)
+        denominators = aggregates.get("denominators")
+        if not isinstance(denominators, dict):
+            denominators = {}
+            aggregates["denominators"] = denominators
+        denominators.setdefault("computed", 0)
+        denominators.setdefault("apply_outcomes", 0)
+        denominators.setdefault("applied_shadow", 0)
+        denominators.setdefault("timing", 0)
+
+    def _refresh_apply_aggregates_locked(self, aggregates):
+        self._ensure_apply_aggregate_keys(aggregates)
+        index = self._read_apply_index()
+        computed = 0
+        applied = 0
+        fallback = 0
+        unknown = 0
+        applied_shadow = 0
+        order_changes_applied = 0
+        for key, entry in index.items():
+            if key in ("version", "updated_at") or not isinstance(entry, dict):
+                continue
+            computed += 1
+            state = entry.get("apply_state")
+            if state not in KNOWN_APPLY_STATES:
+                unknown += 1
+                continue
+            if state == APPLY_STATE_APPLIED:
+                applied += 1
+                if entry.get("complete_comparable"):
+                    applied_shadow += 1
+                if entry.get("kind") == "order_change":
+                    order_changes_applied += 1
+            elif state == APPLY_STATE_FALLBACK:
+                fallback += 1
+            else:
+                unknown += 1
+        no_change_applied = max(0, applied - order_changes_applied)
+        timing = 0
+        histogram = aggregates.get("latency_histogram") or {}
+        if isinstance(histogram, dict):
+            timing = sum(value for value in histogram.values()
+                         if isinstance(value, int))
+        aggregates["computed"] = computed
+        aggregates["applied"] = applied
+        aggregates["fallback"] = fallback
+        aggregates["unknown"] = unknown
+        aggregates["no_change_applied"] = no_change_applied
+        aggregates["order_changes_applied"] = order_changes_applied
+        aggregates["denominators"] = {
+            "computed": computed,
+            "apply_outcomes": applied + fallback + unknown,
+            "applied_shadow": applied_shadow,
+            "timing": timing,
+        }
 
     def _read_annotations(self):
         value = _read_json(os.path.join(self._dir, "annotations.json"), {})

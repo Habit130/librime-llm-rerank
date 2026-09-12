@@ -13,6 +13,7 @@
 #include <vector>
 #include <rime/common.h>
 
+#include "apply_outcome.h"
 #include "fact_store.h"
 
 namespace rime {
@@ -80,6 +81,10 @@ struct PendingEvent {
   int session_seq = 0;
   int64_t utc_confirmed_at_ms = 0;
   uint64_t confirm_seq = 0;  // creation order, used for HLC ordering
+  string plan_identity;
+  string config_identity;
+  vector<string> request_ids;
+  string apply_state;  // applied | fallback | unknown
 };
 
 // Per-engine session state shared by the recorder processor (which owns it)
@@ -102,9 +107,13 @@ class RecorderSession {
   void ClearSnapshots();
   void DropPending();
   void ReplacePending(PendingEvent event);  // keyed by segment_start
+  void PushApplyRecord(WindowApplyRecord record);
+  void ClearApplyRecords();
+  const WindowApplyRecord* LatestApplyRecord(size_t segment_start) const;
 
   // mutable recording state
   std::map<size_t, CompetitionSnapshot> snapshots;
+  std::map<size_t, WindowApplyRecord> apply_records;
   std::map<size_t, PendingEvent> pending;
   uint64_t next_confirm_seq = 0;
   int session_seq = 0;
