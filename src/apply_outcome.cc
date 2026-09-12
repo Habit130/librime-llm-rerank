@@ -15,12 +15,13 @@ namespace rime {
 namespace {
 
 bool SafeIdentity(const string& value) {
-  if (value.empty() || value.size() > 200)
+  if (value.empty() || value.size() > 1024)
     return false;
   for (unsigned char byte : value) {
-    if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-          (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
-          byte == '.' || byte == ':' || byte == '+' || byte == '=')) {
+      if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+            byte == '.' || byte == ':' || byte == '+' || byte == '=' ||
+            byte == '@' || byte == ',')) {
       return false;
     }
   }
