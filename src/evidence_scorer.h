@@ -80,6 +80,8 @@ class EvidenceScorer {
                           vector<double>* s_c,
                           int remaining_deadline_ms);
 
+  string last_request_id() const { return last_request_id_; }
+
   // Canonical evidence config identity shared with the daemon
   // (daemon/evidence.py compose_config_identity).  Six significant digits
   // (defaultfloat / %.6g) are the configuration domain, not merely a display
@@ -111,10 +113,17 @@ class EvidenceScorer {
                    int remaining_deadline_ms,
                    string* response);
 
+ protected:
+  void set_last_request_id(string request_id) {
+    last_request_id_ = std::move(request_id);
+  }
+
+ private:
   string socket_path_;
   string config_identity_;
   int deadline_ms_;
   bool verbose_;
+  string last_request_id_;
 };
 
 }  // namespace rime

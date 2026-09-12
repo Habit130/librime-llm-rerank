@@ -255,6 +255,15 @@ void LlmRerankRecorder::OnSelect(Context* ctx) {
   event.session_id = session_->session_id;
   event.utc_confirmed_at_ms = NowMs();
   event.confirm_seq = session_->next_confirm_seq++;
+  if (const WindowApplyRecord* apply =
+          session_->LatestApplyRecord(seg.start)) {
+    event.plan_identity = apply->plan_identity;
+    event.config_identity = apply->config_identity;
+    event.request_ids = apply->request_ids;
+    event.apply_state = apply->apply_state;
+  } else {
+    event.apply_state = kApplyStateUnknown;
+  }
   session_->ReplacePending(std::move(event));
 }
 

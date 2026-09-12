@@ -31,7 +31,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import tracing as tracing_mod  # noqa: E402
 from tracing import (  # noqa: E402
+    APPLY_STATE_APPLIED,
+    APPLY_STATE_FALLBACK,
+    APPLY_STATE_UNKNOWN,
+    CLIENT_APPLY_FILENAME,
     FAULT_WINDOW,
     LATENCY_WINDOW,
     MISPROMOTION_LIMIT,
@@ -416,6 +421,150 @@ class TraceStoreTest(unittest.TestCase):
             trace_payload=order_change_trace("req-mix-ann"))
         self.store.record_annotation("req-mix-ann")
         self.assertEqual([], self.store.list_alarms())
+
+    def test_feedback_computed_is_not_applied(self):
+        self.store.record_request(
+            request_meta("req-computed"), "ok",
+            trace_payload=order_change_trace("req-computed"))
+        self.assertEqual(APPLY_STATE_UNKNOWN,
+                         self.store.apply_state_for("req-computed"))
+        agg = self.store.aggregates()
+        self.assertEqual(1, agg["computed"])
+        self.assertEqual(0, agg["applied"])
+        self.assertEqual(1, agg["unknown"])
+        self.assertEqual(1, agg["denominators"]["computed"])
+        self.assertEqual(1, agg["denominators"]["apply_outcomes"])
+
+    def test_feedback_ack_applied_and_fallback(self):
+        self.store.record_request(
+            request_meta("req-app"), "ok",
+            trace_payload=order_change_trace("req-app"))
+        self.store.record_request(
+            request_meta("req-fb"), "ok",
+            trace_payload=order_change_trace("req-fb"))
+        applied = self.store.record_apply_ack(
+            ["req-app"], APPLY_STATE_APPLIED, plan_identity="plan-v2:test")
+        fallback = self.store.record_apply_ack(
+            ["req-fb"], APPLY_STATE_FALLBACK, plan_identity="plan-v2:test")
+        self.assertEqual(1, applied["updated"])
+        self.assertEqual(1, fallback["updated"])
+        self.assertEqual(APPLY_STATE_APPLIED,
+                         self.store.apply_state_for("req-app"))
+        self.assertEqual(APPLY_STATE_FALLBACK,
+                         self.store.apply_state_for("req-fb"))
+        agg = self.store.aggregates()
+        self.assertEqual(2, agg["computed"])
+        self.assertEqual(1, agg["applied"])
+        self.assertEqual(1, agg["fallback"])
+        self.assertEqual(0, agg["unknown"])
+        self.assertEqual(1, agg["order_changes_applied"])
+        self.assertEqual(2, agg["denominators"]["apply_outcomes"])
+        self.assertEqual(1, agg["denominators"]["applied_shadow"])
+
+    def test_feedback_server_trace_without_ack_is_not_application(self):
+        self.store.record_request(
+            request_meta("req-timeout"), "ok",
+            trace_payload=order_change_trace("req-timeout"))
+        self.assertNotEqual(APPLY_STATE_APPLIED,
+                            self.store.apply_state_for("req-timeout"))
+        self.assertIsNone(self.store.record_apply_ack(
+            ["req-timeout"], "ok"))
+
+    def test_feedback_legacy_rows_stay_unknown(self):
+        self.store.record_request(
+            request_meta("req-legacy"), "ok",
+            trace_payload=order_change_trace("req-legacy"))
+        index_path = os.path.join(self.store.directory(), "apply_index.json")
+        with open(index_path, encoding="utf-8") as handle:
+            index = json.load(handle)
+        index["req-legacy"]["ack_eligible"] = False
+        del index["req-legacy"]["apply_state"]
+        with open(index_path, "w", encoding="utf-8") as handle:
+            json.dump(index, handle)
+        self.assertEqual(APPLY_STATE_UNKNOWN,
+                         self.store.apply_state_for("req-legacy"))
+        result = self.store.record_apply_ack(
+            ["req-legacy"], APPLY_STATE_APPLIED)
+        self.assertEqual(0, result["updated"])
+        self.assertEqual(APPLY_STATE_UNKNOWN,
+                         self.store.apply_state_for("req-legacy"))
+
+    def test_feedback_first_ack_wins(self):
+        self.store.record_request(request_meta("req-once"), "ok")
+        self.store.record_apply_ack(["req-once"], APPLY_STATE_FALLBACK)
+        self.store.record_apply_ack(["req-once"], APPLY_STATE_APPLIED)
+        self.assertEqual(APPLY_STATE_FALLBACK,
+                         self.store.apply_state_for("req-once"))
+
+    def test_feedback_annotation_binds_apply_state(self):
+        self.store.record_request(
+            request_meta("req-ann-app"), "ok",
+            trace_payload=order_change_trace("req-ann-app"))
+        self.store.record_apply_ack(["req-ann-app"], APPLY_STATE_APPLIED)
+        record, _ = self.store.record_annotation("req-ann-app", "evt-1")
+        self.assertEqual(APPLY_STATE_APPLIED, record["apply_state"])
+        self.assertEqual(
+            request_meta("req-ann-app")["config_identity"],
+            record["config_identity"])
+        self.assertEqual("plan-v2:test", record["plan_identity"])
+
+    def test_feedback_client_jsonl_is_ingested(self):
+        self.store.record_request(request_meta("req-jsonl"), "ok")
+        path = os.path.join(self.store.directory(), CLIENT_APPLY_FILENAME)
+        os.makedirs(self.store.directory(), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            os.chmod(path, 0o600)
+            handle.write(json.dumps({
+                "request_ids": ["req-jsonl"],
+                "apply_state": APPLY_STATE_APPLIED,
+                "plan_identity": "plan-v2:test",
+            }) + "\n")
+        self.assertEqual(APPLY_STATE_APPLIED,
+                         self.store.apply_state_for("req-jsonl"))
+
+    def test_feedback_jsonl_raw_text_is_loss_not_success(self):
+        self.store.record_request(request_meta("req-leak"), "ok")
+        path = os.path.join(self.store.directory(), CLIENT_APPLY_FILENAME)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "request_ids": ["req-leak"],
+                "apply_state": APPLY_STATE_APPLIED,
+                "candidate_text": PRIVATE,
+            }, ensure_ascii=False) + "\n")
+        self.assertEqual(APPLY_STATE_UNKNOWN,
+                         self.store.apply_state_for("req-leak"))
+        self.assertGreaterEqual(self.store.aggregates()["apply_loss"], 1)
+        dumped = json.dumps(self.store.aggregates())
+        self.assertNotIn(PRIVATE, dumped)
+
+    def test_feedback_overflow_is_visible(self):
+        original_apply = tracing_mod.MAX_APPLY_ENTRIES
+        original_traces = tracing_mod.MAX_TRACES
+        tracing_mod.MAX_APPLY_ENTRIES = 3
+        tracing_mod.MAX_TRACES = 3
+        try:
+            for i in range(5):
+                rid = "req-ovf-%d" % i
+                self.store.record_request(
+                    request_meta(rid), "ok",
+                    trace_payload=order_change_trace(rid))
+            agg = self.store.aggregates()
+            self.assertGreaterEqual(agg["dropped_traces"], 1)
+            self.assertGreaterEqual(agg["apply_loss"], 1)
+            self.assertLessEqual(agg["computed"], 3)
+        finally:
+            tracing_mod.MAX_APPLY_ENTRIES = original_apply
+            tracing_mod.MAX_TRACES = original_traces
+
+    def test_feedback_no_complaint_is_not_correct_oracle(self):
+        self.store.record_request(
+            request_meta("req-silent"), "ok",
+            trace_payload=order_change_trace("req-silent"))
+        self.store.record_apply_ack(["req-silent"], APPLY_STATE_APPLIED)
+        agg = self.store.aggregates()
+        self.assertEqual(1, agg["applied"])
+        self.assertEqual(0, len(self.store.annotations()))
+        self.assertEqual(1, agg["denominators"]["applied_shadow"])
 
 
 if __name__ == "__main__":

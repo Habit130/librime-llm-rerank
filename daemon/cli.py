@@ -339,7 +339,7 @@ def build_parser():
     annotate = sub.add_parser(
         "annotate",
         help="record a user-confirmed mispromotion by request/event ID "
-             "(identity only; never copies private facts)")
+             "(identity only; binds apply_state; never copies private facts)")
     annotate.add_argument(
         "mispromotion", nargs="?", const="mispromotion",
         help="the annotation kind (mispromotion)")
@@ -608,6 +608,21 @@ def _print_trial_human(section):
                  aggregates.get("order_changes", 0),
                  aggregates.get("faults", 0),
                  aggregates.get("passthroughs", 0)))
+        print("  apply: computed=%d applied=%d fallback=%d unknown=%d "
+              "(denominators computed=%d apply_outcomes=%d applied_shadow=%d "
+              "timing=%d); dropped_traces=%d apply_loss=%d"
+              % (aggregates.get("computed", 0),
+                 aggregates.get("applied", 0),
+                 aggregates.get("fallback", 0),
+                 aggregates.get("unknown", 0),
+                 (aggregates.get("denominators") or {}).get("computed", 0),
+                 (aggregates.get("denominators") or {}).get(
+                     "apply_outcomes", 0),
+                 (aggregates.get("denominators") or {}).get(
+                     "applied_shadow", 0),
+                 (aggregates.get("denominators") or {}).get("timing", 0),
+                 aggregates.get("dropped_traces", 0),
+                 aggregates.get("apply_loss", 0)))
     alarms = section.get("alarms") or []
     active = [a for a in alarms if not a.get("dismissed")]
     if active:
@@ -862,6 +877,9 @@ def _cmd_annotate(args, paths):
               % (record["request_id"], record["trace_id"]))
         if record.get("event_id"):
             print("  event: %s" % record["event_id"])
+        print("  apply_state: %s" % record.get("apply_state", "unknown"))
+        if record.get("config_identity"):
+            print("  config_identity: %s" % record["config_identity"])
         if alarms:
             print("alarm fired: %s" % alarms[0]["message"])
     return 0
