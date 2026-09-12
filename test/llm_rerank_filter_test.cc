@@ -7,7 +7,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <locale>
@@ -27,6 +29,7 @@
 #include <rime/gear/translator_commons.h>
 
 #include "apply_outcome.h"
+#include "fact_store.h"
 #include "llm_rerank_filter.h"
 #include "llm_scorer.h"
 #include "recorder_session.h"
@@ -1463,6 +1466,58 @@ TEST(EvidenceApplyTest, ObservationWriteFailureDoesNotChangeEmission) {
   const WindowApplyRecord* apply = session->LatestApplyRecord(0);
   ASSERT_NE(nullptr, apply);
   EXPECT_EQ(kApplyStateApplied, apply->apply_state);
+}
+
+TEST(EvidenceApplyTest, EmptyFactsRootFallsBackToDefaultRootDir) {
+  char template_path[] = "/tmp/llm_rerank_home_XXXXXX";
+  char* tmp = mkdtemp(template_path);
+  ASSERT_TRUE(tmp);
+  path home(tmp);
+  std::filesystem::create_directories(home / "Library" / "Application Support" /
+                                      "Squirrel");
+  const char* previous_home = getenv("HOME");
+  const string previous = previous_home ? previous_home : "";
+  const bool had_home = previous_home != nullptr;
+  ASSERT_EQ(0, setenv("HOME", home.string().c_str(), 1));
+  auto evidence = New<FakeEvidenceScorer>();
+  evidence->scripted_["ab"] = {0.0, 0.5};
+  auto session = std::make_shared<RecorderSession>("test", 5, "1234567890");
+  auto filter = MakeEvidenceFilter(evidence, 10.0, session);
+  filter.set_facts_root(path());
+  EXPECT_EQ((vector<string>{"乙", "甲"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 3.0),
+                                                 MakePhrase("table", 0, 2, "乙", 1.0),
+                                             })));
+  path jsonl =
+      FactStore::DefaultRootDir() / "traces" / "client_apply.jsonl";
+  std::ifstream in(jsonl.string());
+  EXPECT_TRUE(in.good());
+  string line;
+  EXPECT_TRUE(static_cast<bool>(std::getline(in, line)));
+  EXPECT_NE(string::npos, line.find("\"apply_state\":\"applied\""));
+  EXPECT_EQ(string::npos, line.find("乙"));
+  if (had_home)
+    setenv("HOME", previous.c_str(), 1);
+  else
+    unsetenv("HOME");
+  std::filesystem::remove_all(home);
+}
+
+TEST(EvidenceApplyTest, MissingEvidenceScorerIsFallbackNotStranded) {
+  auto session = std::make_shared<RecorderSession>("test", 5, "1234567890");
+  auto filter = MakeFilter(New<WeightScorer>(1.0, 1.0));
+  filter.set_evidence_active(true);
+  filter.set_recorder_session(session);
+  filter.set_facts_root(EvidenceFactsRoot());
+  EXPECT_EQ((vector<string>{"甲", "乙"}),
+            CollectTexts(ApplyFilter(filter, {
+                                                 MakePhrase("table", 0, 2, "甲", 3.0),
+                                                 MakePhrase("table", 0, 2, "乙", 1.0),
+                                             })));
+  const WindowApplyRecord* apply = session->LatestApplyRecord(0);
+  ASSERT_NE(nullptr, apply);
+  EXPECT_EQ(kApplyStateFallback, apply->apply_state);
 }
 
 // Spawned-writer mode of ConcurrentWritersBothPersistAtomically (see

@@ -1,5 +1,6 @@
-# Isolated embedding runtime. Install into <worktree>/.venv-embeddings or
-# <worktree>/.local-work/ac168-bge-runtime/venv. Never daemon/.venv.
+# Isolated embedding runtime. Install into <worktree>/.venv-embeddings,
+# <worktree>/.local-work/ac168-bge-runtime/venv, or
+# <worktree>/.local-work/ac170-activate/venv. Never daemon/.venv.
 torch==2.7.1
 transformers==4.52.4
 tokenizers==0.21.1

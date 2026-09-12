@@ -216,6 +216,26 @@ TEST(ClientApplyRecord, WritesIdentityOnlyJsonl) {
   std::filesystem::remove_all(root);
 }
 
+TEST(ClientApplyRecord, AcceptsLongConfigIdentity) {
+  char template_path[] = "/tmp/llm_rerank_apply_XXXXXX";
+  char* tmp = mkdtemp(template_path);
+  ASSERT_TRUE(tmp);
+  path root(tmp);
+  WindowApplyRecord record;
+  record.apply_state = kApplyStateApplied;
+  record.config_identity =
+      string("evidence-v1:repr=") + string(400, 'a') +
+      ":deps=torch@2.7.1,transformers@4.52.4:tau=0.5:kev=8:H=128:sat=3:gamma=1";
+  record.request_ids = {"llm-evidence-v1:1:0"};
+  ASSERT_TRUE(AppendClientApplyRecord(root, record));
+  std::ifstream in((root / "traces" / "client_apply.jsonl").string());
+  ASSERT_TRUE(in.good());
+  string line;
+  ASSERT_TRUE(static_cast<bool>(std::getline(in, line)));
+  EXPECT_NE(string::npos, line.find("llm-evidence-v1:1:0"));
+  std::filesystem::remove_all(root);
+}
+
 TEST(ClientApplyRecord, RejectsUnsafeIdentity) {
   char template_path[] = "/tmp/llm_rerank_apply_XXXXXX";
   char* tmp = mkdtemp(template_path);

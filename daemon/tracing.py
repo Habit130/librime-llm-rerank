@@ -101,7 +101,7 @@ def _now_iso():
 
 
 _SAFE_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+=")
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+=@,")
 
 
 def _safe_name(value, max_len=200):
@@ -309,9 +309,10 @@ class TraceStore:
             if safe is None:
                 return None
             safe_ids.append(safe)
-        if plan_identity is not None and _safe_name(plan_identity) is None:
+        if plan_identity is not None and _safe_name(plan_identity, 1024) is None:
             return None
-        if config_identity is not None and _safe_name(config_identity) is None:
+        if config_identity is not None and _safe_name(
+                config_identity, 1024) is None:
             return None
         with self._lock:
             self._ingest_client_apply_locked()
@@ -692,7 +693,7 @@ class TraceStore:
             value = request_meta.get(key)
             if value is None:
                 continue
-            if _safe_name(value) is None:
+            if _safe_name(value, 1024) is None:
                 self._bump_apply_loss_locked()
                 return
             entry[key] = value
@@ -795,11 +796,12 @@ class TraceStore:
                 continue
             plan_identity = record.get("plan_identity")
             config_identity = record.get("config_identity")
-            if plan_identity is not None and _safe_name(plan_identity) is None:
+            if (plan_identity is not None
+                    and _safe_name(plan_identity, 1024) is None):
                 self._bump_apply_loss_locked()
                 continue
             if (config_identity is not None
-                    and _safe_name(config_identity) is None):
+                    and _safe_name(config_identity, 1024) is None):
                 self._bump_apply_loss_locked()
                 continue
             self._apply_ack_locked(

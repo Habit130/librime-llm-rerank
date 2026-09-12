@@ -24,8 +24,10 @@ plugin consumes them.
   contract defaults. Offline throughput and fixture-only timings are not
   evidence that the hot path meets 200 ms.
 
-Live schema `evidence_enabled` stays false until Squirrel#170. This PR does
-not write `~/Library/Rime` or the live semantic-memory root.
+Live schema `evidence_enabled` stays false until the owner enable step in
+`docs/personal-experiment-activation.md` (Squirrel#170), after independent
+Acceptance. This document does not write `~/Library/Rime` or the live
+semantic-memory root.
 
 ## Isolated runtime
 
@@ -92,8 +94,9 @@ Use the embeddings interpreter, an isolated `--facts-root`, and
 Do not point `--facts-root` at `~/Library/Application Support/Squirrel/SemanticMemory`
 or `~/Library/Rime` for this ticket.
 
-Plugin-side schema for later activation remains out of scope. The public
-example stays `evidence_enabled: false`.
+Owner live enable/stop commands, identity placeholders, and isolated
+activation proofs are in `docs/personal-experiment-activation.md`. The
+public example stays `evidence_enabled: false` until that owner step.
 
 ## Hot path bounds
 

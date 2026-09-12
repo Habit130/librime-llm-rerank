@@ -78,8 +78,10 @@ Squirrel#168 closes the staging `bge_m3` desired-provider gap so builder,
 delta, evidence, and active generation share one BGE representation
 identity for `personal-bge-experiment-v1`. Launch, isolated work dir, exact
 backend, 200 ms deadline, window 32, and fail-closed fallback are in
-`docs/personal-bge-experiment-runtime.md`. That loop does not enable live
-evidence and does not claim hot-path latency.
+`docs/personal-bge-experiment-runtime.md`. Squirrel#170 adds install,
+identity pinning, isolated activation proofs, and the owner enable/stop
+runbook in `docs/personal-experiment-activation.md`. Neither delivery
+enables live evidence or claims a unique_lock / +3pp Pass.
 
 ## Fact Maintenance
 

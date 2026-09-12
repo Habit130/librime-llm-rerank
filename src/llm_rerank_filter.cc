@@ -129,6 +129,10 @@ static std::chrono::steady_clock::time_point NowOr(
   return now ? now() : std::chrono::steady_clock::now();
 }
 
+static path EffectiveFactsRoot(const path& facts_root) {
+  return facts_root.empty() ? FactStore::DefaultRootDir() : facts_root;
+}
+
 static int RemainingDeadlineMs(
     std::chrono::steady_clock::time_point deadline,
     const std::function<std::chrono::steady_clock::time_point()>& now) {
@@ -352,9 +356,8 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       return false;
     }
     EvidenceScorer::FactHighWater high_water;
-    EvidenceScorer::ReadFactHighWater(
-        facts_root_.empty() ? FactStore::DefaultRootDir() : facts_root_,
-        &high_water);
+    EvidenceScorer::ReadFactHighWater(EffectiveFactsRoot(facts_root_),
+                                      &high_water);
     const auto window_deadline =
         NowOr(now_) + std::chrono::milliseconds(deadline_ms_);
     for (const auto& group : *plan.groups) {
@@ -434,7 +437,7 @@ void LlmRerankTranslation::RecordApply(const string& apply_state,
   record.apply_state = apply_state;
   if (recorder_session_)
     recorder_session_->PushApplyRecord(record);
-  AppendClientApplyRecord(facts_root_, record);
+  AppendClientApplyRecord(EffectiveFactsRoot(facts_root_), record);
 }
 
 static bool HasNonAscii(const string& text) {
