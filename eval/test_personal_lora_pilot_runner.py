@@ -310,9 +310,12 @@ class RunnerTestCase(unittest.TestCase):
             "created_at_utc": "2026-09-14T00:00:00Z",
             "audit": {"samples": 24},
             "splits": {
-                "train": {"sha256": pld.sha256_text(train_text), "lines": 24},
-                "validation": {"lines": 6},
-                "test": {"lines": 5},
+                "parts": {
+                    "train": {"sha256": pld.sha256_text(train_text),
+                              "lines": 24},
+                    "validation": {"lines": 6},
+                    "test": {"lines": 5},
+                },
             },
         }
         self.write(os.path.join(self.dataset_dir, plp.MANIFEST_FILE),

@@ -68,9 +68,12 @@ class IsolationTestCase(unittest.TestCase):
             "created_at_utc": "2026-09-14T00:00:00Z",
             "audit": {"samples": 1},
             "splits": {
-                "train": {"sha256": sha256_text(train_text), "lines": 1},
-                "validation": {"lines": 1},
-                "test": {"lines": 1},
+                "parts": {
+                    "train": {"sha256": sha256_text(train_text),
+                              "lines": 1},
+                    "validation": {"lines": 1},
+                    "test": {"lines": 1},
+                },
             },
         }
         write_text(os.path.join(self.dataset, plp.MANIFEST_FILE),
@@ -147,7 +150,7 @@ class SealedFileTest(IsolationTestCase):
         config = self.build_dataset()
         manifest_path = os.path.join(self.dataset, plp.MANIFEST_FILE)
         manifest = json.loads(open(manifest_path, encoding="utf-8").read())
-        manifest["splits"]["train"]["lines"] = 99
+        manifest["splits"]["parts"]["train"]["lines"] = 99
         write_text(manifest_path, json.dumps(manifest, sort_keys=True))
         with self.assertRaises(plp.EnvironmentBlocker):
             plp.identify_dataset(config)

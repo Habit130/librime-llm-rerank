@@ -521,8 +521,8 @@ def identify_dataset(config: Dict[str, Any]) -> Dict[str, Any]:
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise EnvironmentBlocker("dataset manifest schema is not %s"
                                  % MANIFEST_SCHEMA)
-    splits = manifest.get("splits") or {}
-    train_part = splits.get("train") or {}
+    parts = (manifest.get("splits") or {}).get("parts") or {}
+    train_part = parts.get("train") or {}
     if train_part.get("sha256") != digests["train_sha256"]:
         raise EnvironmentBlocker(
             "manifest train sha256 does not match train.jsonl")
@@ -536,8 +536,8 @@ def identify_dataset(config: Dict[str, Any]) -> Dict[str, Any]:
         "freeze_commit": config.get("freeze_commit"),
         "manifest_created_at_utc": manifest.get("created_at_utc"),
         "training_samples": (manifest.get("audit") or {}).get("samples"),
-        "validation_lines": (splits.get("validation") or {}).get("lines"),
-        "test_lines": (splits.get("test") or {}).get("lines"),
+        "validation_lines": (parts.get("validation") or {}).get("lines"),
+        "test_lines": (parts.get("test") or {}).get("lines"),
     }
 
 
