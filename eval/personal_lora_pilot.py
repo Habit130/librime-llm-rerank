@@ -1440,8 +1440,10 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             protected_roots: Optional[Sequence[str]] = None) -> int:
     started = time.perf_counter()
     config = load_config(config_path)
-    root = pld.prepare_artifact_root(config["artifact_root"], allowed_root,
-                                     protected_roots)
+    root = pld.prepare_artifact_root(
+        config["artifact_root"],
+        allowed_root if allowed_root is not None else DEFAULT_ALLOWED_ROOT,
+        protected_roots)
     dataset_identity = identify_dataset(config)
     model_identity = identify_model_dir(config["model_dir"])
     versions = runtime_versions()
@@ -1766,8 +1768,10 @@ def _looks_like_memory_error(error: Exception) -> bool:
 def cmd_verify_reload(config_path: str, allowed_root: Optional[str] = None,
                       protected_roots: Optional[Sequence[str]] = None) -> int:
     config = load_config(config_path)
-    root = pld.prepare_artifact_root(config["artifact_root"], allowed_root,
-                                     protected_roots)
+    root = pld.prepare_artifact_root(
+        config["artifact_root"],
+        allowed_root if allowed_root is not None else DEFAULT_ALLOWED_ROOT,
+        protected_roots)
     if not private_path_exists(root, MEASUREMENT_REL):
         raise PilotError("no completed measurement to verify")
     verification = read_private_json(root, VERIFICATION_REL)
