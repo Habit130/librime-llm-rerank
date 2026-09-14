@@ -72,6 +72,7 @@ GROUP_COMPLETE_N = 32
 PRECEDING_WINDOW = 64
 EXPLICIT_CONFIRMATION_SOURCES = ("explicit_current", "explicit_indexed")
 WORD_CATEGORIES = ("word",)
+SUPPORTED_SCHEMAS = ("luna_pinyin",)
 LOSS_BOUNDARY_INTENT = "completion_only"
 
 # Deterministic temporal freeze constants, recorded in every manifest.
@@ -974,6 +975,9 @@ def audit_events(connection: sqlite3.Connection) -> AuditResult:
         if row["confirmation_source"] not in EXPLICIT_CONFIRMATION_SOURCES:
             exclude("not_explicit_confirmation")
             continue
+        if row["schema_id"] not in SUPPORTED_SCHEMAS:
+            exclude("not_supported_schema")
+            continue
         if row["category"] not in WORD_CATEGORIES:
             exclude("not_word_category")
             continue
@@ -1595,6 +1599,14 @@ def verify_freeze(manifest_path: str,
         rule = (manifest.get("splits") or {}).get("rule") or {}
         if plan.to_json() != rule:
             failures.append("split rule does not reproduce")
+        rederived_terminal, rederived_reasons = decide_terminal(audit,
+                                                                rederived)
+        if rederived_terminal != manifest.get("terminal"):
+            failures.append("terminal does not reproduce from the frozen "
+                            "snapshot")
+        if list(rederived_reasons) != list(manifest.get("terminal_reasons")
+                                           or []):
+            failures.append("terminal reasons do not reproduce")
 
     permission_violations = verify_owner_only(root)
     if permission_violations:

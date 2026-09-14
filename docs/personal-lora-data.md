@@ -53,6 +53,8 @@ exclusion):
   retraction);
 - `confirmation_source` is one of `explicit_current`,
   `explicit_indexed`;
+- the schema is `luna_pinyin`, the repository's Simplified-Chinese scope
+  (other schemas are excluded as `not_supported_schema`);
 - `category` is `word`;
 - required fields (`event_id`, `commit_id`, `schema_id`,
   `canonical_segment_input`, `category`, `session_id`, `session_seq`,

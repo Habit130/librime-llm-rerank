@@ -6,6 +6,7 @@ aliases), refusal to overwrite or rebind a successful freeze, verify-only
 tamper detection, read-only verification and the desensitized public report.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -36,7 +37,7 @@ class PersonalLoraSealingTest(unittest.TestCase):
         created = SyntheticSource()
         self.sources.append(created)
         for index in range(10):
-            created.add_event("e%d" % index, session_id="s1",
+            created.add_event("evtid-%d" % index, session_id="s1",
                               session_seq=index + 1,
                               preceding_text="ctx%d" % index,
                               final_selection_text="w%d" % index,
@@ -175,8 +176,21 @@ class PersonalLoraSealingTest(unittest.TestCase):
         self.assertNotIn("event_id", report)
         self.assertNotIn("choice_key_sha256", report)
         self.assertNotIn("path_sha256", report)
-        self.assertNotIn("e0", report)
+        self.assertNotIn("evtid-", report)
         self.assertIn("snapshot sha256", report)
+
+    def test_verify_only_recomputes_terminal_decision(self):
+        root, _manifest = self.export()
+        manifest_path = os.path.join(root, pld.MANIFEST_REL)
+        with open(manifest_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload["terminal"] = "needs_owner_decision"
+        payload["terminal_reasons"] = ["forged"]
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+        result = pld.verify_freeze(manifest_path)
+        self.assertTrue(any("terminal" in failure
+                            for failure in result["failures"]))
 
 
 if __name__ == "__main__":

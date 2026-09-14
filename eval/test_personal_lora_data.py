@@ -187,6 +187,14 @@ class PersonalLoraEligibilityTest(unittest.TestCase):
                          {"not_explicit_confirmation": 1,
                           "not_word_category": 1})
 
+    def test_non_luna_pinyin_schema_is_excluded(self):
+        source = self.source()
+        source.add_event("other-schema", schema_id="cangjie")
+        audit = self.audit(source)
+        self.assertEqual(audit.samples, 0)
+        self.assertEqual(audit.excluded_by_reason,
+                         {"not_supported_schema": 1})
+
     def test_orphan_commit_is_a_fault(self):
         source = self.source()
         source.add_event("orphan", commit_id="ghost")
