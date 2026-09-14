@@ -841,12 +841,16 @@ def _content_signature(row: Dict) -> str:
     return canonical_json([row.get(name) for name in CONTENT_SIGNATURE_FIELDS])
 
 
-def _capture_signature(row: Dict, retracted_commits) -> str:
+def _capture_signature(row: Dict, retracted_commits, candidates) -> str:
     return canonical_json([
         row.get("schema_id"), row.get("category"),
         row.get("canonical_segment_input"), row.get("preceding_text"),
         row.get("final_selection_text"), row.get("span_start"),
-        row.get("span_end"), row.get("commit_id") in retracted_commits])
+        row.get("span_end"), row.get("confirmation_source"),
+        row.get("display_rank"), row.get("display_page"),
+        row.get("competition_complete"),
+        list(candidates.get(row.get("event_id"), [])),
+        row.get("commit_id") in retracted_commits])
 
 
 def _span_is_valid(row: Dict) -> bool:
@@ -957,7 +961,7 @@ def audit_events(connection: sqlite3.Connection) -> AuditResult:
         if len(group) == 1:
             captured.append(group[0])
             continue
-        if len({_capture_signature(row, retracted_commits)
+        if len({_capture_signature(row, retracted_commits, candidates)
                 for row in group}) == 1:
             duplicates_collapsed += len(group) - 1
             captured.append(group[0])
@@ -1203,6 +1207,8 @@ def decide_terminal(audit: AuditResult,
                     parts: Dict[str, List[EventRecord]]) -> Tuple[str, List[str]]:
     reasons = []
     total = len(audit.events)
+    if audit.data_faults_by_reason:
+        reasons.append("data_faults_present")
     if total == 0:
         reasons.append("no_eligible_samples")
     for name in PARTITIONS:
@@ -1280,6 +1286,45 @@ def _sessions_spanning(parts: Dict[str, List[EventRecord]]) -> int:
     return sum(1 for names in session_parts.values() if len(names) > 1)
 
 
+def build_splits_section(audit: AuditResult, plan: SplitPlan,
+                         parts: Dict[str, List[EventRecord]]) -> Dict:
+    """Deterministic split evidence shared by export and verification."""
+    train_pairs = {(event.preceding_text, event.final_selection_text)
+                   for event in parts["train"]}
+    train_keys = {event.choice_key for event in parts["train"]}
+    target_fractions = {"train": TRAIN_FRACTION,
+                        "validation": VALIDATION_FRACTION,
+                        "test": 1.0 - TRAIN_FRACTION - VALIDATION_FRACTION}
+    split_manifest = {}
+    for name in PARTITIONS:
+        data = encode_partition(parts[name], name)
+        stats = _part_stats(parts[name], len(audit.events),
+                            target_fractions[name])
+        stats.update({
+            "file": "dataset/%s.jsonl" % name,
+            "sha256": sha256_bytes(data),
+            "bytes": len(data),
+            "lines": len(parts[name]),
+        })
+        stats["seen_in_train"] = (
+            None if name == "train"
+            else _seen_in_train(parts[name], train_pairs, train_keys))
+        split_manifest[name] = stats
+    return {
+        "rule": plan.to_json(),
+        "parts": split_manifest,
+        "sessions_spanning_partitions": _sessions_spanning(parts),
+        "boundaries": {name: _boundary_binding(parts[name])
+                       for name in PARTITIONS},
+        "total": {
+            "events": len(audit.events),
+            "commits": len({event.commit_id for event in audit.events}),
+            "sessions": len({event.session_id for event in audit.events}),
+            "keys": len({event.choice_key for event in audit.events}),
+        },
+    }
+
+
 def export_dataset(root: str, audit: AuditResult, plan: SplitPlan,
                    snapshot: Dict, acquisition: Dict,
                    source_observations: Dict) -> Dict:
@@ -1290,31 +1335,12 @@ def export_dataset(root: str, audit: AuditResult, plan: SplitPlan,
             "replace or rebind it" % MANIFEST_REL)
     parts = plan.partitions(audit.events)
     terminal, terminal_reasons = decide_terminal(audit, parts)
-    train_pairs = {(event.preceding_text, event.final_selection_text)
-                   for event in parts["train"]}
-    train_keys = {event.choice_key for event in parts["train"]}
 
     ensure_private_dir(root, "dataset")
-    target_fractions = {"train": TRAIN_FRACTION,
-                        "validation": VALIDATION_FRACTION,
-                        "test": 1.0 - TRAIN_FRACTION - VALIDATION_FRACTION}
-    split_manifest = {}
+    splits = build_splits_section(audit, plan, parts)
     for name in PARTITIONS:
         data = encode_partition(parts[name], name)
-        relative = "dataset/%s.jsonl" % name
-        private_write_bytes(root, relative, data)
-        stats = _part_stats(parts[name], len(audit.events),
-                            target_fractions[name])
-        stats.update({
-            "file": relative,
-            "sha256": sha256_bytes(data),
-            "bytes": len(data),
-            "lines": len(parts[name]),
-        })
-        stats["seen_in_train"] = (
-            None if name == "train"
-            else _seen_in_train(parts[name], train_pairs, train_keys))
-        split_manifest[name] = stats
+        private_write_bytes(root, "dataset/%s.jsonl" % name, data)
 
     trial = {
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION,
@@ -1336,21 +1362,7 @@ def export_dataset(root: str, audit: AuditResult, plan: SplitPlan,
         },
         "acquisition": acquisition,
         "audit": audit.to_json(),
-        "splits": {
-            "rule": plan.to_json(),
-            "parts": split_manifest,
-            "sessions_spanning_partitions": _sessions_spanning(parts),
-            "boundaries": {name: _boundary_binding(parts[name])
-                           for name in PARTITIONS},
-            "total": {
-                "events": len(audit.events),
-                "commits": len({event.commit_id
-                                for event in audit.events}),
-                "sessions": len({event.session_id
-                                 for event in audit.events}),
-                "keys": len({event.choice_key for event in audit.events}),
-            },
-        },
+        "splits": splits,
     }
     manifest = {"schema": MANIFEST_SCHEMA}
     manifest.update(trial)
@@ -1599,6 +1611,9 @@ def verify_freeze(manifest_path: str,
         rule = (manifest.get("splits") or {}).get("rule") or {}
         if plan.to_json() != rule:
             failures.append("split rule does not reproduce")
+        if build_splits_section(audit, plan, rederived) != \
+                manifest.get("splits"):
+            failures.append("split metadata does not reproduce")
         rederived_terminal, rederived_reasons = decide_terminal(audit,
                                                                 rederived)
         if rederived_terminal != manifest.get("terminal"):

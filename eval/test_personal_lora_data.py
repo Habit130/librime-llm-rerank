@@ -151,6 +151,20 @@ class PersonalLoraEligibilityTest(unittest.TestCase):
         self.assertEqual({event.event_id for event in audit.events},
                          {"capture-a", "repeat"})
 
+    def test_capture_conflict_on_confirmation_source_is_a_fault(self):
+        source = self.source()
+        source.add_event("dup-a", session_id="s1", session_seq=1,
+                         final_selection_text="甲", preceding_text="上文",
+                         canonical_segment_input="wo")
+        source.add_event("dup-b", session_id="s1", session_seq=1,
+                         final_selection_text="甲", preceding_text="上文",
+                         canonical_segment_input="wo",
+                         confirmation_source="auto_commit", hlc=(1010, 0))
+        audit = self.audit(source)
+        self.assertEqual(audit.samples, 0)
+        self.assertEqual(audit.data_faults_by_reason,
+                         {"conflicting_duplicate_capture": 2})
+
     def test_target_membership_is_independent_of_training_admission(self):
         source = self.source()
         source.add_event("absent", competition=("甲", "乙"),

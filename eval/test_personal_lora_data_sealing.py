@@ -179,6 +179,18 @@ class PersonalLoraSealingTest(unittest.TestCase):
         self.assertNotIn("evtid-", report)
         self.assertIn("snapshot sha256", report)
 
+    def test_verify_only_recomputes_split_metadata(self):
+        root, _manifest = self.export()
+        manifest_path = os.path.join(root, pld.MANIFEST_REL)
+        with open(manifest_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        payload["splits"]["parts"]["train"]["events"] = 999
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+        result = pld.verify_freeze(manifest_path)
+        self.assertTrue(any("split metadata" in failure
+                            for failure in result["failures"]))
+
     def test_verify_only_recomputes_terminal_decision(self):
         root, _manifest = self.export()
         manifest_path = os.path.join(root, pld.MANIFEST_REL)

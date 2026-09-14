@@ -239,6 +239,17 @@ class PersonalLoraSplitTest(unittest.TestCase):
         with self.assertRaises(pld.DataFaultError):
             pld.plan_splits(audit.events)
 
+    def test_data_faults_block_a_successful_terminal(self):
+        source = self.source()
+        self.add_sequential(source, 10)
+        source.add_event("fault", preceding_text="上" * 65, session_id="s1",
+                         session_seq=11, hlc=(2000, 0))
+        root, manifest = self.export(source)
+        self.assertEqual(manifest["terminal"], "needs_owner_decision")
+        self.assertIn("data_faults_present", manifest["terminal_reasons"])
+        result = pld.verify_freeze(os.path.join(root, pld.MANIFEST_REL))
+        self.assertEqual(result["failures"], [])
+
     def test_split_rule_and_proportions_recorded(self):
         source = self.source()
         self.add_sequential(source, 100, session_size=10)

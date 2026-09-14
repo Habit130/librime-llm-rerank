@@ -174,8 +174,9 @@ Exit status:
 
 - `0` — run: `dataset_frozen`; or verify-only: verification PASS;
 - `2` — run: `needs_owner_decision` (honest report over a legal but
-  unusable dataset: empty partitions, no evaluable validation/test
-  groups, or a split approximation outside the recorded tolerance);
+  unusable dataset: data faults present, empty partitions, no evaluable
+  validation/test groups, or a split approximation outside the recorded
+  tolerance);
 - `1` — error/blocker: source corruption or access failure, schema fault,
   isolation violation, tampered or unreproducible freeze.
 
@@ -188,8 +189,9 @@ corruption or as health success.
 `--verify-only` checks the manifest schema/tool version, the snapshot
 checksum, integrity, identity and foreign keys, every part file's
 checksum/line count, owner-only permissions, and then **re-derives the
-audit, split rule and every part byte from the frozen snapshot** so a
-tampered or non-reproducible freeze fails without changing anything.
+audit, split rule, complete split metadata, terminal decision and every
+part byte from the frozen snapshot** so a tampered or non-reproducible
+freeze fails without changing anything.
 
 ## Frozen run (2026-09-14, aggregate-only evidence)
 
