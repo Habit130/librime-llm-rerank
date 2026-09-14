@@ -866,3 +866,30 @@ Private snapshot, split files, manifest and report stay under ignored
 `.local-work/personal-lora-data/` with owner-only permissions.  The
 desensitized public report is aggregate-only; no training, model load or
 live change is part of this ticket.
+
+## Local MLX LoRA feasibility pilot (Habit130/squirrel#176, AC-176-v1)
+
+`personal_lora_pilot.py` proves one genuine local MLX LoRA
+train/update/save/reload path for the frozen raw-concat completion-only
+objective on the pinned causal `Qwen3-0.6B-Base`, runs the bounded
+rank/micro-batch envelope probes plus one >=20-minute sustained measurement,
+and returns a measured `local_feasible` estimate or a precise blocker.  The
+pinned runtime is a ticket-local venv (`mlx==0.32.0`, `mlx-lm==0.31.3`,
+`numpy==2.4.6`); `python3` below means that venv.  Authoritative
+description, objective/mask semantics, protocol, private/public boundary
+and the frozen run's aggregate evidence:
+`docs/personal-lora-pilot.md`.
+
+```sh
+python3 -m unittest discover -s eval -p 'test_personal_lora_pilot*.py'
+python3 eval/personal_lora_pilot.py --self-test
+python3 eval/personal_lora_pilot.py --run \
+  --config .local-work/personal-lora-pilot/config.json
+python3 eval/personal_lora_pilot.py --verify-reload \
+  --config .local-work/personal-lora-pilot/config.json
+```
+
+Private identity, probes, measurement, adapter and report stay under ignored
+`.local-work/personal-lora-pilot/` with owner-only permissions.  The sealed
+validation/test JSONL files are checksummed but never parsed; no live
+mutation, upload or pin bump is part of this ticket.
