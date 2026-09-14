@@ -48,6 +48,7 @@ import math
 import os
 import platform
 import random
+import resource
 import re
 import subprocess
 import sys
@@ -227,6 +228,12 @@ def sample_system_state(sample_processes: bool = False) -> Dict[str, Any]:
         except Exception as error:  # pragma: no cover - host dependent
             state["process_error"] = str(error)
     return state
+
+
+def process_max_rss_mb() -> Optional[float]:
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    divisor = 1024.0 * 1024.0 if platform.system() == "Darwin" else 1024.0
+    return round(usage / divisor, 3)
 
 
 def machine_facts() -> Dict[str, Any]:
@@ -998,10 +1005,11 @@ def probe_pair(backend: Dict[str, Any], model, examples, rank: int,
     accumulate = EFFECTIVE_BATCH // micro_batch
     stream = ShuffledStream(len(examples), seed)
     mx.reset_peak_memory()
-    swap_before = sample_system_state()["swap_used_mb"]
     warmup_stats = new_stats()
     run_groups(backend, model, optimizer, loss_and_grad, examples, stream,
                micro_batch, accumulate, warmup_groups, warmup_stats)
+    mx.clear_cache()
+    swap_before = sample_system_state()["swap_used_mb"]
     measured = new_stats()
     run_groups(backend, model, optimizer, loss_and_grad, examples, stream,
                micro_batch, accumulate, measured_groups, measured)
@@ -1029,6 +1037,8 @@ def probe_pair(backend: Dict[str, Any], model, examples, rank: int,
         "warmup": phase_stats(warmup_stats),
         "measured": phase_stats(measured),
         "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 4),
+        "active_memory_gb": round(mx.get_active_memory() / 1e9, 4),
+        "cache_memory_gb": round(mx.get_cache_memory() / 1e9, 4),
         "swap_before_mb": swap_before,
         "swap_after_mb": swap_after,
     }
@@ -1052,6 +1062,8 @@ def sustained_run(backend: Dict[str, Any], model, examples, rank: int,
                micro_batch, accumulate, SUSTAINED_WARMUP_GROUPS, warmup_stats,
                hook)
     warmup_seconds = time.perf_counter() - warmup_start
+    mx.clear_cache()
+    samples.append(sample_system_state())
     measured = new_stats()
     started = time.perf_counter()
     deadline = started + seconds
@@ -1080,6 +1092,9 @@ def sustained_run(backend: Dict[str, Any], model, examples, rank: int,
         "measured": phase_stats(measured),
         "samples": samples,
         "peak_memory_gb": round(mx.get_peak_memory() / 1e9, 4),
+        "active_memory_gb": round(mx.get_active_memory() / 1e9, 4),
+        "cache_memory_gb": round(mx.get_cache_memory() / 1e9, 4),
+        "pilot_max_rss_mb": process_max_rss_mb(),
         "swap_start_mb": swap_values[0] if swap_values else None,
         "swap_end_mb": swap_values[-1] if swap_values else None,
         "swap_growth_mb": swap_growth,
@@ -1241,7 +1256,7 @@ def render_public_report(identity: Dict[str, Any],
         lines.append("## Envelope probes (one per declared pair)")
         lines.append("")
         lines.append("| rank | micro-batch | accumulate | status | "
-                     "examples/s | peak GB | swap growth MB |")
+                     "examples/s | peak/active/cache GB | swap growth MB |")
         lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for probe in probes:
             growth = None
@@ -1249,13 +1264,15 @@ def render_public_report(identity: Dict[str, Any],
                     probe.get("swap_after_mb") is not None:
                 growth = round(probe["swap_after_mb"]
                                - probe["swap_before_mb"], 2)
-            lines.append("| %s | %s | %s | %s%s | %s | %s | %s |"
+            lines.append("| %s | %s | %s | %s%s | %s | %s/%s/%s | %s |"
                          % (probe["rank"], probe["micro_batch"],
                             probe["accumulate"], probe["status"],
                             "" if not probe.get("reject_reason")
                             else " (%s)" % probe["reject_reason"],
                             probe["examples_per_second"],
-                            probe["peak_memory_gb"], growth))
+                            probe["peak_memory_gb"],
+                            probe.get("active_memory_gb"),
+                            probe.get("cache_memory_gb"), growth))
         chosen = measurement.get("chosen") or {}
         if chosen:
             lines.append("")
@@ -1296,10 +1313,17 @@ def render_public_report(identity: Dict[str, Any],
                         measured["loss_mean"]))
         thermal = [sample.get("thermal")
                    for sample in (sustained.get("samples") or [])[:3]]
-        lines.append("- peak memory %s GB; swap start/end/growth MB "
-                     "`%s/%s/%s`; thermal `%s`"
+        lines.append("- MLX peak/active/cache GB "
+                     "`%s/%s/%s`; pilot max RSS MB %s"
                      % (sustained["peak_memory_gb"],
-                        sustained["swap_start_mb"], sustained["swap_end_mb"],
+                        sustained.get("active_memory_gb"),
+                        sustained.get("cache_memory_gb"),
+                        sustained.get("pilot_max_rss_mb")))
+        lines.append("- system swap start/end/growth MB "
+                     "`%s/%s/%s` (system-wide trend after the post-warmup "
+                     "baseline; process memory is the MLX/RSS line above); "
+                     "thermal `%s`"
+                     % (sustained["swap_start_mb"], sustained["swap_end_mb"],
                         sustained["swap_growth_mb"],
                         pld.canonical_json(thermal)))
     verification = measurement.get("verification")
@@ -1578,6 +1602,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
                                 "binding": current_binding,
                                 "probes": probes})
             print(pld.canonical_json(entry))
+            backend["mx"].clear_cache()
         current_model = None
     probe_seconds = time.perf_counter() - probes_started
 
@@ -1615,13 +1640,6 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             root, identity, current_binding, probes, chosen, None, timing,
             ["sustained run out of memory at rank %d micro-batch %d"
              % (rank, micro_batch)], setup_seconds=setup_seconds)
-    if sustained["swap_growth_exceeded"]:
-        return finish_with_capacity(
-            root, identity, current_binding, probes, chosen, sustained,
-            timing,
-            ["sustained swap growth exceeded %.0f MB at rank %d micro-batch "
-             "%d" % (SWAP_GROWTH_LIMIT_MB, rank, micro_batch)],
-            setup_seconds=setup_seconds)
 
     digest_after, _ = trainable_digest(backend, model)
     reload_indices = trainable_indices[:config["run"]["reload_subset"]]

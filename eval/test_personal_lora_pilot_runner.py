@@ -177,6 +177,14 @@ class FakeMX(object):
         return 0
 
     @staticmethod
+    def get_active_memory():
+        return 0
+
+    @staticmethod
+    def get_cache_memory():
+        return 0
+
+    @staticmethod
     def clear_cache():
         return None
 

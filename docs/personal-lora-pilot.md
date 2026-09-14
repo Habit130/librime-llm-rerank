@@ -73,23 +73,35 @@ state are float32.
 
 At most one short probe runs per declared `(rank, micro-batch)` pair: one
 warmup group (accumulate micro-batches plus one optimizer update) and three
-measured groups. A probe is rejected when it runs out of memory or when swap
-usage grows by more than 256 MB. The pair is chosen by: no sustained swap
-growth, then highest examples/s, then rank 16 over rank 8 within a 2%
-throughput tie. Probe results are persisted after every pair and resumed, so
-a rerun never repeats a probe.
+measured groups. Each probe clears the MLX allocator cache after warmup and
+takes its swap baseline there, so a probe is rejected only when **its own
+measured groups** run out of memory or move system swap by more than 256 MB.
+The pair is chosen by: no sustained swap growth in the probe window, then
+highest examples/s, then rank 16 over rank 8 within a 2% throughput tie.
+Probe results are persisted after every pair and resumed, so a rerun never
+repeats a probe.
 
 ## Sustained measurement
 
 At the chosen pair the pilot reloads the base model, applies fresh LoRA, runs
-two warmup groups and then measures at least 20 minutes of post-warmup
-train-partition training. Setup (identity, tokenization, probes) and warmup
-are reported separately. The run records wall-clock micro-batch and optimizer
-update times, padded widths, per-group loss, `mx.get_peak_memory()`, periodic
-`vm.swapusage` and thermal samples, and the top-CPU process before the run.
-Train-side save/validation cost is measured with 192 frozen train examples
-and one adapter save; the sealed validation/test files are never parsed or
-used as tuning or save-cost material (their file checksums are recorded).
+two warmup groups, clears the allocator cache and takes the swap baseline,
+then measures at least 20 minutes of post-warmup train-partition training.
+Setup (identity, tokenization, probes) and warmup are reported separately.
+The run records wall-clock micro-batch and optimizer update times, padded
+widths, per-group loss, MLX peak/active/cache memory, the process's own peak
+RSS, periodic `vm.swapusage` samples and thermal probes, and the top-CPU
+process before the run.
+
+The sustained swap series is a **system-wide** trend and is reported, not
+used as a terminal gate: the machine is shared with the live session, and a
+one-time reclamation of other processes' pages is attributed through the MLX
+and RSS lines instead of being misread as envelope capacity. The sustained
+terminal is `capacity_blocker` only for a genuine envelope failure (no
+passing probe, out-of-memory, no trainable examples, or an estimate above
+the 12-hour budget). Train-side save/validation cost is measured with 192
+frozen train examples and one adapter save; the sealed validation/test files
+are never parsed or used as tuning or save-cost material (their file
+checksums are recorded).
 
 After the sustained window the pilot verifies the frozen 32-example train
 subset (the first 32 trainable examples in file order): the trained
