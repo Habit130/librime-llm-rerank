@@ -169,11 +169,90 @@ Isolation rules enforced by the implementation:
   report) instead of replaced, so a rerun cannot duplicate probes or the
   sustained window; a binding mismatch refuses to replace the artifacts.
 
-## Frozen run
+## Frozen run (2026-09-14, aggregate-only evidence)
 
-The frozen measurement for this delivery is appended to this section by the
-delivery-head commit (aggregate-only evidence). The private report lives at
+The measured run was executed at branch head `49f7ebb` (the delivery head
+differs only in this document; `--run` re-verifies the recorded measurement
+against the delivered tool by SHA-256). Terminal: **`local_feasible`**,
+exit status `0`. A private desensitized copy is at
 `.local-work/personal-lora-pilot/public-report.md`.
+
+- Identities: model composite sha256
+  `f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320fafa`
+  (causal `Qwen3ForCausalLM`, 28 layers, bf16), runtime
+  `mlx 0.32.0 / mlx-lm 0.31.3 / numpy 2.4.6`, dataset freeze commit
+  `2076d0a6c92dbf57833b7a123ea54aab10ddd49d`, train sha256
+  `c66ff3adb7a30dc40c33f94de7d777eb9ab304820b0066433d806755c80d8dd2`,
+  manifest sha256
+  `5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae`;
+  sealed validation/test checksummed only
+  (`80e58ebe…`, `12e97326…`).
+- Tokenizer/prompt semantics confirmed on the real tokenizer:
+  `add_bos_token=false`, no special tokens are requested, and the seam calls
+  the backend tokenizer once on `prompt + completion`.
+- Real train-partition token aggregate (12,675 examples): trainable 11,259;
+  untrainable 1,416 (1,308 of them because the whole completion is absorbed
+  by a boundary-spanning token, `+108` empty-context single-token
+  completions); boundary-spanning 1,381 examples / 1,381 tokens (charged to
+  the prompt side); empty context 131 (23 trainable); prompt-side tokens
+  min/p50/p90/p99/max `0/37/42/47/53`; completion-side tokens
+  `0/1/1/2/4`.
+- Envelope probes (all eight declared pairs, one probe each, all `pass`,
+  per-probe swap delta ≈ 0):
+
+  | rank | micro-batch | examples/s | peak/active/cache GB |
+  | --- | --- | --- | --- |
+  | 8 | 1 | 19.25 | 1.458/1.221/0.846 |
+  | 8 | 2 | 31.84 | 1.559/1.220/1.490 |
+  | 8 | 4 | 42.55 | 1.830/1.220/2.047 |
+  | 8 | 8 | 52.10 | 2.408/1.220/3.582 |
+  | 16 | 1 | 18.79 | 1.565/1.251/0.930 |
+  | 16 | 2 | 32.25 | 1.622/1.249/1.534 |
+  | 16 | 4 | 42.56 | 1.871/1.247/2.076 |
+  | 16 | 8 | 51.87 | 2.441/1.247/3.609 |
+
+- Chosen pair: rank 16, micro-batch 8, accumulate 1 (rank 16 preferred over
+  rank 8 within the 2% throughput tie; higher micro-batch wins on
+  examples/s).
+- Sustained post-warmup window: 1,200.62 s, 5,398 micro-batches and 5,398
+  optimizer updates (≈ 3.8 shuffled passes over the trainable partition).
+  Micro-batch seconds min/p50/p90/p99/max
+  `0.139/0.181/0.203/0.596/2.241`, mean `0.1932`; optimizer update seconds
+  mean `0.0270`; padded widths min/p50/p90/p99/max `35/43/48/51/54`; loss
+  first/last/mean `7.646/2.000/2.740`. Setup 12.5 s, warmup 0.34 s.
+- Memory: MLX peak/active `2.767/1.247` GB, process max RSS 1,699 MB, but
+  the MLX allocator **cache grew to 16.87 GB** over the 20-minute window
+  (buffers are cached per batch shape) and system swap moved +1.91 GB after
+  the post-warmup baseline. This is an allocator-cache effect, not activation
+  memory, and it is the reason the recommended shape below binds the cache.
+- Trainable update and reload: adapter digest changed
+  `8a4753a6…` -> `9fd3870e…` (4,587,520 trainable parameters); adapter
+  18,374,616 bytes, save 0.0161 s; save/reload completion log-sum agreement
+  on the frozen 32-example train subset max abs diff `0.0` (tolerance
+  `1e-4`), and the standalone `--verify-reload` from a fresh process also
+  passed with `0.0`.
+- Train-side validation/save cost: 164-example train forward pass
+  0.0326 s/example → 54.1 s for the 1,657-example validation partition per
+  epoch; adapter checkpoint 0.016 s.
+- Estimate at the recommended shape (3 epochs): 1,408 optimizer steps per
+  epoch, 310.1 s train + 54.0 s validation + 0.02 s checkpoint per epoch =
+  **0.303 h (18.2 min)** against the 12-hour budget (`within budget: true`).
+- Recommended #177 shape: the pinned `Qwen3-0.6B-Base`; raw-concat
+  completion-only objective with the boundary rule above; LoRA rank 16,
+  alpha 16 (MLX scale 1.0), dropout 0, `q/k/v/o` on all 28 layers; bf16 base
+  weights with fp32 LoRA/optimizer; micro-batch 8, accumulation 1
+  (effective batch 8), batch-max padding; AdamW lr `1e-4`, weight decay 0,
+  seed 176; 3 epochs with per-epoch validation loss on the frozen validation
+  partition and a per-epoch adapter checkpoint; add `mx.clear_cache()` when
+  the MLX cache exceeds ~2 GB so the full run stays near the measured
+  2.8 GB peak instead of the observed 16.9 GB cache ceiling.
+- Provenance: the first sustained attempt (archived at
+  `superseded/20260914T1004Z/`) completed its 1,200 s window but was
+  classified `capacity_blocker` by a runner defect that treated a one-time
+  system-wide swap step as envelope capacity; the runner now takes per-probe
+  swap baselines after warmup, clears the allocator cache, and reports the
+  sustained swap series with MLX/RSS attribution. The rerun above is the
+  frozen measurement.
 
 ## Limitations
 
