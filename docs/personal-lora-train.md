@@ -29,8 +29,10 @@ drift from the frozen rule:
   a token that spans the boundary is charged to the prompt side, counted and
   reported, never assigned to the loss;
 - loss is completion-only causal cross-entropy: target position `t`
-  contributes only when `t >= max(1, prompt_side)`, so no prompt token and no
-  boundary-spanning token is ever trained;
+  contributes only when `t >= max(1, prompt_side)` and `t < total_tokens`,
+  so no prompt token, no boundary-spanning token and no right-padding token
+  is ever trained (the first pad position is excluded exactly like the
+  impossible position past the longest row);
 - examples with no completion-side target are untrainable; they are skipped
   and reported, never repaired or padded into the loss;
 - batches are right-padded to the batch maximum; padding targets are masked
@@ -185,9 +187,10 @@ Isolation rules enforced by the implementation:
 ## Frozen run (2026-09-15, aggregate-only evidence)
 
 The one frozen run was executed from the delivery worktree with the
-ticket-local venv (`executed_at_utc` 2026-09-15T00:11:25Z, `done` 00:28:18Z)
-and exited `0` with terminal **`trained`**. The recorded tool SHA-256 is
-`1017cffb0facb82936e37230bb0ce8764d63f32024f6e30f02e88502c05a73bc`, which is
+ticket-local venv (`started_at_utc` 2026-09-15T00:45:16Z, `updated_at_utc`
+01:02:45Z) and exited `0` with terminal **`trained`**. The recorded tool
+SHA-256 is
+`cffb5c5117ad11cd228ce85b85b497468c46c02e547e1b93011c1d26df34b3cf`, which is
 the delivered `eval/personal_lora_train.py`; `--run` and `--verify-reload` at
 the delivery head re-verify against it. A private desensitized copy is at
 `.local-work/personal-lora-train/public-report.md`.
@@ -204,7 +207,9 @@ the delivery head re-verify against it. A private desensitized copy is at
   manifest
   `5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae`;
   sealed test checksum-only
-  `12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b`.
+  `12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b`. The
+  runner pins these as module constants and refuses any other model/dataset
+  before writing anything, independently of the config.
 - Config: `config_sha256`
   `2dbc170341799901be5733b6e5b37e0bb7b775ac29b39d863fcdb3d299f26abb` for the
   frozen shape exactly as tabled above; no search and no early stop.
@@ -217,34 +222,42 @@ the delivery head re-verify against it. A private desensitized copy is at
   examples (1,451 trainable; 206 untrainable; 208 boundary-spanning tokens;
   16 empty-context, 4 trainable).
 - No resume was needed (`resumed_from_epoch: null`). Wall clock
-  **1,016.17 s (0.282 h)** against the 12 h budget, including identity,
+  **1,051.68 s (0.292 h)** against the 12 h budget, including identity,
   tokenization, per-epoch validation, per-epoch checkpoints and the
-  save/reload verification. Peak MLX memory **2.775 GB** (active 1.247 GB,
-  cache 2.060 GB; process max RSS 2,468 MB). The 2 GB cache policy cleared
-  the allocator 2,020 times above threshold plus the 3 epoch floors.
+  save/reload verification. Peak MLX memory **2.774 GB** (active 1.247 GB,
+  cache 1.252 GB; process max RSS 2,617 MB). The 2 GB cache policy cleared
+  the allocator 2,022 times above threshold plus the 3 epoch floors.
 
   | epoch | steps | train loss first/last/mean | validation loss | seconds | cache clears | peak GB | selected |
   | --- | --- | --- | --- | --- | --- | --- | --- |
-  | 1 | 1408 | 8.76667/3.7875/3.40113 | 5.085509 | 306.44 | 678 | 2.7742 | yes |
-  | 2 | 1408 | 2.3875/2.675/2.88943 | 5.122387 | 352.13 | 674 | 2.7742 |  |
-  | 3 | 1408 | 2.32083/2.28125/2.49585 | 5.295240 | 353.35 | 671 | 2.7751 |  |
+  | 1 | 1408 | 5.54688/4.66667/4.87694 | 4.595782 | 318.61 | 678 | 2.7742 |  |
+  | 2 | 1408 | 3.53906/3.45833/3.99744 | 4.571959 | 361.29 | 675 | 2.7742 | yes |
+  | 3 | 1408 | 2.84375/1.5/3.19742 | 4.785711 | 368.34 | 672 | 2.7742 |  |
 
-- Selection: **epoch 1** by the predeclared rule (lowest validation
-  completion-only loss; no exact tie). Train loss fell while validation loss
-  rose over the three epochs; the rule selects on validation only and this
-  table is reported as-is. Selected adapter sha256
-  `33caed621f05be443778588430b6083520cae78fb149ebae8cb651654951fec8`,
-  18,374,616 bytes, identical to the epoch-1 checkpoint; the fresh
-  in-process reload and the standalone `--verify-reload` both pass with max
-  abs completion log-sum difference **0.0** on the frozen 32-example train
-  subset (tolerance `1e-4`). The trainable-weight digest changed from
+- Selection: **epoch 2** by the predeclared rule (lowest validation
+  completion-only loss; no exact tie). Train loss fell over the three epochs
+  while validation loss bottomed at epoch 2 and rose at epoch 3; the rule
+  selects on validation only and this table is reported as-is. Selected
+  adapter sha256
+  `7622f26d71efa34f5b9b1e92ebef2c064bd06363c3eac4c88fb0adb44b1462d9`,
+  18,374,616 bytes, identical to the epoch-2 checkpoint; the fresh in-process
+  reload and the standalone `--verify-reload` both pass with max abs
+  completion log-sum difference **0.0** on the frozen 32-example train subset
+  (tolerance `1e-4`). The trainable-weight digest changed from
   `8a4753a6d91345c8cf28b01a3e8f498770ba5bf45e299f28b945b8e5dfa7cfbd` to
-  `a95c066852b4b7e221b2e5ebeb4674059ed69ebd7fe307a3783812e8816266ca`.
+  `406909bb247047ea359d8552616d14fd6544cf0b60b1cc7328ed4b39aa9e0146`.
 - Isolation and cleanup: `test.jsonl` checksummed only; `validation.jsonl`
   used only for the frozen rule; no live mutation, deployment, upload, pin
   bump or #178 scoring; all artifacts owner-only; the training process exited
   and the GPU/quiet-machine interval is released. The live input method
   stayed running during the run.
+- Provenance: the first attempt (tool sha256 `1017cffb0facb82936e37230bb0c
+  e8764d63f32024f6e30f02e88502c05a73bc`) was superseded after Codex review
+  confirmed an off-by-one in the #176 loss helper that charged the first
+  right-padding target of every shorter row. The corrected mask excludes
+  `t == total_tokens`; the superseded artifacts are archived privately at
+  `.local-work/personal-lora-train/superseded/20260915T002818Z/`. This run is
+  the delivery run.
 
 ## Limitations
 

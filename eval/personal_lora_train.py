@@ -104,6 +104,20 @@ RELOAD_SUBSET_SIZE = 32
 BUDGET_SECONDS = 12 * 3600.0
 SELECTION_RULE = "min_validation_completion_loss_later_epoch_tie_break"
 
+FROZEN_FREEZE_COMMIT = "2076d0a6c92dbf57833b7a123ea54aab10ddd49d"
+FROZEN_MODEL_COMPOSITE_SHA256 = (
+    "f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320fafa")
+FROZEN_DATASET_DIGESTS = {
+    "train_sha256":
+        "c66ff3adb7a30dc40c33f94de7d777eb9ab304820b0066433d806755c80d8dd2",
+    "validation_sha256":
+        "80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8bdeaa880",
+    "manifest_sha256":
+        "5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae",
+    "test_sha256":
+        "12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b",
+}
+
 CONFIG_KEYS = frozenset(("artifact_root", "model_dir", "dataset_dir",
                          "freeze_commit", "expected", "run"))
 EXPECTED_KEYS = frozenset(("train_sha256", "manifest_sha256",
@@ -266,12 +280,27 @@ def build_binding(tool_sha: str, model_identity: Dict[str, Any],
     }
 
 
-def assert_expected_model(model_identity: Dict[str, Any],
-                          expected: Dict[str, str]) -> None:
-    observed = model_identity.get("composite_sha256")
-    if observed != expected["model_composite_sha256"]:
-        raise EnvironmentBlocker(
-            "model composite sha256 does not match the #176 identity")
+def assert_frozen_identities(model_identity: Dict[str, Any],
+                             dataset_identity: Dict[str, Any],
+                             expected: Dict[str, str]) -> None:
+    """Pin the #176/#175 identities independently of the mutable config."""
+    problems = []
+    if model_identity.get("composite_sha256") != expected.get(
+            "model_composite_sha256"):
+        problems.append("the model directory does not match the config "
+                        "expected composite")
+    if model_identity.get("composite_sha256") != FROZEN_MODEL_COMPOSITE_SHA256:
+        problems.append("the model composite is not the frozen #176 identity")
+    digests = dataset_identity.get("digests") or {}
+    mismatches = [key for key in sorted(FROZEN_DATASET_DIGESTS)
+                  if digests.get(key) != FROZEN_DATASET_DIGESTS[key]]
+    if mismatches:
+        problems.append("dataset files are not the frozen #175 freeze: %s"
+                        % ",".join(mismatches))
+    if dataset_identity.get("freeze_commit") != FROZEN_FREEZE_COMMIT:
+        problems.append("the dataset freeze commit is not the #175 freeze")
+    if problems:
+        raise EnvironmentBlocker("; ".join(problems))
 
 
 def load_examples(path: str, label: str) -> List[Dict[str, Any]]:
@@ -915,7 +944,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     config_hash = config_sha256(run_section)
     dataset_identity = plp.identify_dataset(config)
     model_identity = plp.identify_model_dir(config["model_dir"])
-    assert_expected_model(model_identity, config["expected"])
+    assert_frozen_identities(model_identity, dataset_identity,
+                             config["expected"])
     versions = plp.runtime_versions()
     plp.assert_pinned_versions(versions)
     tool_sha = pld.sha256_file(os.path.abspath(__file__))
@@ -952,7 +982,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         rows = read_epoch_rows(root, binding)
         next_epoch = state.get("next_epoch")
         if isinstance(next_epoch, bool) or not isinstance(next_epoch, int) \
-                or not 1 <= next_epoch <= EPOCHS:
+                or not 1 <= next_epoch <= EPOCHS + 1:
             raise TrainError("state.json records an invalid next_epoch")
         rows = [row for row in rows if row.get("epoch") < next_epoch]
         problems = resume_requirements(root, rows, next_epoch)
@@ -995,8 +1025,10 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     num_layers = run_section["num_layers"]
     if num_layers is None:
         num_layers = len(model.layers)
-    if num_layers > len(model.layers):
-        raise TrainError("run.num_layers exceeds the model layer count")
+    elif num_layers != len(model.layers):
+        raise TrainError("run.num_layers must cover all %d decoder layers; "
+                         "the frozen LoRA shape is every decoder layer"
+                         % len(model.layers))
 
     if state is None:
         plp.apply_lora(backend, model, RANK, num_layers, SEED)
@@ -1055,14 +1087,14 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         start_epoch = 1
     else:
         identity = read_private_json(root, IDENTITY_REL)
+        start_epoch = resumed_from_epoch
         plp.apply_lora(backend, model, RANK, num_layers, SEED)
-        if resumed_from_epoch > 1:
+        if start_epoch > 1:
             backend["load_weights"](
                 model,
                 pld.safe_target(
-                    root, checkpoint_relative_dir(resumed_from_epoch - 1)
+                    root, checkpoint_relative_dir(start_epoch - 1)
                     + "/" + ADAPTER_FILE))
-        start_epoch = resumed_from_epoch
 
     optimizer = backend["optim"].AdamW(learning_rate=LEARNING_RATE,
                                        weight_decay=WEIGHT_DECAY)
@@ -1137,6 +1169,15 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             None, None, len(train_examples),
             identity["token_aggregate_train"]["untrainable"],
             len(trainable_validation))
+    if time.perf_counter() >= budget_deadline:
+        return finish_terminal(
+            root, state, rows, identity, binding, TERMINAL_RUNTIME,
+            ["the %.0f h wall-clock budget was exhausted before checkpoint "
+             "selection" % (BUDGET_SECONDS / 3600.0)],
+            wall_clock, peak_memory, global_counters, resumed_from_epoch,
+            None, None, len(train_examples),
+            identity["token_aggregate_train"]["untrainable"],
+            len(trainable_validation))
 
     selected = select_epoch(rows)
     digest_after, _final_trainable = plp.trainable_digest(backend, model)
@@ -1189,6 +1230,16 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             "save/reload completion log-sum agreement failed: max abs diff "
             "%.8f > %.1e" % (max_diff, RELOAD_TOLERANCE))
     wall_clock = elapsed_before + (time.perf_counter() - started)
+    if wall_clock > BUDGET_SECONDS:
+        return finish_terminal(
+            root, state, rows, identity, binding, TERMINAL_RUNTIME,
+            ["the total wall clock %.4f h exceeds the %.0f h budget after "
+             "checkpoint selection and save/reload verification"
+             % (wall_clock / 3600.0, BUDGET_SECONDS / 3600.0)],
+            wall_clock, peak_memory, global_counters, resumed_from_epoch,
+            verification, selected, len(train_examples),
+            identity["token_aggregate_train"]["untrainable"],
+            len(trainable_validation))
     return finish_terminal(
         root, state, rows, identity, binding, TERMINAL_TRAINED, [], wall_clock,
         peak_memory, global_counters, resumed_from_epoch, verification,
@@ -1208,6 +1259,8 @@ def cmd_verify_reload(config_path: str, allowed_root: Optional[str] = None,
         raise TrainError("no recorded run to verify")
     state = read_private_json(root, STATE_REL)
     identity = read_private_json(root, IDENTITY_REL)
+    assert_frozen_identities(identity["model"], identity["dataset"],
+                             config["expected"])
     binding = build_binding(
         pld.sha256_file(os.path.abspath(__file__)),
         identity["model"], identity["dataset"], config["run"],

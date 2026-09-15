@@ -68,6 +68,10 @@ class FakeMX(object):
         return np.arange(start, stop)
 
     @staticmethod
+    def logical_and(left, right):
+        return np.logical_and(left, right)
+
+    @staticmethod
     def logsumexp(value, axis, keepdims):
         maximum = value.max(axis=axis, keepdims=True)
         return maximum + np.log(
@@ -239,6 +243,80 @@ class ObjectiveSeamTest(unittest.TestCase):
                 handle.write(text)
             with self.assertRaises(plt.TrainError):
                 plt.load_examples(path, "validation.jsonl")
+
+
+class MarkerModel(object):
+    """Logits whose only channel is the 0-based input position."""
+
+    def __call__(self, ids):
+        ids = np.asarray(ids)
+        positions = np.arange(ids.shape[1], dtype=np.float32)
+        return positions[None, :, None].repeat(ids.shape[0], axis=0)
+
+    def eval(self):
+        pass
+
+    def train(self):
+        pass
+
+
+class MarkerLosses(object):
+
+    @staticmethod
+    def cross_entropy(logits, _targets):
+        return np.asarray(logits)[..., 0]
+
+
+class MarkerNN(object):
+    losses = MarkerLosses()
+
+
+class PaddedLossMaskTest(unittest.TestCase):
+    """The completion-only loss never charges a padding target."""
+
+    def loss(self, rows, lengths):
+        backend = {"np": np, "mx": FakeMX(), "nn": MarkerNN()}
+        return float(plp.make_loss_fn(backend)(
+            MarkerModel(), np.asarray(rows, dtype=np.int32),
+            np.asarray(lengths, dtype=np.int32)))
+
+    def test_first_padding_target_is_excluded(self):
+        loss = self.loss([[1, 2, 3, 0, 0], [4, 5, 6, 7, 8]],
+                         [(2, 3), (2, 5)])
+        self.assertAlmostEqual(loss, 7.0 / 4.0, places=6)
+
+    def test_equal_length_rows_keep_every_completion_position(self):
+        loss = self.loss([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]],
+                         [(2, 5), (2, 5)])
+        self.assertAlmostEqual(loss, 12.0 / 6.0, places=6)
+
+
+class FrozenIdentityConstantTest(unittest.TestCase):
+    """The runner pins the #176/#175 identities independently of config."""
+
+    def test_model_composite_is_the_frozen_identity(self):
+        self.assertEqual(
+            plt.FROZEN_MODEL_COMPOSITE_SHA256,
+            "f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320"
+            "fafa")
+
+    def test_dataset_digests_are_the_frozen_identities(self):
+        self.assertEqual(plt.FROZEN_DATASET_DIGESTS, {
+            "train_sha256":
+                "c66ff3adb7a30dc40c33f94de7d777eb9ab304820b0066433d806755c8"
+                "0d8dd2",
+            "validation_sha256":
+                "80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8b"
+                "deaa880",
+            "manifest_sha256":
+                "5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704"
+                "774bae",
+            "test_sha256":
+                "12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a"
+                "9f2d2b",
+        })
+        self.assertEqual(plt.FROZEN_FREEZE_COMMIT,
+                         "2076d0a6c92dbf57833b7a123ea54aab10ddd49d")
 
 
 class EpochPlanTest(unittest.TestCase):

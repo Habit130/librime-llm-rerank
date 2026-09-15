@@ -831,6 +831,13 @@ def trainable_digest(backend: Dict[str, Any], model) -> Tuple[str, int]:
 
 
 def make_loss_fn(backend: Dict[str, Any]) -> Callable:
+    """Completion-only loss; right-padding targets are never charged.
+
+    Target position ``t`` (1-based over the row) contributes only when
+    ``t >= prompt_side`` and ``t < total_tokens``, so the first padding token
+    of a row shorter than the batch width is excluded, exactly like the
+    larger row's impossible position ``t == total_tokens``.
+    """
     mx = backend["mx"]
     nn = backend["nn"]
 
@@ -840,7 +847,7 @@ def make_loss_fn(backend: Dict[str, Any]) -> Callable:
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
         mask = mx.logical_and(steps >= lengths[:, 0:1],
-                              steps <= lengths[:, 1:])
+                              steps < lengths[:, 1:])
         losses = nn.losses.cross_entropy(logits, targets) * mask
         return losses.astype(mx.float32).sum() / mask.sum()
 

@@ -291,6 +291,19 @@ class RunnerTestCase(unittest.TestCase):
             "mlx": "0.32.0", "mlx-lm": "0.31.3", "numpy": "2.4.6"}
         self.addCleanup(setattr, plt, "require_mlx", real_require_mlx)
         self.addCleanup(setattr, plp, "runtime_versions", real_versions)
+        config = json.loads(open(self.config_path, encoding="utf-8").read())
+        frozen_values = {
+            "FROZEN_MODEL_COMPOSITE_SHA256":
+                config["expected"]["model_composite_sha256"],
+            "FROZEN_DATASET_DIGESTS": {
+                key: config["expected"][key]
+                for key in ("train_sha256", "validation_sha256",
+                            "manifest_sha256", "test_sha256")},
+            "FROZEN_FREEZE_COMMIT": config["freeze_commit"],
+        }
+        for name, value in frozen_values.items():
+            self.addCleanup(setattr, plt, name, getattr(plt, name))
+            setattr(plt, name, value)
 
     def build_model_dir(self):
         for name in plp.REQUIRED_MODEL_FILES:
@@ -633,6 +646,97 @@ class RunnerTestCase(unittest.TestCase):
         self.write(self.config_path, json.dumps(config, sort_keys=True))
         with self.assertRaises(plt.EnvironmentBlocker):
             self.run_train()
+
+    def test_self_consistent_config_cannot_override_the_frozen_identity(self):
+        train_path = os.path.join(self.dataset_dir, plp.TRAIN_FILE)
+        with open(train_path, encoding="utf-8") as handle:
+            train_text = handle.read()
+        extra = json.dumps({
+            "schema": plp.DATASET_SCHEMA, "prompt": "a", "completion": "b",
+            "loss": "completion_only",
+            "provenance": {"empty_context": False},
+        }) + "\n"
+        self.write(train_path, train_text + extra)
+        manifest_path = os.path.join(self.dataset_dir, plp.MANIFEST_FILE)
+        manifest = json.loads(open(manifest_path, encoding="utf-8").read())
+        manifest["splits"]["parts"]["train"] = {
+            "sha256": pld.sha256_text(train_text + extra), "lines": 25}
+        self.write(manifest_path, json.dumps(manifest, sort_keys=True)
+                   + "\n")
+        config = json.loads(open(self.config_path, encoding="utf-8").read())
+        config["expected"]["train_sha256"] = pld.sha256_text(train_text
+                                                             + extra)
+        config["expected"]["manifest_sha256"] = pld.sha256_file(manifest_path)
+        self.write(self.config_path, json.dumps(config, sort_keys=True))
+        with self.assertRaises(plt.EnvironmentBlocker):
+            self.run_train()
+
+    def test_num_layers_must_cover_all_decoder_layers(self):
+        config = json.loads(open(self.config_path, encoding="utf-8").read())
+        config["run"]["num_layers"] = 1
+        self.write(self.config_path, json.dumps(config, sort_keys=True))
+        with self.assertRaises(plt.TrainError):
+            self.run_train()
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, plt.STATE_REL)))
+
+    def test_selection_only_resume_after_a_crash_following_epoch_three(self):
+        real_select = plt.select_epoch
+        raised = {"done": False}
+
+        def flaky(rows):
+            if not raised["done"]:
+                raised["done"] = True
+                raise RuntimeError("simulated crash before selection")
+            return real_select(rows)
+
+        plt.select_epoch = flaky
+        try:
+            with self.assertRaises(RuntimeError):
+                self.run_train()
+        finally:
+            plt.select_epoch = real_select
+        state = self.read_json(plt.STATE_REL)
+        self.assertIsNone(state["terminal"])
+        self.assertEqual(state["next_epoch"], 4)
+        before = [row["checkpoint"]["adapter_sha256"] for row in
+                  self.read_json(plt.EPOCHS_REL)["rows"]]
+        self.assertEqual(len(before), 3)
+        LOAD_WEIGHT_CALLS[:] = []
+        code, _output = self.run_train()
+        self.assertEqual(code, 0)
+        state = self.read_json(plt.STATE_REL)
+        self.assertEqual(state["terminal"], plt.TERMINAL_TRAINED)
+        self.assertEqual(state["resumed_from_epoch"], 4)
+        after = [row["checkpoint"]["adapter_sha256"] for row in
+                 self.read_json(plt.EPOCHS_REL)["rows"]]
+        self.assertEqual(after, before)
+        self.assertEqual(LOAD_WEIGHT_CALLS, ["epoch-3"])
+
+    def test_budget_crossed_by_verification_is_a_runtime_blocker(self):
+        real_select = plt.select_epoch
+        real_budget = plt.BUDGET_SECONDS
+
+        def select_and_tighten(rows):
+            plt.BUDGET_SECONDS = -1.0
+            return real_select(rows)
+
+        plt.select_epoch = select_and_tighten
+        try:
+            code, _output = self.run_train()
+        finally:
+            plt.select_epoch = real_select
+            plt.BUDGET_SECONDS = real_budget
+        self.assertEqual(code, 0)
+        state = self.read_json(plt.STATE_REL)
+        self.assertEqual(state["terminal"], plt.TERMINAL_RUNTIME)
+        self.assertEqual(state["next_epoch"], 4)
+        self.assertFalse(self.read_json(plt.MEASUREMENT_REL)["within_budget"])
+        code, _output = self.run_train()
+        self.assertEqual(code, 0)
+        state = self.read_json(plt.STATE_REL)
+        self.assertEqual(state["terminal"], plt.TERMINAL_TRAINED)
+        self.assertEqual(state["resumed_from_epoch"], 4)
 
 
 if __name__ == "__main__":
