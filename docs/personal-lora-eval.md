@@ -171,9 +171,12 @@ Isolation rules enforced by the implementation:
   opens the file in binary mode only. Invalid JSON in the sealed file cannot
   block the validation-only selection;
 - the lock is re-derived from its own recorded validation statistics before
-  the sealed parse, and `test/attempt.json` records an attempt before that
-  parse; a started attempt without results fails closed instead of a second
-  parse;
+  the sealed parse, and `test/attempt.json` is claimed atomically
+  (`O_CREAT|O_EXCL`) before that parse; a started attempt without results
+  fails closed instead of a second parse, and the attempt is completed only
+  when both the results and their per-group digest match;
+- the latency measurement records the per-group digest and reuse refuses a
+  missing or mismatched per-group artifact;
 - artifact roots outside the ticket root or inside live locations
   (`~/Library/Application Support/Squirrel`, `~/Library/Rime`) are refused,
   including symlink aliases;
@@ -218,7 +221,7 @@ GPU/quiet-machine intervals: `--select-policy` (validation only),
   (`store_epoch 8407bd6b456ba5c5a526b4b95951bac3`, `history_id
   dc3ffbf1a21957e0bb4ceed535c9df56`, high-water `1789348852036, 0`);
 - delivery tool sha256
-  `d9b140db9c6b3ce8417d7c6811fd6a5b8150f279a5f525ffbbb7373d9c95eefb`;
+  `16269c03206c54bff04111116bba97c0522d8399cd2c9d193a2d93cf783a4109`;
   the tool pins the exact `adapter_config.json` digest and its semantic
   fields (epoch, rank, alpha, MLX scale, dropout, modules, layer count,
   objective, seed, training config hash, `#175` train partition and freeze
@@ -292,26 +295,27 @@ observation and not as ranking benefit.
 
 | Metric | cold (1 group) | warm (1,120 groups) | all (1,121 groups) |
 | --- | --- | --- | --- |
-| group seconds p50/p90/p99 | 0.083037/0.083037/0.083037 | 0.062411/0.140815/0.255053 | 0.062411/0.140815/0.255053 |
-| per-candidate seconds p50/p90/p99 | 0.010380/0.010380/0.010380 | 0.012328/0.020097/0.034154 | 0.012312/0.020097/0.034154 |
+| group seconds p50/p90/p99 | 0.073283/0.073283/0.073283 | 0.061942/0.145258/0.288605 | 0.061942/0.145258/0.288605 |
+| per-candidate seconds p50/p90/p99 | 0.009160/0.009160/0.009160 | 0.012187/0.020468/0.032008 | 0.012186/0.020468/0.032008 |
 
 The timed region is candidate tokenization + padded model forward +
-completion-only log-sum + locked-policy (S2) ranking. Model load 0.2727 s
-(warm page cache); scoring 94.71 s for 1,121 groups and 8,222 candidates;
-MLX peak 3.3587 GB, active 1.1273 GB, cache 0.1512 GB; process max RSS
-1,428.3 MB; system swap before/after 5,970.5/5,962.5 MB (the shared machine
+completion-only log-sum + locked-policy (S2) ranking. Model load 0.2640 s
+(warm page cache); scoring 95.18 s for 1,121 groups and 8,222 candidates;
+MLX peak 2.9375 GB, active 1.1273 GB, cache 0.1796 GB; process max RSS
+1,429.5 MB; system swap before/after 6,014.6/5,990.6 MB (the shared machine
 was not idle: the pre-run top-CPU process was the ticket-owned Python
-process at 83.1%, the post-run top process the driving session at 143.2%;
-the live input method stayed running). Across the four recorded passes the
+process at 82.3%, the post-run top process the driving session at 108.1%;
+the live input method stayed running). Across the six recorded passes the
 warm p50 ranged 0.062–0.119 s per group (0.012–0.021 s per candidate) and
-the MLX peak 2.93–3.36 GB, disclosed as shared-machine contention and
+the MLX peak 2.94–3.36 GB, disclosed as shared-machine contention and
 allocator variance rather than a protocol change; the delivered pass is the
 one bound in `latency/measurement.json`.
 
 ### Provenance and superseded passes
 
-Three earlier passes were archived before Acceptance, each after a Codex
-review round whose findings were confirmed and fixed:
+Five earlier passes were archived before Acceptance, each after a Codex
+review round whose findings were confirmed and fixed (or, for pass 5, after
+a pre-emptive consistency fix before the next review round):
 
 - pass 1 (tool `0a9a4dc111b6d5499eb69356014abf1fe880647bd0cac388c89f1418d12bee1e`,
   archived `superseded/20260915T075708Z/`) — findings: the model-free
@@ -331,10 +335,22 @@ review round whose findings were confirmed and fixed:
   another still-available policy was accepted before opening the sealed
   test (the lock is now re-derived from its own validation statistics); an
   interrupted test pass left no record, so a rerun could parse the sealed
-  partition again (now recorded in `test/attempt.json` and refused).
+  partition again (now recorded in `test/attempt.json` and refused);
+- pass 4 (tool `d9b140db9c6b3ce8417d7c6811fd6a5b8150f279a5f525ffbbb7373d9c95eefb`,
+  archived `superseded/20260915T091611Z/`) — findings: the sealed-test
+  attempt was claimed non-atomically, so concurrent processes could both
+  parse the sealed partition (now claimed with `O_CREAT|O_EXCL`); recovery
+  accepted results without the per-group artifact (now the per-group file
+  is written first, its digest is recorded, and reuse refuses a missing or
+  mismatched file);
+- pass 5 (tool `f87d5b0003adce562652f17a31ebcc3a45a7149afa9cb440559e33e486ebd958`,
+  archived `superseded/20260915T092708Z/`) — no finding was raised against
+  it; it was superseded by applying the same per-group consistency rule to
+  the latency artifacts (the measurement records the per-group digest and
+  reuse refuses a missing or mismatched file) before the next review round.
 
 The delivered pass re-selected the policy on validation only (S2 again;
-per-policy statistics and test aggregates bit-identical across all four
+per-policy statistics and test aggregates bit-identical across all six
 passes, which is recorded as determinism evidence). No test-informed change,
 no retuning, no competitor invention and no second locked pass on the
 delivered artifacts were made; the delivered artifact set contains exactly

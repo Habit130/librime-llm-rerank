@@ -684,6 +684,10 @@ class LockedTestRankingTest(unittest.TestCase):
         self.assertIn("target_rank", per_group["groups"][0])
         self.assertTrue(os.path.exists(os.path.join(
             self.fixture.artifact_root, "latency/per-group.json")))
+        self.assertEqual(
+            measurement["groups_sha256"],
+            pld.sha256_file(os.path.join(self.fixture.artifact_root,
+                                         "latency/per-group.json")))
         measurement_path = os.path.join(self.fixture.artifact_root,
                                         "latency/measurement.json")
         before = pld.sha256_file(measurement_path)
@@ -743,6 +747,16 @@ class LockedTestRankingTest(unittest.TestCase):
                                         allowed_root=self.fixture.artifact_root,
                                         backend=fake_backend())
 
+    def test_latency_missing_per_group_refuses_reuse(self):
+        self.fixture.latency()
+        os.unlink(os.path.join(self.fixture.artifact_root,
+                               "latency/per-group.json"))
+        with command_patches(self.fixture):
+            with self.assertRaises(ple.EvalError):
+                ple.cmd_measure_latency(self.fixture.config_path,
+                                        allowed_root=self.fixture.artifact_root,
+                                        backend=fake_backend())
+
     def test_interrupted_attempt_blocks_a_second_parse(self):
         pld.private_write_bytes(
             self.fixture.artifact_root, "test/attempt.json",
@@ -773,6 +787,37 @@ class LockedTestRankingTest(unittest.TestCase):
             attempt["results_sha256"],
             pld.sha256_file(os.path.join(self.fixture.artifact_root,
                                          "test/results.json")))
+        self.assertEqual(
+            attempt["groups_sha256"],
+            pld.sha256_file(os.path.join(self.fixture.artifact_root,
+                                         "test/per-group.json")))
+
+    def test_claim_attempt_is_exclusive(self):
+        payload = {"schema": ple.ATTEMPT_SCHEMA, "state": "started"}
+        ple.claim_attempt(self.fixture.artifact_root, payload)
+        with self.assertRaises(ple.EvalError):
+            ple.claim_attempt(self.fixture.artifact_root, payload)
+
+    def test_missing_per_group_artifact_refuses_reuse(self):
+        self.fixture.eval_test()
+        os.unlink(os.path.join(self.fixture.artifact_root,
+                               "test/per-group.json"))
+        self.fixture.eval_test_error(ple.EvalError)
+
+    def test_started_attempt_with_complete_artifacts_is_recovered(self):
+        self.fixture.eval_test()
+        attempt_path = os.path.join(self.fixture.artifact_root,
+                                    "test/attempt.json")
+        with open(attempt_path, encoding="utf-8") as handle:
+            attempt = json.load(handle)
+        attempt["state"] = "started"
+        attempt.pop("completed_at_utc", None)
+        with open(attempt_path, "w", encoding="utf-8") as handle:
+            json.dump(attempt, handle)
+        os.chmod(attempt_path, 0o600)
+        self.assertEqual(self.fixture.eval_test(), 0)
+        recovered = self.fixture.read_artifact("test/attempt.json")
+        self.assertEqual(recovered["state"], "completed")
 
 
 class InconclusiveTest(unittest.TestCase):

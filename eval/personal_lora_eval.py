@@ -1031,6 +1031,24 @@ def read_lock(root: str, binding: Dict[str, Any],
     return lock
 
 
+def claim_attempt(root: str, payload: Dict[str, Any]) -> str:
+    """Atomically claim the single sealed-test attempt (O_EXCL create)."""
+    pld.ensure_private_dir(root, "test")
+    target = pld.safe_target(root, ATTEMPT_REL)
+    try:
+        descriptor = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600)
+    except FileExistsError as error:
+        raise EvalError("a sealed-test attempt is already recorded; "
+                        "refusing a concurrent or repeated parse of the "
+                        "sealed partition") from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(pld.canonical_json(payload) + "\n")
+    os.chmod(target, 0o600)
+    return target
+
+
 def selection_matches(lock: Dict[str, Any],
                       selection: Dict[str, Any],
                       tolerance: float = 1e-9) -> Optional[str]:
@@ -1219,6 +1237,15 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
                 pld.safe_target(root, LOCK_REL)):
             raise EvalError("test/results.json does not match the current "
                             "policy lock")
+        if not private_path_exists(root, TEST_GROUPS_REL):
+            raise EvalError("the completed test pass is missing its "
+                            "per-group artifact; refusing to accept an "
+                            "incomplete result set")
+        results_sha = pld.sha256_file(pld.safe_target(root, TEST_RESULTS_REL))
+        groups_sha = pld.sha256_file(pld.safe_target(root, TEST_GROUPS_REL))
+        if results.get("groups_sha256") != groups_sha:
+            raise EvalError("the per-group artifact does not match the "
+                            "completed test results")
         attempt = read_private_json(root, ATTEMPT_REL) \
             if private_path_exists(root, ATTEMPT_REL) else None
         if attempt is None or attempt.get("schema") != ATTEMPT_SCHEMA or \
@@ -1229,12 +1256,11 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
         if attempt.get("state") == "started":
             attempt["state"] = "completed"
             attempt["completed_at_utc"] = pld.utc_now_iso()
-            attempt["results_sha256"] = pld.sha256_file(
-                pld.safe_target(root, TEST_RESULTS_REL))
+            attempt["results_sha256"] = results_sha
+            attempt["groups_sha256"] = groups_sha
             write_private_json(root, ATTEMPT_REL, attempt)
         elif attempt.get("state") != "completed" or \
-                attempt.get("results_sha256") != pld.sha256_file(
-                    pld.safe_target(root, TEST_RESULTS_REL)):
+                attempt.get("results_sha256") != results_sha:
             raise EvalError("the test attempt record does not match the "
                             "completed results")
         assert_owner_only(root)
@@ -1249,7 +1275,7 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
         raise EvalError("a previous sealed-test attempt was recorded without "
                         "producing results; refusing a second parse of the "
                         "sealed partition (recorded attempt: %s)" % ATTEMPT_REL)
-    write_private_json(root, ATTEMPT_REL, {
+    claim_attempt(root, {
         "schema": ATTEMPT_SCHEMA,
         "tool": TOOL_NAME,
         "tool_version": TOOL_VERSION,
@@ -1363,13 +1389,16 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
             for group in groups
         ],
     }
-    write_private_json(root, TEST_RESULTS_REL, results)
     write_private_json(root, TEST_GROUPS_REL, per_group)
+    results["groups_sha256"] = pld.sha256_file(
+        pld.safe_target(root, TEST_GROUPS_REL))
+    write_private_json(root, TEST_RESULTS_REL, results)
     attempt = read_private_json(root, ATTEMPT_REL)
     attempt["state"] = "completed"
     attempt["completed_at_utc"] = pld.utc_now_iso()
     attempt["results_sha256"] = pld.sha256_file(
         pld.safe_target(root, TEST_RESULTS_REL))
+    attempt["groups_sha256"] = results["groups_sha256"]
     write_private_json(root, ATTEMPT_REL, attempt)
     render_public_report(root)
     print("terminal=%s" % TERMINAL_TEST_EVALUATED)
@@ -1454,6 +1483,14 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
             raise EvalError("latency/measurement.json does not match the "
                             "current policy lock; refusing to replace the "
                             "recorded measurement")
+        if not private_path_exists(root, LATENCY_GROUPS_REL):
+            raise EvalError("the recorded latency measurement is missing "
+                            "its per-group artifact; refusing to accept an "
+                            "incomplete result set")
+        if measurement.get("groups_sha256") != pld.sha256_file(
+                pld.safe_target(root, LATENCY_GROUPS_REL)):
+            raise EvalError("the per-group latency artifact does not match "
+                            "the recorded measurement")
         assert_owner_only(root)
         print("terminal=%s" % TERMINAL_LATENCY)
         print("latency_reused=true")
@@ -1564,11 +1601,13 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
         "system_after": system_after,
         "total_seconds": total_seconds,
     }
-    write_private_json(root, LATENCY_REL, measurement)
     write_private_json(root, LATENCY_GROUPS_REL, {
         "schema": "personal-lora-eval-latency-per-group-v1",
         "groups": per_group,
     })
+    measurement["groups_sha256"] = pld.sha256_file(
+        pld.safe_target(root, LATENCY_GROUPS_REL))
+    write_private_json(root, LATENCY_REL, measurement)
     render_public_report(root)
     print("terminal=%s" % TERMINAL_LATENCY)
     print("groups=%d" % len(groups))
