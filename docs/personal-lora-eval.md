@@ -364,6 +364,17 @@ reused by later verification; no live mutation, deployment, upload or pin
 bump happened; all artifacts are owner-only; the scoring processes exited and
 the GPU/quiet-machine intervals are released.
 
+### Deferred follow-ups
+
+A fifth Codex review round on the delivered head reported no P0/P1 and two
+P2 robustness nits: after a crash between writing `test/results.json` (or
+`latency/measurement.json`) and rendering `public-report.md`, a reuse run
+reports success without regenerating the report. The delivered artifact set
+is complete — each command regenerated the report after its artifacts — and
+the issue is cosmetic recovery behavior, so the two P2s are recorded as
+non-blocking follow-up rather than triggering another sealed-test pass; a
+future revision can call the report renderer from the reuse paths.
+
 ## Limitations
 
 - The Rime reference is the recorded observed UI order, not an as-of Rime
