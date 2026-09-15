@@ -733,7 +733,7 @@ class LockedTestRankingTest(unittest.TestCase):
                                  "policy_lock.json")
         with open(lock_path, encoding="utf-8") as handle:
             lock = json.load(handle)
-        lock["selected_policy"] = "S1"
+        lock["candidate_tie_break"] = "tampered"
         with open(lock_path, "w", encoding="utf-8") as handle:
             json.dump(lock, handle)
         os.chmod(lock_path, 0o600)
@@ -742,6 +742,37 @@ class LockedTestRankingTest(unittest.TestCase):
                 ple.cmd_measure_latency(self.fixture.config_path,
                                         allowed_root=self.fixture.artifact_root,
                                         backend=fake_backend())
+
+    def test_interrupted_attempt_blocks_a_second_parse(self):
+        pld.private_write_bytes(
+            self.fixture.artifact_root, "test/attempt.json",
+            (json.dumps({
+                "schema": ple.ATTEMPT_SCHEMA,
+                "state": "started",
+            }) + "\n").encode("utf-8"))
+        opened = []
+        original_open = builtins.open
+
+        def tracking_open(path, mode="r", *args, **kwargs):
+            if os.path.abspath(str(path)).endswith("test.jsonl"):
+                opened.append(mode)
+            return original_open(path, mode, *args, **kwargs)
+
+        with mock.patch.object(builtins, "open", tracking_open):
+            self.fixture.eval_test_error(ple.EvalError)
+        self.assertTrue(all(mode == "rb" for mode in opened),
+                        "test.jsonl was opened in a text mode: %r" % opened)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.fixture.artifact_root, "test/results.json")))
+
+    def test_attempt_record_is_completed_with_the_results(self):
+        self.fixture.eval_test()
+        attempt = self.fixture.read_artifact("test/attempt.json")
+        self.assertEqual(attempt["state"], "completed")
+        self.assertEqual(
+            attempt["results_sha256"],
+            pld.sha256_file(os.path.join(self.fixture.artifact_root,
+                                         "test/results.json")))
 
 
 class InconclusiveTest(unittest.TestCase):

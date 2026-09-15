@@ -68,10 +68,19 @@ LoRA adapter's top-1 first, then LoRA MRR, then the fixed policy order
 `S1 > S2 > S3 > S4`. `policy_lock.json` is written before `test.jsonl` is
 parsed as text; before that the sealed test file is opened only in binary
 mode for its SHA-256 checksum. `--eval-test` refuses to run without a lock
-that matches the current identities and binds the sealed test checksum, and
-a conflict between the recomputed selection and an existing lock is an
-error, never an overwrite. The locked policy is applied to all three systems
-(and to unadapted Qwen) in the test pass.
+that matches the current identities and binds the sealed test checksum; the
+lock is also re-derived from its own recorded validation statistics, so an
+edited `selected_policy` that the frozen rule would not have chosen is
+refused. A conflict between the recomputed selection and an existing lock is
+an error, never an overwrite. The locked policy is applied to all three
+systems (and to unadapted Qwen) in the test pass.
+
+The sealed test is parsed once. Before the parse, `test/attempt.json` is
+written (binding, lock checksum, sealed test checksum, `state=started`) and
+after a successful pass it is marked `completed` with the results digest. A
+rerun with a recorded attempt and no results fails closed instead of parsing
+the sealed partition a second time; a completed `test/results.json` is
+verified and reused rather than recomputed.
 
 ## Metrics, verdict and strata (EVAL-3/4)
 
@@ -139,6 +148,7 @@ config.json                    operator-supplied paths and expected digests
 identity.json                  model/adapter/dataset/snapshot/runtime identity
 policy_lock.json               the frozen validation selection (write-once)
 validation/selection.json      validation policy statistics and group summary
+test/attempt.json              sealed-test attempt record (started/completed)
 test/results.json              the single locked test pass and verdict
 test/per-group.json            private per-group ranks and log-sums (no text)
 latency/measurement.json       cold/warm latency and resource log
@@ -160,6 +170,10 @@ Isolation rules enforced by the implementation:
   pure-Python guard refuses any earlier text parse, and the pre-lock path
   opens the file in binary mode only. Invalid JSON in the sealed file cannot
   block the validation-only selection;
+- the lock is re-derived from its own recorded validation statistics before
+  the sealed parse, and `test/attempt.json` records an attempt before that
+  parse; a started attempt without results fails closed instead of a second
+  parse;
 - artifact roots outside the ticket root or inside live locations
   (`~/Library/Application Support/Squirrel`, `~/Library/Rime`) are refused,
   including symlink aliases;
@@ -204,7 +218,7 @@ GPU/quiet-machine intervals: `--select-policy` (validation only),
   (`store_epoch 8407bd6b456ba5c5a526b4b95951bac3`, `history_id
   dc3ffbf1a21957e0bb4ceed535c9df56`, high-water `1789348852036, 0`);
 - delivery tool sha256
-  `f5a5c3c6e4c7b2624bcab161ed87e81c8ccda45c11b23ddd80395e1543d98234`;
+  `d9b140db9c6b3ce8417d7c6811fd6a5b8150f279a5f525ffbbb7373d9c95eefb`;
   the tool pins the exact `adapter_config.json` digest and its semantic
   fields (epoch, rank, alpha, MLX scale, dropout, modules, layer count,
   objective, seed, training config hash, `#175` train partition and freeze
@@ -278,24 +292,25 @@ observation and not as ranking benefit.
 
 | Metric | cold (1 group) | warm (1,120 groups) | all (1,121 groups) |
 | --- | --- | --- | --- |
-| group seconds p50/p90/p99 | 0.088407/0.088407/0.088407 | 0.118844/0.295518/0.551713 | 0.118768/0.295518/0.551713 |
-| per-candidate seconds p50/p90/p99 | 0.011051/0.011051/0.011051 | 0.020781/0.048861/0.105857 | 0.020763/0.048861/0.105857 |
+| group seconds p50/p90/p99 | 0.083037/0.083037/0.083037 | 0.062411/0.140815/0.255053 | 0.062411/0.140815/0.255053 |
+| per-candidate seconds p50/p90/p99 | 0.010380/0.010380/0.010380 | 0.012328/0.020097/0.034154 | 0.012312/0.020097/0.034154 |
 
 The timed region is candidate tokenization + padded model forward +
-completion-only log-sum + locked-policy (S2) ranking. Model load 0.3340 s
-(warm page cache); scoring 178.95 s for 1,121 groups and 8,222 candidates;
-MLX peak 3.2164 GB, active 1.1273 GB, cache 0.1530 GB; process max RSS
-1,427.1 MB; system swap before/after 5,746.6/6,130.5 MB (the shared machine
+completion-only log-sum + locked-policy (S2) ranking. Model load 0.2727 s
+(warm page cache); scoring 94.71 s for 1,121 groups and 8,222 candidates;
+MLX peak 3.3587 GB, active 1.1273 GB, cache 0.1512 GB; process max RSS
+1,428.3 MB; system swap before/after 5,970.5/5,962.5 MB (the shared machine
 was not idle: the pre-run top-CPU process was the ticket-owned Python
-process at 85.9%, the post-run top process a browser helper at 74.2%; the
-live input method stayed running). The three passes measured the same warm
-p50 in the range 0.062–0.119 s per group (0.012–0.021 s per candidate),
-which is disclosed as shared-machine contention rather than a protocol
-change; the delivered pass is the one bound in `latency/measurement.json`.
+process at 83.1%, the post-run top process the driving session at 143.2%;
+the live input method stayed running). Across the four recorded passes the
+warm p50 ranged 0.062–0.119 s per group (0.012–0.021 s per candidate) and
+the MLX peak 2.93–3.36 GB, disclosed as shared-machine contention and
+allocator variance rather than a protocol change; the delivered pass is the
+one bound in `latency/measurement.json`.
 
 ### Provenance and superseded passes
 
-Two earlier passes were archived before Acceptance, each after a Codex
+Three earlier passes were archived before Acceptance, each after a Codex
 review round whose findings were confirmed and fixed:
 
 - pass 1 (tool `0a9a4dc111b6d5499eb69356014abf1fe880647bd0cac388c89f1418d12bee1e`,
@@ -310,10 +325,16 @@ review round whose findings were confirmed and fixed:
   archived `superseded/20260915T082522Z/`) — findings: the adapter config
   was bound between phases but not authenticated against a frozen digest
   (now pinned with semantic checks); latency reuse did not verify the lock
-  digest or policy (now stored and verified).
+  digest or policy (now stored and verified);
+- pass 3 (tool `f5a5c3c6e4c7b2624bcab161ed87e81c8ccda45c11b23ddd80395e1543d98234`,
+  archived `superseded/20260915T085506Z/`) — findings: a lock edited to
+  another still-available policy was accepted before opening the sealed
+  test (the lock is now re-derived from its own validation statistics); an
+  interrupted test pass left no record, so a rerun could parse the sealed
+  partition again (now recorded in `test/attempt.json` and refused).
 
 The delivered pass re-selected the policy on validation only (S2 again;
-per-policy statistics and test aggregates bit-identical across all three
+per-policy statistics and test aggregates bit-identical across all four
 passes, which is recorded as determinism evidence). No test-informed change,
 no retuning, no competitor invention and no second locked pass on the
 delivered artifacts were made; the delivered artifact set contains exactly

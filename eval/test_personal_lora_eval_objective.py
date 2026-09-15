@@ -265,19 +265,33 @@ class PolicyTest(unittest.TestCase):
 
     def test_lock_refusals(self):
         binding = {"tool_sha256": "t", "model_composite_sha256": "m"}
+        stats = {
+            "S1": {"top1": 5, "mrr": 0.5, "ranked_rows": 10,
+                   "omitted_rows": 0, "omission_rate": 0.0},
+            "S2": {"top1": 4, "mrr": 0.4, "ranked_rows": 10,
+                   "omitted_rows": 0, "omission_rate": 0.0},
+            "S3": "n/a",
+            "S4": "n/a",
+        }
         good = {
             "schema": ple.LOCK_SCHEMA, "tool": ple.TOOL_NAME,
             "tool_version": ple.TOOL_VERSION, "tool_sha256": "t",
             "binding": binding, "selected_policy": "S1",
             "available_policies": ["S1", "S2"], "test_sha256": "c",
+            "policy_stats": stats,
         }
         ple.assert_lock(good, binding, "c")
+        with self.assertRaises(ple.LockError):
+            ple.assert_lock(dict(good, selected_policy="S2"), binding, "c")
+        with self.assertRaises(ple.LockError):
+            ple.assert_lock({"schema": ple.LOCK_SCHEMA}, binding, "c")
         for mutation in (
             {"schema": "other"},
             {"tool_sha256": "x"},
             {"binding": {"tool_sha256": "t"}},
             {"selected_policy": "S9"},
             {"available_policies": ["S2"]},
+            {"policy_stats": {}},
         ):
             broken = dict(good)
             broken.update(mutation)

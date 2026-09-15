@@ -49,6 +49,7 @@ TOOL_VERSION = 1
 IDENTITY_SCHEMA = "personal-lora-eval-identity-v1"
 LOCK_SCHEMA = "personal-lora-eval-policy-lock-v1"
 SELECTION_SCHEMA = "personal-lora-eval-policy-selection-v1"
+ATTEMPT_SCHEMA = "personal-lora-eval-test-attempt-v1"
 TEST_SCHEMA = "personal-lora-eval-test-results-v1"
 LATENCY_SCHEMA = "personal-lora-eval-latency-v1"
 OBJECTIVE = plp.OBJECTIVE
@@ -62,6 +63,7 @@ DEFAULT_ALLOWED_ROOT = os.path.join(_REPO_ROOT, ".local-work",
 IDENTITY_REL = "identity.json"
 LOCK_REL = "policy_lock.json"
 SELECTION_REL = "validation/selection.json"
+ATTEMPT_REL = "test/attempt.json"
 TEST_RESULTS_REL = "test/results.json"
 TEST_GROUPS_REL = "test/per-group.json"
 LATENCY_REL = "latency/measurement.json"
@@ -1001,6 +1003,19 @@ def assert_lock(lock: Dict[str, Any], binding: Dict[str, Any],
         raise LockError("policy_lock.json has an invalid selected policy")
     if selected not in (lock.get("available_policies") or []):
         raise LockError("policy_lock.json selected an unavailable policy")
+    stats = {policy: value
+             for policy, value in (lock.get("policy_stats") or {}).items()
+             if isinstance(value, dict)}
+    if not stats:
+        raise LockError("policy_lock.json records no policy statistics")
+    derived = select_policy(stats, [policy for policy in POLICIES
+                                    if policy in stats])
+    if derived != selected:
+        raise LockError(
+            "policy_lock.json selected_policy %s is not the frozen "
+            "selection rule's choice %s from its recorded validation "
+            "statistics; refusing to open the sealed test"
+            % (selected, derived))
     if test_sha256 is not None and lock.get("test_sha256") != test_sha256:
         raise LockError("policy_lock.json does not bind the sealed test "
                         "partition checksum")
@@ -1204,6 +1219,24 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
                 pld.safe_target(root, LOCK_REL)):
             raise EvalError("test/results.json does not match the current "
                             "policy lock")
+        attempt = read_private_json(root, ATTEMPT_REL) \
+            if private_path_exists(root, ATTEMPT_REL) else None
+        if attempt is None or attempt.get("schema") != ATTEMPT_SCHEMA or \
+                attempt.get("binding_sha256") != binding_sha256(binding):
+            raise EvalError("the completed test pass has no matching "
+                            "attempt record; refusing to accept an "
+                            "unprovenanced result set")
+        if attempt.get("state") == "started":
+            attempt["state"] = "completed"
+            attempt["completed_at_utc"] = pld.utc_now_iso()
+            attempt["results_sha256"] = pld.sha256_file(
+                pld.safe_target(root, TEST_RESULTS_REL))
+            write_private_json(root, ATTEMPT_REL, attempt)
+        elif attempt.get("state") != "completed" or \
+                attempt.get("results_sha256") != pld.sha256_file(
+                    pld.safe_target(root, TEST_RESULTS_REL)):
+            raise EvalError("the test attempt record does not match the "
+                            "completed results")
         assert_owner_only(root)
         print("terminal=%s" % TERMINAL_TEST_EVALUATED)
         print("results_reused=true")
@@ -1212,6 +1245,21 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
               % (results.get("verdict_evidence") or {}).get(
                   "scored_denominator"))
         return 0
+    if private_path_exists(root, ATTEMPT_REL):
+        raise EvalError("a previous sealed-test attempt was recorded without "
+                        "producing results; refusing a second parse of the "
+                        "sealed partition (recorded attempt: %s)" % ATTEMPT_REL)
+    write_private_json(root, ATTEMPT_REL, {
+        "schema": ATTEMPT_SCHEMA,
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "tool_sha256": binding["tool_sha256"],
+        "binding_sha256": binding_sha256(binding),
+        "lock_sha256": pld.sha256_file(pld.safe_target(root, LOCK_REL)),
+        "test_sha256": test_sha256,
+        "state": "started",
+        "created_at_utc": pld.utc_now_iso(),
+    })
 
     backend = backend if backend is not None else require_mlx()
     connection = pld.open_sqlite_readonly(config["snapshot_path"],
@@ -1317,6 +1365,12 @@ def cmd_eval_test(config_path: str, allowed_root: Optional[str] = None,
     }
     write_private_json(root, TEST_RESULTS_REL, results)
     write_private_json(root, TEST_GROUPS_REL, per_group)
+    attempt = read_private_json(root, ATTEMPT_REL)
+    attempt["state"] = "completed"
+    attempt["completed_at_utc"] = pld.utc_now_iso()
+    attempt["results_sha256"] = pld.sha256_file(
+        pld.safe_target(root, TEST_RESULTS_REL))
+    write_private_json(root, ATTEMPT_REL, attempt)
     render_public_report(root)
     print("terminal=%s" % TERMINAL_TEST_EVALUATED)
     print("policy=%s" % policy)
