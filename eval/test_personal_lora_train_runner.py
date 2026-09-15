@@ -775,6 +775,66 @@ class RunnerTestCase(unittest.TestCase):
         self.assertEqual([row["epoch"] for row in
                           self.read_json(plt.EPOCHS_REL)["rows"]], [1])
 
+    def test_tampered_epoch_checkpoint_blocks_resume(self):
+        real_epoch = plt.train_epoch
+        raised = {"done": False}
+
+        def flaky(backend, model, optimizer, loss_and_grad, examples, epoch,
+                  stats, counters, deadline=None):
+            if epoch == 2 and not raised["done"]:
+                raised["done"] = True
+                raise plt.CapacityBlocker("simulated out of memory")
+            return real_epoch(backend, model, optimizer, loss_and_grad,
+                              examples, epoch, stats, counters, deadline)
+
+        plt.train_epoch = flaky
+        try:
+            code, _output = self.run_train()
+        finally:
+            plt.train_epoch = real_epoch
+        self.assertEqual(code, 0)
+        checkpoint = os.path.join(self.root, "epochs", "epoch-1",
+                                  "adapters.safetensors")
+        with open(checkpoint, "ab") as handle:
+            handle.write(b"tamper")
+        with self.assertRaises(plt.TrainError):
+            self.run_train()
+
+    def test_verify_reload_rejects_changed_inputs(self):
+        self.run_train()
+        vocab = os.path.join(self.model_dir, "vocab.json")
+        with open(vocab, "a", encoding="utf-8") as handle:
+            handle.write("x")
+        with self.assertRaises(plt.EnvironmentBlocker):
+            self.run_verify()
+
+    def test_verify_reload_rejects_a_changed_runtime_pin(self):
+        self.run_train()
+        plp.runtime_versions = lambda: {
+            "mlx": "0.0.0", "mlx-lm": "0.0.0", "numpy": "0.0.0"}
+        with self.assertRaises(plp.EnvironmentBlocker):
+            self.run_verify()
+
+    def test_environment_blockers_from_the_shared_seam_exit_three(self):
+        real_root = plt.DEFAULT_ALLOWED_ROOT
+        plt.DEFAULT_ALLOWED_ROOT = self.root
+        try:
+            plp.runtime_versions = lambda: {
+                "mlx": "0.0.0", "mlx-lm": "0.0.0", "numpy": "0.0.0"}
+            self.assertEqual(
+                plt.main(["--run", "--config", self.config_path]), 3)
+            plp.runtime_versions = lambda: {
+                "mlx": "0.32.0", "mlx-lm": "0.31.3", "numpy": "2.4.6"}
+            config = json.loads(open(self.config_path,
+                                     encoding="utf-8").read())
+            config["expected"]["train_sha256"] = "0" * 64
+            self.write(self.config_path, json.dumps(config, sort_keys=True))
+            self.assertEqual(
+                plt.main(["--run", "--config", self.config_path]), 3)
+        finally:
+            plt.DEFAULT_ALLOWED_ROOT = real_root
+            self.build_config()
+
 
 if __name__ == "__main__":
     unittest.main()

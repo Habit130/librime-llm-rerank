@@ -628,10 +628,19 @@ def resume_requirements(root: str, rows: Sequence[Dict[str, Any]],
         problems.append("completed epoch rows are not exactly %s" % expected)
         return problems
     for row in rows:
+        recorded = (row.get("checkpoint") or {}).get("adapter_sha256")
+        if not recorded:
+            problems.append("epoch %s has no recorded checkpoint digest"
+                            % row.get("epoch"))
+            continue
         for name in (ADAPTER_FILE, ADAPTER_CONFIG_FILE):
             relative = checkpoint_relative_dir(row["epoch"]) + "/" + name
             if not os.path.isfile(pld.safe_target(root, relative)):
                 problems.append("%s is missing" % relative)
+        adapter = checkpoint_relative_dir(row["epoch"]) + "/" + ADAPTER_FILE
+        target = pld.safe_target(root, adapter)
+        if os.path.isfile(target) and pld.sha256_file(target) != recorded:
+            problems.append("%s does not match its recorded sha256" % adapter)
     return problems
 
 
@@ -662,9 +671,17 @@ def verify_completed_artifacts(root: str, rows: Sequence[Dict[str, Any]],
             problems.append("the selected epoch does not match the recorded "
                             "verification")
     for row in rows:
+        recorded = (row.get("checkpoint") or {}).get("adapter_sha256")
+        if not recorded:
+            problems.append("epoch %s has no recorded checkpoint digest"
+                            % row.get("epoch"))
+            continue
         relative = checkpoint_relative_dir(row["epoch"]) + "/" + ADAPTER_FILE
-        if not os.path.isfile(pld.safe_target(root, relative)):
+        target = pld.safe_target(root, relative)
+        if not os.path.isfile(target):
             problems.append("%s is missing" % relative)
+        elif pld.sha256_file(target) != recorded:
+            problems.append("%s does not match its recorded sha256" % relative)
     return problems
 
 
@@ -899,6 +916,22 @@ def render_public_report(identity: Dict[str, Any],
     return "\n".join(lines)
 
 
+def next_epoch_deadline(now: float, training_used: float,
+                        budget: Optional[float] = None) -> Optional[float]:
+    """Absolute deadline for the next epoch, anchored to the current clock.
+
+    ``training_used`` already contains the completed epochs, so the remaining
+    window starts now; anchoring it to the process start would charge the
+    elapsed epochs twice.
+    """
+    if budget is None:
+        budget = BUDGET_SECONDS
+    remaining = budget - training_used
+    if remaining <= 0:
+        return None
+    return now + remaining
+
+
 def run_one_epoch(backend: Dict[str, Any], model, optimizer,
                   loss_and_grad: Callable, train_examples,
                   validation_examples, validation_indices, subset_indices,
@@ -1119,8 +1152,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     terminal = None
     reasons: List[str] = []
     for epoch in range(start_epoch, EPOCHS + 1):
-        remaining = BUDGET_SECONDS - training_used
-        if remaining <= 0 or time.perf_counter() >= started + remaining:
+        deadline = next_epoch_deadline(time.perf_counter(), training_used)
+        if deadline is None:
             terminal = TERMINAL_RUNTIME
             reasons = ["the %.0f h training budget is exhausted; AC-177-v1 "
                        "does not grant fresh training time (the per-epoch "
@@ -1132,7 +1165,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
                 backend, model, optimizer, loss_and_grad, train_examples,
                 tokenized_validation, trainable_validation, subset_indices,
                 tokenized_train, epoch, root, num_layers, identity,
-                config_hash, global_counters, started + remaining)
+                config_hash, global_counters, deadline)
         except RuntimeBudgetExceeded as error:
             terminal = TERMINAL_RUNTIME
             reasons = [str(error)]
@@ -1270,11 +1303,14 @@ def cmd_verify_reload(config_path: str, allowed_root: Optional[str] = None,
         raise TrainError("no recorded run to verify")
     state = read_private_json(root, STATE_REL)
     identity = read_private_json(root, IDENTITY_REL)
-    assert_frozen_identities(identity["model"], identity["dataset"],
+    dataset_identity = plp.identify_dataset(config)
+    model_identity = plp.identify_model_dir(config["model_dir"])
+    assert_frozen_identities(model_identity, dataset_identity,
                              config["expected"])
+    plp.assert_pinned_versions(plp.runtime_versions())
     binding = build_binding(
         pld.sha256_file(os.path.abspath(__file__)),
-        identity["model"], identity["dataset"], config["run"],
+        model_identity, dataset_identity, config["run"],
         config_sha256(config["run"]))
     assert_state(state, binding)
     assert_identity(identity, binding)
@@ -1412,11 +1448,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.run:
             return cmd_run(args.config)
         return cmd_verify_reload(args.config)
-    except EnvironmentBlocker as error:
+    except (EnvironmentBlocker, plp.EnvironmentBlocker) as error:
         print("terminal=%s" % TERMINAL_ENVIRONMENT)
         print("blocker=%s" % error)
         return 3
-    except (TrainError, pld.PersonalLoraDataError) as error:
+    except (TrainError, pld.PersonalLoraDataError, plp.PilotError) as error:
         print("error=%s" % error)
         return 1
 

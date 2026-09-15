@@ -338,6 +338,20 @@ class EpochPlanTest(unittest.TestCase):
             plt.epoch_batches(-1, 1)
 
 
+class EpochDeadlineTest(unittest.TestCase):
+    """The remaining budget starts at the current clock, not process start."""
+
+    def test_deadline_is_anchored_to_now(self):
+        self.assertEqual(
+            plt.next_epoch_deadline(1000.0, 3000.0, 3600.0), 1600.0)
+
+    def test_exhausted_budget_has_no_deadline(self):
+        self.assertIsNone(
+            plt.next_epoch_deadline(1000.0, 3600.0, 3600.0))
+        self.assertIsNone(
+            plt.next_epoch_deadline(1000.0, 4000.0, 3600.0))
+
+
 class SelectionTest(unittest.TestCase):
 
     def test_lowest_validation_loss_wins(self):
