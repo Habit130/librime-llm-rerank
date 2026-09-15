@@ -244,6 +244,7 @@ class EvalFixture(object):
         self._build()
 
     def _build(self):
+        self._write_dataset()
         for name, text in REQUIRED_MODEL_CONTENTS.items():
             write_file(os.path.join(self.model_dir, name), text)
         model_identity = plp.identify_model_dir(self.model_dir)
@@ -253,9 +254,23 @@ class EvalFixture(object):
                        "epoch": 2,
                        "rank": 16,
                        "alpha": 16,
-                       "loss": "completion_only",
+                       "mlx_scale": 1.0,
+                       "num_layers": 4,
+                       "fine_tune_type": "lora",
+                       "objective": plp.OBJECTIVE,
+                       "seed": 176,
+                       "config_sha256": "f" * 64,
+                       "dataset_train_sha256":
+                           self.digests["train_sha256"],
+                       "freeze_commit": "synthetic-freeze",
                        "base_model_composite_sha256":
                            model_identity["composite_sha256"],
+                       "lora_parameters": {
+                           "rank": 16,
+                           "scale": 1.0,
+                           "dropout": 0.0,
+                           "keys": list(plp.LORA_MODULES),
+                       },
                    }))
         with open(os.path.join(self.adapter_dir, "adapters.safetensors"),
                   "wb") as handle:
@@ -265,7 +280,6 @@ class EvalFixture(object):
         with open(self.checkpoint_path, "wb") as handle:
             handle.write(adapter_bytes)
         os.chmod(self.checkpoint_path, 0o600)
-        self._write_dataset()
         self._write_snapshot()
         self._write_config()
 
@@ -390,11 +404,14 @@ class EvalFixture(object):
         model_identity = plp.identify_model_dir(self.model_dir)
         adapter_sha = pld.sha256_file(
             os.path.join(self.adapter_dir, "adapters.safetensors"))
+        adapter_config_sha = pld.sha256_file(
+            os.path.join(self.adapter_dir, "adapter_config.json"))
         snapshot_sha = pld.sha256_file(self.snapshot_path)
         self.expected = dict(self.digests)
         self.expected.update({
             "model_composite_sha256": model_identity["composite_sha256"],
             "adapter_sha256": adapter_sha,
+            "adapter_config_sha256": adapter_config_sha,
             "snapshot_sha256": snapshot_sha,
         })
         self.config_path = os.path.join(self.root, "config.json")
@@ -414,6 +431,10 @@ class EvalFixture(object):
             "FROZEN_MODEL_COMPOSITE":
                 self.expected["model_composite_sha256"],
             "FROZEN_ADAPTER_SHA256": self.expected["adapter_sha256"],
+            "FROZEN_ADAPTER_CONFIG_SHA256":
+                self.expected["adapter_config_sha256"],
+            "FROZEN_ADAPTER_CONFIG_HASH": "f" * 64,
+            "FROZEN_ADAPTER_NUM_LAYERS": 4,
             "FROZEN_SNAPSHOT_SHA256": self.expected["snapshot_sha256"],
             "FROZEN_FREEZE_COMMIT": "synthetic-freeze",
             "FROZEN_DATASET_DIGESTS": dict(self.digests),
@@ -690,6 +711,37 @@ class LockedTestRankingTest(unittest.TestCase):
         self.fixture.eval_test_error(ple.EvalError)
         self.assertFalse(os.path.exists(os.path.join(
             self.fixture.artifact_root, "test/results.json")))
+
+    def test_changed_adapter_config_before_the_first_run_is_blocked(self):
+        config_path = os.path.join(self.fixture.adapter_dir,
+                                   "adapter_config.json")
+        with open(config_path, encoding="utf-8") as handle:
+            adapter_config = json.load(handle)
+        adapter_config["mlx_scale"] = 2.0
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(adapter_config, handle)
+        os.chmod(config_path, 0o600)
+        with command_patches(self.fixture):
+            with self.assertRaises(ple.EnvironmentBlocker):
+                ple.cmd_select_policy(self.fixture.config_path,
+                                      allowed_root=self.fixture.artifact_root,
+                                      backend=fake_backend())
+
+    def test_latency_reuse_verifies_the_lock(self):
+        self.fixture.latency()
+        lock_path = os.path.join(self.fixture.artifact_root,
+                                 "policy_lock.json")
+        with open(lock_path, encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["selected_policy"] = "S1"
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(lock, handle)
+        os.chmod(lock_path, 0o600)
+        with command_patches(self.fixture):
+            with self.assertRaises(ple.EvalError):
+                ple.cmd_measure_latency(self.fixture.config_path,
+                                        allowed_root=self.fixture.artifact_root,
+                                        backend=fake_backend())
 
 
 class InconclusiveTest(unittest.TestCase):

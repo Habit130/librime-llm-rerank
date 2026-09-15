@@ -204,7 +204,11 @@ GPU/quiet-machine intervals: `--select-policy` (validation only),
   (`store_epoch 8407bd6b456ba5c5a526b4b95951bac3`, `history_id
   dc3ffbf1a21957e0bb4ceed535c9df56`, high-water `1789348852036, 0`);
 - delivery tool sha256
-  `3464ffd2d20745bd59bacb3adf2d6ffd7e73a4de016068d958eea82c46c1327f`.
+  `f5a5c3c6e4c7b2624bcab161ed87e81c8ccda45c11b23ddd80395e1543d98234`;
+  the tool pins the exact `adapter_config.json` digest and its semantic
+  fields (epoch, rank, alpha, MLX scale, dropout, modules, layer count,
+  objective, seed, training config hash, `#175` train partition and freeze
+  commit) in addition to the adapter weight digest.
 
 ### Validation-only policy lock
 
@@ -274,39 +278,46 @@ observation and not as ranking benefit.
 
 | Metric | cold (1 group) | warm (1,120 groups) | all (1,121 groups) |
 | --- | --- | --- | --- |
-| group seconds p50/p90/p99 | 0.073827/0.073827/0.073827 | 0.062154/0.144221/0.246550 | 0.062154/0.144221/0.246550 |
-| per-candidate seconds p50/p90/p99 | 0.009228/0.009228/0.009228 | 0.012083/0.019771/0.031036 | 0.012082/0.019771/0.031036 |
+| group seconds p50/p90/p99 | 0.088407/0.088407/0.088407 | 0.118844/0.295518/0.551713 | 0.118768/0.295518/0.551713 |
+| per-candidate seconds p50/p90/p99 | 0.011051/0.011051/0.011051 | 0.020781/0.048861/0.105857 | 0.020763/0.048861/0.105857 |
 
 The timed region is candidate tokenization + padded model forward +
-completion-only log-sum + locked-policy (S2) ranking. Model load 0.2725 s
-(warm page cache); scoring 93.30 s for 1,121 groups and 8,222 candidates;
-MLX peak 2.9587 GB, active 1.1273 GB, cache 0.1844 GB; process max RSS
-1,426.1 MB; system swap before/after 5,527.4/5,519.4 MB (the shared machine
+completion-only log-sum + locked-policy (S2) ranking. Model load 0.3340 s
+(warm page cache); scoring 178.95 s for 1,121 groups and 8,222 candidates;
+MLX peak 3.2164 GB, active 1.1273 GB, cache 0.1530 GB; process max RSS
+1,427.1 MB; system swap before/after 5,746.6/6,130.5 MB (the shared machine
 was not idle: the pre-run top-CPU process was the ticket-owned Python
-process at 82.3%, the post-run top process the driving session at 138.6%;
-the live input method stayed running).
+process at 85.9%, the post-run top process a browser helper at 74.2%; the
+live input method stayed running). The three passes measured the same warm
+p50 in the range 0.062–0.119 s per group (0.012–0.021 s per candidate),
+which is disclosed as shared-machine contention rather than a protocol
+change; the delivered pass is the one bound in `latency/measurement.json`.
 
-### Provenance and superseded pass
+### Provenance and superseded passes
 
-A first pass (tool sha256
-`0a9a4dc111b6d5499eb69356014abf1fe880647bd0cac388c89f1418d12bee1e`) was
-executed and archived under `superseded/20260915T075708Z/` after Codex review
-of the PR raised four findings, all confirmed and fixed before Acceptance:
-(1) the model-free release gate would fail on an unconditional `mlx` import
-in the objective tests — the MLX batch-scoring tests now skip when `mlx` is
-absent; (2) the fake-backend tests reached the pinned-runtime check under the
-model-free venv — the fixture now stubs the runtime probe (verified with a
-simulated model-free venv: 710 tests, 4 MLX-only skips); (3) the adapter
-`adapter_config.json` digest was not bound, so a config change would not
-invalidate the identity/lock while `load_adapters` consumed the changed
-config — the binding now includes the adapter-config digest, with a
-regression test; (4) the latency timer excluded the ranking step — the timed
-region now includes the locked-policy ranking and the command requires the
-matching lock. The final pass re-selected the policy on validation only
-(S2 again; per-policy statistics bit-identical) and produced test aggregates
-identical to the first pass, which is recorded as determinism evidence; no
-test-informed change, no retuning and no second locked pass on the delivered
-artifacts were made.
+Two earlier passes were archived before Acceptance, each after a Codex
+review round whose findings were confirmed and fixed:
+
+- pass 1 (tool `0a9a4dc111b6d5499eb69356014abf1fe880647bd0cac388c89f1418d12bee1e`,
+  archived `superseded/20260915T075708Z/`) — findings: the model-free
+  release gate would fail on an unconditional `mlx` import in the objective
+  tests (MLX tests now skip when `mlx` is absent); the fake-backend tests
+  reached the pinned-runtime check under the model-free venv (the fixture
+  now stubs the runtime probe); the adapter `adapter_config.json` digest was
+  not bound (now bound); the latency timer excluded the ranking step (now
+  included, and `--measure-latency` requires the lock);
+- pass 2 (tool `3464ffd2d20745bd59bacb3adf2d6ffd7e73a4de016068d958eea82c46c1327f`,
+  archived `superseded/20260915T082522Z/`) — findings: the adapter config
+  was bound between phases but not authenticated against a frozen digest
+  (now pinned with semantic checks); latency reuse did not verify the lock
+  digest or policy (now stored and verified).
+
+The delivered pass re-selected the policy on validation only (S2 again;
+per-policy statistics and test aggregates bit-identical across all three
+passes, which is recorded as determinism evidence). No test-informed change,
+no retuning, no competitor invention and no second locked pass on the
+delivered artifacts were made; the delivered artifact set contains exactly
+one test pass.
 
 ### Isolation and cleanup
 

@@ -78,7 +78,16 @@ FROZEN_MODEL_COMPOSITE = \
     "f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320fafa"
 FROZEN_ADAPTER_SHA256 = \
     "7622f26d71efa34f5b9b1e92ebef2c064bd06363c3eac4c88fb0adb44b1462d9"
+FROZEN_ADAPTER_CONFIG_SHA256 = \
+    "d11ca5ab361149c8b95c0b1a8ceaf3678d0d17ad42209e3d0de02bc6a70d65cd"
 FROZEN_ADAPTER_EPOCH = 2
+FROZEN_ADAPTER_RANK = 16
+FROZEN_ADAPTER_ALPHA = 16
+FROZEN_ADAPTER_MLX_SCALE = 1.0
+FROZEN_ADAPTER_NUM_LAYERS = 28
+FROZEN_ADAPTER_CONFIG_HASH = \
+    "2dbc170341799901be5733b6e5b37e0bb7b775ac29b39d863fcdb3d299f26abb"
+FROZEN_ADAPTER_SEED = 176
 FROZEN_SNAPSHOT_SHA256 = \
     "be2b09256dd2c24485ed618501fc06408b4441e1d14a8d86d2645797e82ae6de"
 FROZEN_DATASET_DIGESTS = {
@@ -115,7 +124,8 @@ CONFIG_KEYS = frozenset((
 ))
 EXPECTED_KEYS = frozenset((
     "model_composite_sha256", "snapshot_sha256", "adapter_sha256",
-    "train_sha256", "validation_sha256", "test_sha256", "manifest_sha256",
+    "adapter_config_sha256", "train_sha256", "validation_sha256",
+    "test_sha256", "manifest_sha256",
 ))
 
 
@@ -299,6 +309,58 @@ def identify_snapshot(snapshot_path: str) -> Dict[str, Any]:
     }
 
 
+def adapter_semantic_problems(model_identity: Dict[str, Any],
+                              adapter_identity: Dict[str, Any]
+                              ) -> List[str]:
+    """Pin the effective adapter semantics, not just the weight bytes."""
+    summary = adapter_identity.get("config") or {}
+    lora = summary.get("lora_parameters") or {}
+    model_config = model_identity.get("config") or {}
+    problems = []
+    if summary.get("epoch") != FROZEN_ADAPTER_EPOCH:
+        problems.append("the adapter config does not record the frozen "
+                        "epoch %d" % FROZEN_ADAPTER_EPOCH)
+    if summary.get("fine_tune_type") != "lora":
+        problems.append("the adapter config is not a LoRA config")
+    if summary.get("rank") != FROZEN_ADAPTER_RANK or \
+            lora.get("rank") != FROZEN_ADAPTER_RANK:
+        problems.append("the adapter rank is not the frozen %d"
+                        % FROZEN_ADAPTER_RANK)
+    if summary.get("alpha") != FROZEN_ADAPTER_ALPHA:
+        problems.append("the adapter alpha is not the frozen %d"
+                        % FROZEN_ADAPTER_ALPHA)
+    if summary.get("mlx_scale") != FROZEN_ADAPTER_MLX_SCALE or \
+            lora.get("scale") != FROZEN_ADAPTER_MLX_SCALE:
+        problems.append("the adapter MLX scale is not the frozen %r"
+                        % FROZEN_ADAPTER_MLX_SCALE)
+    if lora.get("dropout") not in (0, 0.0):
+        problems.append("the adapter dropout is not zero")
+    if tuple(lora.get("keys") or ()) != tuple(plp.LORA_MODULES):
+        problems.append("the adapter LoRA modules are not the frozen set")
+    if summary.get("num_layers") != FROZEN_ADAPTER_NUM_LAYERS:
+        problems.append("the adapter layer count is not the frozen %d"
+                        % FROZEN_ADAPTER_NUM_LAYERS)
+    if summary.get("num_layers") != model_config.get("num_hidden_layers"):
+        problems.append("the adapter layer count does not cover the pinned "
+                        "model's decoder layers")
+    if summary.get("objective") != OBJECTIVE:
+        problems.append("the adapter objective is not the frozen completion "
+                        "objective")
+    if summary.get("seed") != FROZEN_ADAPTER_SEED:
+        problems.append("the adapter seed is not the frozen %d"
+                        % FROZEN_ADAPTER_SEED)
+    if summary.get("config_sha256") != FROZEN_ADAPTER_CONFIG_HASH:
+        problems.append("the adapter training config hash is not the frozen "
+                        "#177 hash")
+    if summary.get("dataset_train_sha256") != \
+            FROZEN_DATASET_DIGESTS["train_sha256"]:
+        problems.append("the adapter does not bind the frozen #175 train "
+                        "partition")
+    if summary.get("freeze_commit") != FROZEN_FREEZE_COMMIT:
+        problems.append("the adapter freeze commit is not the #175 freeze")
+    return problems
+
+
 def assert_frozen_identities(model_identity: Dict[str, Any],
                              dataset_identity: Dict[str, Any],
                              adapter_identity: Dict[str, Any],
@@ -327,6 +389,16 @@ def assert_frozen_identities(model_identity: Dict[str, Any],
     if adapter_sha != FROZEN_ADAPTER_SHA256:
         problems.append("the adapter is not the selected #177 epoch-2 "
                         "adapter")
+    adapter_config_sha = (adapter_identity.get("files") or {}).get(
+        ADAPTER_CONFIG_FILE, {}).get("sha256")
+    if adapter_config_sha != expected.get("adapter_config_sha256"):
+        problems.append("the adapter config does not match the config "
+                        "expected sha256")
+    if adapter_config_sha != FROZEN_ADAPTER_CONFIG_SHA256:
+        problems.append("the adapter config is not the frozen #177 epoch-2 "
+                        "configuration file")
+    problems.extend(adapter_semantic_problems(model_identity,
+                                              adapter_identity))
     if not (adapter_identity.get("epoch_checkpoint") or {}).get(
             "matches_selected"):
         problems.append("the selected adapter bytes differ from the frozen "
@@ -1316,11 +1388,17 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
         config_path, allowed_root, protected_roots)
     lock = read_lock(root, binding)
     policy = lock["selected_policy"]
+    lock_sha256 = pld.sha256_file(pld.safe_target(root, LOCK_REL))
     if private_path_exists(root, LATENCY_REL):
         measurement = read_private_json(root, LATENCY_REL)
         if measurement.get("binding") != binding:
             raise EvalError("latency/measurement.json was written under "
                             "different identities; refusing to replace the "
+                            "recorded measurement")
+        if measurement.get("lock_sha256") != lock_sha256 or \
+                measurement.get("policy") != policy:
+            raise EvalError("latency/measurement.json does not match the "
+                            "current policy lock; refusing to replace the "
                             "recorded measurement")
         assert_owner_only(root)
         print("terminal=%s" % TERMINAL_LATENCY)
@@ -1379,6 +1457,8 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
         "tool_sha256": binding["tool_sha256"],
         "binding": binding,
         "binding_sha256": binding_sha256(binding),
+        "policy": policy,
+        "lock_sha256": lock_sha256,
         "machine": plp.machine_facts(),
         "protocol": {
             "partition": plp.VALIDATION_FILE,
