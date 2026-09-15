@@ -271,6 +271,8 @@ def build_binding(tool_sha: str, model_identity: Dict[str, Any],
                   config_hash: str) -> Dict[str, Any]:
     return {
         "tool_sha256": tool_sha,
+        "pilot_sha256": pld.sha256_file(os.path.abspath(plp.__file__)),
+        "data_sha256": pld.sha256_file(os.path.abspath(pld.__file__)),
         "model_composite_sha256": model_identity["composite_sha256"],
         "dataset": dataset_identity["digests"],
         "freeze_commit": dataset_identity.get("freeze_commit"),
@@ -278,6 +280,13 @@ def build_binding(tool_sha: str, model_identity: Dict[str, Any],
         "config_sha256": config_hash,
         "run": run,
     }
+
+
+def assert_owner_only(root: str) -> None:
+    violations = pld.verify_owner_only(root)
+    if violations:
+        raise TrainError("owner-only permission violation under the artifact "
+                         "root: %s" % ",".join(violations))
 
 
 def assert_frozen_identities(model_identity: Dict[str, Any],
@@ -696,6 +705,7 @@ def finish_terminal(root: str, state: Dict[str, Any], rows: Sequence[Dict],
                     selected: Optional[Dict[str, Any]],
                     trainable_count: int, untrainable_count: int,
                     validation_trainable: int) -> int:
+    assert_owner_only(root)
     measurement = {
         "schema": MEASUREMENT_SCHEMA,
         "terminal": terminal,
@@ -732,10 +742,6 @@ def finish_terminal(root: str, state: Dict[str, Any], rows: Sequence[Dict],
     pld.private_write_bytes(
         root, PUBLIC_REPORT_REL,
         render_public_report(identity, measurement).encode("utf-8"))
-    violations = pld.verify_owner_only(root)
-    if violations:
-        raise TrainError("owner-only permission violation under the artifact "
-                         "root: %s" % ",".join(violations))
     print("terminal=%s" % terminal)
     print(pld.canonical_json({
         "terminal": terminal,
@@ -983,6 +989,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         config["artifact_root"],
         allowed_root if allowed_root is not None else DEFAULT_ALLOWED_ROOT,
         protected_roots)
+    assert_owner_only(root)
     run_section = config["run"]
     config_hash = config_sha256(run_section)
     dataset_identity = plp.identify_dataset(config)
@@ -1000,6 +1007,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     rows: List[Dict[str, Any]] = []
     elapsed_before = 0.0
     training_seconds_before = 0.0
+    retained_peak_gb = 0.0
+    retained_counters: Dict[str, Any] = {}
     if private_path_exists(root, STATE_REL):
         state = read_private_json(root, STATE_REL)
         assert_state(state, binding)
@@ -1014,6 +1023,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             if problems:
                 raise TrainError("the completed run is incomplete: %s"
                                  % "; ".join(problems))
+            assert_owner_only(root)
             print("run_reused=true")
             print(pld.canonical_json({
                 "terminal": terminal,
@@ -1036,6 +1046,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         resumed_from_epoch = next_epoch
         elapsed_before = float(state.get("wall_clock_seconds") or 0.0)
         training_seconds_before = float(state.get("training_seconds") or 0.0)
+        retained_peak_gb = float(state.get("peak_memory_gb") or 0.0)
+        retained_counters = state.get("cache_clears") or {}
         state["resumed_from_epoch"] = resumed_from_epoch
         state["updated_at_utc"] = pld.utc_now_iso()
         write_private_json(root, STATE_REL, state)
@@ -1125,6 +1137,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             "init_digest": digest_before,
             "wall_clock_seconds": 0.0,
             "training_seconds": 0.0,
+            "peak_memory_gb": 0.0,
+            "cache_clears": new_cache_counters(),
             "started_at_utc": pld.utc_now_iso(),
             "updated_at_utc": pld.utc_now_iso(),
         }
@@ -1147,7 +1161,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     loss_and_grad = backend["nn"].value_and_grad(model, plp.make_loss_fn(
         backend))
     backend["mx"].reset_peak_memory()
-    global_counters = new_cache_counters()
+    global_counters = {key: int(retained_counters.get(key, 0))
+                       for key in SET_COUNTER_KEYS}
     training_used = training_seconds_before
     terminal = None
     reasons: List[str] = []
@@ -1189,6 +1204,10 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         state["epochs_completed"] = len(rows)
         state["wall_clock_seconds"] = round(elapsed, 4)
         state["training_seconds"] = round(training_used, 4)
+        state["peak_memory_gb"] = round(max(
+            float(state.get("peak_memory_gb") or 0.0),
+            row["peak_memory_gb"]), 4)
+        state["cache_clears"] = dict(global_counters)
         state["updated_at_utc"] = pld.utc_now_iso()
         write_epoch_rows(root, binding, rows)
         write_private_json(root, STATE_REL, state)
@@ -1211,7 +1230,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
 
     wall_clock = elapsed_before + (time.perf_counter() - started)
     peak_memory = {
-        "peak_gb": round(backend["mx"].get_peak_memory() / 1e9, 4),
+        "peak_gb": round(max(retained_peak_gb,
+                             backend["mx"].get_peak_memory() / 1e9), 4),
         "active_gb": round(backend["mx"].get_active_memory() / 1e9, 4),
         "cache_gb": round(backend["mx"].get_cache_memory() / 1e9, 4),
     }
@@ -1299,6 +1319,7 @@ def cmd_verify_reload(config_path: str, allowed_root: Optional[str] = None,
         config["artifact_root"],
         allowed_root if allowed_root is not None else DEFAULT_ALLOWED_ROOT,
         protected_roots)
+    assert_owner_only(root)
     if not private_path_exists(root, STATE_REL):
         raise TrainError("no recorded run to verify")
     state = read_private_json(root, STATE_REL)

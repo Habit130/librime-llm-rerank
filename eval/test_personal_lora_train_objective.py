@@ -338,6 +338,20 @@ class EpochPlanTest(unittest.TestCase):
             plt.epoch_batches(-1, 1)
 
 
+class BindingTest(unittest.TestCase):
+
+    def test_binding_covers_the_shared_modules(self):
+        binding = plt.build_binding(
+            "d" * 64, {"composite_sha256": "a" * 64},
+            {"digests": {"train_sha256": "b" * 64}, "freeze_commit": "c"},
+            {"epochs": 3}, "e" * 64)
+        self.assertEqual(binding["tool_sha256"], "d" * 64)
+        self.assertEqual(binding["pilot_sha256"],
+                         pld.sha256_file(plt.plp.__file__))
+        self.assertEqual(binding["data_sha256"],
+                         pld.sha256_file(plt.pld.__file__))
+
+
 class EpochDeadlineTest(unittest.TestCase):
     """The remaining budget starts at the current clock, not process start."""
 

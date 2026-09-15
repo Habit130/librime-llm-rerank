@@ -569,6 +569,7 @@ class RunnerTestCase(unittest.TestCase):
             self.run_verify()
 
     def test_capacity_blocker_leaves_a_resumable_artifact(self):
+        FakeMX.cache_memory = plt.CACHE_CLEAR_THRESHOLD_BYTES + 1
         real_train_epoch = plt.train_epoch
         raised = {"done": False}
 
@@ -604,6 +605,12 @@ class RunnerTestCase(unittest.TestCase):
         rows = measurement["epochs"]
         self.assertEqual([row["epoch"] for row in rows], [1, 2, 3])
         self.assertEqual(rows[0]["validation_loss"], first_loss)
+        self.assertEqual(measurement["cache_clears"]["threshold"],
+                         sum(row["cache_clears"]["threshold"]
+                             for row in rows))
+        self.assertEqual(measurement["cache_clears"]["epoch_floor"],
+                         sum(row["cache_clears"]["epoch_floor"]
+                             for row in rows))
         self.assertEqual(LOAD_WEIGHT_CALLS, ["epoch-1"])
 
     def test_runtime_budget_blocker_then_resume(self):
@@ -797,6 +804,25 @@ class RunnerTestCase(unittest.TestCase):
                                   "adapters.safetensors")
         with open(checkpoint, "ab") as handle:
             handle.write(b"tamper")
+        with self.assertRaises(plt.TrainError):
+            self.run_train()
+
+    def test_non_owner_only_file_refuses_the_run(self):
+        note = os.path.join(self.root, "operator-note.txt")
+        with open(note, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.chmod(note, 0o644)
+        with self.assertRaises(plt.TrainError):
+            self.run_train()
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, plt.STATE_REL)))
+
+    def test_permission_violation_blocks_reuse(self):
+        self.run_train()
+        note = os.path.join(self.root, "operator-note.txt")
+        with open(note, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.chmod(note, 0o644)
         with self.assertRaises(plt.TrainError):
             self.run_train()
 

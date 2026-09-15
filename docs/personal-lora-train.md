@@ -118,8 +118,10 @@ setup and finalization is tracked separately. A `capacity_blocker` rerun with
 the same binding resumes from `next_epoch` with the last checkpoint's weights
 and the remaining training budget (the optimizer state is re-initialized; the
 interrupted partial epoch is discarded and re-run from its seeded order),
-records `resumed_from_epoch`, and re-hashes every retained checkpoint against
-its recorded SHA-256 before the resume or the completed-run reuse accepts it. An exhausted training
+records `resumed_from_epoch`, re-hashes every retained checkpoint against
+its recorded SHA-256 before the resume or the completed-run reuse accepts it,
+and carries the cache-clear totals and the peak-memory high-water mark across
+attempts so the final measurement covers all work on the artifact. An exhausted training
 budget is explicitly non-resumable under this contract: a rerun reports the
 blocker with the retained checkpoints instead of silently granting fresh
 training time. A run whose three epochs completed can still be finalized by
@@ -197,15 +199,20 @@ Isolation rules enforced by the implementation:
 - `--run` is immutable for a completed run: the recorded binding (tool,
   model composite, dataset digests, config hash) is verified before any
   write, a mismatch refuses to replace the artifacts, and a matching rerun
-  only re-verifies.
+  only re-verifies. The binding also covers the digests of the executed
+  `personal_lora_pilot` and `personal_lora_data` modules, so a change in the
+  imported seam invalidates reuse, resume and verification.
+- owner-only permissions are verified on the artifact root before a run
+  starts and before a completed run is reused or any terminal is persisted,
+  so a privacy violation cannot be recorded as `trained` or reused.
 
 ## Frozen run (2026-09-15, aggregate-only evidence)
 
 The one frozen run was executed from the delivery worktree with the
-ticket-local venv (`started_at_utc` 2026-09-15T01:55:19Z, `updated_at_utc`
-02:13:51Z) and exited `0` with terminal **`trained`**. The recorded tool
+ticket-local venv (`started_at_utc` 2026-09-15T02:33:26Z, `updated_at_utc`
+02:56:37Z) and exited `0` with terminal **`trained`**. The recorded tool
 SHA-256 is
-`268c0467efde7032871c6a44733e5edb90c3debdfb54938e2ca84c63d5678193`, which is
+`27e09565b187b95618f65975bb4a336b6d578664d39b5a7fdff82e10cc68fa78`, which is
 the delivered `eval/personal_lora_train.py`; `--run` and `--verify-reload` at
 the delivery head re-verify against it. A private desensitized copy is at
 `.local-work/personal-lora-train/public-report.md`.
@@ -237,18 +244,18 @@ the delivery head re-verify against it. A private desensitized copy is at
   examples (1,451 trainable; 206 untrainable; 208 boundary-spanning tokens;
   16 empty-context, 4 trainable).
 - No resume was needed (`resumed_from_epoch: null`). Budgeted training work
-  **1,109.89 s (0.308 h)** against the 12 h budget; total wall clock
+  **1,389.58 s (0.386 h)** against the 12 h budget; total wall clock
   including identity, tokenization and the selected-adapter save/reload
-  verification **1,113.72 s (0.309 h)**. Peak MLX memory **2.747 GB**
-  (active 1.247 GB, cache 1.254 GB; process max RSS 2,027 MB). The 2 GB
-  cache policy cleared the allocator 2,022 times above threshold plus the 3
+  verification **1,393.32 s (0.387 h)**. Peak MLX memory **2.746 GB**
+  (active 1.247 GB, cache 1.130 GB; process max RSS 2,604 MB). The 2 GB
+  cache policy cleared the allocator 2,021 times above threshold plus the 3
   epoch floors.
 
   | epoch | steps | train loss first/last/mean | validation loss | seconds | cache clears | peak GB | selected |
   | --- | --- | --- | --- | --- | --- | --- | --- |
-  | 1 | 1408 | 5.54688/4.66667/4.87694 | 4.595782 | 336.08 | 678 | 2.7458 |  |
-  | 2 | 1408 | 3.53906/3.45833/3.99744 | 4.571959 | 371.97 | 675 | 2.7467 | yes |
-  | 3 | 1408 | 2.84375/1.5/3.19742 | 4.785711 | 401.85 | 672 | 2.7467 |  |
+  | 1 | 1408 | 5.54688/4.66667/4.87694 | 4.595782 | 400.08 | 678 | 2.7458 |  |
+  | 2 | 1408 | 3.53906/3.45833/3.99744 | 4.571959 | 492.66 | 674 | 2.7458 | yes |
+  | 3 | 1408 | 2.84375/1.5/3.19742 | 4.785711 | 496.83 | 672 | 2.7458 |  |
 
 - Selection: **epoch 2** by the predeclared rule (lowest validation
   completion-only loss; no exact tie). Train loss fell over the three epochs
@@ -269,7 +276,7 @@ the delivery head re-verify against it. A private desensitized copy is at
   bump or #178 scoring; all artifacts owner-only; the training process exited
   and the GPU/quiet-machine interval is released. The live input method
   stayed running during the run.
-- Provenance: three earlier attempts at this contract were superseded after
+- Provenance: four earlier attempts at this contract were superseded after
   Codex review confirmed defects in the tool, each archived privately. The
   first (tool sha256 `1017cffb0facb82936e37230bb0ce8764d63f32024f6e30f02e885
   02c05a73bc`, archive `superseded/20260915T002818Z/`) charged the first
@@ -282,10 +289,18 @@ the delivery head re-verify against it. A private desensitized copy is at
   non-resumable for training, and a completed 3-epoch run can still be
   finalized by a selection-only resume. The third (tool sha256
   `9f9288ded017310744b02dcbb1d33e02b0dc59ce86fb38971191de10d5fe0f8a`,
-  archive `superseded/20260915T013426Z/`) re-anchored epoch deadlines so
-  completed epochs are not charged twice, re-hashes retained checkpoints
-  before a resume or reuse, and re-identifies the current model, dataset and
-  runtime pins in `--verify-reload`. This run is the delivery run.
+  archive `superseded/20260915T013426Z/`) double-charged completed epochs in
+  the deadline, trusted checkpoint existence instead of digests, and let
+  `--verify-reload` trust stored identities; deadlines are now anchored to
+  the current clock, retained checkpoints are re-hashed, and verification
+  re-identifies the current inputs and pins. The fourth (tool sha256
+  `268c0467efde7032871c6a44733e5edb90c3debdfb54938e2ca84c63d5678193`,
+  archive `superseded/20260915T021351Z/`) bound only the runner's own digest;
+  the binding now also covers the executed `personal_lora_pilot` and
+  `personal_lora_data` module digests, owner-only permissions are checked
+  before any terminal is persisted and again on reuse, and cache-clear and
+  peak-memory totals carry across resumed attempts. This run is the delivery
+  run.
 
 ## Limitations
 
