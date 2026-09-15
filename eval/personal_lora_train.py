@@ -388,7 +388,7 @@ def train_epoch(backend: Dict[str, Any], model, optimizer,
     for indices in epoch_batches(len(examples), epoch):
         if deadline is not None and time.perf_counter() >= deadline:
             raise RuntimeBudgetExceeded(
-                "the %.0f h wall-clock budget was exhausted inside epoch %d"
+                "the %.0f h training budget was exhausted inside epoch %d"
                 % (BUDGET_SECONDS / 3600.0, epoch))
         batches = [micro_batch_tensors(backend, examples, indices)]
         losses, grads = plp.accumulate_gradients(
@@ -671,7 +671,7 @@ def verify_completed_artifacts(root: str, rows: Sequence[Dict[str, Any]],
 def finish_terminal(root: str, state: Dict[str, Any], rows: Sequence[Dict],
                     identity: Dict[str, Any], binding: Dict[str, Any],
                     terminal: str, reasons: Sequence[str],
-                    wall_clock_seconds: float,
+                    wall_clock_seconds: float, training_seconds: float,
                     peak_memory: Dict[str, Any],
                     cache_counters: Dict[str, int],
                     resumed_from_epoch: Optional[int],
@@ -688,9 +688,11 @@ def finish_terminal(root: str, state: Dict[str, Any], rows: Sequence[Dict],
         "selection_rule": SELECTION_RULE,
         "selected_epoch": (selected or {}).get("epoch"),
         "epochs": list(rows),
+        "training_seconds": round(training_seconds, 4),
         "wall_clock_seconds": round(wall_clock_seconds, 4),
         "budget_seconds": BUDGET_SECONDS,
-        "within_budget": wall_clock_seconds <= BUDGET_SECONDS,
+        "within_budget": training_seconds <= BUDGET_SECONDS,
+        "within_total_wall_clock": wall_clock_seconds <= BUDGET_SECONDS,
         "peak_memory": peak_memory,
         "process_max_rss_mb": plp.process_max_rss_mb(),
         "cache_clears": dict(cache_counters),
@@ -706,6 +708,7 @@ def finish_terminal(root: str, state: Dict[str, Any], rows: Sequence[Dict],
     state["terminal"] = terminal
     state["terminal_reasons"] = list(reasons)
     state["selected_epoch"] = (selected or {}).get("epoch")
+    state["training_seconds"] = round(training_seconds, 4)
     state["wall_clock_seconds"] = round(wall_clock_seconds, 4)
     state["updated_at_utc"] = pld.utc_now_iso()
     write_private_json(root, STATE_REL, state)
@@ -747,12 +750,19 @@ def render_public_report(identity: Dict[str, Any],
     lines.append("- selection rule: `%s`" % SELECTION_RULE)
     lines.append("- config sha256: `%s`"
                  % measurement.get("config_sha256"))
-    lines.append("- wall clock %.4f s (%.4f h) against a %.1f h budget "
-                 "(within budget: %s)"
+    lines.append("- training budget %.1f h covers the 3-epoch pass with "
+                 "per-epoch validation/save; measured %.4f h (within budget: "
+                 "%s)"
+                 % (BUDGET_SECONDS / 3600.0,
+                    measurement.get("training_seconds", 0.0) / 3600.0,
+                    measurement.get("within_budget")))
+    lines.append("- total wall clock including identity, tokenization and the "
+                 "selected-adapter save/reload verification: %.4f s (%.4f h; "
+                 "within the %.1f h envelope: %s)"
                  % (measurement.get("wall_clock_seconds", 0.0),
                     measurement.get("wall_clock_seconds", 0.0) / 3600.0,
                     BUDGET_SECONDS / 3600.0,
-                    measurement.get("within_budget")))
+                    measurement.get("within_total_wall_clock")))
     lines.append("- resumed from a blocker: %s"
                  % ("yes (epoch %s)" % measurement.get("resumed_from_epoch")
                     if measurement.get("resumed_from_epoch")
@@ -956,6 +966,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     resumed_from_epoch: Optional[int] = None
     rows: List[Dict[str, Any]] = []
     elapsed_before = 0.0
+    training_seconds_before = 0.0
     if private_path_exists(root, STATE_REL):
         state = read_private_json(root, STATE_REL)
         assert_state(state, binding)
@@ -991,6 +1002,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
                              % "; ".join(problems))
         resumed_from_epoch = next_epoch
         elapsed_before = float(state.get("wall_clock_seconds") or 0.0)
+        training_seconds_before = float(state.get("training_seconds") or 0.0)
         state["resumed_from_epoch"] = resumed_from_epoch
         state["updated_at_utc"] = pld.utc_now_iso()
         write_private_json(root, STATE_REL, state)
@@ -1079,6 +1091,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             "resumed_from_epoch": None,
             "init_digest": digest_before,
             "wall_clock_seconds": 0.0,
+            "training_seconds": 0.0,
             "started_at_utc": pld.utc_now_iso(),
             "updated_at_utc": pld.utc_now_iso(),
         }
@@ -1102,21 +1115,24 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         backend))
     backend["mx"].reset_peak_memory()
     global_counters = new_cache_counters()
-    budget_deadline = started + max(0.0, BUDGET_SECONDS - elapsed_before)
+    training_used = training_seconds_before
     terminal = None
     reasons: List[str] = []
     for epoch in range(start_epoch, EPOCHS + 1):
-        if time.perf_counter() >= budget_deadline:
+        remaining = BUDGET_SECONDS - training_used
+        if remaining <= 0 or time.perf_counter() >= started + remaining:
             terminal = TERMINAL_RUNTIME
-            reasons = ["the %.0f h wall-clock budget was exhausted before "
-                       "epoch %d" % (BUDGET_SECONDS / 3600.0, epoch)]
+            reasons = ["the %.0f h training budget is exhausted; AC-177-v1 "
+                       "does not grant fresh training time (the per-epoch "
+                       "checkpoints are retained)"
+                       % (BUDGET_SECONDS / 3600.0)]
             break
         try:
             row = run_one_epoch(
                 backend, model, optimizer, loss_and_grad, train_examples,
                 tokenized_validation, trainable_validation, subset_indices,
                 tokenized_train, epoch, root, num_layers, identity,
-                config_hash, global_counters, budget_deadline)
+                config_hash, global_counters, started + remaining)
         except RuntimeBudgetExceeded as error:
             terminal = TERMINAL_RUNTIME
             reasons = [str(error)]
@@ -1134,10 +1150,12 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
                        % (epoch, error)]
             break
         rows.append(row)
+        training_used += row["seconds"]
         elapsed = elapsed_before + (time.perf_counter() - started)
         state["next_epoch"] = epoch + 1
         state["epochs_completed"] = len(rows)
         state["wall_clock_seconds"] = round(elapsed, 4)
+        state["training_seconds"] = round(training_used, 4)
         state["updated_at_utc"] = pld.utc_now_iso()
         write_epoch_rows(root, binding, rows)
         write_private_json(root, STATE_REL, state)
@@ -1150,10 +1168,12 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             "cache_clears": (row["cache_clears"]["threshold"]
                              + row["cache_clears"]["epoch_floor"]),
         }))
-        if time.perf_counter() >= budget_deadline:
+        if training_used > BUDGET_SECONDS:
             terminal = TERMINAL_RUNTIME
-            reasons = ["the %.0f h wall-clock budget was exhausted after "
-                       "epoch %d" % (BUDGET_SECONDS / 3600.0, epoch)]
+            reasons = ["the training wall clock %.4f h exceeds the %.0f h "
+                       "budget after epoch %d"
+                       % (training_used / 3600.0, BUDGET_SECONDS / 3600.0,
+                          epoch)]
             break
 
     wall_clock = elapsed_before + (time.perf_counter() - started)
@@ -1165,17 +1185,8 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
     if terminal is not None:
         return finish_terminal(
             root, state, rows, identity, binding, terminal, reasons,
-            wall_clock, peak_memory, global_counters, resumed_from_epoch,
-            None, None, len(train_examples),
-            identity["token_aggregate_train"]["untrainable"],
-            len(trainable_validation))
-    if time.perf_counter() >= budget_deadline:
-        return finish_terminal(
-            root, state, rows, identity, binding, TERMINAL_RUNTIME,
-            ["the %.0f h wall-clock budget was exhausted before checkpoint "
-             "selection" % (BUDGET_SECONDS / 3600.0)],
-            wall_clock, peak_memory, global_counters, resumed_from_epoch,
-            None, None, len(train_examples),
+            wall_clock, training_used, peak_memory, global_counters,
+            resumed_from_epoch, None, None, len(train_examples),
             identity["token_aggregate_train"]["untrainable"],
             len(trainable_validation))
 
@@ -1230,20 +1241,20 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
             "save/reload completion log-sum agreement failed: max abs diff "
             "%.8f > %.1e" % (max_diff, RELOAD_TOLERANCE))
     wall_clock = elapsed_before + (time.perf_counter() - started)
-    if wall_clock > BUDGET_SECONDS:
+    if training_used > BUDGET_SECONDS:
         return finish_terminal(
             root, state, rows, identity, binding, TERMINAL_RUNTIME,
-            ["the total wall clock %.4f h exceeds the %.0f h budget after "
-             "checkpoint selection and save/reload verification"
-             % (wall_clock / 3600.0, BUDGET_SECONDS / 3600.0)],
-            wall_clock, peak_memory, global_counters, resumed_from_epoch,
-            verification, selected, len(train_examples),
+            ["the training wall clock %.4f h exceeds the %.0f h budget; the "
+             "selected checkpoint and its verification are retained"
+             % (training_used / 3600.0, BUDGET_SECONDS / 3600.0)],
+            wall_clock, training_used, peak_memory, global_counters,
+            resumed_from_epoch, verification, selected, len(train_examples),
             identity["token_aggregate_train"]["untrainable"],
             len(trainable_validation))
     return finish_terminal(
         root, state, rows, identity, binding, TERMINAL_TRAINED, [], wall_clock,
-        peak_memory, global_counters, resumed_from_epoch, verification,
-        selected, len(train_examples),
+        training_used, peak_memory, global_counters, resumed_from_epoch,
+        verification, selected, len(train_examples),
         identity["token_aggregate_train"]["untrainable"],
         len(trainable_validation))
 

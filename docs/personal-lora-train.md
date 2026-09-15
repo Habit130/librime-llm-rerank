@@ -95,7 +95,7 @@ starts; the canonical hash of the resolved shape is the run's
 | cache policy | `mx.clear_cache()` whenever the MLX cache exceeds 2,000,000,000 bytes, and at least once per epoch |
 | validation | frozen validation partition, completion-only loss after every epoch |
 | selection | lowest validation loss; an exact tie goes to the later epoch |
-| budget | 12 hours for the run plus per-epoch validation/checkpointing |
+| budget | 12 hours for the 3-epoch pass with per-epoch validation/save; identity, tokenization and the selected-adapter save/reload verification are reported separately |
 
 ## Epochs, checkpoints and resume
 
@@ -108,15 +108,25 @@ log-sums for that epoch's weights, and writes an owner-only checkpoint under
 `run/epochs.json` row and `state.json` are written after each epoch, so an
 interrupted run is resumable.
 
-The run stops with `runtime_blocker` (wall clock) or `capacity_blocker`
-(out of memory) if the frozen work cannot complete, leaving the last complete
-epoch's checkpoint plus `next_epoch` in `state.json`. A rerun with the same
-binding resumes from `next_epoch` with the last checkpoint's weights (the
-optimizer state is re-initialized; the interrupted partial epoch is
-discarded and re-run from its seeded order) and records
-`resumed_from_epoch`. A run that reached `trained` is never rewritten: a
-rerun re-verifies the recorded artifacts and reports `run_reused=true`.
-`identity.json` is written once and is never overwritten by a reuse or resume.
+The run stops with `runtime_blocker` (training budget) or
+`capacity_blocker` (out of memory) if the frozen work cannot complete,
+leaving the last complete epoch's checkpoint plus `next_epoch` in
+`state.json`. The budgeted work (`training_seconds`) accumulates the epoch
+passes and their per-epoch validation/save across attempts; total wall clock
+including setup and finalization is tracked separately. A `capacity_blocker`
+rerun with the same binding resumes from `next_epoch` with the last
+checkpoint's weights and the remaining training budget (the optimizer state
+is re-initialized; the interrupted partial epoch is discarded and re-run
+from its seeded order) and records `resumed_from_epoch`. An exhausted
+training budget is explicitly non-resumable under this contract: a rerun
+reports the blocker with the retained checkpoints instead of silently
+granting fresh training time. A run whose three epochs completed can still
+be finalized by a selection-only resume (`next_epoch = EPOCHS + 1`), which
+selects the checkpoint and runs the save/reload verification, recording the
+honest overrun terminal when the training budget was exceeded. A run that
+reached `trained` is never rewritten: a rerun re-verifies the recorded
+artifacts and reports `run_reused=true`. `identity.json` is written once and
+is never overwritten by a reuse or resume.
 
 After the third epoch the runner selects the checkpoint by the predeclared
 rule and copies it to `selected/`. It then loads a fresh base model, applies
@@ -187,10 +197,10 @@ Isolation rules enforced by the implementation:
 ## Frozen run (2026-09-15, aggregate-only evidence)
 
 The one frozen run was executed from the delivery worktree with the
-ticket-local venv (`started_at_utc` 2026-09-15T00:45:16Z, `updated_at_utc`
-01:02:45Z) and exited `0` with terminal **`trained`**. The recorded tool
+ticket-local venv (`started_at_utc` 2026-09-15T01:16:45Z, `updated_at_utc`
+01:34:26Z) and exited `0` with terminal **`trained`**. The recorded tool
 SHA-256 is
-`cffb5c5117ad11cd228ce85b85b497468c46c02e547e1b93011c1d26df34b3cf`, which is
+`9f9288ded017310744b02dcbb1d33e02b0dc59ce86fb38971191de10d5fe0f8a`, which is
 the delivered `eval/personal_lora_train.py`; `--run` and `--verify-reload` at
 the delivery head re-verify against it. A private desensitized copy is at
 `.local-work/personal-lora-train/public-report.md`.
@@ -221,18 +231,19 @@ the delivery head re-verify against it. A private desensitized copy is at
   1,381 examples; 131 empty-context, 23 trainable); validation 1,657
   examples (1,451 trainable; 206 untrainable; 208 boundary-spanning tokens;
   16 empty-context, 4 trainable).
-- No resume was needed (`resumed_from_epoch: null`). Wall clock
-  **1,051.68 s (0.292 h)** against the 12 h budget, including identity,
-  tokenization, per-epoch validation, per-epoch checkpoints and the
-  save/reload verification. Peak MLX memory **2.774 GB** (active 1.247 GB,
-  cache 1.252 GB; process max RSS 2,617 MB). The 2 GB cache policy cleared
-  the allocator 2,022 times above threshold plus the 3 epoch floors.
+- No resume was needed (`resumed_from_epoch: null`). Budgeted training work
+  **1,060.03 s (0.294 h)** against the 12 h budget; total wall clock
+  including identity, tokenization and the selected-adapter save/reload
+  verification **1,063.36 s (0.295 h)**. Peak MLX memory **2.770 GB**
+  (active 1.247 GB, cache 2.060 GB; process max RSS 2,621 MB). The 2 GB
+  cache policy cleared the allocator 2,021 times above threshold plus the 3
+  epoch floors.
 
   | epoch | steps | train loss first/last/mean | validation loss | seconds | cache clears | peak GB | selected |
   | --- | --- | --- | --- | --- | --- | --- | --- |
-  | 1 | 1408 | 5.54688/4.66667/4.87694 | 4.595782 | 318.61 | 678 | 2.7742 |  |
-  | 2 | 1408 | 3.53906/3.45833/3.99744 | 4.571959 | 361.29 | 675 | 2.7742 | yes |
-  | 3 | 1408 | 2.84375/1.5/3.19742 | 4.785711 | 368.34 | 672 | 2.7742 |  |
+  | 1 | 1408 | 5.54688/4.66667/4.87694 | 4.595782 | 322.48 | 678 | 2.7699 |  |
+  | 2 | 1408 | 3.53906/3.45833/3.99744 | 4.571959 | 365.18 | 675 | 2.7699 | yes |
+  | 3 | 1408 | 2.84375/1.5/3.19742 | 4.785711 | 372.37 | 672 | 2.7699 |  |
 
 - Selection: **epoch 2** by the predeclared rule (lowest validation
   completion-only loss; no exact tie). Train loss fell over the three epochs
@@ -245,19 +256,26 @@ the delivery head re-verify against it. A private desensitized copy is at
   completion log-sum difference **0.0** on the frozen 32-example train subset
   (tolerance `1e-4`). The trainable-weight digest changed from
   `8a4753a6d91345c8cf28b01a3e8f498770ba5bf45e299f28b945b8e5dfa7cfbd` to
-  `406909bb247047ea359d8552616d14fd6544cf0b60b1cc7328ed4b39aa9e0146`.
+  `406909bb247047ea359d8552616d14fd6544cf0b60b1cc7328ed4b39aa9e0146`. The
+  adapter bytes reproduce the preceding superseded attempt exactly, which
+  also confirms the seeded run is deterministic.
 - Isolation and cleanup: `test.jsonl` checksummed only; `validation.jsonl`
   used only for the frozen rule; no live mutation, deployment, upload, pin
   bump or #178 scoring; all artifacts owner-only; the training process exited
   and the GPU/quiet-machine interval is released. The live input method
   stayed running during the run.
-- Provenance: the first attempt (tool sha256 `1017cffb0facb82936e37230bb0c
-  e8764d63f32024f6e30f02e88502c05a73bc`) was superseded after Codex review
-  confirmed an off-by-one in the #176 loss helper that charged the first
-  right-padding target of every shorter row. The corrected mask excludes
-  `t == total_tokens`; the superseded artifacts are archived privately at
-  `.local-work/personal-lora-train/superseded/20260915T002818Z/`. This run is
-  the delivery run.
+- Provenance: two earlier attempts at this contract were superseded after
+  Codex review confirmed defects in the tool, each archived privately. The
+  first (tool sha256 `1017cffb0facb82936e37230bb0ce8764d63f32024f6e30f02e885
+  02c05a73bc`, archive `superseded/20260915T002818Z/`) charged the first
+  right-padding target of shorter rows to the loss; the mask now excludes
+  `t == total_tokens`. The second (tool sha256 `cffb5c5117ad11cd228ce85b85b4
+  97468c46c02e547e1b93011c1d26df34b3cf`, archive
+  `superseded/20260915T010245Z/`) gave an exhausted-budget resume a past
+  deadline; the budget is now the cumulative training pass with per-epoch
+  validation/save, exhaustion is explicitly non-resumable for training, and a
+  completed 3-epoch run can still be finalized by a selection-only resume.
+  This run is the delivery run.
 
 ## Limitations
 

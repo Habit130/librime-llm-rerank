@@ -434,6 +434,8 @@ class RunnerTestCase(unittest.TestCase):
                          plt.select_epoch(rows)["epoch"])
         self.assertGreater(state["wall_clock_seconds"], 0.0)
         self.assertTrue(measurement["within_budget"])
+        self.assertLessEqual(measurement["training_seconds"],
+                             measurement["wall_clock_seconds"])
         verification = measurement["verification"]
         self.assertTrue(verification["agreement_pass"])
         self.assertTrue(verification["weights_changed"])
@@ -713,7 +715,7 @@ class RunnerTestCase(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(LOAD_WEIGHT_CALLS, ["epoch-3"])
 
-    def test_budget_crossed_by_verification_is_a_runtime_blocker(self):
+    def test_overrun_after_the_epochs_finalizes_then_reports_runtime_blocker(self):
         real_select = plt.select_epoch
         real_budget = plt.BUDGET_SECONDS
 
@@ -732,11 +734,46 @@ class RunnerTestCase(unittest.TestCase):
         self.assertEqual(state["terminal"], plt.TERMINAL_RUNTIME)
         self.assertEqual(state["next_epoch"], 4)
         self.assertFalse(self.read_json(plt.MEASUREMENT_REL)["within_budget"])
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.root, plt.SELECTED_DIR_REL, "adapters.safetensors")))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.root, plt.VERIFICATION_REL)))
         code, _output = self.run_train()
         self.assertEqual(code, 0)
         state = self.read_json(plt.STATE_REL)
         self.assertEqual(state["terminal"], plt.TERMINAL_TRAINED)
         self.assertEqual(state["resumed_from_epoch"], 4)
+
+    def test_training_budget_overrun_is_explicitly_non_resumable(self):
+        real_epoch = plt.run_one_epoch
+        calls = {"count": 0}
+
+        def slow_epoch(*args, **kwargs):
+            row = real_epoch(*args, **kwargs)
+            calls["count"] += 1
+            if calls["count"] == 1:
+                row = dict(row)
+                row["seconds"] = row["seconds"] + plt.BUDGET_SECONDS
+            return row
+
+        plt.run_one_epoch = slow_epoch
+        try:
+            code, _output = self.run_train()
+        finally:
+            plt.run_one_epoch = real_epoch
+        self.assertEqual(code, 0)
+        state = self.read_json(plt.STATE_REL)
+        self.assertEqual(state["terminal"], plt.TERMINAL_RUNTIME)
+        self.assertEqual(state["next_epoch"], 2)
+        rows = self.read_json(plt.EPOCHS_REL)["rows"]
+        self.assertEqual([row["epoch"] for row in rows], [1])
+        code, output = self.run_train()
+        self.assertEqual(code, 0)
+        self.assertIn("does not grant fresh training time", output)
+        state = self.read_json(plt.STATE_REL)
+        self.assertEqual(state["terminal"], plt.TERMINAL_RUNTIME)
+        self.assertEqual([row["epoch"] for row in
+                          self.read_json(plt.EPOCHS_REL)["rows"]], [1])
 
 
 if __name__ == "__main__":

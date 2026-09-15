@@ -257,7 +257,9 @@ class ReportPrivacyTest(IsolationTestCase):
             "terminal_reasons": [],
             "config_sha256": "7" * 64,
             "wall_clock_seconds": 1080.0,
+            "training_seconds": 1020.0,
             "within_budget": True,
+            "within_total_wall_clock": True,
             "resumed_from_epoch": None,
             "selected_epoch": 2,
             "epochs": [{
