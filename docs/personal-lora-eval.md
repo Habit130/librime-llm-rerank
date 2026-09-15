@@ -101,15 +101,17 @@ and reused rather than recomputed.
 ## Mac scoring latency (EVAL-5)
 
 `--measure-latency` scores **all** validation ranking-eligible groups
-(1,121) with the exact adapter, one group at a time. Cold is the first group
-after the model load; warm is every remaining group. Per-group wall clock
-covers candidate tokenization, the padded model forward, the completion-only
-log-sum and the ranking; per-candidate time is the group time divided by the
-group's saved candidates. p50/p90/p99 are reported for both, together with
-the model load time, MLX peak/active/cache memory, process max RSS, swap
-before/after and the surrounding system samples. This is offline candidate
-scoring only: not IMK/panel presentation and not a live `get_context` wait
-repair claim.
+(1,121) with the exact adapter, one group at a time. It requires the
+matching `policy_lock.json` and uses the locked policy for the ranking step.
+Cold is the first group after the model load; warm is every remaining group.
+The timed per-group wall clock covers candidate tokenization, the padded
+model forward, the completion-only log-sum, the locked-policy score
+application and the candidate sort; per-candidate time is the group time
+divided by the group's saved candidates. p50/p90/p99 are reported for both,
+together with the model load time, MLX peak/active/cache memory, process max
+RSS, swap before/after and the surrounding system samples. This is offline
+candidate scoring only: not IMK/panel presentation and not a live
+`get_context` wait repair claim.
 
 ## CLI, artifacts and boundaries
 
@@ -164,13 +166,15 @@ Isolation rules enforced by the implementation:
 - no live input-method, deployment, fact-store or configuration mutation; no
   upload; no network use beyond the pinned packages; no pin bump;
 - the identity manifest binds the executed `personal_lora_data`,
-  `personal_lora_pilot` and `oracle` module digests, so a changed seam
-  invalidates reuse and verification.
+  `personal_lora_pilot` and `oracle` module digests, the adapter
+  `adapters.safetensors` digest **and** the `adapter_config.json` digest, so
+  a changed seam or a changed effective adapter config invalidates reuse and
+  verification;
 
 ## Frozen run (2026-09-15, aggregate-only evidence)
 
-Executed from the delivery worktree with the ticket-local venv in one
-announced GPU/quiet-machine interval: `--select-policy` (validation only),
+Executed from the delivery worktree with the ticket-local venv in announced
+GPU/quiet-machine intervals: `--select-policy` (validation only),
 `--eval-test` (one locked pass), `--measure-latency`. Identities:
 
 - model composite sha256
@@ -179,10 +183,12 @@ announced GPU/quiet-machine interval: `--select-policy` (validation only),
   numpy 2.4.6`;
 - selected adapter `adapters.safetensors` sha256
   `7622f26d71efa34f5b9b1e92ebef2c064bd06363c3eac4c88fb0adb44b1462d9`
-  (18,374,616 bytes), `epoch=2`, `base_model_composite_sha256` equal to the
-  frozen base composite, `rank=16`, `alpha=16`, `mlx_scale=1.0`,
-  `num_layers=28`, dropout 0, `q/k/v/o`; the selected bytes are identical to
-  the `epochs/epoch-2/adapters.safetensors` checkpoint
+  (18,374,616 bytes), `adapter_config.json` sha256
+  `d11ca5ab361149c8b95c0b1a8ceaf3678d0d17ad42209e3d0de02bc6a70d65cd`,
+  `epoch=2`, `base_model_composite_sha256` equal to the frozen base
+  composite, `rank=16`, `alpha=16`, `mlx_scale=1.0`, `num_layers=28`,
+  dropout 0, `q/k/v/o`; the selected bytes are identical to the
+  `epochs/epoch-2/adapters.safetensors` checkpoint
   (`matches_selected=true`), which excludes a warm start or a different
   checkpoint;
 - dataset freeze commit `2076d0a6c92dbf57833b7a123ea54aab10ddd49d`, train
@@ -196,7 +202,9 @@ announced GPU/quiet-machine interval: `--select-policy` (validation only),
 - snapshot sha256
   `be2b09256dd2c24485ed618501fc06408b4441e1d14a8d86d2645797e82ae6de`
   (`store_epoch 8407bd6b456ba5c5a526b4b95951bac3`, `history_id
-  dc3ffbf1a21957e0bb4ceed535c9df56`, high-water `1789348852036, 0`).
+  dc3ffbf1a21957e0bb4ceed535c9df56`, high-water `1789348852036, 0`);
+- delivery tool sha256
+  `3464ffd2d20745bd59bacb3adf2d6ffd7e73a4de016068d958eea82c46c1327f`.
 
 ### Validation-only policy lock
 
@@ -266,23 +274,47 @@ observation and not as ranking benefit.
 
 | Metric | cold (1 group) | warm (1,120 groups) | all (1,121 groups) |
 | --- | --- | --- | --- |
-| group seconds p50/p90/p99 | 0.144579/0.144579/0.144579 | 0.070479/0.183681/0.360053 | 0.070479/0.183681/0.360053 |
-| per-candidate seconds p50/p90/p99 | 0.018072/0.018072/0.018072 | 0.013636/0.027128/0.058763 | 0.013636/0.027128/0.058763 |
+| group seconds p50/p90/p99 | 0.073827/0.073827/0.073827 | 0.062154/0.144221/0.246550 | 0.062154/0.144221/0.246550 |
+| per-candidate seconds p50/p90/p99 | 0.009228/0.009228/0.009228 | 0.012083/0.019771/0.031036 | 0.012082/0.019771/0.031036 |
 
-Model load 0.5298 s (warm page cache); scoring 111.53 s for 1,121 groups and
-8,222 candidates; MLX peak 2.9251 GB, active 1.1273 GB, cache 1.3752 GB;
-process max RSS 1,432.8 MB; system swap before/after 5,757.9/5,693.9 MB
-(the shared machine was not idle: the pre-run top-CPU process was the
-ticket-owned Python process at 84.6%, the post-run top process a WebKit
-content process at 97.0%; the live input method stayed running).
+The timed region is candidate tokenization + padded model forward +
+completion-only log-sum + locked-policy (S2) ranking. Model load 0.2725 s
+(warm page cache); scoring 93.30 s for 1,121 groups and 8,222 candidates;
+MLX peak 2.9587 GB, active 1.1273 GB, cache 0.1844 GB; process max RSS
+1,426.1 MB; system swap before/after 5,527.4/5,519.4 MB (the shared machine
+was not idle: the pre-run top-CPU process was the ticket-owned Python
+process at 82.3%, the post-run top process the driving session at 138.6%;
+the live input method stayed running).
+
+### Provenance and superseded pass
+
+A first pass (tool sha256
+`0a9a4dc111b6d5499eb69356014abf1fe880647bd0cac388c89f1418d12bee1e`) was
+executed and archived under `superseded/20260915T075708Z/` after Codex review
+of the PR raised four findings, all confirmed and fixed before Acceptance:
+(1) the model-free release gate would fail on an unconditional `mlx` import
+in the objective tests — the MLX batch-scoring tests now skip when `mlx` is
+absent; (2) the fake-backend tests reached the pinned-runtime check under the
+model-free venv — the fixture now stubs the runtime probe (verified with a
+simulated model-free venv: 710 tests, 4 MLX-only skips); (3) the adapter
+`adapter_config.json` digest was not bound, so a config change would not
+invalidate the identity/lock while `load_adapters` consumed the changed
+config — the binding now includes the adapter-config digest, with a
+regression test; (4) the latency timer excluded the ranking step — the timed
+region now includes the locked-policy ranking and the command requires the
+matching lock. The final pass re-selected the policy on validation only
+(S2 again; per-policy statistics bit-identical) and produced test aggregates
+identical to the first pass, which is recorded as determinism evidence; no
+test-informed change, no retuning and no second locked pass on the delivered
+artifacts were made.
 
 ### Isolation and cleanup
 
 `test.jsonl` was checksummed before the lock and parsed only after the
-matching lock existed; the test pass ran exactly once and was reused by later
-verification; no live mutation, deployment, upload or pin bump happened; all
-artifacts are owner-only; the scoring processes exited and the
-GPU/quiet-machine interval is released.
+matching lock existed; the delivered test pass ran exactly once and was
+reused by later verification; no live mutation, deployment, upload or pin
+bump happened; all artifacts are owner-only; the scoring processes exited and
+the GPU/quiet-machine intervals are released.
 
 ## Limitations
 

@@ -12,8 +12,12 @@ import os
 import sys
 import unittest
 
-import mlx.core as mx
 import numpy as np
+
+try:
+    import mlx.core as mx
+except Exception:  # pragma: no cover - model-free gates have no mlx
+    mx = None
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
@@ -99,6 +103,7 @@ def reference_logsum(ids, prompt_side):
     return float((picked * mask).sum()), int(mask.sum())
 
 
+@unittest.skipIf(mx is None, "the mlx runtime is not installed here")
 class BatchScoringTest(unittest.TestCase):
 
     def score(self, examples):

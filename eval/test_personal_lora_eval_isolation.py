@@ -27,7 +27,7 @@ if _ROOT not in sys.path:
 import personal_lora_data as pld  # noqa: E402
 import personal_lora_eval as ple  # noqa: E402
 from test_personal_lora_eval_runner import (  # noqa: E402
-    EvalFixture, PRIVATE_SENTINEL, fake_backend)
+    EvalFixture, PRIVATE_SENTINEL, command_patches, fake_backend)
 
 
 class IsolationTestCase(unittest.TestCase):
@@ -66,8 +66,7 @@ class SealedPartitionTest(IsolationTestCase):
                 opened.append(mode)
             return original_open(path, mode, *args, **kwargs)
 
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with mock.patch.object(builtins, "open", tracking_open):
                 with self.assertRaises(ple.LockError):
                     ple.cmd_eval_test(
@@ -98,8 +97,7 @@ class ArtifactBoundaryTest(IsolationTestCase):
         alias = os.path.join(self.fixture.root, "alias")
         os.symlink(live, alias)
         self.rewrite_config({"artifact_root": alias})
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(pld.IsolationError):
                 ple.cmd_select_policy(
                     self.fixture.config_path,
@@ -111,8 +109,7 @@ class ArtifactBoundaryTest(IsolationTestCase):
         outside = tempfile.mkdtemp(prefix="outside_")
         try:
             self.rewrite_config({"artifact_root": outside})
-            patches = self.fixture.frozen_patches()
-            with mock.patch.multiple(ple, **patches):
+            with command_patches(self.fixture):
                 with self.assertRaises(pld.IsolationError):
                     ple.cmd_select_policy(
                         self.fixture.config_path,
@@ -125,8 +122,7 @@ class ArtifactBoundaryTest(IsolationTestCase):
         stray = os.path.join(self.fixture.artifact_root, "stray")
         os.makedirs(stray, mode=0o755, exist_ok=True)
         os.chmod(stray, 0o755)
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.EvalError):
                 ple.cmd_select_policy(
                     self.fixture.config_path,
@@ -153,8 +149,7 @@ class IdentityImmutabilityTest(IsolationTestCase):
         with open(self.fixture.checkpoint_path, "wb") as handle:
             handle.write(b"a-different-checkpoint")
         os.chmod(self.fixture.checkpoint_path, 0o600)
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.EnvironmentBlocker):
                 ple.cmd_select_policy(
                     self.fixture.config_path,
@@ -167,8 +162,7 @@ class IdentityImmutabilityTest(IsolationTestCase):
         with open(adapter_path, "wb") as handle:
             handle.write(b"another-adapter")
         os.chmod(adapter_path, 0o600)
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.EnvironmentBlocker):
                 ple.cmd_select_policy(
                     self.fixture.config_path,
@@ -196,8 +190,7 @@ class IdentityImmutabilityTest(IsolationTestCase):
         with open(identity_path, "w", encoding="utf-8") as handle:
             json.dump(identity, handle)
         os.chmod(identity_path, 0o600)
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.EvalError):
                 ple.cmd_select_policy(
                     self.fixture.config_path,

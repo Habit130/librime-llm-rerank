@@ -170,6 +170,23 @@ def fake_backend():
     }
 
 
+@contextlib.contextmanager
+def command_patches(fixture, **extra):
+    """Frozen-identity patches plus a stubbed pinned-runtime probe.
+
+    The model-free release gate installs only NumPy/pypinyin and no
+    MLX runtime, so these fake-backend tests stub the runtime probe while
+    still exercising the evaluation logic; every real run checks the pinned
+    runtime itself.
+    """
+    patches = fixture.frozen_patches()
+    patches.update(extra)
+    with mock.patch.multiple(ple, **patches), \
+            mock.patch.object(ple.plp, "runtime_versions",
+                              lambda: dict(ple.PINNED_VERSIONS)):
+        yield
+
+
 def write_file(path, text, mode=0o600):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -403,8 +420,7 @@ class EvalFixture(object):
         }
 
     def select(self, backend=None, emit=False):
-        patches = self.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self):
             if emit:
                 return ple.cmd_select_policy(
                     self.config_path, allowed_root=self.artifact_root,
@@ -414,15 +430,8 @@ class EvalFixture(object):
                     self.config_path, allowed_root=self.artifact_root,
                     backend=backend or fake_backend())
 
-    def eval_test(self, backend=None, expect_error=None, emit=False):
-        patches = self.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
-            if expect_error is not None:
-                with self.assertRaises(expect_error):
-                    ple.cmd_eval_test(self.config_path,
-                                      allowed_root=self.artifact_root,
-                                      backend=backend or fake_backend())
-                return None
+    def eval_test(self, backend=None, emit=False):
+        with command_patches(self):
             if emit:
                 return ple.cmd_eval_test(
                     self.config_path, allowed_root=self.artifact_root,
@@ -431,10 +440,20 @@ class EvalFixture(object):
                 return ple.cmd_eval_test(
                     self.config_path, allowed_root=self.artifact_root,
                     backend=backend or fake_backend())
+
+    def eval_test_error(self, error, backend=None):
+        with command_patches(self):
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    ple.cmd_eval_test(
+                        self.config_path, allowed_root=self.artifact_root,
+                        backend=backend or fake_backend())
+                except error:
+                    return None
+        raise AssertionError("expected %s from cmd_eval_test" % error)
 
     def latency(self, backend=None, emit=False):
-        patches = self.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self):
             if emit:
                 return ple.cmd_measure_latency(
                     self.config_path, allowed_root=self.artifact_root,
@@ -515,16 +534,14 @@ class PolicyLockTest(unittest.TestCase):
         lock["selected_policy"] = "S2"
         with open(lock_path, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(lock))
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.LockError):
                 ple.cmd_select_policy(self.fixture.config_path,
                                       allowed_root=self.fixture.artifact_root,
                                       backend=fake_backend())
 
     def test_eval_test_refuses_without_a_lock(self):
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.LockError):
                 ple.cmd_eval_test(self.fixture.config_path,
                                   allowed_root=self.fixture.artifact_root,
@@ -541,8 +558,7 @@ class PolicyLockTest(unittest.TestCase):
         lock["test_sha256"] = "0" * 64
         with open(lock_path, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(lock))
-        patches = self.fixture.frozen_patches()
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture):
             with self.assertRaises(ple.LockError):
                 ple.cmd_eval_test(self.fixture.config_path,
                                   allowed_root=self.fixture.artifact_root,
@@ -619,9 +635,9 @@ class LockedTestRankingTest(unittest.TestCase):
                                     "adapters.safetensors")
         with open(adapter_path, "wb") as handle:
             handle.write(b"another-adapter")
-        patches = self.fixture.frozen_patches()
-        patches["FROZEN_ADAPTER_SHA256"] = pld.sha256_file(adapter_path)
-        with mock.patch.multiple(ple, **patches):
+        with command_patches(self.fixture,
+                             FROZEN_ADAPTER_SHA256=pld.sha256_file(
+                                 adapter_path)):
             with self.assertRaises(ple.EvalError):
                 ple.cmd_eval_test(self.fixture.config_path,
                                   allowed_root=self.fixture.artifact_root,
@@ -638,9 +654,13 @@ class LockedTestRankingTest(unittest.TestCase):
         self.assertEqual(measurement["warm"]["groups"], 239)
         self.assertEqual(measurement["protocol"]["partition"],
                          "validation.jsonl")
+        self.assertEqual(measurement["protocol"]["policy"], "S1")
+        self.assertIn("ranking", measurement["protocol"]["timed_region"])
         self.assertIn("p50", measurement["warm"]["group_seconds"])
         self.assertIn("p90", measurement["warm"]["per_candidate_seconds"])
         self.assertIn("p99", measurement["all_groups"]["group_seconds"])
+        per_group = self.fixture.read_artifact("latency/per-group.json")
+        self.assertIn("target_rank", per_group["groups"][0])
         self.assertTrue(os.path.exists(os.path.join(
             self.fixture.artifact_root, "latency/per-group.json")))
         measurement_path = os.path.join(self.fixture.artifact_root,
@@ -648,6 +668,28 @@ class LockedTestRankingTest(unittest.TestCase):
         before = pld.sha256_file(measurement_path)
         self.assertEqual(self.fixture.latency(), 0)
         self.assertEqual(pld.sha256_file(measurement_path), before)
+
+    def test_latency_requires_the_policy_lock(self):
+        fixture = EvalFixture()
+        try:
+            with self.assertRaises(ple.LockError):
+                fixture.latency()
+        finally:
+            fixture.cleanup()
+
+    def test_changed_adapter_config_is_refused_after_the_lock(self):
+        config_path = os.path.join(self.fixture.adapter_dir,
+                                   "adapter_config.json")
+        with open(config_path, encoding="utf-8") as handle:
+            adapter_config = json.load(handle)
+        adapter_config["rank"] = 8
+        adapter_config.setdefault("lora_parameters", {})["rank"] = 8
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(adapter_config, handle)
+        os.chmod(config_path, 0o600)
+        self.fixture.eval_test_error(ple.EvalError)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.fixture.artifact_root, "test/results.json")))
 
 
 class InconclusiveTest(unittest.TestCase):

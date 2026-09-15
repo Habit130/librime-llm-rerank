@@ -360,6 +360,8 @@ def build_binding(config: Dict[str, Any], model_identity: Dict[str, Any],
         "modules": module_digests(),
         "model_composite_sha256": model_identity["composite_sha256"],
         "adapter_sha256": adapter_identity["sha256"],
+        "adapter_config_sha256":
+            adapter_identity["files"][ADAPTER_CONFIG_FILE]["sha256"],
         "adapter_epoch": FROZEN_ADAPTER_EPOCH,
         "epoch_checkpoint_sha256":
             adapter_identity["epoch_checkpoint"]["sha256"],
@@ -1018,7 +1020,7 @@ def cmd_select_policy(config_path: str, allowed_root: Optional[str] = None,
         groups, summary = build_groups(rows, connection, plp.VALIDATION_FILE)
     finally:
         connection.close()
-    train_pairs, train_keys, train_rows = load_train_membership(config)
+    train_pairs, train_keys, _train_rows = load_train_membership(config)
     membership = apply_train_membership(groups, train_pairs, train_keys)
 
     model, tokenizer = plp.load_base_model(backend, config["model_dir"])
@@ -1061,7 +1063,6 @@ def cmd_select_policy(config_path: str, allowed_root: Optional[str] = None,
         "test_sha256": test_sha256,
         "test_parsed": False,
     }
-    selection_problems = []
     if private_path_exists(root, LOCK_REL):
         lock = read_lock(root, binding, test_sha256)
         problem = selection_matches(lock, {
@@ -1313,6 +1314,8 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
     started = time.perf_counter()
     config, root, identity, binding = prepare_environment(
         config_path, allowed_root, protected_roots)
+    lock = read_lock(root, binding)
+    policy = lock["selected_policy"]
     if private_path_exists(root, LATENCY_REL):
         measurement = read_private_json(root, LATENCY_REL)
         if measurement.get("binding") != binding:
@@ -1349,7 +1352,9 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
     scoring_start = time.perf_counter()
     for index, group in enumerate(groups):
         start = time.perf_counter()
-        score_group(backend, model, tokenize, group)
+        scores = score_group(backend, model, tokenize, group)
+        system = build_system_eval([group], [scores], policy)
+        target_rank = system["per_group"][0]["rank"]
         elapsed = time.perf_counter() - start
         guard_cache(backend, counters)
         per_group.append({
@@ -1357,6 +1362,7 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
             "candidates": len(group.candidates),
             "seconds": elapsed,
             "per_candidate_seconds": elapsed / float(len(group.candidates)),
+            "target_rank": target_rank,
             "cold": index == 0,
         })
     scoring_seconds = time.perf_counter() - scoring_start
@@ -1378,6 +1384,9 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
             "partition": plp.VALIDATION_FILE,
             "ranking_eligible_groups": summary["ranking_eligible"],
             "adapter": "selected epoch-2 LoRA",
+            "policy": policy,
+            "timed_region": "candidate tokenization + padded model forward + "
+                            "completion-only log-sum + locked-policy ranking",
             "cold": "the first group after the model load",
             "warm": "every remaining group",
             "per_candidate": "group wall clock / saved candidates in the "
@@ -1430,6 +1439,7 @@ def cmd_measure_latency(config_path: str, allowed_root: Optional[str] = None,
     print("terminal=%s" % TERMINAL_LATENCY)
     print("groups=%d" % len(groups))
     print("candidates=%d" % measurement["candidates"])
+    print("policy=%s" % policy)
     print("load_seconds=%.4f" % load_seconds)
     print("warm_group_p50_seconds=%.6f"
           % measurement["warm"]["group_seconds"].get("p50", 0.0))
@@ -1476,6 +1486,8 @@ def render_public_report(root: str) -> str:
                      % binding["model_composite_sha256"])
         lines.append("| selected adapter sha256 (epoch %s) | `%s` |"
                      % (binding["adapter_epoch"], binding["adapter_sha256"]))
+        lines.append("| adapter config sha256 | `%s` |"
+                     % binding["adapter_config_sha256"])
         lines.append("| epoch-2 checkpoint equals selected | %s |"
                      % identity["adapter"]["epoch_checkpoint"][
                          "matches_selected"])
@@ -1593,6 +1605,11 @@ def render_public_report(root: str) -> str:
                      "adapter)")
         lines.append("")
         lines.append("Protocol: %s." % latency["protocol"]["scope"])
+        lines.append("")
+        lines.append("The timed region is `%s` under the locked policy "
+                     "`%s`."
+                     % (latency["protocol"].get("timed_region", "n/a"),
+                        latency["protocol"].get("policy", "n/a")))
         lines.append("")
         lines.append("| Metric | cold (1 group) | warm (%d groups) | all "
                      "(%d groups) |"
