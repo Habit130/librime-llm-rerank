@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Eligibility, audit, export and privacy tests for the #175 dataset freeze.
+"""Eligibility, audit, export and privacy tests for the #182 dataset freeze.
 
-Pins AC-175-v1 DATA-2 (event, retraction, duplicate and causal-text rules;
+Pins AC-182-v1 DATA-2 (event, retraction, duplicate and causal-text rules;
 training vs ranking eligibility) and the private/public output boundary of
 DATA-4/DATA-5 on synthetic facts only.
 """

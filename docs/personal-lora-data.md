@@ -1,11 +1,16 @@
 # Personal LoRA completion dataset freeze (`personal-lora-completion-v1`)
 
 This document is the authoritative description of the private completion
-dataset produced for Squirrel#175 (contract AC-175-v1, parent spec #174).
+dataset produced for Squirrel#182 (contract AC-182-v1, parent spec #180).
 It covers the dataset schema, training vs ranking eligibility, the
 deterministic temporal split rule, the CLI, the private/public output
 boundary, freeze verification and the frozen run's aggregate
 qualification evidence.
+
+This is a new dataset freeze identity for the replacement adapter. It
+does not restore deleted #175 artifacts and does not treat historically
+published #175 checksums as this freeze's identity. #176/#177/#178
+consumed that earlier freeze; those artifacts are gone.
 
 Data and evaluation tooling only: this delivery does not download or load
 a model, train, change live behavior, or write to the live fact store.
@@ -23,9 +28,10 @@ example:
   counted stratum, never a fault.
 - `completion` — the stored `final_selection_text`, the finally committed
   selected word.
-- `loss` — `completion_only`: the loss-boundary intent exported for the
-  pilot. No tokenizer-dependent mask is validated or claimed here;
-  token lengths are explicitly deferred until the pilot pins a tokenizer.
+- `loss` — `completion_only`: the loss-boundary intent exported for
+  training. No tokenizer-dependent mask is validated or claimed here;
+  token lengths are explicitly deferred until training (#183) pins a
+  tokenizer.
 
 Records are never concatenated into documents, later choices are never
 used as preceding text, and no candidate-negative, synthetic response or
@@ -35,8 +41,8 @@ ranking-eligibility flag, empty-context flag, character counts and
 partition). Raw text and per-example fingerprints stay in the private
 JSONL files only.
 
-Separate splits are written so downstream pilot/training runs can consume
-only their permitted partition:
+Separate splits are written so downstream training can consume only its
+permitted partition:
 
 ```text
 dataset/train.jsonl  dataset/validation.jsonl  dataset/test.jsonl
@@ -141,6 +147,13 @@ dataset/manifest.json              aggregate-only frozen manifest
 dataset/public-report.md           desensitized qualification report
 ```
 
+Config keys: `source_db` and `artifact_root` (required); `status_cli`,
+`status_timeout_seconds`, `expected_fact_schema_version` (optional).
+Relative paths resolve against the repository root. Unknown keys and
+invalid values fail closed. Writable paths that resolve into live
+fact/Rime/app locations, outside this ticket-owned root, or through
+symlink aliases are refused.
+
 - The live source is opened read-only/query-only and only through the
   SQLite Online Backup API. No source mutation, maintenance, restart,
   userdb access or remote upload happens here.
@@ -150,9 +163,8 @@ dataset/public-report.md           desensitized qualification report
   tampered frozen artifacts are an error, not a reason to re-acquire.
 - An existing `dataset/manifest.json` (successful freeze) makes the run
   refuse to overwrite or rebind; only `--verify-only` may touch it
-  afterwards.
-- Writable paths that resolve into live fact/Rime/app locations, outside
-  the ticket-owned root, or through symlink aliases are refused.
+  afterwards. A recovered older freeze in this root is also refused,
+  never overwritten.
 - The public report contains aggregate counts, choices, HLC boundaries
   and artifact checksums only: no raw text, token sequences, per-example
   fingerprints, event identifiers or absolute private paths.
@@ -164,11 +176,6 @@ python3 eval/personal_lora_data.py --config .local-work/personal-lora-data/confi
 python3 eval/personal_lora_data.py --verify-only \
     --manifest .local-work/personal-lora-data/dataset/manifest.json
 ```
-
-Config keys: `source_db` and `artifact_root` (required); `status_cli`,
-`status_timeout_seconds`, `expected_fact_schema_version` (optional).
-Relative paths resolve against the repository root. Unknown keys and
-invalid values fail closed.
 
 Exit status:
 
@@ -193,9 +200,10 @@ audit, split rule, complete split metadata, terminal decision and every
 part byte from the frozen snapshot** so a tampered or non-reproducible
 freeze fails without changing anything.
 
-## Frozen run (2026-09-14, aggregate-only evidence)
+## Frozen run (2026-09-17, aggregate-only evidence)
 
 - terminal: `dataset_frozen`; exit status `0`.
+- created_at_utc: `2026-09-17T09:38:23Z`.
 - snapshot sha256:
   `be2b09256dd2c24485ed618501fc06408b4441e1d14a8d86d2645797e82ae6de`
   (34,095,104 bytes, `integrity ok`, no foreign-key violations).
@@ -205,10 +213,10 @@ freeze fails without changing anything.
   `history_id dc3ffbf1a21957e0bb4ceed535c9df56`,
   `fact_schema_version 1`, `event_format_version 1`,
   high-water `[1789348852036, 0]`.
-- acquisition attempts: 2 — attempt 1 explicitly failed (a snapshot-open
-  defect for WAL copies without a `-shm` file was found, fixed and
-  regression-tested before the successful retry), attempt 2 succeeded.
-  Metadata continuity held across the successful acquisition.
+- acquisition attempts: 1 — attempt 1 succeeded (`reused=False`).
+  Metadata continuity held across the successful acquisition
+  (`store_epoch`, `history_id`, schema fingerprint and source path
+  stable; high-water monotonic).
 - health: `unknown` (no status CLI is configured for this run;
   continuity is from direct metadata, not from service health).
 - rows 16792; training samples 15930; exclusions `retracted` 862;
@@ -232,35 +240,43 @@ freeze fails without changing anything.
 - prompt Unicode-character lengths (min/p50/p90/p99/max):
   train `0/64/64/64/64`, validation `0/64/64/64/64`,
   test `0/64/64/64/64`; completion lengths: all splits `1/2/2/3/4`.
+- tool: `personal_lora_data` version 1, script sha256
+  `8d4a9ddaa5c46de4264c88c00180e4926afb7acb7d593538f857421339f2031d`.
 - manifest sha256:
-  `5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae`.
+  `3c955756c7e109a8274f7796396c43208f178d4328670fe77d4c3141e3239b88`.
 - The private manifest and public report are at
   `.local-work/personal-lora-data/dataset/manifest.json` and
   `.local-work/personal-lora-data/dataset/public-report.md`.
+
+The snapshot and split-file sha256 values are byte-identical to the
+numbers historically published for #175. That is a property of the live
+store at acquisition time (it had not advanced), not a restoration of
+#175 files and not this freeze's binding identity. The binding identity
+is the new acquisition record, `created_at_utc`, manifest sha256 and
+tool script sha256 above.
 
 ## Limitations
 
 - The split is a static historical snapshot-as-of-retractions; later
   retractions require a new dataset/adapter version. This is not instant
   unlearning.
-- Earlier project experiments may have seen this historical period; the
-  test partition is not claimed as an untouched project-wide prospective
-  test. New post-freeze events belong to later prospective confirmation.
-- Token lengths and the tokenizer-dependent loss mask are deferred to the
-  pilot; the exported `loss` field is intent only.
+- Earlier project experiments, including #174/#175/#176/#177/#178, may
+  have seen this historical period; the test partition is not claimed as
+  an untouched project-wide prospective test. New post-freeze events
+  belong to later prospective confirmation.
+- Token lengths and the tokenizer-dependent loss mask are deferred to
+  #183; the exported `loss` field is intent only.
 - The 4907 historical retrieval-actionable count is not a training
   admission threshold, and nonzero counts are not a statistical adequacy
   claim.
 - Persisted `session_id`s interleave; five sessions span partitions and
   are disclosed rather than hidden.
-- The test partition stays sealed for the #178 evaluation; #176/#177 must
-  not read it for tuning.
 
 ## Downstream sealing
 
-- #176/#177 consume `dataset/train.jsonl` (and validation where the
-  contract allows) only; the pilot must not read test outcomes.
+- #183 consumes `dataset/train.jsonl` (and validation where that
+  contract allows) only; training must not parse test outcomes.
 - Any new snapshot produces a new freeze and a new adapter identity; the
   frozen files and their checksums are never edited or replaced.
-- `--verify-only` is the read-only provenance gate for the pilot and for
+- `--verify-only` is the read-only provenance gate for #183 and for
   independent Acceptance.
