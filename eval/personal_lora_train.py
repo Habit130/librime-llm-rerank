@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One frozen local MLX LoRA training run (Habit130/squirrel#177, AC-177-v1).
+"""One frozen local MLX LoRA training run (Habit130/squirrel#183, AC-183-v1).
 
 Trains one versioned personal LoRA adapter on the pinned causal
 ``Qwen3-0.6B-Base`` with the frozen completion-only objective, validates the
@@ -104,7 +104,7 @@ RELOAD_SUBSET_SIZE = 32
 BUDGET_SECONDS = 12 * 3600.0
 SELECTION_RULE = "min_validation_completion_loss_later_epoch_tie_break"
 
-FROZEN_FREEZE_COMMIT = "2076d0a6c92dbf57833b7a123ea54aab10ddd49d"
+FROZEN_FREEZE_COMMIT = "c5509d78761ef46f04a2364f587c7c496f22edec"
 FROZEN_MODEL_COMPOSITE_SHA256 = (
     "f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320fafa")
 FROZEN_DATASET_DIGESTS = {
@@ -113,10 +113,13 @@ FROZEN_DATASET_DIGESTS = {
     "validation_sha256":
         "80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8bdeaa880",
     "manifest_sha256":
-        "5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae",
+        "3c955756c7e109a8274f7796396c43208f178d4328670fe77d4c3141e3239b88",
     "test_sha256":
         "12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b",
 }
+HISTORICAL_175_FREEZE_COMMIT = "2076d0a6c92dbf57833b7a123ea54aab10ddd49d"
+HISTORICAL_175_MANIFEST_SHA256 = (
+    "5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae")
 
 CONFIG_KEYS = frozenset(("artifact_root", "model_dir", "dataset_dir",
                          "freeze_commit", "expected", "run"))
@@ -292,7 +295,7 @@ def assert_owner_only(root: str) -> None:
 def assert_frozen_identities(model_identity: Dict[str, Any],
                              dataset_identity: Dict[str, Any],
                              expected: Dict[str, str]) -> None:
-    """Pin the #176/#175 identities independently of the mutable config."""
+    """Pin the #182 identities independently of the mutable config."""
     problems = []
     if model_identity.get("composite_sha256") != expected.get(
             "model_composite_sha256"):
@@ -300,14 +303,23 @@ def assert_frozen_identities(model_identity: Dict[str, Any],
                         "expected composite")
     if model_identity.get("composite_sha256") != FROZEN_MODEL_COMPOSITE_SHA256:
         problems.append("the model composite is not the frozen #176 identity")
+    if expected.get("model_composite_sha256") != FROZEN_MODEL_COMPOSITE_SHA256:
+        problems.append("config expected model composite is not the frozen "
+                        "#176 identity")
     digests = dataset_identity.get("digests") or {}
     mismatches = [key for key in sorted(FROZEN_DATASET_DIGESTS)
                   if digests.get(key) != FROZEN_DATASET_DIGESTS[key]]
     if mismatches:
-        problems.append("dataset files are not the frozen #175 freeze: %s"
+        problems.append("dataset files are not the frozen #182 freeze: %s"
                         % ",".join(mismatches))
+    expected_mismatches = [
+        key for key in sorted(FROZEN_DATASET_DIGESTS)
+        if expected.get(key) != FROZEN_DATASET_DIGESTS[key]]
+    if expected_mismatches:
+        problems.append("config expected digests are not the frozen #182 "
+                        "freeze: %s" % ",".join(expected_mismatches))
     if dataset_identity.get("freeze_commit") != FROZEN_FREEZE_COMMIT:
-        problems.append("the dataset freeze commit is not the #175 freeze")
+        problems.append("the dataset freeze commit is not the #182 freeze")
     if problems:
         raise EnvironmentBlocker("; ".join(problems))
 
@@ -759,7 +771,7 @@ def render_public_report(identity: Dict[str, Any],
     lines = []
     lines.append("# Frozen personal LoRA training run — desensitized report")
     lines.append("")
-    lines.append("Contract AC-177-v1 (Habit130/squirrel#177). Aggregate "
+    lines.append("Contract AC-183-v1 (Habit130/squirrel#183). Aggregate "
                  "evidence only: no prompt/completion text, no event "
                  "identifiers, no absolute private paths.")
     lines.append("")
@@ -1170,7 +1182,7 @@ def cmd_run(config_path: str, allowed_root: Optional[str] = None,
         deadline = next_epoch_deadline(time.perf_counter(), training_used)
         if deadline is None:
             terminal = TERMINAL_RUNTIME
-            reasons = ["the %.0f h training budget is exhausted; AC-177-v1 "
+            reasons = ["the %.0f h training budget is exhausted; AC-183-v1 "
                        "does not grant fresh training time (the per-epoch "
                        "checkpoints are retained)"
                        % (BUDGET_SECONDS / 3600.0)]
@@ -1400,6 +1412,25 @@ def self_test() -> List[str]:
           LEARNING_RATE == 1e-4 and WEIGHT_DECAY == 0.0 and SEED == 176)
     check("cache_threshold_is_two_gb",
           CACHE_CLEAR_THRESHOLD_BYTES == 2_000_000_000)
+    check("frozen_freeze_commit_is_ac182",
+          FROZEN_FREEZE_COMMIT
+          == "c5509d78761ef46f04a2364f587c7c496f22edec")
+    check("frozen_manifest_is_ac182",
+          FROZEN_DATASET_DIGESTS["manifest_sha256"]
+          == "3c955756c7e109a8274f7796396c43208f178d4328670fe77d4c3141e3239b88")
+    check("historical_175_manifest_is_not_the_freeze",
+          FROZEN_DATASET_DIGESTS["manifest_sha256"]
+          != HISTORICAL_175_MANIFEST_SHA256
+          and FROZEN_FREEZE_COMMIT != HISTORICAL_175_FREEZE_COMMIT)
+    check("split_hashes_alone_do_not_identify_the_freeze",
+          FROZEN_DATASET_DIGESTS["train_sha256"]
+          == "c66ff3adb7a30dc40c33f94de7d777eb9ab304820b0066433d806755c80d8dd2"
+          and FROZEN_DATASET_DIGESTS["validation_sha256"]
+          == "80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8bdeaa880"
+          and FROZEN_DATASET_DIGESTS["test_sha256"]
+          == "12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b"
+          and FROZEN_DATASET_DIGESTS["manifest_sha256"]
+          != HISTORICAL_175_MANIFEST_SHA256)
 
     first = epoch_batches(11, 1)
     check("epoch_batches_cover_every_index_once",
@@ -1451,7 +1482,7 @@ def cmd_self_test() -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="One frozen local MLX LoRA training run (AC-177-v1)")
+        description="One frozen local MLX LoRA training run (AC-183-v1)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--self-test", action="store_true",
                        help="run frozen-config and selection self-checks")

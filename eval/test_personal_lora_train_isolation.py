@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sealing, privacy and identity tests for the #177 training runner.
+"""Sealing, privacy and identity tests for the #183 training runner.
 
 These tests pin the contract's isolation rules: ``test.jsonl`` is opened only
 in binary mode for checksumming and is never parsed, private outputs stay
