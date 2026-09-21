@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Objective, mask, batching, selection and config tests for #177.
+"""Objective, mask, batching, selection and config tests for #183.
 
 Fixtures are synthetic; the real tokenizer, the real dataset and MLX are
 never needed. These tests pin that the training runner uses the frozen #176
@@ -292,7 +292,21 @@ class PaddedLossMaskTest(unittest.TestCase):
 
 
 class FrozenIdentityConstantTest(unittest.TestCase):
-    """The runner pins the #176/#175 identities independently of config."""
+    """The runner pins the #182 identities independently of config."""
+
+    def frozen_expected(self, **overrides):
+        expected = dict(plt.FROZEN_DATASET_DIGESTS)
+        expected["model_composite_sha256"] = plt.FROZEN_MODEL_COMPOSITE_SHA256
+        expected.update(overrides)
+        return expected
+
+    def frozen_dataset(self, **overrides):
+        digests = dict(plt.FROZEN_DATASET_DIGESTS)
+        freeze_commit = plt.FROZEN_FREEZE_COMMIT
+        if "freeze_commit" in overrides:
+            freeze_commit = overrides.pop("freeze_commit")
+        digests.update(overrides)
+        return {"digests": digests, "freeze_commit": freeze_commit}
 
     def test_model_composite_is_the_frozen_identity(self):
         self.assertEqual(
@@ -309,14 +323,44 @@ class FrozenIdentityConstantTest(unittest.TestCase):
                 "80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8b"
                 "deaa880",
             "manifest_sha256":
-                "5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704"
-                "774bae",
+                "3c955756c7e109a8274f7796396c43208f178d4328670fe77d4c3141e3"
+                "239b88",
             "test_sha256":
                 "12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a"
                 "9f2d2b",
         })
         self.assertEqual(plt.FROZEN_FREEZE_COMMIT,
-                         "2076d0a6c92dbf57833b7a123ea54aab10ddd49d")
+                         "c5509d78761ef46f04a2364f587c7c496f22edec")
+
+    def test_historical_manifest_is_rejected_even_when_split_hashes_match(self):
+        model = {"composite_sha256": plt.FROZEN_MODEL_COMPOSITE_SHA256}
+        dataset = self.frozen_dataset(
+            manifest_sha256=plt.HISTORICAL_175_MANIFEST_SHA256)
+        expected = self.frozen_expected(
+            manifest_sha256=plt.HISTORICAL_175_MANIFEST_SHA256)
+        with self.assertRaises(plt.EnvironmentBlocker) as raised:
+            plt.assert_frozen_identities(model, dataset, expected)
+        message = str(raised.exception)
+        self.assertIn("manifest_sha256", message)
+        self.assertIn("#182", message)
+
+    def test_historical_freeze_commit_is_rejected_when_file_hashes_match(self):
+        model = {"composite_sha256": plt.FROZEN_MODEL_COMPOSITE_SHA256}
+        dataset = self.frozen_dataset(
+            freeze_commit=plt.HISTORICAL_175_FREEZE_COMMIT)
+        with self.assertRaises(plt.EnvironmentBlocker) as raised:
+            plt.assert_frozen_identities(
+                model, dataset, self.frozen_expected())
+        self.assertIn("#182", str(raised.exception))
+
+    def test_config_cannot_waive_the_frozen_manifest_pin(self):
+        model = {"composite_sha256": plt.FROZEN_MODEL_COMPOSITE_SHA256}
+        dataset = self.frozen_dataset()
+        expected = self.frozen_expected(
+            manifest_sha256=plt.HISTORICAL_175_MANIFEST_SHA256)
+        with self.assertRaises(plt.EnvironmentBlocker) as raised:
+            plt.assert_frozen_identities(model, dataset, expected)
+        self.assertIn("manifest_sha256", str(raised.exception))
 
 
 class EpochPlanTest(unittest.TestCase):
@@ -480,6 +524,9 @@ class CliTest(unittest.TestCase):
         self.assertIn("cache_threshold_is_two_gb", checks)
         self.assertIn("selection_prefers_later_epoch_on_a_tie", checks)
         self.assertIn("epoch_batches_cover_every_index_once", checks)
+        self.assertIn("frozen_manifest_is_ac182", checks)
+        self.assertIn("historical_175_manifest_is_not_the_freeze", checks)
+        self.assertIn("split_hashes_alone_do_not_identify_the_freeze", checks)
 
 
 if __name__ == "__main__":

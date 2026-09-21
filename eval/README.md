@@ -896,24 +896,26 @@ Private identity, probes, measurement, adapter and report stay under ignored
 validation/test JSONL files are checksummed but never parsed; no live
 mutation, upload or pin bump is part of this ticket.
 
-## Frozen personal LoRA training (Habit130/squirrel#177, AC-177-v1)
+## Frozen personal LoRA training (Habit130/squirrel#183, AC-183-v1)
 
 `personal_lora_train.py` trains one versioned personal LoRA adapter with the
 #176 raw-concat completion-only objective on the pinned causal
-`Qwen3-0.6B-Base`: exactly 3 epochs, LoRA rank 16 / alpha 16 / dropout 0 on
-all decoder layers, bf16 base with fp32 LoRA and optimizer, micro-batch 8
-with accumulation 1 (effective batch 8), AdamW lr `1e-4`, weight decay 0,
-seed 176, `mx.clear_cache()` above 2 GB and at least once per epoch.  There
-is no search, no extra grid and no early stop; a config that deviates from
-the frozen shape is refused.  After every epoch the frozen validation
-partition's mean completion-only loss is computed with the same mask, and
-the selected checkpoint is the lowest validation loss with a later epoch
-winning an exact tie.  The sealed `test.jsonl` is checksummed only and never
-parsed.  The pinned runtime is a ticket-local venv (`mlx==0.32.0`,
-`mlx-lm==0.31.3`, `numpy==2.4.6`); `python3` below means that venv.
-Authoritative description, selection/resume protocol, private/public
-boundary and the frozen run's aggregate evidence:
-`docs/personal-lora-train.md`.
+`Qwen3-0.6B-Base` and the accepted #182 dataset identity: exactly 3 epochs,
+LoRA rank 16 / alpha 16 / dropout 0 on all decoder layers, bf16 base with
+fp32 LoRA and optimizer, micro-batch 8 with accumulation 1 (effective batch
+8), AdamW lr `1e-4`, weight decay 0, seed 176, `mx.clear_cache()` above 2 GB
+and at least once per epoch.  Matching train/validation/test hashes with the
+historical #175 manifest do not identify this freeze.  There is no search,
+no extra grid and no early stop; a config that deviates from the frozen
+shape is refused.  After every epoch the frozen validation partition's mean
+completion-only loss is computed with the same mask, and the selected
+checkpoint is the lowest validation loss with a later epoch winning an exact
+tie.  The sealed `test.jsonl` is checksummed only and never parsed.  The
+pinned runtime is a ticket-local venv (`mlx==0.32.0`, `mlx-lm==0.31.3`,
+`numpy==2.4.6`); `python3` below means that venv.  Authoritative description,
+selection/resume protocol, private/public boundary and the frozen run's
+aggregate evidence: `docs/personal-lora-train.md`.  The #177 run is
+historical evidence only.
 
 ```sh
 python3 -m unittest discover -s eval -p 'test_personal_lora_train*.py'

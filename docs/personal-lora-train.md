@@ -1,19 +1,21 @@
 # Frozen personal LoRA training (`personal-lora-train`)
 
-This document is the authoritative description of the Squirrel#177 execution
-(contract AC-177-v1, parent spec #174). It covers the frozen completion-only
-objective seam, the pinned identities, the frozen hyperparameters, the
-predeclared checkpoint-selection rule, the per-epoch checkpoint/resume
+This document is the authoritative description of the Squirrel#183 execution
+(contract AC-183-v1, parent spec #180). It covers the frozen completion-only
+objective seam, the pinned #182 identities, the frozen #177 training shape,
+the predeclared checkpoint-selection rule, the per-epoch checkpoint/resume
 protocol, the save/reload agreement check, the private/public output
-boundary, and the one frozen run's selected checkpoint.
+boundary, and the one frozen replacement run's selected checkpoint.
 
-The delivery trains and selects exactly one personal LoRA adapter. It does
-not score the sealed test partition, claim ranking benefit, change live
-`alpha`/`gamma`/evidence, upload data, or start #178. The implementation is
-`eval/personal_lora_train.py`; synthetic tests are
-`eval/test_personal_lora_train_objective.py`,
+The delivery trains and selects exactly one personal LoRA adapter from the
+accepted #182 dataset. It does not score the sealed test partition, claim
+ranking benefit, change live `alpha`/`gamma`/evidence, upload data, or start
+#184. The implementation is `eval/personal_lora_train.py`; synthetic tests
+are `eval/test_personal_lora_train_objective.py`,
 `eval/test_personal_lora_train_runner.py` and
-`eval/test_personal_lora_train_isolation.py`.
+`eval/test_personal_lora_train_isolation.py`. The #177 run is preserved
+below as historical evidence; matching split hashes do not identify this
+freeze.
 
 ## Objective and serialization
 
@@ -58,15 +60,18 @@ trainable validation examples (`sum NLL / sum completion tokens`).
 - Runtime: ticket-local venv with `mlx==0.32.0`, `mlx-lm==0.31.3`,
   `numpy==2.4.6`. Any mismatch is an `environment_blocker`; the pins are
   never bumped here.
-- Dataset: the Completed #175 freeze at plugin
-  `origin/master@2076d0a6c92dbf57833b7a123ea54aab10ddd49d`.
+- Dataset: the Completed #182 freeze at plugin
+  `origin/master@c5509d78761ef46f04a2364f587c7c496f22edec`.
   `train.jsonl`
   `c66ff3adb7a30dc40c33f94de7d777eb9ab304820b0066433d806755c80d8dd2`,
   `validation.jsonl`
   `80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8bdeaa880`,
   `manifest.json`
-  `5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae`; the
-  manifest train binding and line counts are re-checked.
+  `3c955756c7e109a8274f7796396c43208f178d4328670fe77d4c3141e3239b88`; the
+  manifest train binding and line counts are re-checked. Identical
+  train/validation/test hashes with the historical #175 manifest
+  `5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae` at
+  freeze commit `2076d0a6c92dbf57833b7a123ea54aab10ddd49d` are refused.
 - `test.jsonl` is checksummed only
   (`12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b`). It is
   opened in binary mode for hashing and is never parsed; the test partition
@@ -99,9 +104,10 @@ starts; the canonical hash of the resolved shape is the run's
 
 ## Epochs, checkpoints and resume
 
-Each epoch is one deterministic shuffled pass over the 11,259 trainable train
+Each epoch is one deterministic shuffled pass over all trainable train
 examples in batches of 8 (`random.Random(seed + epoch)`); the final batch is
-smaller when the count is not divisible. After every epoch the runner
+smaller when the count is not divisible. Token aggregates are re-derived on
+this run; historical #177 counts are not substitute evidence. After every epoch the runner
 computes the validation loss, records the frozen 32-example train subset
 log-sums for that epoch's weights, and writes an owner-only checkpoint under
 `epochs/epoch-<n>/` (`adapters.safetensors` plus `adapter_config.json`). A
@@ -206,18 +212,95 @@ Isolation rules enforced by the implementation:
   starts and before a completed run is reused or any terminal is persisted,
   so a privacy violation cannot be recorded as `trained` or reused.
 
-## Frozen run (2026-09-15, aggregate-only evidence)
+## Frozen run (Squirrel#183, 2026-09-21, aggregate-only evidence)
 
-The one frozen run was executed from the delivery worktree with the
-ticket-local venv (`started_at_utc` 2026-09-15T02:33:26Z, `updated_at_utc`
-02:56:37Z) and exited `0` with terminal **`trained`**. The recorded tool
-SHA-256 is
-`27e09565b187b95618f65975bb4a336b6d578664d39b5a7fdff82e10cc68fa78`, which is
+The one frozen replacement run was executed from the delivery worktree with
+the ticket-local venv (`created_at_utc` 2026-09-21T02:28:47Z,
+`updated_at_utc` 2026-09-21T02:47:04Z) and exited `0` with terminal
+**`trained`**. The recorded tool SHA-256 is
+`fcc583edc26a59b16471c38d14a87a03d9d0fa301a5cb65a031fa7d103c2fa3d`, which is
 the delivered `eval/personal_lora_train.py`; `--run` and `--verify-reload` at
 the delivery head re-verify against it. A private desensitized copy is at
-`.local-work/personal-lora-train/public-report.md`.
+`.local-work/personal-lora-train/public-report.md`. Historical #177 metrics
+below are not this run's evidence.
 
 - Identities: causal `Qwen3ForCausalLM` composite sha256
+  `f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320fafa`,
+  `model.safetensors` sha256
+  `cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba`
+  (1,192,135,096 bytes); tokenizer.json sha256
+  `c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539`;
+  tokenizer_config.json sha256
+  `3c04ed3ca964ea2f6b2b5faf0dc4d31aec1cb1e8b4bcf63f402d295046b422b5`;
+  runtime `mlx 0.32.0 / mlx-lm 0.31.3 / numpy 2.4.6`; dataset freeze commit
+  `c5509d78761ef46f04a2364f587c7c496f22edec`, train
+  `c66ff3adb7a30dc40c33f94de7d777eb9ab304820b0066433d806755c80d8dd2`,
+  validation
+  `80e58ebe0688bb28a083e723cb4d38c5386fa7856c0dc592d526e0f8bdeaa880`,
+  manifest
+  `3c955756c7e109a8274f7796396c43208f178d4328670fe77d4c3141e3239b88`;
+  sealed test checksum-only
+  `12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b`. The
+  runner pins these as module constants and refuses any other
+  model/dataset, including the historical #175 manifest, before writing
+  anything, independently of the config. Executed seam digests: data
+  `8d4a9ddaa5c46de4264c88c00180e4926afb7acb7d593538f857421339f2031d`,
+  pilot `b02db1ef58933eb13072120d955512aa3683d418238bb8813f543716bd2315f5`.
+- Config: `config_sha256`
+  `2dbc170341799901be5733b6e5b37e0bb7b775ac29b39d863fcdb3d299f26abb` for the
+  frozen shape exactly as tabled above; no search and no early stop.
+- Fresh start: `warm_start=false`, `mlx_random_seed_176`, 4,587,520 trainable
+  parameters before the first update; no adapter was loaded before training.
+- Token aggregates re-derived with the pinned tokenizer: train 12,675
+  examples (11,259 trainable; 1,416 untrainable; 1,381 boundary-spanning
+  tokens over 1,381 examples; 131 empty-context, 23 trainable); validation
+  1,657 examples (1,451 trainable; 206 untrainable; 208 boundary-spanning
+  tokens; 16 empty-context, 4 trainable).
+- No resume was needed (`resumed_from_epoch: null`). Budgeted training work
+  **1,095.88 s (0.304 h)** against the 12 h budget; total wall clock
+  including identity, tokenization and the selected-adapter save/reload
+  verification **1,099.38 s (0.305 h)**. Peak MLX memory **2.774 GB**
+  (active 1.247 GB, cache 2.060 GB; process max RSS 2,280 MB). The 2 GB
+  cache policy cleared the allocator 2,021 times above threshold plus the 3
+  epoch floors.
+
+  | epoch | steps | train loss first/last/mean | validation loss | seconds | cache clears | peak GB | selected |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1 | 1408 | 5.54688/4.66667/4.87694 | 4.595782 | 326.36 | 678 | 2.7467 |  |
+  | 2 | 1408 | 3.53906/3.45833/3.99744 | 4.571959 | 368.63 | 675 | 2.7742 | yes |
+  | 3 | 1408 | 2.84375/1.5/3.19742 | 4.785711 | 400.89 | 671 | 2.7742 |  |
+
+- Selection: **epoch 2** by the predeclared rule (lowest validation
+  completion-only loss; no exact tie). Selected adapter sha256
+  `7622f26d71efa34f5b9b1e92ebef2c064bd06363c3eac4c88fb0adb44b1462d9`,
+  18,374,616 bytes, identical to the epoch-2 checkpoint; selected
+  `adapter_config.json` sha256
+  `656e2ea61b91f270bbca559b0d6377cac01ede1de7ea11710893a5a7ad4671b8`
+  (freeze commit `c5509d78761ef46f04a2364f587c7c496f22edec`). The fresh
+  in-process reload and the standalone `--verify-reload` both pass with max
+  abs completion log-sum difference **0.0** on the frozen 32-example train
+  subset (tolerance `1e-4`). The trainable-weight digest changed from
+  `8a4753a6d91345c8cf28b01a3e8f498770ba5bf45e299f28b945b8e5dfa7cfbd` to
+  `406909bb247047ea359d8552616d14fd6544cf0b60b1cc7328ed4b39aa9e0146`. The
+  selected adapter bytes coincide with the historical #177 epoch-2 adapter;
+  that coincidence is disclosed, not claimed as restoration or a warm start.
+- Isolation and cleanup: `test.jsonl` checksummed only, unchanged after the
+  run; `validation.jsonl` used only for the frozen rule; no live mutation,
+  deployment, upload, pin bump or #184 enablement; all artifacts owner-only;
+  the training process exited and the GPU/quiet-machine interval is
+  released. The live input method stayed running during the run.
+
+## Historical frozen run (Squirrel#177, 2026-09-15, aggregate-only)
+
+The #177 frozen run was executed from its delivery worktree with the
+ticket-local venv (`started_at_utc` 2026-09-15T02:33:26Z, `updated_at_utc`
+02:56:37Z) and exited `0` with terminal **`trained`**. That recorded tool
+SHA-256 is
+`27e09565b187b95618f65975bb4a336b6d578664d39b5a7fdff82e10cc68fa78`. This
+section is historical; it does not identify or evidence the #183 adapter.
+
+- Identities (historical #175/#177 binding): causal `Qwen3ForCausalLM`
+  composite sha256
   `f072952bdda49858e131745b9e63a25040fce85ca19c9ac0b1eadd833320fafa`,
   `model.safetensors` sha256
   `cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba`
@@ -230,8 +313,8 @@ the delivery head re-verify against it. A private desensitized copy is at
   `5d02844d5e365d67360c52d2946ef54c4d1d0a00730c84fa3314562704774bae`;
   sealed test checksum-only
   `12e973269edaa12fd56b54c644c05943dadf51d504ff519bdae38adc6a9f2d2b`. The
-  runner pins these as module constants and refuses any other model/dataset
-  before writing anything, independently of the config.
+  #183 runner refuses this historical manifest even when the split hashes
+  match.
 - Config: `config_sha256`
   `2dbc170341799901be5733b6e5b37e0bb7b775ac29b39d863fcdb3d299f26abb` for the
   frozen shape exactly as tabled above; no search and no early stop.

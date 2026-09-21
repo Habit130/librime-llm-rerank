@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end runner tests for #177 with a deterministic fake MLX.
+"""End-to-end runner tests for #183 with a deterministic fake MLX.
 
 The fake backend implements the small mlx/mlx-lm surface the runner uses, so
 ``--run``, ``--verify-reload``, checkpoint selection, reuse/immutability,
