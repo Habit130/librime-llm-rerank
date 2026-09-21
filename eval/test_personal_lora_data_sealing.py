@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sealing, immutability and privacy tests for the #175 dataset (DATA-4).
+"""Sealing, immutability and privacy tests for the #182 dataset (DATA-4).
 
 Pins owner-only storage, artifact-root isolation (including symlink
 aliases), refusal to overwrite or rebind a successful freeze, verify-only

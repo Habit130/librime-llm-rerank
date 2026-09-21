@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic temporal freeze tests for the #175 dataset (DATA-3).
+"""Deterministic temporal freeze tests for the #182 dataset (DATA-3).
 
 Pins whole-commit preservation, session-boundary preference, ordered
 nonoverlapping boundaries, deterministic repeated export, overlap reporting

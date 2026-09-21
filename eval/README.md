@@ -843,17 +843,18 @@ The desensitized freeze, manifest and report are mirrored to the new
 tracked path `eval/production_config_lock/`.  That path never overwrites
 AC-157/159/162/164/78/79 artifacts.
 
-## Personal LoRA completion dataset freeze (Habit130/squirrel#175, AC-175-v1)
+## Personal LoRA completion dataset freeze (Habit130/squirrel#182, AC-182-v1)
 
 `personal_lora_data.py` turns one read-only SQLite Online Backup of the
 canonical fact store into a private completion dataset (prompt = stored
 raw causal 上文, completion = finally committed word) with a
 deterministic, whole-commit, session-preferred ~80/10/10 temporal split.
 Training and ranking-evaluation eligibility are independent; retraction,
-duplicate and causal-text rules are reported per reason.  Authoritative
-description, eligibility rules, split rule, sealing and the frozen run's
-aggregate qualification evidence:
-`docs/personal-lora-data.md`.
+duplicate and causal-text rules are reported per reason.  This freeze is
+a new dataset identity for the replacement adapter; it does not restore
+deleted #175 artifacts.  Authoritative description, eligibility rules,
+split rule, sealing and the frozen run's aggregate qualification
+evidence: `docs/personal-lora-data.md`.
 
 ```sh
 python3 -m unittest discover -s eval -p 'test_personal_lora_data*.py'
@@ -865,7 +866,8 @@ python3 eval/personal_lora_data.py --verify-only \
 Private snapshot, split files, manifest and report stay under ignored
 `.local-work/personal-lora-data/` with owner-only permissions.  The
 desensitized public report is aggregate-only; no training, model load or
-live change is part of this ticket.
+live change is part of this ticket. #183 may consume only the permitted
+partitions through `--verify-only`.
 
 ## Local MLX LoRA feasibility pilot (Habit130/squirrel#176, AC-176-v1)
 

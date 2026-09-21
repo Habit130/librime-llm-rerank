@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only acquisition tests for the #175 dataset freeze (DATA-1).
+"""Read-only acquisition tests for the #182 dataset freeze (DATA-1).
 
 Pins the one-successful-Online-Backup state machine, explicit failed
 attempts, frozen-identity immutability, source metadata continuity,

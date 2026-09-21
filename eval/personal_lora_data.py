@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Personal LoRA completion-dataset freeze (Habit130/squirrel#175).
+"""Personal LoRA completion-dataset freeze (Habit130/squirrel#182).
 
 Turns one consistent, read-only SQLite Online Backup of the canonical fact
 store into a private completion-training dataset:
@@ -67,7 +67,7 @@ TOOL_VERSION = 1
 DATASET_SCHEMA = "personal-lora-completion-v1"
 MANIFEST_SCHEMA = "personal-lora-data-manifest-v1"
 
-# Established conventions (AC-175-v1 Established / existing #76/#77 seams).
+# Established conventions (AC-182-v1 Established / existing #76/#77 seams).
 GROUP_COMPLETE_N = 32
 PRECEDING_WINDOW = 64
 EXPLICIT_CONFIRMATION_SOURCES = ("explicit_current", "explicit_indexed")
@@ -1399,7 +1399,7 @@ def render_public_report(manifest: Dict) -> str:
         "# Personal LoRA dataset freeze — public report",
         "",
         "Aggregate-only qualification report for the private completion "
-        "dataset freeze (Habit130/squirrel#175, AC-175-v1). No raw strings, "
+        "dataset freeze (Habit130/squirrel#182, AC-182-v1). No raw strings, "
         "token sequences, per-example fingerprints or absolute private paths.",
         "",
         "## Terminal",
@@ -1518,7 +1518,7 @@ def render_public_report(manifest: Dict) -> str:
         "- New post-freeze events belong to later prospective confirmation, "
         "not to this snapshot.",
         "- Token lengths and any tokenizer-dependent loss mask are deferred "
-        "until a tokenizer is pinned in the pilot.",
+        "until a tokenizer is pinned in training (#183).",
         "- The 4907 historical retrieval-actionable count is not a training "
         "admission threshold for this dataset.",
         "",
@@ -1740,7 +1740,7 @@ def main(argv: Optional[Sequence[str]] = None,
          protected_roots: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Freeze the personal LoRA completion dataset "
-                    "(AC-175-v1).")
+                    "(AC-182-v1).")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--config", help="private freeze config JSON")
     group.add_argument("--verify-only", action="store_true",
