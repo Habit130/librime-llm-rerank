@@ -932,3 +932,10 @@ verification and report stay under ignored
 run is never rewritten: a rerun re-verifies it and reports `run_reused=true`;
 a blocker leaves a resumable per-epoch checkpoint.  No test scoring, live
 change, pin bump or upload is part of this ticket.
+
+## Personal LoRA live (Squirrel#184)
+
+Live adapter load is daemon-local (`--adapter` / `LLM_RERANK_ADAPTER`), not
+an eval runner and not a public schema key. Authoritative install, identity
+pins, live-switch and stop: `docs/personal-lora-live.md`. This section does
+not relabel #177/#178 as live evidence.

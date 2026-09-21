@@ -44,12 +44,15 @@ class PinAndTemplateTest(unittest.TestCase):
             "__INTERPRETER__",
             "__SERVER__",
             "__MODEL__",
+            "__ADAPTER__",
             "__SOCKET__",
             "__LOG__",
             "__LOG_ERR__",
             "__FACTS_ROOT__",
         ):
             self.assertIn(token, text)
+        self.assertIn("LLM_RERANK_ADAPTER", text)
+        self.assertIn("--context-window", text)
 
     def test_server_default_model_is_not_a_maintainer_path(self):
         with open(os.path.join(HERE, "server.py"), encoding="utf-8") as handle:
@@ -62,6 +65,7 @@ class PinAndTemplateTest(unittest.TestCase):
             "interpreter": "/tmp/checkout/daemon/.venv/bin/python",
             "server": "/tmp/checkout/daemon/server.py",
             "model": "/tmp/models/Qwen3-0.6B-Base",
+            "adapter": "/tmp/adapters/personal-lora",
             "socket": "/tmp/run/llm-rerank.sock",
             "log": "/tmp/run/llm-rerank.log",
             "log_err": "/tmp/run/llm-rerank.err",
@@ -74,6 +78,55 @@ class PinAndTemplateTest(unittest.TestCase):
         self.assertNotRegex(rendered, r"__[A-Z0-9_]+__")
         for value in values.values():
             self.assertIn(value, rendered)
+        self.assertIn("--adapter", rendered)
+        self.assertIn("LLM_RERANK_ADAPTER", rendered)
+
+    def test_render_plist_allows_empty_adapter(self):
+        values = {
+            "checkout": "/tmp/checkout",
+            "interpreter": "/tmp/checkout/daemon/.venv/bin/python",
+            "server": "/tmp/checkout/daemon/server.py",
+            "model": "/tmp/models/Qwen3-0.6B-Base",
+            "adapter": "",
+            "socket": "/tmp/run/llm-rerank.sock",
+            "log": "/tmp/run/llm-rerank.log",
+            "log_err": "/tmp/run/llm-rerank.err",
+            "facts_root": "/tmp/run/facts",
+        }
+        rendered = deploy.render_plist(
+            os.path.join(HERE, "com.squirrel.llm-rerank.plist"), values
+        )
+        self.assertNotRegex(rendered, r"__[A-Z0-9_]+__")
+        self.assertIn("--adapter", rendered)
+
+    def test_server_command_includes_adapter_and_context_window(self):
+        paths = {
+            "interpreter": "/tmp/python",
+            "server": "/tmp/server.py",
+            "socket": "/tmp/sock",
+            "model": "/tmp/model",
+            "facts_root": "/tmp/facts",
+            "adapter": "/tmp/adapter",
+        }
+        command = deploy.server_command(paths, False)
+        self.assertEqual(
+            [
+                "/tmp/python",
+                "/tmp/server.py",
+                "--serve",
+                "--socket", "/tmp/sock",
+                "--model", "/tmp/model",
+                "--facts-root", "/tmp/facts",
+                "--context-window", "64",
+                "--adapter", "/tmp/adapter",
+            ],
+            command,
+        )
+        health_only = deploy.server_command(
+            {**paths, "adapter": ""}, True
+        )
+        self.assertNotIn("--adapter", health_only)
+        self.assertIn("--health-only", health_only)
 
 
 class IsolatedLifecycleTest(unittest.TestCase):
