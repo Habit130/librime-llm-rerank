@@ -11,6 +11,10 @@ This is not a Squirrel.app package and does not redistribute model weights.
   ship one. Set `LLM_RERANK_MODEL` or pass `--model` to an on-disk checkout
   such as Qwen3-0.6B-Base. Isolated start/health/stop uses `--health-only`
   and a documented stand-in directory that is not a real model.
+- Optional personal LoRA: `--adapter` or `LLM_RERANK_ADAPTER` points at a
+  local adapter directory. Empty keeps base-only scoring. When set, the
+  daemon fail-closes unless the Established #184 identities match. This is
+  not a schema key. See `docs/personal-lora-live.md`.
 
 ## Install, start, health, stop
 
@@ -35,6 +39,7 @@ any path:
 --checkout      plugin checkout root
 --interpreter   python that runs server.py (default: daemon/.venv/bin/python)
 --model         local mlx-lm model directory
+--adapter       local LoRA adapter directory (optional; empty = base-only)
 --socket        unix socket path
 --log           stdout log
 --log-err       stderr log
@@ -53,6 +58,7 @@ python3 daemon/deploy.py render-plist \
   --checkout "$PWD" \
   --interpreter "$PWD/daemon/.venv/bin/python" \
   --model "$LLM_RERANK_MODEL" \
+  --adapter "${LLM_RERANK_ADAPTER:-}" \
   --socket "$HOME/Library/Application Support/Squirrel/llm-rerank.sock" \
   --log /tmp/llm-rerank-daemon.log \
   --log-err /tmp/llm-rerank-daemon.err \

@@ -38,6 +38,13 @@ from staging import build_staging_machine_from_config
 from publish import (build_publisher_from_config, read_active_manifest)
 from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
                       build_evidence_service_from_config)
+from personal_lora_live import (
+    IdentityError,
+    identify_adapter,
+    identity_fingerprint,
+    load_adapted_model,
+    pin_live_identities,
+)
 
 SOCKET_PATH = os.path.expanduser(
     "~/Library/Application Support/Squirrel/llm-rerank.sock"
@@ -46,6 +53,7 @@ FACTS_ROOT = os.path.expanduser(
     "~/Library/Application Support/Squirrel/SemanticMemory"
 )
 MODEL_PATH = os.environ.get("LLM_RERANK_MODEL") or ""
+ADAPTER_PATH = os.environ.get("LLM_RERANK_ADAPTER") or ""
 IDLE_TIMEOUT = 300  # seconds
 TAIL_CHARS = 4  # chars of context tail re-tokenized per candidate
 CONTEXT_WINDOW = 64  # chars of 上文 tail the model is conditioned on (ADR-0002)
@@ -390,15 +398,51 @@ class ModelState:
     """
 
     def __init__(self, model_path, context_window=CONTEXT_WINDOW,
-                 scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN):
+                 scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN,
+                 adapter_path=""):
         self.model_path = model_path
+        self.adapter_path = adapter_path or ""
         self.context_window = context_window
         self.scoring_strategy = scoring_strategy
         self.model = None
         self.tokenizer = None
         self.pad_id = None
+        self.adapter_digest = None
+        self._identity_fingerprint = None
+
+    def _pin_adapter_identity(self):
+        fingerprint = identity_fingerprint(self.model_path, self.adapter_path)
+        if fingerprint == self._identity_fingerprint and self.adapter_digest:
+            return
+        record = pin_live_identities(self.model_path, self.adapter_path)
+        self.adapter_digest = record["adapter"]["sha256"]
+        self._identity_fingerprint = fingerprint
+        return record
 
     def load(self):
+        if self.adapter_path:
+            try:
+                changed = (
+                    identity_fingerprint(self.model_path, self.adapter_path)
+                    != self._identity_fingerprint
+                )
+                if changed or self.model is None:
+                    self._pin_adapter_identity()
+                    if self.model is not None and changed:
+                        self.unload()
+            except IdentityError:
+                if self.model is not None:
+                    self.unload()
+                raise
+            if self.model is not None:
+                return
+            self.model, self.tokenizer = load_adapted_model(
+                self.model_path, self.adapter_path
+            )
+            self.pad_id = self.tokenizer.pad_token_id
+            if self.pad_id is None:
+                self.pad_id = self.tokenizer.eos_token_id
+            return
         if self.model is not None:
             return
         import mlx.core as mx
@@ -411,11 +455,11 @@ class ModelState:
             self.pad_id = self.tokenizer.eos_token_id
 
     def unload(self):
-        import mlx.core as mx
-
         self.model = None
         self.tokenizer = None
+        self._identity_fingerprint = None
         try:
+            import mlx.core as mx
             mx.clear_cache()
         except Exception:
             pass
@@ -594,6 +638,7 @@ def protocol_error(
         "invalid_json": "request is not valid JSON",
         "invalid_request": "request does not match the scoring protocol",
         "inference_failed": "scoring failed",
+        "identity_mismatch": "model or adapter identity does not match the live pins",
         "invalid_score_result": "scorer returned an invalid result",
         "score_count_mismatch": "score count does not match candidate count",
         "non_finite_score": "scorer returned a non-finite score",
@@ -673,6 +718,19 @@ def read_request(conn, deadline_seconds=REQUEST_READ_DEADLINE, now=time.monotoni
     return framed[:-1].decode("utf-8")
 
 
+def adapter_digest_for_health(state):
+    digest = getattr(state, "adapter_digest", None)
+    if digest:
+        return digest
+    path = getattr(state, "adapter_path", None) or ""
+    if not path:
+        return None
+    try:
+        return identify_adapter(path)["sha256"]
+    except IdentityError:
+        return None
+
+
 def handle_health(state, request, coordinator=None):
     """Model-free serving observation (issue #51 status core).
 
@@ -695,6 +753,7 @@ def handle_health(state, request, coordinator=None):
             "cache_limit_mb": getattr(state, "cache_limit_mb", CACHE_LIMIT_MB),
             "telemetry": bool(os.environ.get("LLM_RERANK_TELEMETRY")),
             "started_at": getattr(state, "started_at", None),
+            "adapter_digest": adapter_digest_for_health(state),
         },
     }
     if coordinator is not None:
@@ -1027,6 +1086,13 @@ def handle_request(state, data, coordinator=None, completion_sink=None):
             request_id=req["request_id"],
             plan_identity=req["plan_identity"],
         ))
+    except IdentityError:
+        return finish(protocol_error(
+            "identity_mismatch",
+            phase="score",
+            request_id=req["request_id"],
+            plan_identity=req["plan_identity"],
+        ))
     except TokenAttributionError:
         return finish(protocol_error(
             "token_attribution_failed",
@@ -1134,14 +1200,24 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
                cache_limit_mb=CACHE_LIMIT_MB,
                scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False,
                control_socket=None, facts_root=None, evidence_config=None,
-               health_only=False):
+               health_only=False, adapter_path=""):
+    adapter_path = adapter_path or ""
+    if adapter_path and not health_only:
+        pin_live_identities(model_path, adapter_path)
     if not health_only:
         import mlx.core as mx
 
         if cache_limit_mb > 0:
             mx.set_cache_limit(cache_limit_mb * 10**6)
 
-    state = ModelState(model_path, context_window, scoring_strategy)
+    state = ModelState(
+        model_path, context_window, scoring_strategy, adapter_path=adapter_path
+    )
+    if adapter_path:
+        try:
+            state.adapter_digest = identify_adapter(adapter_path)["sha256"]
+        except IdentityError:
+            state.adapter_digest = None
     state.health_only = health_only
     state.cache_limit_mb = cache_limit_mb
     state.started_at = datetime.now(timezone.utc).isoformat()
@@ -1468,6 +1544,12 @@ if __name__ == "__main__":
         "this flag. Required for scoring. This repository does not ship "
         "model weights.",
     )
+    parser.add_argument(
+        "--adapter",
+        default=ADAPTER_PATH,
+        help="local LoRA adapter directory; set LLM_RERANK_ADAPTER or pass "
+        "this flag. Empty keeps base-only scoring. Not a schema key.",
+    )
     parser.add_argument("--facts-root")
     parser.add_argument("--control-socket")
     parser.add_argument(
@@ -1524,5 +1606,5 @@ if __name__ == "__main__":
             args.socket, args.model, args.context_window, args.cache_limit_mb,
             args.scoring, test_mode=True, control_socket=args.control_socket,
             facts_root=args.facts_root, evidence_config=evidence_config,
-            health_only=args.health_only,
+            health_only=args.health_only, adapter_path=args.adapter,
         )

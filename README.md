@@ -42,8 +42,11 @@ The released dylib talks to a project-local Python inference daemon. Create
 `daemon/.venv` from the pinned set, launch with portable paths, and verify
 install/start/health/stop without maintainer-specific `/Users/habit/...`
 defaults. Scoring needs a local mlx-lm model directory (`--model` or
-`LLM_RERANK_MODEL`); weights are not shipped. Isolated verification uses
-`--health-only` and a stand-in path. See `docs/daemon-deploy.md`.
+`LLM_RERANK_MODEL`); weights are not shipped. An optional local LoRA adapter
+(`--adapter` or `LLM_RERANK_ADAPTER`) is daemon-local, fail-closed on
+identity mismatch, and is not a released schema key. Isolated verification
+uses `--health-only` and a stand-in path. See `docs/daemon-deploy.md` and
+`docs/personal-lora-live.md`.
 
 ```sh
 python3 daemon/deploy.py install

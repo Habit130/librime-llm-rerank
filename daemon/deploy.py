@@ -90,6 +90,15 @@ def resolve_model(explicit):
     return ""
 
 
+def resolve_adapter(explicit):
+    if explicit:
+        return os.path.abspath(explicit)
+    env = os.environ.get("LLM_RERANK_ADAPTER")
+    if env:
+        return os.path.abspath(env)
+    return ""
+
+
 def find_python(explicit=None):
     candidates = []
     if explicit:
@@ -196,6 +205,7 @@ def paths_from_args(args):
         args.facts_root or os.path.join(runtime, "facts")
     )
     model = resolve_model(getattr(args, "model", None))
+    adapter = resolve_adapter(getattr(args, "adapter", None))
     pid_path = os.path.abspath(
         getattr(args, "pid_file", None) or os.path.join(runtime, "daemon.pid")
     )
@@ -209,6 +219,7 @@ def paths_from_args(args):
         "log_err": log_err,
         "facts_root": facts_root,
         "model": model,
+        "adapter": adapter,
         "pid_file": pid_path,
         "venv": default_venv(checkout),
         "requirements": default_requirements(checkout),
@@ -224,6 +235,7 @@ def render_plist(template_path, values):
         "__INTERPRETER__": values["interpreter"],
         "__SERVER__": values["server"],
         "__MODEL__": values["model"],
+        "__ADAPTER__": values.get("adapter") or "",
         "__SOCKET__": values["socket"],
         "__LOG__": values["log"],
         "__LOG_ERR__": values["log_err"],
@@ -316,6 +328,23 @@ def _prepare_runtime(paths, health_only):
     return paths
 
 
+def server_command(paths, health_only):
+    command = [
+        paths["interpreter"],
+        paths["server"],
+        "--serve",
+        "--socket", paths["socket"],
+        "--model", paths["model"],
+        "--facts-root", paths["facts_root"],
+        "--context-window", "64",
+    ]
+    if paths.get("adapter"):
+        command.extend(["--adapter", paths["adapter"]])
+    if health_only:
+        command.append("--health-only")
+    return command
+
+
 def cmd_start(args):
     paths = _prepare_runtime(paths_from_args(args), args.health_only)
     if not os.path.isfile(paths["interpreter"]):
@@ -328,16 +357,7 @@ def cmd_start(args):
     existing = read_pid(paths["pid_file"])
     if pid_alive(existing):
         raise DeployError("daemon already running as pid %d" % existing)
-    command = [
-        paths["interpreter"],
-        paths["server"],
-        "--serve",
-        "--socket", paths["socket"],
-        "--model", paths["model"],
-        "--facts-root", paths["facts_root"],
-    ]
-    if args.health_only:
-        command.append("--health-only")
+    command = server_command(paths, args.health_only)
     pid = _spawn_daemon(command, paths["checkout"], paths["log"], paths["log_err"])
     write_pid(paths["pid_file"], pid)
     deadline = time.time() + args.timeout
@@ -497,6 +517,7 @@ def isolated_verify(source_checkout, work_dir=None, install_pins=True,
             log_err=os.path.join(runtime, "llm-rerank.err"),
             facts_root=os.path.join(runtime, "facts"),
             model=None,
+            adapter=None,
             pid_file=os.path.join(runtime, "daemon.pid"),
             python=python,
             venv=os.path.join(checkout, "daemon", ".venv"),
@@ -519,6 +540,8 @@ def isolated_verify(source_checkout, work_dir=None, install_pins=True,
             if health.get("health", {}).get("model_loaded"):
                 raise DeployError("health-only start loaded a model")
             ns.model = os.path.join(runtime, STANDIN_MODEL_NAME)
+            if not install_pins:
+                ns.interpreter = default_interpreter(checkout)
             cmd_render_plist(ns)
             with open(ns.output, encoding="utf-8") as handle:
                 rendered = handle.read()
@@ -572,6 +595,7 @@ def build_parser():
     parser.add_argument("--server")
     parser.add_argument("--socket")
     parser.add_argument("--model")
+    parser.add_argument("--adapter")
     parser.add_argument("--log")
     parser.add_argument("--log-err")
     parser.add_argument("--facts-root")

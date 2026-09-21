@@ -15,13 +15,19 @@
 		<string>__SOCKET__</string>
 		<string>--model</string>
 		<string>__MODEL__</string>
+		<string>--adapter</string>
+		<string>__ADAPTER__</string>
 		<string>--facts-root</string>
 		<string>__FACTS_ROOT__</string>
+		<string>--context-window</string>
+		<string>64</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>LLM_RERANK_MODEL</key>
 		<string>__MODEL__</string>
+		<key>LLM_RERANK_ADAPTER</key>
+		<string>__ADAPTER__</string>
 		<key>SQUIRREL_SEMANTIC_MEMORY_ROOT</key>
 		<string>__FACTS_ROOT__</string>
 	</dict>
