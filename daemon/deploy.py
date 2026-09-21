@@ -540,6 +540,8 @@ def isolated_verify(source_checkout, work_dir=None, install_pins=True,
             if health.get("health", {}).get("model_loaded"):
                 raise DeployError("health-only start loaded a model")
             ns.model = os.path.join(runtime, STANDIN_MODEL_NAME)
+            if not install_pins:
+                ns.interpreter = default_interpreter(checkout)
             cmd_render_plist(ns)
             with open(ns.output, encoding="utf-8") as handle:
                 rendered = handle.read()

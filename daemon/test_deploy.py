@@ -248,8 +248,13 @@ class IsolatedLifecycleTest(unittest.TestCase):
             with open(record["plist"], encoding="utf-8") as handle:
                 rendered = handle.read()
             self.assertIsNone(HABIT_PATH.search(rendered))
+            isolated_interpreter = os.path.join(
+                record["checkout"], "daemon", ".venv", "bin", "python"
+            )
+            self.assertEqual(record["interpreter"], isolated_interpreter)
             self.assertIn(record["checkout"], rendered)
             self.assertIn(record["interpreter"], rendered)
+            self.assertNotIn(sys.executable, rendered)
             self.assertIn(record["model"], rendered)
             self.assertIn(record["socket"], rendered)
             self.assertIn(record["runtime"], rendered)

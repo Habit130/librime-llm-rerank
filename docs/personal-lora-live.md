@@ -62,9 +62,10 @@ the embeddings venv. Do not download models.
 
 ```sh
 python3 daemon/deploy.py install
-python3 daemon/deploy.py start \
+python3 daemon/deploy.py \
   --model "$LLM_RERANK_MODEL" \
-  --adapter .local-work/personal-lora-live
+  --adapter .local-work/personal-lora-live \
+  start
 python3 daemon/deploy.py health
 python3 daemon/deploy.py stop
 ```
