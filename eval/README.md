@@ -937,5 +937,7 @@ change, pin bump or upload is part of this ticket.
 
 Live adapter load is daemon-local (`--adapter` / `LLM_RERANK_ADAPTER`), not
 an eval runner and not a public schema key. Authoritative install, identity
-pins, live-switch and stop: `docs/personal-lora-live.md`. This section does
-not relabel #177/#178 as live evidence.
+pins, live-switch, owner-authorized daily leave-on (Squirrel#186), and the
+#184 stop procedure: `docs/personal-lora-live.md`. Merge still does not
+self-enable. This section does not relabel #177/#178 or the #184 stop-state
+as daily evidence.

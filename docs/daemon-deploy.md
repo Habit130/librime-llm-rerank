@@ -67,7 +67,11 @@ python3 daemon/deploy.py render-plist \
 ```
 
 Loading that plist with `launchctl` is optional and is not part of the
-isolated verification path.
+isolated verification path. Owner-authorized daily leave-on (Squirrel#186)
+installs the phase-1 job with `RunAtLoad` / `KeepAlive`, the Established
+model/adapter pins, lazy load, and `IDLE_TIMEOUT=300`; see
+`docs/personal-lora-live.md`. Merge does not self-enable. Isolated
+render/verify still refuse maintainer `/Users/habit` paths.
 
 ## Isolated verification
 
