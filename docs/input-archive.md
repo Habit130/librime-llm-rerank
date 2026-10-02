@@ -21,7 +21,10 @@ observation storage.
 
 Incompatibility is an error, never a successful semantic interpretation:
 `unsupported_version`, `unsupported_schema`, `stale_revision`, `unsafe_root`,
-`page_bound`, `identity_conflict`.
+`page_bound`, `identity_conflict`, `invalid_request`. A symlink at a managed
+artifact path, including `observations.jsonl`, `quarantine.jsonl`, and the CLI
+logs, is `unsafe_root` before chmod, truncate, or append. The link target is
+not created or rewritten.
 
 ## Start, check, stop
 
@@ -112,6 +115,14 @@ result = producer.admit({
 })
 ```
 
+`Producer.admit` refuses a missing `source_local_sequence` or an identity that
+is not a safe token before enqueue. That result is `admitted=false`,
+`code=invalid_request`, and `durable=false`. It increments the producer
+`known_refused` count and is not a durable observation. A direct `admit_batch`
+item with the same defect returns `invalid_request` and increments
+`admission_refused_units`. Collector-accounted results, including
+`identity_conflict`, are not counted again by the sender.
+
 `source_instance_id` plus `source_local_sequence` identifies a capture attempt.
 The same pair and the same content is an idempotent retry. The same pair with
 different content is `identity_conflict`: the original stays, and the new
@@ -192,9 +203,13 @@ publication point:
 2. Flush and fsync that file.
 3. Write the new watermark to `state.json`, fsync it, and fsync the directory.
 
-A crash before step 3 does not make those bytes durable. Restart truncates to
-the watermark, reports `crash_tail=unknown`, and does not parse the discarded
-bytes into observations or add them to `known_dropped_units`. Only a provable
+A crash before step 3 does not make those bytes durable. Restart truncates both
+the observation log and the quarantine file to their durable watermarks,
+reports `crash_tail=unknown`, and does not parse the discarded bytes into
+observations or add them to `known_dropped_units`. A quarantine tail left on
+disk is not omitted from capacity accounting; it is truncated back to
+`quarantine_bytes` or the archive fails closed if the file is shorter than
+that watermark. Only a provable
 drop, refusal, or storage failure increments its own counter.
 
 Known queue pressure is `known_dropped_units` / `queue_saturated`. Storage

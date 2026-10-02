@@ -16,7 +16,7 @@ import time
 
 from archive.interface import INTERFACE_VERSION, Client, strip_content
 from archive.producer import Producer
-from archive.safety import UnsafeRoot, escape_terminal_data, validate_root
+from archive.safety import UnsafeRoot, escape_terminal_data, open_nofollow, validate_root
 
 _COLLECTOR_FLAGS = (
     "no_auto_checkpoint",
@@ -137,10 +137,15 @@ def _start(args):
     os.chmod(args.root, 0o700)
     stdout_path = os.path.join(args.root, "collector.out")
     stderr_path = os.path.join(args.root, "collector.err")
-    out_fd = os.open(stdout_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    err_fd = os.open(stderr_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    os.chmod(stdout_path, 0o600)
-    os.chmod(stderr_path, 0o600)
+    out_fd = None
+    try:
+        out_fd = open_nofollow(stdout_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        err_fd = open_nofollow(stderr_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+    except UnsafeRoot:
+        if out_fd is not None:
+            os.close(out_fd)
+        sys.stderr.write("code=unsafe_root\n")
+        return 2
     command = [sys.executable, "-m", "archive.collector", "--root", args.root, "--socket", args.socket]
     command.extend(_forward_flags(args))
     proc = subprocess.Popen(command, stdout=out_fd, stderr=err_fd, start_new_session=True)

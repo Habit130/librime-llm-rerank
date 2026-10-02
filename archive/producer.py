@@ -20,6 +20,7 @@ from archive.interface import (
     Client,
 )
 from archive.limits import resolve
+from archive.safety import safe_token
 
 _HIGH_KINDS = {
     "start",
@@ -165,8 +166,12 @@ class Producer(object):
         _budget_bytes(snapshot, self.limits["max_event_bytes"], acc)
         if acc[0] > self.limits["max_event_bytes"]:
             return AdmissionResult(False, "event_too_large")
+        if _locally_invalid(snapshot):
+            return self._refuse_invalid()
         if snapshot.get("eligibility") == "excluded" or snapshot.get("excluded") is True:
             notice = self._exclusion_notice(snapshot)
+            if _locally_invalid(notice):
+                return self._refuse_invalid()
             return self._enqueue(notice, "exclusion_notice", _budget_of(notice))
         schema = snapshot.get("schema_id", "unknown")
         kind = snapshot.get("observation_kind")
@@ -181,6 +186,11 @@ class Producer(object):
             return AdmissionResult(False, code)
         kind = snapshot.get("observation_kind") or "unknown_outcome"
         return self._enqueue(snapshot, kind, acc[0])
+
+    def _refuse_invalid(self):
+        with self._lock:
+            self._known_refused += 1
+        return AdmissionResult(False, "invalid_request")
 
     def _exclusion_notice(self, snapshot):
         return {
@@ -320,10 +330,61 @@ class Producer(object):
             with self._lock:
                 self._collector_unavailable = True
             return False
+        self._note_unaccounted(response, len(batch))
         return True
+
+    def _note_unaccounted(self, response, count):
+        codes = (response.get("body") or {}).get("codes")
+        if not isinstance(codes, list):
+            with self._lock:
+                self._known_refused += count
+            return
+        unaccounted = 0
+        if len(codes) != count:
+            unaccounted += max(0, count - len(codes))
+        for code in codes:
+            if code not in _ACCOUNTED_RESULTS:
+                unaccounted += 1
+        if unaccounted:
+            with self._lock:
+                self._known_refused += unaccounted
 
     def _send_losses(self, losses):
         self._client().call("admit_batch", {"observations": losses})
+
+
+_ACCOUNTED_RESULTS = {
+    "admitted",
+    "duplicate",
+    "identity_conflict",
+    "queue_saturated",
+    "capture_disabled",
+    "capacity_stop",
+    "storage_failure",
+    "event_too_large",
+    "unsupported_version",
+    "unsupported_schema",
+    "invalid_request",
+    "excluded",
+}
+
+
+def _locally_invalid(snapshot):
+    if not isinstance(snapshot, dict):
+        return True
+    if safe_token(snapshot.get("source_instance_id")) is None:
+        return True
+    if safe_token(snapshot.get("process_id")) is None:
+        return True
+    if "source_local_sequence" not in snapshot:
+        return True
+    sequence = snapshot.get("source_local_sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        return True
+    kind = snapshot.get("observation_kind")
+    if not isinstance(kind, str) or not kind:
+        return True
+    return False
 
 
 def _budget_of(snapshot):

@@ -45,6 +45,10 @@ class CheckFailure(Exception):
         super().__init__(code)
 
 
+def quarantine_tail_inconsistent(file_bytes, watermark):
+    return file_bytes > watermark
+
+
 def contains_marker(text, marker):
     if text is None:
         return False
@@ -118,6 +122,10 @@ def run_self_test():
     empty = {"result": "pass", "canary_in_report": False, "coverage": {"required": list(REQUIRED), "executed": [], "skipped": []}, "criteria": {}}
     if not validate_report(empty):
         failures.append("negative_empty")
+    if not quarantine_tail_inconsistent(128, 0):
+        failures.append("negative_quarantine_tail")
+    if quarantine_tail_inconsistent(0, 0):
+        failures.append("positive_quarantine_watermark")
     if failures:
         sys.stdout.write("self-test fail %s\n" % ",".join(failures))
         return 1
@@ -377,6 +385,7 @@ class Suite(object):
             raise CheckFailure("quarantine")
         if CANARY in observations_text or CANARY in quarantine:
             raise CheckFailure("unsupported_stored")
+        self._check_invalid_admission(sock)
         self.counts["provenance_records"] = client.status()["body"]["durable_seq"]
 
     def check_admission(self):
@@ -578,6 +587,7 @@ class Suite(object):
         self.counts["discarded_unpublished_bytes"] = status["discarded_unpublished_bytes"]
         if status["discarded_unpublished_bytes"] <= 0:
             raise CheckFailure("no_unpublished_bytes")
+        self._check_quarantine_tail()
 
     def check_policy(self):
         root, sock, pid = self.start("policy", freshness_window_ms=400, heartbeat_interval_ms=50)
@@ -706,6 +716,7 @@ class Suite(object):
         if ESC_MARK.encode() not in escaped:
             raise CheckFailure("escaped_detail_missing")
         self._assert_no_tcp(pid)
+        self._check_aliases()
         self.counts["privacy_files"] = len(files["names"])
 
     def check_capacity(self):
@@ -876,6 +887,161 @@ class Suite(object):
         if example.get("ok"):
             raise CheckFailure("fresh_still_running")
         self.counts["documented_defaults"] = len(DEFAULTS)
+
+    def _check_invalid_admission(self, sock):
+        producer = Producer(
+            sock,
+            source_instance_id="invalid-source",
+            limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000},
+        )
+        try:
+            self._wait_enabled(producer)
+            missing = _sample("invalid-source", sequence=1, process_id="proc-missing")
+            del missing["source_local_sequence"]
+            unsafe = _sample("invalid-source", sequence=2, process_id="bad id")
+            missing_result = producer.admit(missing)
+            unsafe_result = producer.admit(unsafe)
+            if missing_result.admitted or missing_result.durable or missing_result.code != "invalid_request":
+                raise CheckFailure("missing_sequence_admitted")
+            if unsafe_result.admitted or unsafe_result.code != "invalid_request":
+                raise CheckFailure("unsafe_identity_admitted")
+            if producer.local_status()["known_refused"] < 2:
+                raise CheckFailure("invalid_not_refused")
+        finally:
+            producer.close()
+        client = Client(sock, timeout=5)
+        before = client.status()["body"].get("admission_refused_units", 0)
+        direct = client.call("admit_batch", {"observations": [missing, unsafe]})
+        codes = (direct.get("body") or {}).get("codes") or []
+        if codes.count("invalid_request") < 2:
+            raise CheckFailure("direct_invalid_not_refused")
+        if not _wait(lambda: client.status().get("body", {}).get("admission_refused_units", 0) >= before + 2):
+            raise CheckFailure("invalid_not_accounted")
+        conflict_before = client.status()["body"]["identity_conflicts"]
+        original = _sample("invalid-source", sequence=8, process_id="proc-conflict-once")
+        client.call("admit_batch", {"observations": [original]})
+        client.checkpoint()
+        conflict = dict(original)
+        conflict["payload"] = {"text": "INV-CONFLICT-ONCE"}
+        conflicted = client.call("admit_batch", {"observations": [conflict]})
+        if "identity_conflict" not in (conflicted.get("body") or {}).get("codes", []):
+            raise CheckFailure("conflict_not_accounted")
+        if client.status()["body"]["identity_conflicts"] != conflict_before + 1:
+            raise CheckFailure("conflict_double_counted")
+        if producer.local_status()["known_refused"] != 2:
+            raise CheckFailure("conflict_counted_as_refusal")
+
+    def _check_quarantine_tail(self):
+        phase = self.root("qcrash") + ".fifo"
+        fd = _open_fifo(phase)
+        try:
+            os.write(fd, b"x")
+            root, sock, pid = self.start(
+                "qcrash",
+                no_auto_checkpoint=True,
+                publication_phase_hold=phase,
+                freshness_window_ms=5000,
+                archive_capacity_bytes=2500,
+            )
+            client = Client(sock, timeout=5)
+            self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+            original = _sample("qcrash-source", sequence=1, process_id="proc-q")
+            client.call("admit_batch", {"observations": [original]})
+            client.checkpoint()
+            if not _wait(lambda: client.status().get("body", {}).get("durable_seq", 0) >= 1):
+                raise CheckFailure("quarantine_baseline")
+            known = client.status()["body"]["known_dropped_units"]
+            conflict = dict(original)
+            conflict["payload"] = {"text": "INV-QUARANTINE-TAIL"}
+            client.call("admit_batch", {"observations": [conflict]})
+            thread = threading.Thread(target=client.checkpoint, daemon=True)
+            thread.start()
+            if not _wait(lambda: client.status().get("body", {}).get("publication_phase_hold") is True):
+                raise CheckFailure("quarantine_phase_hold")
+            os.kill(pid, signal.SIGKILL)
+            self._wait_dead(pid)
+        finally:
+            os.close(fd)
+        root, sock, _pid = self.start("qcrash", freshness_window_ms=5000, archive_capacity_bytes=2500)
+        client = Client(sock, timeout=5)
+        status = client.status()["body"]
+        qpath = os.path.join(root, "quarantine.jsonl")
+        qsize = os.lstat(qpath).st_size if os.path.lexists(qpath) and not stat.S_ISLNK(os.lstat(qpath).st_mode) else -1
+        if status["crash_tail"] != "unknown":
+            raise CheckFailure("quarantine_tail_not_unknown")
+        if status["known_dropped_units"] != known:
+            raise CheckFailure("quarantine_tail_counted_known")
+        if qsize != status["quarantine_bytes"]:
+            raise CheckFailure("quarantine_watermark_disagrees")
+        if status.get("discarded_quarantine_bytes", 0) <= 0:
+            raise CheckFailure("quarantine_tail_not_discarded")
+        if quarantine_tail_inconsistent(qsize, status["quarantine_bytes"]):
+            raise CheckFailure("quarantine_tail_still_unaccounted")
+        self.counts["discarded_quarantine_bytes"] = status["discarded_quarantine_bytes"]
+
+    def _check_aliases(self):
+        parent = os.path.join(self.workspace, "alias-probes")
+        os.makedirs(parent, 0o700)
+        os.chmod(parent, 0o700)
+        self._assert_alias_rejected(parent, "observations.jsonl", "obs-existing", dangling=False)
+        self._assert_alias_rejected(parent, "observations.jsonl", "obs-dangling", dangling=True)
+        self._assert_alias_rejected(parent, "quarantine.jsonl", "quar-existing", dangling=False)
+        self._assert_alias_rejected(parent, "quarantine.jsonl", "quar-dangling", dangling=True)
+        self._assert_log_alias(parent)
+
+    def _assert_alias_rejected(self, parent, name, label, dangling):
+        target = os.path.join(parent, label + "-target")
+        before = b"SEED"
+        if not dangling:
+            fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+            os.write(fd, before)
+            os.close(fd)
+            os.chmod(target, 0o644)
+        root = os.path.join(parent, label + "-root")
+        os.mkdir(root, 0o700)
+        link = os.path.join(root, name)
+        os.symlink(target, link)
+        sock = os.path.join(root, "collector.sock")
+        proc = subprocess.run(
+            [sys.executable, "-m", "archive.cli", "--root", root, "--socket", sock, "--timeout", "5", "collector", "start"],
+            cwd=REPO, capture_output=True, text=True, timeout=15,
+        )
+        self._ordinary(proc.stdout, proc.stderr)
+        if proc.returncode == 0:
+            raise CheckFailure("alias_start_accepted")
+        if os.path.islink(link) is False:
+            raise CheckFailure("alias_replaced")
+        if dangling:
+            if os.path.lexists(target):
+                raise CheckFailure("dangling_target_created")
+            return
+        info = os.lstat(target)
+        if os.lstat(target).st_size != len(before) or open(target, "rb").read() != before:
+            raise CheckFailure("alias_target_rewritten")
+        if stat.S_IMODE(info.st_mode) != 0o644:
+            raise CheckFailure("alias_target_chmod")
+
+    def _assert_log_alias(self, parent):
+        target = os.path.join(parent, "log-target")
+        before = b"LOGSEED"
+        fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+        os.write(fd, before)
+        os.close(fd)
+        os.chmod(target, 0o644)
+        root = os.path.join(parent, "log-root")
+        os.mkdir(root, 0o700)
+        os.symlink(target, os.path.join(root, "collector.out"))
+        sock = os.path.join(root, "collector.sock")
+        proc = subprocess.run(
+            [sys.executable, "-m", "archive.cli", "--root", root, "--socket", sock, "--timeout", "5", "collector", "start"],
+            cwd=REPO, capture_output=True, text=True, timeout=15,
+        )
+        self._ordinary(proc.stdout, proc.stderr)
+        if proc.returncode == 0 or "code=unsafe_root" not in proc.stderr:
+            raise CheckFailure("log_alias_accepted")
+        info = os.lstat(target)
+        if open(target, "rb").read() != before or stat.S_IMODE(info.st_mode) != 0o644:
+            raise CheckFailure("log_alias_truncated")
 
     def _review_admission_path(self):
         tree = ast.parse(open(os.path.join(REPO, "archive", "producer.py"), "r").read())

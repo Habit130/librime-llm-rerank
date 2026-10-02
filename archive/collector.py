@@ -39,7 +39,9 @@ from archive.safety import (
     UnsafeRoot,
     atomic_write,
     ensure_private_dir,
+    open_nofollow,
     ordinary_token,
+    reject_alias,
     safe_token,
     validate_root,
 )
@@ -155,12 +157,26 @@ class Collector(object):
     def prepare(self):
         ensure_private_dir(self.root)
         self._validate_socket()
+        self._refuse_managed_aliases()
         self._reject_foreign_collector()
         self._load_policy()
         self._load_state()
         self._prepare_files()
         self._rebuild_index()
         self._persist_state()
+
+    def _refuse_managed_aliases(self):
+        for path in (
+            self.observations_path,
+            self.quarantine_path,
+            self.state_path,
+            self.policy_path,
+            self.pid_path,
+            self.socket_path,
+            os.path.join(self.root, "collector.out"),
+            os.path.join(self.root, "collector.err"),
+        ):
+            reject_alias(path)
 
     def _validate_socket(self):
         if os.path.dirname(self.socket_path) != self.root:
@@ -169,10 +185,11 @@ class Collector(object):
             raise UnsafeRoot("symlink_socket")
 
     def _reject_foreign_collector(self):
-        if not os.path.exists(self.pid_path):
+        reject_alias(self.pid_path)
+        if not os.path.lexists(self.pid_path):
             return
         try:
-            raw = open(self.pid_path, "r").read().strip()
+            raw = self._read_nofollow(self.pid_path).strip()
             pid = int(raw)
         except (OSError, ValueError):
             return
@@ -183,8 +200,9 @@ class Collector(object):
             raise UnsafeRoot("collector_already_running")
 
     def _load_policy(self):
-        if os.path.exists(self.policy_path):
-            self._policy = json.loads(open(self.policy_path, "r").read())
+        reject_alias(self.policy_path)
+        if os.path.lexists(self.policy_path):
+            self._policy = json.loads(self._read_nofollow(self.policy_path))
             if self._policy.get("desired") not in {"off", "enabled", "paused"}:
                 self._policy["desired"] = "off"
         else:
@@ -199,19 +217,34 @@ class Collector(object):
             self._write_policy()
 
     def _load_state(self):
-        if not os.path.exists(self.state_path):
+        reject_alias(self.state_path)
+        if not os.path.lexists(self.state_path):
             self._state = self._fresh_state("none", ["collector_start"])
             self._loaded_existing_state = False
             return
         self._loaded_existing_state = True
-        previous = json.loads(open(self.state_path, "r").read())
+        previous = json.loads(self._read_nofollow(self.state_path))
         reasons = ["collector_start"]
         crash_tail = "none"
         discarded = 0
+        quarantine_discarded = 0
+        short = False
         if not previous.get("clean_stop"):
             crash_tail = "unknown"
             reasons.append("unclean_shutdown")
-            discarded = self._truncate_unpublished(previous.get("durable_offset", 0))
+        obs_extra, obs_short = self._reconcile_file(
+            self.observations_path, int(previous.get("durable_offset", 0))
+        )
+        quar_extra, quar_short = self._reconcile_file(
+            self.quarantine_path, int(previous.get("quarantine_bytes", 0))
+        )
+        discarded = obs_extra
+        quarantine_discarded = quar_extra
+        short = obs_short or quar_short
+        if obs_extra or quar_extra or short:
+            crash_tail = "unknown"
+            if "unpublished_tail" not in reasons:
+                reasons.append("unpublished_tail")
         self._state = self._fresh_state(crash_tail, reasons)
         for key in (
             "durable_seq",
@@ -224,10 +257,14 @@ class Collector(object):
             "capacity_stop",
             "storage_failure",
             "quarantine_bytes",
+            "admission_refused_units",
         ):
             if key in previous:
                 self._state[key] = previous[key]
         self._state["discarded_unpublished_bytes"] = discarded
+        self._state["discarded_quarantine_bytes"] = quarantine_discarded
+        if short:
+            self._state["storage_failure"] = True
         if crash_tail == "unknown":
             self._state["crash_tail"] = "unknown"
 
@@ -250,28 +287,47 @@ class Collector(object):
             "continuity_break_reasons": reasons,
             "clean_stop": False,
             "quarantine_bytes": 0,
+            "admission_refused_units": 0,
+            "discarded_quarantine_bytes": 0,
         }
 
-    def _truncate_unpublished(self, offset):
-        if not os.path.exists(self.observations_path):
-            return 0
-        size = os.path.getsize(self.observations_path)
-        if size <= offset:
-            return 0
-        fd = os.open(self.observations_path, os.O_RDWR)
+    def _reconcile_file(self, path, watermark):
+        """Return (extra_bytes_truncated, short_of_watermark). Never follow a symlink."""
+        reject_alias(path)
+        if not os.path.lexists(path):
+            if watermark:
+                return 0, True
+            return 0, False
+        size = os.lstat(path).st_size
+        if size > watermark:
+            self._truncate_file(path, watermark)
+            return size - watermark, False
+        if size < watermark:
+            return 0, True
+        return 0, False
+
+    def _read_nofollow(self, path):
+        fd = open_nofollow(path, os.O_RDONLY)
         try:
-            os.ftruncate(fd, offset)
-            os.fsync(fd)
+            chunks = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8")
         finally:
             os.close(fd)
-        return size - offset
 
     def _prepare_files(self):
         for path in (self.observations_path, self.quarantine_path):
-            if not os.path.exists(path):
-                fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+            reject_alias(path)
+            if not os.path.lexists(path):
+                fd = open_nofollow(path, os.O_CREAT | os.O_WRONLY)
                 os.close(fd)
-            os.chmod(path, 0o600)
+            else:
+                fd = open_nofollow(path, os.O_RDWR)
+                os.close(fd)
         atomic_write(self.pid_path, ("%s\n" % os.getpid()).encode("ascii"))
 
     def _rebuild_index(self):
@@ -492,6 +548,8 @@ class Collector(object):
                 "crash_tail": self._state["crash_tail"],
                 "unclean_shutdown_observed": "unclean_shutdown" in self._state["continuity_break_reasons"],
                 "discarded_unpublished_bytes": self._state["discarded_unpublished_bytes"],
+                "discarded_quarantine_bytes": self._state.get("discarded_quarantine_bytes", 0),
+                "admission_refused_units": self._state.get("admission_refused_units", 0),
                 "storage_failure": self._state["storage_failure"],
                 "capacity_stop": self._state["capacity_stop"],
                 "warning": warning and not self._state["capacity_stop"],
@@ -594,6 +652,8 @@ class Collector(object):
 
     def _accept_one(self, observation):
         if not isinstance(observation, dict):
+            with self._lock:
+                self._state["admission_refused_units"] = self._state.get("admission_refused_units", 0) + 1
             return "invalid_request"
         if observation.get("envelope_version", ENVELOPE_VERSION) != ENVELOPE_VERSION:
             return "unsupported_version"
@@ -601,6 +661,9 @@ class Collector(object):
             return "unsupported_version"
         prepared = self._prepare(observation)
         if isinstance(prepared, str):
+            if prepared == "invalid_request":
+                with self._lock:
+                    self._state["admission_refused_units"] = self._state.get("admission_refused_units", 0) + 1
             return prepared
         size = len(canonical_bytes(prepared["semantic"]))
         if size > self.limits["max_event_bytes"]:
@@ -812,13 +875,14 @@ class Collector(object):
             observation_lines.append(line)
             metas.append(record)
             used += len(line)
-        before_offset = os.path.getsize(self.observations_path) if os.path.exists(self.observations_path) else 0
+        before_offset = self._regular_size(self.observations_path)
+        before_quarantine = self._regular_size(self.quarantine_path)
         try:
             if quarantine_lines:
                 self._append(self.quarantine_path, b"".join(quarantine_lines))
             if observation_lines:
                 self._append(self.observations_path, b"".join(observation_lines))
-        except OSError:
+        except (OSError, UnsafeRoot):
             with self._lock:
                 self._state["storage_failure"] = True
                 self._state["storage_failed_units"] += len(observation_lines) + len(quarantine_lines)
@@ -828,7 +892,7 @@ class Collector(object):
                         self._identities.pop(identity, None)
             self._persist_state()
             return
-        if self.phase_hold and observation_lines:
+        if self.phase_hold and (observation_lines or quarantine_lines):
             with self._lock:
                 self._phase_hold_active = True
             _block_fifo(self.phase_hold, lambda: self._stop)
@@ -836,6 +900,7 @@ class Collector(object):
                 self._phase_hold_active = False
             if self._stop:
                 self._truncate_file(self.observations_path, before_offset)
+                self._truncate_file(self.quarantine_path, before_quarantine)
                 return
         with self._lock:
             offset = self._state["durable_offset"]
@@ -852,13 +917,18 @@ class Collector(object):
         self._persist_state()
 
     def _append(self, path, data):
-        fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        fd = open_nofollow(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY)
         try:
             os.write(fd, data)
             os.fsync(fd)
-            os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
+
+    def _regular_size(self, path):
+        reject_alias(path)
+        if not os.path.lexists(path):
+            return 0
+        return os.lstat(path).st_size
 
     def _persist_state(self):
         with self._lock:
@@ -889,9 +959,10 @@ class Collector(object):
         self._persist_state()
 
     def _truncate_file(self, path, offset):
-        if not os.path.exists(path):
+        reject_alias(path)
+        if not os.path.lexists(path):
             return
-        fd = os.open(path, os.O_RDWR)
+        fd = open_nofollow(path, os.O_RDWR)
         try:
             os.ftruncate(fd, offset)
             os.fsync(fd)

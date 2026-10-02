@@ -7,6 +7,7 @@ compromise, and they do not claim universal sensitive-text detection.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import tempfile
@@ -121,7 +122,34 @@ def assert_private_tree(path):
     return problems
 
 
+def reject_alias(path):
+    """Refuse a symlink before any chmod, truncate, or write through it."""
+    if path and os.path.lexists(path) and stat.S_ISLNK(os.lstat(path).st_mode):
+        raise UnsafeRoot("artifact_alias")
+
+
+def open_nofollow(path, flags, mode=0o600):
+    """Open a regular file. A final-component symlink fails closed."""
+    reject_alias(path)
+    try:
+        fd = os.open(path, flags | os.O_NOFOLLOW, mode)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise UnsafeRoot("artifact_alias")
+        raise
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise UnsafeRoot("artifact_alias")
+        os.fchmod(fd, mode)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def atomic_write(path, data):
+    reject_alias(path)
     directory = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
     try:
@@ -131,7 +159,6 @@ def atomic_write(path, data):
         os.close(fd)
         fd = -1
         os.replace(tmp, path)
-        os.chmod(path, 0o600)
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
@@ -148,11 +175,10 @@ def atomic_write(path, data):
 
 
 def write_bytes(path, data):
-    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    fd = open_nofollow(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY)
     try:
         os.write(fd, data)
         os.fsync(fd)
-        os.fchmod(fd, 0o600)
     finally:
         os.close(fd)
 
