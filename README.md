@@ -55,6 +55,13 @@ python3 daemon/deploy.py health
 python3 daemon/deploy.py stop
 ```
 
+## Input archive
+
+Explicitly started, local-only input archive for later recording work
+(Habit130/squirrel#188). Install does not enable capture, load a model, or
+touch the inference daemon. Procedure, Interface, limits, and loss semantics:
+`docs/input-archive.md`.
+
 ## Scope
 
 Simplified Chinese (简体) only, developed against the `luna_pinyin` schema.

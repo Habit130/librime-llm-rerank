@@ -1,0 +1,1276 @@
+#!/usr/bin/env python3
+"""Contract driver for the input-archive Interface.
+
+This is not a second storage implementation. It starts the delivered collector,
+calls the public Interface, and drives the CLI/TUI Adapters.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import pty
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from archive import Client, Producer  # noqa: E402
+from archive.interface import INTERFACE_VERSION, strip_content  # noqa: E402
+from archive.limits import DEFAULTS  # noqa: E402
+from archive.synthetic import INVENTED_TEXT, scale_observation, supported_processes  # noqa: E402
+
+CANARY = "CANARY188BODY"
+EXCL = "CANARY188EXCL"
+CONF = "CANARY188CONF"
+ESC_MARK = "CANARY188ESC"
+REQUIRED = ["ARCH188-%s" % i for i in range(1, 9)]
+PAGE = 20
+
+
+class CheckFailure(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def contains_marker(text, marker):
+    if text is None:
+        return False
+    if isinstance(text, bytes):
+        return marker.encode("utf-8") in text
+    return marker in text
+
+
+def validate_report(report):
+    problems = []
+    try:
+        blob = json.dumps(report, ensure_ascii=True)
+    except TypeError:
+        return ["report_not_serializable"]
+    for marker in (CANARY, EXCL, CONF, ESC_MARK):
+        if marker in blob:
+            problems.append("canary_in_report")
+            break
+    if "\u001b" in blob or "\\u001b" in blob and "private" in blob:
+        pass
+    if "\x1b" in blob:
+        problems.append("control_byte_in_report")
+    coverage = report.get("coverage") or {}
+    executed = coverage.get("executed") or []
+    skipped = coverage.get("skipped") or []
+    criteria = report.get("criteria") or {}
+    if coverage.get("required") != REQUIRED:
+        problems.append("required_coverage_mismatch")
+    if skipped:
+        problems.append("skipped_required")
+    if not executed:
+        problems.append("empty_coverage")
+    for criterion in REQUIRED:
+        if criterion not in executed:
+            problems.append("missing_" + criterion)
+        item = criteria.get(criterion) or {}
+        if item.get("result") != "pass":
+            problems.append("criterion_not_pass_" + criterion)
+        if item.get("failed"):
+            problems.append("criterion_failed_" + criterion)
+    if report.get("result") != "pass":
+        problems.append("result_not_pass")
+    if report.get("canary_in_report") is not False:
+        problems.append("canary_flag")
+    return problems
+
+
+def run_self_test():
+    failures = []
+    if not contains_marker("prefix" + CANARY + "suffix", CANARY):
+        failures.append("positive_detector")
+    if contains_marker("ordinary status", CANARY):
+        failures.append("negative_detector")
+    good = {
+        "result": "pass",
+        "canary_in_report": False,
+        "coverage": {"required": list(REQUIRED), "executed": list(REQUIRED), "skipped": []},
+        "criteria": {item: {"result": "pass", "failed": []} for item in REQUIRED},
+    }
+    if validate_report(good):
+        failures.append("positive_report")
+    missing = json.loads(json.dumps(good))
+    missing["coverage"]["executed"] = ["ARCH188-1"]
+    missing["coverage"]["skipped"] = ["ARCH188-2"]
+    if not validate_report(missing):
+        failures.append("negative_skipped")
+    leaked = json.loads(json.dumps(good))
+    leaked["note"] = CANARY
+    if "canary_in_report" not in validate_report(leaked):
+        failures.append("negative_canary")
+    empty = {"result": "pass", "canary_in_report": False, "coverage": {"required": list(REQUIRED), "executed": [], "skipped": []}, "criteria": {}}
+    if not validate_report(empty):
+        failures.append("negative_empty")
+    if failures:
+        sys.stdout.write("self-test fail %s\n" % ",".join(failures))
+        return 1
+    sys.stdout.write("self-test pass\n")
+    return 0
+
+
+class Suite(object):
+    def __init__(self, workspace):
+        self.workspace = os.path.abspath(workspace)
+        self.pids = set()
+        self.results = {item: [] for item in REQUIRED}
+        self.executed = []
+        self.counts = {}
+        self.walkthrough_sha = ""
+        self.limits = dict(DEFAULTS)
+
+    def run(self):
+        checks = [
+            ("ARCH188-1", "provenance", self.check_provenance),
+            ("ARCH188-2", "admission", self.check_admission),
+            ("ARCH188-3", "durability", self.check_durability),
+            ("ARCH188-4", "policy", self.check_policy),
+            ("ARCH188-5", "privacy", self.check_privacy),
+            ("ARCH188-6", "capacity", self.check_capacity),
+            ("ARCH188-7", "walkthrough", self.check_walkthrough),
+            ("ARCH188-8", "usability", self.check_usability),
+        ]
+        for criterion, name, fn in checks:
+            self.executed.append(criterion)
+            try:
+                fn()
+            except CheckFailure as exc:
+                self.results[criterion].append(name + ":" + exc.code)
+            except Exception:
+                self.results[criterion].append(name + ":unexpected")
+            finally:
+                self.stop_owned()
+        return self.report()
+
+    def report(self):
+        criteria = {}
+        failed = False
+        for item in REQUIRED:
+            problems = self.results[item]
+            if problems or item not in self.executed:
+                failed = True
+            criteria[item] = {
+                "result": "fail" if problems else "pass",
+                "checks": 1,
+                "failed": problems,
+            }
+        return {
+            "report_version": 1,
+            "interface_version": INTERFACE_VERSION,
+            "result": "fail" if failed else "pass",
+            "criteria": criteria,
+            "coverage": {
+                "required": list(REQUIRED),
+                "executed": list(self.executed),
+                "skipped": [],
+            },
+            "counts": self.counts,
+            "identities": {
+                "python": "%s.%s.%s" % sys.version_info[:3],
+                "interface_version": INTERFACE_VERSION,
+                "envelope_version": 1,
+                "content_version": 1,
+            },
+            "limits": self.limits,
+            "walkthrough_sha256": self.walkthrough_sha,
+            "canary_in_report": False,
+            "dependencies": [],
+            "inference_dependency": False,
+        }
+
+    def root(self, name):
+        path = os.path.join(self.workspace, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def start(self, name, **flags):
+        root = self.root(name)
+        sock = os.path.join(root, "collector.sock")
+        cmd = [
+            sys.executable, "-m", "archive.cli",
+            "--root", root, "--socket", sock, "--timeout", "8",
+            "collector", "start",
+        ]
+        cmd.extend(self._flags(flags))
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=20)
+        self._ordinary(proc.stdout, proc.stderr)
+        if proc.returncode != 0:
+            raise CheckFailure("start_failed")
+        pid = _pid_from_text(proc.stdout)
+        if pid:
+            self.pids.add(pid)
+        return root, sock, pid
+
+    def start_rejected(self, root):
+        sock = os.path.join(self.workspace, "rejected.sock")
+        cmd = [
+            sys.executable, "-m", "archive.cli",
+            "--root", root, "--socket", sock, "--timeout", "5",
+            "collector", "start",
+        ]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=15)
+        self._ordinary(proc.stdout, proc.stderr)
+        if proc.returncode == 0 or "code=unsafe_root" not in proc.stderr:
+            raise CheckFailure("unsafe_root_not_rejected")
+        return proc
+
+    def stop_root(self, root, sock):
+        cmd = [
+            sys.executable, "-m", "archive.cli",
+            "--root", root, "--socket", sock, "--timeout", "8",
+            "collector", "stop",
+        ]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=20)
+        self._ordinary(proc.stdout, proc.stderr)
+        return proc
+
+    def cli(self, *args, timeout=15):
+        cmd = [sys.executable, "-m", "archive.cli", *args]
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=timeout)
+        if "--private-detail" not in args:
+            self._ordinary(proc.stdout, proc.stderr)
+        return proc
+
+    def stop_owned(self):
+        for pid in list(self.pids):
+            if _alive(pid) and _is_collector(pid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        deadline = time.time() + 2
+        while time.time() < deadline and any(_alive(pid) for pid in self.pids):
+            time.sleep(0.05)
+        for pid in list(self.pids):
+            if _alive(pid) and _is_collector(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        self.pids.clear()
+
+    def check_provenance(self):
+        root, sock, _pid = self.start("provenance", freshness_window_ms=5000, heartbeat_interval_ms=50)
+        client = Client(sock, timeout=5)
+        status = client.status()
+        self._require(status)
+        if status["body"]["desired_policy"] != "off":
+            raise CheckFailure("initial_not_off")
+        enabled = self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        if enabled.returncode != 0:
+            raise CheckFailure("enable_failed")
+        source = "prov-source"
+        observations = supported_processes(source)
+        observations.append({
+            "envelope_version": 99,
+            "content_version": 1,
+            "schema_id": "luna_pinyin",
+            "source_instance_id": source,
+            "source_local_sequence": 90,
+            "observation_kind": "start",
+            "process_id": "proc-bad-version",
+            "payload": {"text": CANARY},
+        })
+        observations.append({
+            "envelope_version": 1,
+            "content_version": 1,
+            "schema_id": "not_luna",
+            "source_instance_id": source,
+            "source_local_sequence": 91,
+            "observation_kind": "start",
+            "process_id": "proc-bad-schema",
+            "payload": {"text": CANARY},
+        })
+        first = client.call("admit_batch", {"observations": observations})
+        self._require(first)
+        codes = first["body"]["codes"]
+        if "unsupported_version" not in codes or "unsupported_schema" not in codes:
+            raise CheckFailure("version_not_refused")
+        if CANARY in json.dumps(strip_content(first)):
+            raise CheckFailure("canary_leak:admit")
+        again = client.call("admit_batch", {"observations": [observations[0]]})
+        self._require(again)
+        if "duplicate" not in again["body"]["codes"]:
+            raise CheckFailure("duplicate")
+        conflict = dict(observations[0])
+        conflict["payload"] = {"text": CONF}
+        conflicted = client.call("admit_batch", {"observations": [conflict]})
+        self._require(conflicted)
+        if "identity_conflict" not in conflicted["body"]["codes"]:
+            raise CheckFailure("conflict")
+        if CONF in json.dumps(strip_content(conflicted)):
+            raise CheckFailure("canary_leak:conflict")
+        late = {
+            "envelope_version": 1,
+            "content_version": 1,
+            "schema_id": "luna_pinyin",
+            "source_instance_id": source,
+            "source_local_sequence": 7,
+            "observation_kind": "input_change",
+            "process_id": "proc-ooo",
+            "update_id": "ooo-2",
+            "parent_update_id": "ooo-1",
+            "clocks": {"event_time": 100, "observation_time": None, "clock_domain": "unknown"},
+            "payload": {"text": INVENTED_TEXT},
+        }
+        early = dict(late)
+        early["source_local_sequence"] = 6
+        early["update_id"] = "ooo-1"
+        early["parent_update_id"] = None
+        client.call("admit_batch", {"observations": [late]})
+        client.checkpoint()
+        client.call("admit_batch", {"observations": [early]})
+        client.checkpoint()
+        self._wait_durable(client, 1)
+        for process_id in (
+            "proc-commit",
+            "proc-cancel",
+            "proc-raw",
+            "proc-unavailable",
+            "proc-unknown",
+            "proc-commit-only",
+        ):
+            found = client.query("process", process_id=process_id, page_size=PAGE)
+            self._require(found)
+            rows = found["body"]["observations"]
+            if not rows:
+                raise CheckFailure("missing_process")
+            if any(row.get("host_persistence") != "unknown" or row.get("host_persistence_proof") for row in rows):
+                raise CheckFailure("host_persistence_claimed")
+            if any(row.get("content_included") for row in rows):
+                raise CheckFailure("ordinary_content")
+        commit_only = client.query("process", process_id="proc-commit-only", page_size=PAGE)
+        incompleteness = commit_only["body"]["observations"][0]["incompleteness"]
+        if "missing_intermediate" not in incompleteness or "missing_parent_update" not in incompleteness:
+            raise CheckFailure("missing_not_disclosed")
+        if commit_only["body"]["observations"][0]["semantic_interpretation"] != "commit_attempt_observed":
+            raise CheckFailure("commit_reinterpreted")
+        ooo = client.query("process", process_id="proc-ooo", page_size=PAGE)
+        seqs = [row["source_local_sequence"] for row in ooo["body"]["observations"]]
+        if seqs != [7, 6]:
+            raise CheckFailure("reordered_by_time")
+        private = client.query("process", process_id="proc-commit", private_detail=True, page_size=PAGE)
+        original = json.dumps(private)
+        if CONF in original:
+            raise CheckFailure("conflict_replaced_original")
+        if INVENTED_TEXT not in original:
+            raise CheckFailure("original_missing")
+        quarantine = open(os.path.join(root, "quarantine.jsonl"), "r").read()
+        observations_text = open(os.path.join(root, "observations.jsonl"), "r").read()
+        if CONF not in quarantine or CONF in observations_text:
+            raise CheckFailure("quarantine")
+        if CANARY in observations_text or CANARY in quarantine:
+            raise CheckFailure("unsupported_stored")
+        self.counts["provenance_records"] = client.status()["body"]["durable_seq"]
+
+    def check_admission(self):
+        self._review_admission_path()
+        missing = os.path.join(self.workspace, "missing", "collector.sock")
+        os.makedirs(os.path.dirname(missing), exist_ok=True)
+        producer = Producer(missing, source_instance_id="absent-source", limits={"heartbeat_interval_ms": 50})
+        try:
+            blocked = _BlockedWork()
+            result, waited = _watch(lambda: producer.admit(_sample("absent-source")))
+            if waited or blocked.finished():
+                raise CheckFailure("admission_waited_absent")
+            if result.admitted:
+                raise CheckFailure("admitted_without_collector")
+        finally:
+            producer.close()
+        root, sock, pid = self.start("exited", freshness_window_ms=5000)
+        os.kill(pid, signal.SIGKILL)
+        self._wait_dead(pid)
+        producer = Producer(sock, source_instance_id="exited-source", limits={"heartbeat_interval_ms": 50})
+        try:
+            result, waited = _watch(lambda: producer.admit(_sample("exited-source")))
+            if waited or result.admitted or _alive(pid):
+                raise CheckFailure("admission_waited_exited")
+        finally:
+            producer.close()
+        hold = self.root("hold") + ".fifo"
+        fd = _open_fifo(hold)
+        try:
+            root, sock, pid = self.start(
+                "hold",
+                publication_hold=hold,
+                collector_queue_count=1,
+                freshness_window_ms=5000,
+                heartbeat_interval_ms=50,
+            )
+            client = Client(sock, timeout=5)
+            self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+            if not _wait(lambda: client.status().get("body", {}).get("publication_hold") is True):
+                raise CheckFailure("hold_not_entered")
+            producer = Producer(
+                sock,
+                source_instance_id="hold-source",
+                limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000, "producer_queue_count": 32},
+            )
+            try:
+                self._wait_enabled(producer)
+                blocked = _BlockedWork()
+                results = []
+                for index in range(6):
+                    item = _sample("hold-source", sequence=index, kind="input_change")
+                    result, waited = _watch(lambda item=item: producer.admit(item))
+                    results.append(result)
+                    if waited:
+                        raise CheckFailure("admission_waited_hold")
+                if blocked.finished():
+                    raise CheckFailure("blocked_work_released")
+                status = client.status()["body"]
+                if not status["publication_hold"]:
+                    raise CheckFailure("hold_released")
+                if not _wait(lambda: _pressured(client), timeout=5):
+                    status = client.status()["body"]
+                    raise CheckFailure("saturation_not_observed")
+                self.counts["held_known_dropped"] = status["known_dropped_units"]
+            finally:
+                producer.close()
+        finally:
+            os.write(fd, b"x")
+            os.close(fd)
+        control = self.root("control") + ".fifo"
+        fd = _open_fifo(control)
+        thread = None
+        try:
+            _root, sock, _pid = self.start("control", control_hold=control, freshness_window_ms=5000)
+            client = Client(sock, timeout=8)
+            thread = None
+            def _control():
+                client.set_policy("enabled", 0)
+            thread = threading.Thread(target=_control, daemon=True)
+            thread.start()
+            if not _wait(lambda: client.status().get("body", {}).get("control_hold") is True, timeout=5):
+                raise CheckFailure("control_not_blocked")
+            producer = Producer(sock, source_instance_id="control-source", limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000})
+            try:
+                result, waited = _watch(lambda: producer.admit(_sample("control-source")))
+                if waited or not thread.is_alive():
+                    raise CheckFailure("admission_waited_control")
+                if result is None:
+                    raise CheckFailure("admission_missing")
+            finally:
+                producer.close()
+        finally:
+            os.write(fd, b"x")
+            os.close(fd)
+            if thread is not None:
+                thread.join(timeout=3)
+        self._check_storage_failure()
+
+    def _check_storage_failure(self):
+        root, sock, _pid = self.start("storage-fail", freshness_window_ms=5000, heartbeat_interval_ms=50)
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        client.call("admit_batch", {"observations": [_sample("fail-source", sequence=1, process_id="kept")]})
+        client.checkpoint()
+        path = os.path.join(root, "observations.jsonl")
+        before = open(path, "rb").read()
+        os.chmod(path, 0o444)
+        try:
+            producer = Producer(
+                sock,
+                source_instance_id="fail-source",
+                limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000},
+            )
+            try:
+                self._wait_enabled(producer)
+                blocked = _BlockedWork()
+                result, waited = _watch(lambda: producer.admit(_sample("fail-source", sequence=2, process_id="lost")))
+                if waited or blocked.finished():
+                    raise CheckFailure("admission_waited_storage_failure")
+                if result is None:
+                    raise CheckFailure("admission_missing")
+                if not _wait(lambda: client.checkpoint().get("body", {}).get("storage_failure") is True, timeout=8):
+                    raise CheckFailure("storage_failure_not_disclosed")
+            finally:
+                producer.close()
+            status = client.status()["body"]
+            if not status["storage_failure"]:
+                raise CheckFailure("storage_failure_not_disclosed")
+            if open(path, "rb").read() != before:
+                raise CheckFailure("storage_failure_rewrote")
+            if not client.query("process", process_id="kept", page_size=PAGE)["body"]["observations"]:
+                raise CheckFailure("storage_failure_lost_history")
+            if client.query("process", process_id="lost", page_size=PAGE)["body"]["observations"]:
+                raise CheckFailure("storage_failure_published")
+        finally:
+            os.chmod(path, 0o600)
+
+    def check_durability(self):
+        root, sock, pid = self.start("flush", freshness_window_ms=5000)
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        client.call("admit_batch", {"observations": [_sample("flush-source", text=INVENTED_TEXT)]})
+        client.checkpoint()
+        if client.status()["body"]["durable_seq"] < 1:
+            raise CheckFailure("not_durable")
+        epoch = client.status()["body"]["continuity_epoch"]
+        self.stop_root(root, sock)
+        self._wait_dead(pid)
+        root, sock, pid = self.start("flush", freshness_window_ms=5000)
+        client = Client(sock, timeout=5)
+        status = client.status()["body"]
+        if status["crash_tail"] != "none" or status["durable_seq"] < 1:
+            raise CheckFailure("reopen")
+        if status["continuity_epoch"] == epoch:
+            raise CheckFailure("restart_kept_continuity")
+        if status["desired_policy"] != "enabled":
+            raise CheckFailure("policy_lost")
+        phase = self.root("crash") + ".fifo"
+        fd = _open_fifo(phase)
+        try:
+            os.write(fd, b"x")
+            root, sock, pid = self.start(
+                "crash",
+                no_auto_checkpoint=True,
+                publication_phase_hold=phase,
+                freshness_window_ms=5000,
+            )
+            client = Client(sock, timeout=5)
+            self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+            client.call("admit_batch", {"observations": [_sample("crash-source", sequence=1, process_id="proc-a")]})
+            client.checkpoint()
+            if not _wait(lambda: client.status().get("body", {}).get("durable_seq", 0) >= 1):
+                raise CheckFailure("crash_baseline")
+            known = client.status()["body"]["known_dropped_units"]
+            client.call("admit_batch", {"observations": [_sample("crash-source", sequence=2, process_id="proc-b")]})
+            thread = threading.Thread(target=client.checkpoint)
+            thread.daemon = True
+            thread.start()
+            if not _wait(lambda: client.status().get("body", {}).get("publication_phase_hold") is True):
+                raise CheckFailure("phase_hold")
+            os.kill(pid, signal.SIGKILL)
+            self._wait_dead(pid)
+        finally:
+            os.close(fd)
+        root, sock, _pid = self.start("crash", freshness_window_ms=5000)
+        client = Client(sock, timeout=5)
+        status = client.status()["body"]
+        if status["crash_tail"] != "unknown":
+            raise CheckFailure("crash_tail_claimed_known")
+        if status["known_dropped_units"] != known:
+            raise CheckFailure("crash_counted_as_known_loss")
+        present = client.query("process", process_id="proc-a", page_size=PAGE)
+        absent = client.query("process", process_id="proc-b", page_size=PAGE)
+        if not present["body"]["observations"] or absent["body"]["observations"]:
+            raise CheckFailure("unpublished_tail_treated_durable")
+        state = json.loads(open(os.path.join(root, "state.json"), "r").read())
+        if state.get("crash_tail") != "unknown":
+            raise CheckFailure("watermark_not_unknown")
+        self.counts["discarded_unpublished_bytes"] = status["discarded_unpublished_bytes"]
+        if status["discarded_unpublished_bytes"] <= 0:
+            raise CheckFailure("no_unpublished_bytes")
+
+    def check_policy(self):
+        root, sock, pid = self.start("policy", freshness_window_ms=400, heartbeat_interval_ms=50)
+        initial = self.cli("--json", "--socket", sock, "status")
+        if initial.returncode != 0:
+            raise CheckFailure("status_cli")
+        body = json.loads(initial.stdout)
+        if body["body"]["desired_policy"] != "off" or body["body"]["globally_effective"]:
+            raise CheckFailure("initial_effective")
+        if "separately_configured_may_continue" not in initial.stdout:
+            raise CheckFailure("legacy_disclosure")
+        if body["body"]["legacy_switch_changed"] is not False:
+            raise CheckFailure("legacy_switch")
+        enabled = self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        if enabled.returncode != 0:
+            raise CheckFailure("enable")
+        producer = Producer(
+            sock,
+            source_instance_id="stale-source",
+            limits={"heartbeat_interval_ms": 60000, "freshness_window_ms": 400},
+        )
+        try:
+            if not _wait(lambda: _producer_seen(Client(sock, timeout=2))):
+                raise CheckFailure("producer_not_seen")
+            time.sleep(0.6)
+            status = Client(sock, timeout=2).status()["body"]
+            if status["globally_effective"]:
+                raise CheckFailure("stale_reported_effective")
+            observations = status["producer_observations"]
+            if not observations or observations[0]["freshness"] != "stale":
+                raise CheckFailure("stale_not_labeled")
+            if status["desired_policy"] != "enabled":
+                raise CheckFailure("stale_while_disabled")
+        finally:
+            producer.close()
+        stale = self.cli("--socket", sock, "policy", "pause", "--expect-revision", "0")
+        if stale.returncode == 0 or "stale_revision" not in stale.stdout + stale.stderr:
+            raise CheckFailure("stale_revision")
+        paused = self.cli("--socket", sock, "policy", "pause", "--expect-revision", "1")
+        if paused.returncode != 0:
+            raise CheckFailure("pause")
+        self.stop_root(root, sock)
+        self._wait_dead(pid)
+        root, sock, pid = self.start("policy", freshness_window_ms=5000)
+        status = self.cli("--socket", sock, "status")
+        if "desired_policy=paused" not in status.stdout:
+            raise CheckFailure("pause_not_durable")
+        refused = Client(sock, timeout=3).call("admit_batch", {"observations": [_sample("policy-source", sequence=3)]})
+        if "capture_disabled" not in refused.get("body", {}).get("codes", []):
+            raise CheckFailure("paused_interval_collected")
+        before = Client(sock, timeout=3).status()["body"]["durable_seq"]
+        resumed = self.cli("--socket", sock, "policy", "resume", "--expect-revision", "2")
+        if resumed.returncode != 0:
+            raise CheckFailure("resume")
+        after = Client(sock, timeout=3).query("timeline", page_size=PAGE)
+        if after["body"]["as_of_durable_seq"] != before:
+            raise CheckFailure("resume_backfill")
+        self._drive_tui_pause(sock)
+        self.counts["policy_revision"] = Client(sock, timeout=3).status()["body"]["desired_revision"]
+
+    def check_privacy(self):
+        self._review_imports()
+        real = self.root("symlink-target")
+        os.mkdir(real)
+        link = self.root("symlink-root")
+        os.symlink(real, link)
+        self.start_rejected(link)
+        if os.path.exists(os.path.join(real, "policy.json")) or os.path.exists(os.path.join(real, "observations.jsonl")):
+            raise CheckFailure("symlink_written")
+        self.start_rejected("/bin")
+        cloud = os.path.join(self.workspace, "Dropbox", "archive")
+        self.start_rejected(cloud)
+        if os.path.exists(cloud):
+            raise CheckFailure("cloud_written")
+        root, sock, pid = self.start("privacy", freshness_window_ms=5000, heartbeat_interval_ms=50)
+        self._assert_modes(root)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        client = Client(sock, timeout=5)
+        client.call("admit_batch", {"observations": [_sample("priv-source", sequence=1, process_id="proc-body", text=CANARY)]})
+        client.call("admit_batch", {"observations": [{
+            "envelope_version": 1,
+            "content_version": 1,
+            "schema_id": "luna_pinyin",
+            "source_instance_id": "priv-source",
+            "source_local_sequence": 2,
+            "observation_kind": "input_change",
+            "process_id": "proc-excluded",
+            "eligibility": "excluded",
+            "payload": {"text": EXCL},
+        }]})
+        client.call("admit_batch", {"observations": [_sample("priv-source", sequence=3, process_id="proc-esc", text="\x1b[2J" + ESC_MARK)]})
+        client.checkpoint()
+        ordinary = []
+        for args in (
+            ("--socket", sock, "status"),
+            ("--socket", sock, "query", "overview"),
+            ("--socket", sock, "query", "timeline", "--page-size", "20"),
+            ("--socket", sock, "query", "process", "--process-id", "proc-body"),
+        ):
+            proc = self.cli(*args)
+            ordinary.append(proc.stdout + proc.stderr)
+        bad = client.call("status", {"payload": {"text": CANARY}}, envelope_version=99)
+        ordinary.append(json.dumps(bad))
+        joined = "\n".join(ordinary)
+        for marker in (CANARY, EXCL, ESC_MARK):
+            if marker in joined:
+                raise CheckFailure("canary_leak:ordinary")
+        if "\x1b" in joined:
+            raise CheckFailure("escape_in_ordinary")
+        private = self.cli("--socket", sock, "query", "process", "--process-id", "proc-body", "--private-detail")
+        if CANARY not in private.stdout:
+            raise CheckFailure("private_detail_missing")
+        if EXCL in private.stdout:
+            raise CheckFailure("excluded_in_detail")
+        files = _scan_tree(root)
+        if EXCL in files["blob"]:
+            raise CheckFailure("excluded_stored")
+        if CANARY not in open(os.path.join(root, "observations.jsonl"), "r").read():
+            raise CheckFailure("body_not_in_artifact")
+        for name in ("state.json", "policy.json", "collector.err", "collector.out"):
+            if CANARY in open(os.path.join(root, name), "r", errors="ignore").read():
+                raise CheckFailure("canary_leak:" + name)
+        escaped = _tui_capture(sock, ["expand proc-esc", "quit"], repo=REPO)
+        if b"\x1b" in escaped:
+            raise CheckFailure("terminal_escape")
+        if ESC_MARK.encode() not in escaped:
+            raise CheckFailure("escaped_detail_missing")
+        self._assert_no_tcp(pid)
+        self.counts["privacy_files"] = len(files["names"])
+
+    def check_capacity(self):
+        self._assert_docs_limits()
+        for count, name in ((100, "scale100"), (10000, "scale10000")):
+            root, sock, pid = self.start(name, freshness_window_ms=5000, heartbeat_interval_ms=50)
+            client = Client(sock, timeout=8)
+            self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+            producer = Producer(
+                sock,
+                source_instance_id="scale-" + name,
+                limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000, "producer_queue_count": 256},
+            )
+            try:
+                self._wait_enabled(producer)
+                pending = [scale_observation(index, "scale-" + name) for index in range(1, count + 1)]
+                deadline = time.time() + (30 if count < 1000 else 90)
+                while pending and time.time() < deadline:
+                    result = producer.admit(pending[0])
+                    if result.admitted:
+                        pending.pop(0)
+                    elif result.code == "queue_saturated":
+                        time.sleep(0.01)
+                    else:
+                        raise CheckFailure("scale_refused")
+                if pending:
+                    raise CheckFailure("scale_timeout")
+                if not _wait(lambda: producer.local_status().get("queued") == 0, timeout=60):
+                    raise CheckFailure("scale_not_shipped")
+                if not _wait(lambda: client.checkpoint().get("body", {}).get("durable_seq", 0) >= count, timeout=90):
+                    raise CheckFailure("scale_not_durable")
+            finally:
+                producer.close()
+            page = client.query("timeline", page_size=PAGE)
+            self._require(page)
+            if page["body"]["returned"] != PAGE:
+                raise CheckFailure("page_bound_not_applied")
+            encoded = json.dumps(strip_content(page))
+            if len(encoded) > 65536 or CANARY in encoded:
+                raise CheckFailure("page_unbounded")
+            over = client.query("timeline", page_size=DEFAULTS["page_size_max"] + 1)
+            if (over.get("error") or {}).get("code") != "page_bound":
+                raise CheckFailure("page_bound_refusal")
+            rss = _rss_kb(pid)
+            self.counts[name + "_page"] = page["body"]["returned"]
+            self.counts[name + "_response_bytes"] = len(encoded)
+            self.counts[name + "_rss_kb"] = rss
+            self.counts[name + "_processes"] = count
+            self.stop_owned()
+        root, sock, _pid = self.start(
+            "capacity",
+            archive_capacity_bytes=12000,
+            warning_ratio=0.5,
+            freshness_window_ms=5000,
+        )
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        warned = False
+        stopped = False
+        first_id = "cap-1"
+        for index in range(1, 80):
+            client.call("admit_batch", {"observations": [_sample("cap-source", sequence=index, process_id="cap-%s" % index, text="x")]})
+            client.checkpoint()
+            status = client.status()["body"]
+            if status["warning"]:
+                warned = True
+            if status["capacity_stop"]:
+                stopped = True
+                break
+        if not warned or not stopped:
+            raise CheckFailure("capacity_warning")
+        digest = _file_sha(os.path.join(root, "observations.jsonl"))
+        before = client.status()["body"]["durable_seq"]
+        client.call("admit_batch", {"observations": [_sample("cap-source", sequence=90, process_id="cap-overflow", text="y")]})
+        client.checkpoint()
+        if _file_sha(os.path.join(root, "observations.jsonl")) != digest:
+            raise CheckFailure("capacity_overwrite")
+        if client.status()["body"]["durable_seq"] != before:
+            raise CheckFailure("capacity_advanced")
+        if not client.query("process", process_id=first_id, page_size=PAGE)["body"]["observations"]:
+            raise CheckFailure("capacity_lost_history")
+        self.counts["capacity_durable_seq"] = before
+
+    def check_walkthrough(self):
+        root, sock, pid = self.start("walk", freshness_window_ms=5000, heartbeat_interval_ms=50)
+        transcript = []
+        started = self.cli("--socket", sock, "status")
+        transcript.append(started.stdout)
+        enabled = self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        transcript.append(enabled.stdout)
+        fixture = os.path.join(root, "fixture.json")
+        observations = supported_processes("walk-source")
+        fd = os.open(fixture, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        os.write(fd, json.dumps({"observations": observations}).encode("utf-8"))
+        os.close(fd)
+        admitted = self.cli(
+            "--socket", sock, "--timeout", "8", "admit",
+            "--fixture", fixture, "--source-instance-id", "walk-source",
+        )
+        transcript.append(admitted.stdout)
+        Client(sock, timeout=5).checkpoint()
+        if not _wait(lambda: Client(sock, timeout=2).status().get("body", {}).get("durable_seq", 0) >= 1):
+            raise CheckFailure("walk_not_durable")
+        first = _tui_session(sock, ["timeline", "expand proc-commit", "pause", "quit"])
+        transcript.append(first.decode("utf-8", "replace"))
+        if b"SCREEN overview" not in first or b"SCREEN timeline" not in first or b"SCREEN private-detail" not in first:
+            raise CheckFailure("walk_screens")
+        if INVENTED_TEXT.encode() in first.split(b"SCREEN private-detail")[0]:
+            raise CheckFailure("walk_overview_leaked")
+        if INVENTED_TEXT.encode() not in first.split(b"SCREEN private-detail")[1]:
+            raise CheckFailure("walk_detail_missing")
+        if not _alive(pid):
+            raise CheckFailure("tui_stopped_collector")
+        status = Client(sock, timeout=3).status()["body"]
+        if status["desired_policy"] != "paused":
+            raise CheckFailure("tui_pause")
+        second = _tui_session(sock, ["quit"])
+        transcript.append(second.decode("utf-8", "replace"))
+        if b"desired_policy=paused" not in second:
+            raise CheckFailure("tui_reopen")
+        if not _alive(pid):
+            raise CheckFailure("tui_reopen_stopped_collector")
+        self.stop_root(root, sock)
+        self._wait_dead(pid)
+        root, sock, pid = self.start("walk", freshness_window_ms=5000)
+        restarted = self.cli("--socket", sock, "status")
+        transcript.append(restarted.stdout)
+        if "desired_policy=paused" not in restarted.stdout:
+            raise CheckFailure("walk_restart_pause")
+        if not Client(sock, timeout=3).query("process", process_id="proc-commit", page_size=PAGE)["body"]["observations"]:
+            raise CheckFailure("walk_record_lost")
+        path = os.path.join(root, "walkthrough.txt")
+        blob = "\n".join(transcript).encode("utf-8")
+        out = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        os.write(out, blob)
+        os.close(out)
+        self.walkthrough_sha = hashlib.sha256(blob).hexdigest()
+        self.counts["walkthrough_bytes"] = len(blob)
+
+    def check_usability(self):
+        self._assert_docs_contract()
+        fresh = os.path.join(self.workspace, "fresh")
+        archive_src = os.path.join(REPO, "archive")
+        shutil.copytree(archive_src, os.path.join(fresh, "archive"))
+        root = os.path.join(fresh, "demo")
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        sock = os.path.join(root, "collector.sock")
+        start = subprocess.run(
+            [sys.executable, "-m", "archive.cli", "--root", root, "--socket", sock, "collector", "start"],
+            cwd=fresh, capture_output=True, text=True, timeout=20,
+        )
+        self._ordinary(start.stdout, start.stderr)
+        if start.returncode != 0 or "capture_enabled=false" not in start.stdout:
+            raise CheckFailure("fresh_start")
+        status = subprocess.run(
+            [sys.executable, "-m", "archive.cli", "--socket", sock, "status"],
+            cwd=fresh, capture_output=True, text=True, timeout=10,
+        )
+        if status.returncode != 0 or "desired_policy=off" not in status.stdout:
+            raise CheckFailure("fresh_status")
+        stop = subprocess.run(
+            [sys.executable, "-m", "archive.cli", "--root", root, "--socket", sock, "collector", "stop"],
+            cwd=fresh, capture_output=True, text=True, timeout=15,
+        )
+        if stop.returncode != 0:
+            raise CheckFailure("fresh_stop")
+        example = Client(sock, timeout=1).status()
+        if example.get("ok"):
+            raise CheckFailure("fresh_still_running")
+        self.counts["documented_defaults"] = len(DEFAULTS)
+
+    def _review_admission_path(self):
+        tree = ast.parse(open(os.path.join(REPO, "archive", "producer.py"), "r").read())
+        wanted = {"admit", "_enqueue"}
+        forbidden = {"sleep", "dumps", "dump", "connect", "send", "sendall", "recv", "open", "urlopen", "Popen", "fsync"}
+        found = set()
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name in wanted:
+                        found.add(item.name)
+                        for child in ast.walk(item):
+                            name = ""
+                            if isinstance(child, ast.Call):
+                                func = child.func
+                                if isinstance(func, ast.Name):
+                                    name = func.id
+                                elif isinstance(func, ast.Attribute):
+                                    name = func.attr
+                            if name in forbidden:
+                                raise CheckFailure("admission_path_io")
+        if found != wanted:
+            raise CheckFailure("admission_path_missing")
+
+    def _review_imports(self):
+        forbidden = {"mlx", "urllib", "requests", "http"}
+        for name in os.listdir(os.path.join(REPO, "archive")):
+            if not name.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(REPO, "archive", name), "r").read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name.split(".")[0] for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    modules = [node.module.split(".")[0]]
+                else:
+                    continue
+                if any(item in forbidden for item in modules):
+                    raise CheckFailure("inference_import")
+        for name in ("cli.py", "tui.py"):
+            text = open(os.path.join(REPO, "archive", name), "r").read()
+            if "archive.collector" in text and "import" in text:
+                tree = ast.parse(text)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom) and node.module == "archive.collector":
+                        raise CheckFailure("adapter_imports_storage")
+
+    def _assert_no_tcp(self, pid):
+        proc = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-i"], capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            raise CheckFailure("tcp_connection")
+        if "Library/Rime" in open(os.path.join(REPO, "archive", "collector.py"), "r").read():
+            raise CheckFailure("legacy_root_reference")
+
+    def _assert_modes(self, root):
+        for current, dirs, files in os.walk(root):
+            if stat.S_IMODE(os.lstat(current).st_mode) & 0o077:
+                raise CheckFailure("directory_mode")
+            for name in dirs + files:
+                info = os.lstat(os.path.join(current, name))
+                if stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+                    raise CheckFailure("private_mode")
+
+    def _assert_docs_limits(self):
+        text = open(os.path.join(REPO, "docs", "input-archive.md"), "r").read()
+        for key, value in DEFAULTS.items():
+            line = "DEFAULT %s=%s" % (key, value)
+            if isinstance(value, float) and line not in text and "DEFAULT %s=%s" % (key, int(value) if value == int(value) else value) not in text:
+                if line not in text:
+                    raise CheckFailure("limits_not_documented")
+            elif not isinstance(value, float) and line not in text:
+                raise CheckFailure("limits_not_documented")
+
+    def _assert_docs_contract(self):
+        text = open(os.path.join(REPO, "docs", "input-archive.md"), "r").read()
+        for token in (
+            "input-archive-v1",
+            "Producer.admit",
+            "unsupported_version",
+            "stale_revision",
+            "unsafe_root",
+            "page_bound",
+            "identity_conflict",
+            "crash_tail",
+            "separately_configured_may_continue",
+            "collector start",
+            "collector stop",
+            "not host",
+        ):
+            if token not in text:
+                raise CheckFailure("docs_missing")
+        self._assert_docs_limits()
+
+    def _drive_tui_pause(self, sock):
+        client = Client(sock, timeout=3)
+        client.set_policy("enabled", client.status()["body"]["desired_revision"])
+        captured = _tui_session(sock, ["pause", "quit"])
+        if b"desired_policy=paused" not in captured:
+            raise CheckFailure("tui_control_mismatch")
+        if client.status()["body"]["desired_policy"] != "paused":
+            raise CheckFailure("tui_not_interface")
+
+    def _wait_enabled(self, producer):
+        if not _wait(lambda: _enabled(producer)):
+            raise CheckFailure("producer_not_enabled")
+
+    def _wait_durable(self, client, minimum):
+        if not _wait(lambda: client.checkpoint().get("body", {}).get("durable_seq", 0) >= minimum):
+            raise CheckFailure("not_durable")
+
+    def _wait_dead(self, pid):
+        if not _wait(lambda: not _alive(pid), timeout=3):
+            raise CheckFailure("pid_still_alive")
+
+    def _require(self, response):
+        if not response.get("ok"):
+            raise CheckFailure((response.get("error") or {}).get("code", "not_ok"))
+
+    def _ordinary(self, stdout, stderr):
+        for marker in (CANARY, EXCL, CONF, ESC_MARK):
+            if marker in (stdout or "") or marker in (stderr or ""):
+                raise CheckFailure("canary_leak:cli")
+
+    def _flags(self, flags):
+        forwarded = []
+        for key, value in flags.items():
+            flag = "--" + key.replace("_", "-")
+            if value is True:
+                forwarded.append(flag)
+            elif value not in (None, False, ""):
+                forwarded.extend([flag, str(value)])
+        return forwarded
+
+
+def _sample(source, sequence=1, process_id="proc-sample", kind="start", text=INVENTED_TEXT):
+    return {
+        "envelope_version": 1,
+        "content_version": 1,
+        "schema_id": "luna_pinyin",
+        "source_instance_id": source,
+        "source_local_sequence": sequence,
+        "observation_kind": kind,
+        "process_id": process_id,
+        "payload": {"text": text},
+    }
+
+
+def _watch(fn, bound=0.5):
+    done = threading.Event()
+    box = {}
+
+    def run():
+        box["result"] = fn()
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    finished = done.wait(bound)
+    if not finished:
+        return None, True
+    return box.get("result"), False
+
+
+class _BlockedWork(object):
+    def __init__(self):
+        self.fd_read, self.fd_write = os.pipe()
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._block, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+
+    def _block(self):
+        os.read(self.fd_read, 1)
+        self.done.set()
+
+    def finished(self):
+        return self.done.is_set()
+
+    def release(self):
+        try:
+            os.write(self.fd_write, b"x")
+        except OSError:
+            pass
+        self.thread.join(timeout=1)
+
+
+def _wait(fn, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if fn():
+                return True
+        except (OSError, KeyError, TypeError):
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def _enabled(producer):
+    local = producer.local_status()
+    return local.get("fresh") and local.get("observed_desired") == "enabled"
+
+
+def _pressured(client):
+    body = client.status().get("body") or {}
+    return body.get("publication_hold") is True and (
+        body.get("known_dropped_units", 0) >= 1 or body.get("received_unpublished", 0) >= 1
+    )
+
+
+def _producer_seen(client):
+    body = client.status().get("body") or {}
+    return bool(body.get("producer_observations"))
+
+
+def _pid_from_text(text):
+    for line in text.splitlines():
+        if line.startswith("pid="):
+            return int(line.split("=", 1)[1])
+    return None
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _is_collector(pid):
+    try:
+        command = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return "archive.collector" in command
+
+
+def _wait_dead(pid):
+    return _wait(lambda: not _alive(pid), timeout=3)
+
+
+def _open_fifo(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        os.mkfifo(path, 0o600)
+    fd = os.open(path, os.O_RDWR)
+    os.chmod(path, 0o600)
+    return fd
+
+
+def _rss_kb(pid):
+    try:
+        text = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True)
+        return int(text.strip() or "0")
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0
+
+
+def _file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def _scan_tree(root):
+    names = []
+    blob = []
+    for current, _dirs, files in os.walk(root):
+        for name in files:
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            if stat.S_ISSOCK(info.st_mode) or stat.S_ISFIFO(info.st_mode):
+                continue
+            names.append(name)
+            try:
+                blob.append(open(path, "rb").read().decode("utf-8", "ignore"))
+            except OSError:
+                continue
+    return {"names": names, "blob": "\n".join(blob)}
+
+
+def _tui_capture(sock, commands, repo):
+    master, slave = pty.openpty()
+    try:
+        import termios
+        attr = termios.tcgetattr(slave)
+        attr[3] = attr[3] & ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attr)
+    except Exception:
+        pass
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "archive.cli", "--socket", sock, "tui"],
+        cwd=repo,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+    )
+    os.close(slave)
+    buf = _read_until(master, b"SCREEN overview", 5)
+    for command in commands:
+        os.write(master, (command + "\n").encode("utf-8"))
+        token = b"SCREEN closed" if command == "quit" else b"SCREEN"
+        buf += _read_until(master, token, 5)
+    proc.wait(timeout=5)
+    os.close(master)
+    return buf
+
+
+def _tui_session(sock, commands):
+    return _tui_capture(sock, commands, REPO)
+
+
+def _read_until(fd, token, timeout):
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if not ready:
+            if token in buf:
+                return buf
+            continue
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        buf += chunk
+        if token in buf and (token != b"SCREEN" or buf.count(b"SCREEN") >= 1):
+            if token == b"SCREEN closed" or token != b"SCREEN":
+                return buf
+    return buf
+
+
+def _prepare_workspace(path):
+    real = os.path.realpath(path)
+    allowed = os.path.realpath(os.path.join(REPO, ".local-work"))
+    if real != allowed and not real.startswith(allowed + os.sep):
+        sys.stderr.write("code=unsafe_root\n")
+        return None
+    if os.path.isdir(real):
+        shutil.rmtree(real)
+    os.makedirs(real, 0o700)
+    return real
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return run_self_test()
+    if "--suite" not in argv or "contract" not in argv:
+        sys.stderr.write("code=invalid_request\n")
+        return 2
+    root = None
+    report = None
+    args = argv[1:]
+    index = 0
+    while index < len(args):
+        if args[index] == "--root" and index + 1 < len(args):
+            root = args[index + 1]
+            index += 2
+            continue
+        if args[index] == "--report" and index + 1 < len(args):
+            report = args[index + 1]
+            index += 2
+            continue
+        index += 1
+    if not root or not report:
+        sys.stderr.write("code=invalid_request\n")
+        return 2
+    workspace = _prepare_workspace(root)
+    if workspace is None:
+        return 2
+    report_path = os.path.abspath(report)
+    if not report_path.startswith(os.path.realpath(os.path.join(REPO, ".local-work")) + os.sep):
+        sys.stderr.write("code=unsafe_root\n")
+        return 2
+    suite = Suite(workspace)
+    try:
+        payload = suite.run()
+    finally:
+        suite.stop_owned()
+    problems = validate_report(payload) if payload.get("result") == "pass" else ["result_not_pass"]
+    if any(item == "canary_in_report" for item in problems):
+        payload = {"report_version": 1, "result": "fail", "canary_in_report": True, "criteria": {}}
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    blob = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    fd = os.open(report_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    os.write(fd, blob)
+    os.close(fd)
+    os.chmod(report_path, 0o600)
+    sys.stdout.write("result=%s\n" % payload.get("result"))
+    for item in REQUIRED:
+        failed = (payload.get("criteria") or {}).get(item, {}).get("failed") or []
+        sys.stdout.write("%s %s\n" % (item, "fail" if failed else payload.get("criteria", {}).get(item, {}).get("result", "fail")))
+        for code in failed:
+            sys.stdout.write("fail %s %s\n" % (item, code))
+    if payload.get("result") != "pass":
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
