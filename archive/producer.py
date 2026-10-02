@@ -165,6 +165,8 @@ class Producer(object):
         acc = [0]
         _budget_bytes(snapshot, self.limits["max_event_bytes"], acc)
         if acc[0] > self.limits["max_event_bytes"]:
+            with self._lock:
+                self._known_refused += 1
             return AdmissionResult(False, "event_too_large")
         if _locally_invalid(snapshot):
             return self._refuse_invalid()

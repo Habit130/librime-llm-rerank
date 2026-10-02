@@ -496,7 +496,7 @@ class Collector(object):
             for source_id, observed in self._producers.items():
                 age_ms = int((now - observed["seen"]) * 1000)
                 is_fresh = age_ms <= self.limits["freshness_window_ms"]
-                matches = observed["revision"] == self._policy["revision"]
+                matches = observed["revision"] is not None and observed["revision"] == self._policy["revision"]
                 if not is_fresh or not matches:
                     stale += 1
                 elif is_fresh and matches:
@@ -576,9 +576,11 @@ class Collector(object):
         if safe_token(source_id) is None:
             return self.snapshot()
         with self._lock:
-            delivered = self._policy["revision"]
+            declared = body.get("observed_revision")
+            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
+                declared = None
             self._producers[source_id] = {
-                "revision": delivered,
+                "revision": declared,
                 "seen": time.monotonic(),
             }
         return {
@@ -667,6 +669,8 @@ class Collector(object):
             return prepared
         size = len(canonical_bytes(prepared["semantic"]))
         if size > self.limits["max_event_bytes"]:
+            with self._lock:
+                self._state["admission_refused_units"] = self._state.get("admission_refused_units", 0) + 1
             return "event_too_large"
         with self._lock:
             if self._state["storage_failure"]:

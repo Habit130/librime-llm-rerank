@@ -27,8 +27,10 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from archive import Client, Producer  # noqa: E402
-from archive.interface import INTERFACE_VERSION, strip_content  # noqa: E402
+from archive.collector import Collector  # noqa: E402
+from archive.interface import INTERFACE_VERSION, canonical_bytes, strip_content  # noqa: E402
 from archive.limits import DEFAULTS  # noqa: E402
+from archive.producer import _budget_bytes  # noqa: E402
 from archive.synthetic import INVENTED_TEXT, scale_observation, supported_processes  # noqa: E402
 
 CANARY = "CANARY188BODY"
@@ -47,6 +49,83 @@ class CheckFailure(Exception):
 
 def quarantine_tail_inconsistent(file_bytes, watermark):
     return file_bytes > watermark
+
+
+OVERSIZE_CJK = "你好世界输入法候选择词测试样本"
+# 10845 invented CJK units: producer raw budget fits max_event_bytes while the
+# canonical semantic size does not. This is the supported boundary that attempt 2
+# reported, reproduced here as synthetic data with no real input.
+OVERSIZE_UNITS = 10845
+
+
+def _oversize_observation(source, units=OVERSIZE_UNITS, sequence=1):
+    """A supported luna_pinyin observation whose exact refusal boundary matters."""
+    text = (OVERSIZE_CJK * (units // len(OVERSIZE_CJK) + 1))[:units]
+    return {
+        "envelope_version": 1,
+        "content_version": 1,
+        "schema_id": "luna_pinyin",
+        "source_instance_id": source,
+        "source_local_sequence": sequence,
+        "observation_kind": "commit_attempt",
+        "process_id": "proc-oversize",
+        "update_id": "oversize-u",
+        "commit_id": "oversize-c",
+        "stage": "unknown",
+        "host_persistence": "unknown",
+        "clocks": {"event_time": None, "observation_time": None, "clock_domain": "unknown"},
+        "payload": {"text": text},
+    }
+
+
+def _policy_observation_is_acknowledged(declared_revision, desired_revision):
+    """A revision is acknowledged only when an observation declares it.
+
+    A response that merely delivers `desired_revision` never acknowledges it.
+    """
+    return declared_revision is not None and declared_revision == desired_revision
+
+
+def _oversize_boundary_trial():
+    """In-process trial of the exact oversize refusal boundary.
+
+    Measures the producer raw budget with the producer's own function and the
+    canonical semantic size with the collector's own prepare path, then drives
+    the real `_accept_one` refusal branch twice: once on the exact boundary
+    fixture, and once on a fixture shrunk well inside the limit as a control.
+    Never starts a collector and never writes storage.
+    """
+    trial = object.__new__(Collector)
+    trial.limits = dict(DEFAULTS)
+    trial._lock = threading.Lock()
+    trial._cv = threading.Condition(trial._lock)
+    trial._policy = {"revision": 1, "desired": "enabled"}
+    trial._queue = []
+    trial._queue_bytes = 0
+    trial._identities = {}
+
+    def run(units):
+        trial._state = Collector._fresh_state(trial, "none", [])
+        trial._queue = []
+        trial._queue_bytes = 0
+        trial._identities = {}
+        observation = _oversize_observation("self-test-oversize", units=units)
+        budget = [0]
+        _budget_bytes(observation, 10 ** 9, budget)
+        prepared = Collector._prepare(trial, observation)
+        canonical = len(canonical_bytes(prepared["semantic"]))
+        code = trial._accept_one(observation)
+        with trial._lock:
+            refused_units = trial._state["admission_refused_units"]
+        return budget[0], canonical, code, refused_units
+
+    raw, canonical, code, refused_units = run(OVERSIZE_UNITS)
+    accounted = code == "event_too_large" and refused_units == 1
+    # Control: a fixture well inside the limit must not be refused at all, so the
+    # boundary trial above cannot pass by refusing everything.
+    _raw_small, _canon_small, small_code, small_refused = run(64)
+    unrefused_inside_limit = small_code != "event_too_large" and small_refused == 0
+    return raw, canonical, accounted, unrefused_inside_limit
 
 
 def contains_marker(text, marker):
@@ -126,6 +205,23 @@ def run_self_test():
         failures.append("negative_quarantine_tail")
     if quarantine_tail_inconsistent(0, 0):
         failures.append("positive_quarantine_watermark")
+    # An oversize refusal is only honest if it is observable. These controls fail
+    # if the boundary fixture stops being an exact boundary, if the refusal stops
+    # moving the owning counter, or if the fixture is refused for another reason.
+    raw, canonical, accounted, unrefused_inside_limit = _oversize_boundary_trial()
+    if not (raw <= DEFAULTS["max_event_bytes"] < canonical):
+        failures.append("negative_oversize_boundary")
+    if not accounted:
+        failures.append("negative_oversize_unaccounted")
+    if not unrefused_inside_limit:
+        failures.append("positive_oversize_inside_limit")
+    # A delivered revision is not an acknowledgement; only a declared one is.
+    if not _policy_observation_is_acknowledged(1, 1):
+        failures.append("positive_policy_acknowledgement")
+    if _policy_observation_is_acknowledged(0, 1):
+        failures.append("negative_policy_stale_declaration")
+    if _policy_observation_is_acknowledged(None, 1):
+        failures.append("negative_policy_absent_declaration")
     if failures:
         sys.stdout.write("self-test fail %s\n" % ",".join(failures))
         return 1
@@ -483,6 +579,91 @@ class Suite(object):
             if thread is not None:
                 thread.join(timeout=3)
         self._check_storage_failure()
+        self._check_oversize_refusal()
+
+    def _check_oversize_refusal(self):
+        """ARCH188-1: the exact oversize boundary must be observable, not silent.
+
+        The fixture sits at the reported boundary: the producer raw budget fits
+        `max_event_bytes` while the canonical semantic size does not. Acceptance
+        and genuine counter movement are asserted separately from queue drain and
+        query absence, so a silent disappearance cannot pass.
+        """
+        root, sock, _pid = self.start("oversize", freshness_window_ms=5000, heartbeat_interval_ms=50)
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        observation = _oversize_observation("oversize-source")
+        budget = [0]
+        _budget_bytes(observation, 10 ** 9, budget)
+        raw = budget[0]
+        self.counts["oversize_raw_budget"] = raw
+        if raw > DEFAULTS["max_event_bytes"]:
+            raise CheckFailure("oversize_fixture_not_on_boundary")
+
+        # Direct public admission: the refusal code must be accompanied by an
+        # observable refusal counter instead of arriving with no accounting.
+        before = client.status()["body"]["admission_refused_units"]
+        direct = client.call("admit_batch", {"observations": [observation]})
+        codes = (direct.get("body") or {}).get("codes")
+        if codes != ["event_too_large"]:
+            raise CheckFailure("oversize_direct_code")
+        after = client.status()["body"]["admission_refused_units"]
+        if after != before + 1:
+            raise CheckFailure("oversize_direct_unaccounted")
+        self.counts["oversize_collector_refused_units"] = after - before
+
+        # The producer admits the boundary item locally, then the drain refuses it.
+        # Acceptance, queue drain, query absence and counter movement are checked
+        # as separate facts.
+        producer = Producer(
+            sock,
+            source_instance_id="oversize-source",
+            limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000},
+        )
+        try:
+            self._wait_enabled(producer)
+            pre = client.status()["body"]["admission_refused_units"]
+            result = producer.admit(observation)
+            if not result.admitted:
+                raise CheckFailure("oversize_local_not_admitted")
+            if not _wait(lambda: producer.local_status().get("queued") == 0, timeout=8):
+                raise CheckFailure("oversize_queue_not_drained")
+            if not _wait(lambda: client.status()["body"]["admission_refused_units"] > pre, timeout=8):
+                raise CheckFailure("oversize_drained_unaccounted")
+            after_drain = client.status()["body"]["admission_refused_units"]
+            self.counts["oversize_drained_refused_units"] = after_drain - pre
+            query = client.query("process", process_id="proc-oversize", page_size=PAGE)["body"]
+            if query.get("observations"):
+                raise CheckFailure("oversize_appeared_in_query")
+            if query.get("returned"):
+                raise CheckFailure("oversize_query_returned")
+        finally:
+            producer.close()
+
+        # Producer-local refusal is observable too, and is not double-counted by
+        # the collector when it is refused before the sender ever ships it.
+        big = Producer(
+            sock,
+            source_instance_id="oversize-local",
+            limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000},
+        )
+        try:
+            self._wait_enabled(big)
+            collector_before = client.status()["body"]["admission_refused_units"]
+            refused_before = big.local_status()["known_refused"]
+            local_result = big.admit(_oversize_observation("oversize-local", units=40000))
+            if local_result.admitted or local_result.code != "event_too_large":
+                raise CheckFailure("oversize_local_not_refused")
+            refused_after = big.local_status()["known_refused"]
+            if refused_after != refused_before + 1:
+                raise CheckFailure("oversize_local_unaccounted")
+            time.sleep(0.3)
+            if client.status()["body"]["admission_refused_units"] != collector_before:
+                raise CheckFailure("oversize_local_double_counted")
+            self.counts["oversize_local_known_refused"] = refused_after - refused_before
+        finally:
+            big.close()
+        self.stop_owned()
 
     def _check_storage_failure(self):
         root, sock, _pid = self.start("storage-fail", freshness_window_ms=5000, heartbeat_interval_ms=50)
@@ -623,6 +804,66 @@ class Suite(object):
                 raise CheckFailure("stale_while_disabled")
         finally:
             producer.close()
+        # ARCH188-4: a request that declares an older observed revision must be
+        # recorded as declaring it. The revision delivered by the response is not
+        # an acknowledgement, so status must not call that caller effective.
+        client = Client(sock, timeout=3)
+        desired_revision = client.status()["body"]["desired_revision"]
+        stale_revision = desired_revision - 1
+        if stale_revision < 0:
+            raise CheckFailure("stale_observation_unavailable")
+        stale_response = client.call(
+            "policy_observe",
+            {"source_instance_id": "declared-stale", "observed_revision": stale_revision},
+        )
+        if not stale_response.get("ok"):
+            raise CheckFailure("stale_observation_refused")
+        stale_entry = _producer_entry(client, "declared-stale")
+        if stale_entry is None:
+            raise CheckFailure("stale_declaration_not_recorded")
+        if stale_entry["observed_revision"] != stale_revision:
+            raise CheckFailure("stale_declaration_overwritten")
+        if stale_entry["matches_desired_revision"] or stale_entry["effective"]:
+            raise CheckFailure("stale_declaration_effective")
+        if client.status()["body"]["globally_effective"]:
+            raise CheckFailure("stale_call_globally_effective")
+        self.counts["policy_declared_stale_revision"] = stale_entry["observed_revision"]
+
+        # A later observation that reports the delivered revision is what
+        # acknowledges it, and only then is that producer effective.
+        match_response = client.call(
+            "policy_observe",
+            {"source_instance_id": "declared-stale", "observed_revision": desired_revision},
+        )
+        if not match_response.get("ok"):
+            raise CheckFailure("matching_observation_refused")
+        match_entry = _producer_entry(client, "declared-stale")
+        if match_entry is None or match_entry["observed_revision"] != desired_revision:
+            raise CheckFailure("matching_declaration_not_recorded")
+        if not match_entry["matches_desired_revision"] or not match_entry["effective"]:
+            raise CheckFailure("matching_declaration_not_effective")
+        # Other producers seen earlier may still be inside their freshness window,
+        # so assert this producer's entry rather than blanket global effectiveness.
+        self.counts["policy_matching_revision"] = match_entry["observed_revision"]
+
+        # The producer's own polling edge: it reports the revision delivered in the
+        # response, and the collector records that only as a declaration until the
+        # next observation reports it.
+        polled = Producer(
+            sock,
+            source_instance_id="polled-source",
+            limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 2000},
+        )
+        try:
+            if not _wait(lambda: _producer_acknowledged(client, "polled-source", desired_revision),
+                         timeout=8):
+                raise CheckFailure("producer_poll_not_acknowledged")
+            local = polled.local_status()
+            if local["observed_revision"] != desired_revision or not local["fresh"]:
+                raise CheckFailure("producer_poll_local_status")
+            self.counts["policy_polled_revision"] = local["observed_revision"]
+        finally:
+            polled.close()
         stale = self.cli("--socket", sock, "policy", "pause", "--expect-revision", "0")
         if stale.returncode == 0 or "stale_revision" not in stale.stdout + stale.stderr:
             raise CheckFailure("stale_revision")
@@ -1254,6 +1495,24 @@ def _pressured(client):
 def _producer_seen(client):
     body = client.status().get("body") or {}
     return bool(body.get("producer_observations"))
+
+
+def _producer_entry(client, source_instance_id):
+    body = client.status().get("body") or {}
+    for entry in body.get("producer_observations") or []:
+        if entry.get("source_instance_id") == source_instance_id:
+            return entry
+    return None
+
+
+def _producer_acknowledged(client, source_instance_id, revision):
+    entry = _producer_entry(client, source_instance_id)
+    return bool(
+        entry
+        and entry.get("observed_revision") == revision
+        and entry.get("matches_desired_revision")
+        and entry.get("freshness") == "fresh"
+    )
 
 
 def _pid_from_text(text):

@@ -167,6 +167,16 @@ desired and collector-effective capture are enabled and every observed producer
 is fresh at that revision. A saved request or a stale producer is not globally
 effective.
 
+A `policy_observe` call records the revision the caller **declares** in
+`observed_revision`, not the revision that response delivers. A declaration that
+is absent, negative, or not an integer is recorded as no declaration and never
+matches. A delivered revision therefore does not acknowledge itself: after
+`set_policy` raises the revision to 1, a caller still declaring revision `0` is
+recorded at `0`, stays `matches_desired_revision=false`, and is not effective or
+globally effective. That caller becomes acknowledged only when a later
+observation reports revision `1`. A producer that starts before any
+observation reports nothing and is stale until its first response is applied.
+
 Scope is archive-only. Status always discloses
 `legacy_selection_recording=separately_configured_may_continue` and
 `legacy_switch_changed=false`. This module does not read or write the legacy
@@ -247,6 +257,20 @@ Quarantine bytes count toward the same capacity. Warning is
 At capacity, new admission stops. These defaults are configurable engineering
 choices, checked by the contract suite's page and capacity observations, not a
 measured RAM ceiling or a retention period inferred from memory size.
+
+`max_event_bytes` is enforced on the collector's canonical semantic encoding of
+a prepared observation. The producer's input-path budget is a separate, cheaper
+bound on the owned snapshot; it does not compute that canonical encoding and
+does not serialize payload content. The two measurements can therefore disagree
+at the boundary: an observation can fit the producer budget, be admitted
+locally, and still be refused `event_too_large` by the collector. Neither
+refusal is silent. A producer-local refusal is `admitted=false`,
+`code=event_too_large`, increments the producer `known_refused`, is not a
+durable observation, and is never shipped, so it is not also counted by the
+collector. A collector refusal returns `event_too_large` in the batch `codes`
+and increments `admission_refused_units`, which is the same counter that
+accounts a direct `invalid_request` refusal. The refused item is absent from
+query results; absence alone is not the evidence, the counter movement is.
 
 DEFAULT producer_queue_count=256
 DEFAULT producer_queue_bytes=1048576
