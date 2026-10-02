@@ -40,6 +40,14 @@ class OwnershipRefused(Exception):
         super().__init__(code)
 
 
+def _refuse_non_regular(path):
+    """A managed lock path is a regular file or it does not exist."""
+    if not os.path.lexists(path):
+        return
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise UnsafeRoot("artifact_alias")
+
+
 class OwnerLock(object):
     """A stable root-local descriptor lock held for one collector lifetime."""
 
@@ -55,11 +63,19 @@ class OwnerLock(object):
         if self._fd is not None:
             return
         reject_alias(self.path)
-        fd = os.open(
-            self.path,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-        )
+        _refuse_non_regular(self.path)
+        try:
+            fd = os.open(
+                self.path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+        except OSError as exc:
+            # A directory, socket, or device at the lock path is an unsafe
+            # artifact, not an I/O failure to report as retryable.
+            if exc.errno in (errno.EISDIR, errno.ENOTSUP, errno.ENXIO, errno.ELOOP):
+                raise UnsafeRoot("artifact_alias")
+            raise
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):

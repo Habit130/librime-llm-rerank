@@ -1504,6 +1504,7 @@ class Suite(object):
         """SCN5-1: five fresh roots, two concurrent supported starts each."""
         rounds = 0
         refusals = 0
+        survivors = 0
         for index in range(5):
             name = "ownership/race-%d" % index
             root = self.fresh_private_root(name)
@@ -1513,19 +1514,23 @@ class Suite(object):
             if stopped.returncode != 0:
                 raise CheckFailure("race_stop")
             if not self.wait_no_fixture_collectors(root):
+                survivors = max(survivors, len(self.fixture_collectors(root)))
                 raise CheckFailure("race_survivor_after_stop")
             restarted = self.start(name, freshness_window_ms=5000)
             if self.fixture_collectors(root) != [restarted[2]]:
                 raise CheckFailure("race_restart_owners")
             self.stop_root(root, sock)
             if not self.wait_no_fixture_collectors(root):
+                survivors = max(survivors, len(self.fixture_collectors(root)))
                 raise CheckFailure("race_restart_survivor")
             rounds += 1
             refusals += 1
+        if not survivors_are_zero(survivors):
+            raise CheckFailure("race_survivors")
         return {
             "rounds": rounds,
             "refusals": refusals,
-            "survivors_after_stop": 0,
+            "survivors_after_stop": survivors,
             "restarts": rounds,
         }
 
@@ -1741,6 +1746,8 @@ class Suite(object):
         self._ordinary(contender_out, contender_err)
         if contender.returncode == 0:
             raise CheckFailure("incumbent_contender_accepted")
+        if "code=collector_already_running" not in contender_err:
+            raise CheckFailure("incumbent_contender_code")
         if self.fixture_collectors(incumbent_root) != [incumbent]:
             raise CheckFailure("incumbent_contender_survivor")
         if not os.path.isdir(blocked):
@@ -1794,6 +1801,15 @@ class Suite(object):
             raise CheckFailure("lock_fifo_accepted")
         if not stat.S_ISFIFO(os.lstat(fifo_lock).st_mode):
             raise CheckFailure("lock_fifo_replaced")
+        dir_root = self.fresh_private_root("ownership/artifact/dir-root")
+        dir_lock = os.path.join(dir_root, "collector.lock")
+        os.mkdir(dir_lock, 0o700)
+        as_dir = self.direct_entry(dir_root, os.path.join(dir_root, "collector.sock"))
+        self._ordinary(as_dir.stdout, as_dir.stderr)
+        if as_dir.returncode == 0 or "code=unsafe_root" not in as_dir.stderr:
+            raise CheckFailure("lock_directory_accepted")
+        if not os.path.isdir(dir_lock) or os.path.islink(dir_lock):
+            raise CheckFailure("lock_directory_replaced")
         name = "ownership/artifact/stable"
         stable_root = self.fresh_private_root(name)
         stable_sock = os.path.join(stable_root, "collector.sock")
@@ -1823,6 +1839,7 @@ class Suite(object):
         return {
             "alias_refused": 1,
             "non_regular_refused": 1,
+            "directory_refused": 1,
             "inode_stable": 1,
             "mode": "0600",
         }
@@ -1852,6 +1869,20 @@ class Suite(object):
         other = client_b.status()["body"]
         if other["durable_seq"] != 0 or other["desired_revision"] != 0 or other["desired_policy"] != "off":
             raise CheckFailure("locality_leaked")
+        # A stale PID naming a live collector of another root proves nothing
+        # about this unowned root: it must not block a legitimate start.
+        stale_name = "ownership/locality-stale"
+        stale_root = self.fresh_private_root(stale_name)
+        stale_sock = os.path.join(stale_root, "collector.sock")
+        fd = os.open(os.path.join(stale_root, "collector.pid"), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        os.write(fd, ("%s\n" % pid_a).encode("ascii"))
+        os.close(fd)
+        _root, _sock, stale_pid = self.start(stale_name, freshness_window_ms=5000)
+        if self.fixture_collectors(stale_root) != [stale_pid]:
+            raise CheckFailure("stale_pid_start_owners")
+        self.stop_root(stale_root, stale_sock)
+        if not self.wait_no_fixture_collectors(stale_root):
+            raise CheckFailure("stale_pid_survivor")
         self.stop_root(root_a, sock_a)
         self._wait_dead(pid_a)
         if not _alive(pid_b) or self.fixture_collectors(root_b) != [pid_b]:
@@ -1892,6 +1923,7 @@ class Suite(object):
         return {
             "roots": 2,
             "cross_root_effect": 0,
+            "stale_foreign_pid_start": 1,
             "stopped_roots": 2,
             "restart_retained": 1,
         }

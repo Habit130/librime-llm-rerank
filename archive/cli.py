@@ -7,6 +7,7 @@ The CLI does not open observation storage. Collector start only spawns
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import secrets
@@ -147,14 +148,22 @@ def _start(args):
     stderr_path = os.path.join(args.root, "collector.err")
     out_fd = None
     try:
-        out_fd = open_nofollow(stdout_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-        err_fd = open_nofollow(stderr_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        # Append, never truncate: a refused start must not erase the live
+        # owner's own diagnostics before it discovers it is not the owner.
+        out_fd = open_nofollow(stdout_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+        err_fd = open_nofollow(stderr_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND)
     except UnsafeRoot:
         if out_fd is not None:
             os.close(out_fd)
         sys.stderr.write("code=unsafe_root\n")
         return 2
-    read_fd, write_fd = _readiness_pipe()
+    try:
+        read_fd, write_fd = _readiness_pipe()
+    except OSError:
+        os.close(out_fd)
+        os.close(err_fd)
+        sys.stderr.write("code=collector_unavailable\n")
+        return 1
     token = secrets.token_hex(16)
     command = [sys.executable, "-m", "archive.collector", "--root", args.root, "--socket", args.socket]
     command.extend(_forward_flags(args))
@@ -181,7 +190,7 @@ def _start(args):
         outcome, code = _await_readiness(proc, read_fd, token, args.timeout)
     finally:
         os.close(read_fd)
-    if outcome == "ready" and _confirm_owner(args, proc.pid):
+    if outcome == "ready" and _confirm_owner(args, proc, args.timeout):
         sys.stdout.write("interface_version=%s\n" % INTERFACE_VERSION)
         sys.stdout.write("collector_started=true\n")
         sys.stdout.write("capture_enabled=false\n")
@@ -205,11 +214,16 @@ def _readiness_pipe():
 
 
 def _high_fd(fd):
-    while fd < 3:
-        spare = os.dup(fd)
-        os.close(fd)
-        fd = spare
-    return fd
+    """Move a descriptor above the stdio range, or fail with OSError.
+
+    F_DUPFD asks the kernel for the lowest descriptor at or above 3 in one
+    step, so this cannot loop or hand a stdio slot to the child.
+    """
+    if fd >= 3:
+        return fd
+    spare = fcntl.fcntl(fd, fcntl.F_DUPFD, 3)
+    os.close(fd)
+    return spare
 
 
 def _await_readiness(proc, read_fd, token, timeout):
@@ -236,16 +250,25 @@ def _await_readiness(proc, read_fd, token, timeout):
     return parsed
 
 
-def _confirm_owner(args, pid):
-    """Confirm the answering endpoint, root metadata and this child agree."""
-    try:
-        response = Client(args.socket, timeout=0.2).status()
-    except (OSError, InterfaceError):
-        return False
-    body = response.get("body") or {}
-    if not response.get("ok") or body.get("owner_pid") != pid:
-        return False
-    return _read_pid(args.root) == pid
+def _confirm_owner(args, proc, timeout):
+    """Confirm the answering endpoint, root metadata and this child agree.
+
+    A single probe can miss a child that has only just started serving under
+    load, and killing a healthy owner is worse than retrying briefly, so this
+    re-probes inside a bounded window before a start is called unverified.
+    """
+    deadline = time.time() + max(0.5, min(2.0, timeout))
+    while True:
+        try:
+            response = Client(args.socket, timeout=0.2).status()
+            body = response.get("body") or {}
+            if response.get("ok") and body.get("owner_pid") == proc.pid and _read_pid(args.root) == proc.pid:
+                return True
+        except (OSError, InterfaceError):
+            pass
+        if proc.poll() is not None or time.time() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _reap(proc, timeout):

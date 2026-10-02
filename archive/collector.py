@@ -212,9 +212,11 @@ class Collector(object):
     def _reject_foreign_collector(self):
         """Second, diagnostic gate behind the ownership lock.
 
-        A live `archive.collector` named by `collector.pid` is refused even if
-        exclusion was bypassed (for example a manually removed lock path). The
-        PID check is diagnostic, never the exclusion primitive.
+        A live `archive.collector` *for this root* named by `collector.pid` is
+        refused even if exclusion was bypassed (for example a manually removed
+        lock path). The PID check is diagnostic, never the exclusion primitive,
+        and a stale PID naming an unrelated root's collector proves nothing
+        about this root.
         """
         reject_alias(self.pid_path)
         if not os.path.lexists(self.pid_path):
@@ -227,7 +229,9 @@ class Collector(object):
         if pid == os.getpid() or not _pid_alive(pid):
             return
         command = _pid_command(pid)
-        if "archive.collector" in command:
+        if "archive.collector" not in command:
+            return
+        if ("--root %s" % self.root) in command or ("--root=%s" % self.root) in command:
             raise OwnershipRefused()
 
     def _load_policy(self):

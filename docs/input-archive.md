@@ -78,34 +78,43 @@ The owner holds that lock for its whole lifetime, through the final checkpoint,
 clean-stop marking, and socket cleanup. A second start on the same root is
 refused immediately and exits nonzero with `code=collector_already_running`; it
 does not wait, does not reload, reconcile, truncate, or rebind the winner's
-paths, and leaves no collector process behind. Different roots are independent.
+managed paths, and leaves no collector process behind. Its startup diagnostics
+append to `collector.out`/`collector.err` instead of truncating the running
+owner's log. Different roots are independent.
 
 `collector start` reports success only for the child it spawned. The collector
 receives an inherited pipe and a per-start token and writes `ready` on it only
 after it owns the root, is listening, and is serving its own publication path.
-The CLI additionally requires that the answering endpoint reports the same pid
-in `owner_pid` and that `collector.pid` names that pid. A refused, failed, or
-unverified start prints `code=<reason>` on stderr, never prints
-`collector_started=true`, and reaps the child it spawned. A start whose
-readiness deadline passes is also reaped, so no unconfirmed collector is left
-running.
+The CLI then confirms that the answering endpoint reports the same pid in
+`owner_pid` and that `collector.pid` names that pid, re-probing inside a bounded
+window before it calls a start unverified, so one stalled round trip does not
+condemn a healthy owner. A refused, failed, or unverified start prints
+`code=<reason>` on stderr, never prints `collector_started=true`, and reaps the
+child it spawned. A start whose readiness deadline passes is also reaped, so no
+unconfirmed collector is left running.
 
-Exit codes: `collector start` returns `0` started, `1` refused or failed startup
-with the stderr `code` naming the reason, `2` invalid or unsafe request. The
-collector process returns `0` after a normal stop, `1` when it refused
-ownership, and `2` for an unsafe or invalid request.
+Exit codes: `collector start` returns `0` started; `1` when this start did not
+become the confirmed owner or its startup failed, with the stderr `code` naming
+the reason (this includes a child-side `unsafe_root` such as an occupied socket
+path); `2` when the request is rejected before spawning (`invalid_request`, an
+unsafe root, or an unsafe request argument). The collector process returns `0`
+after a normal stop, `1` when it refused ownership, and `2` for an unsafe or
+invalid request.
 
 Ownership is released by the kernel when the owning process ends. A normal stop,
 a contained prepare/bind failure after acquisition, and `SIGKILL` all let the
 next legitimate start proceed without deleting archive content, editing state,
 or clearing a live owner's lock. Stale `collector.pid`, `collector.sock`, and
 `collector.lock` files are metadata, not ownership, and need no manual cleanup;
-a stale PID is never proof that a root is owned. The next successful start
-reclaims a stale socket left by a dead owner. Any other occupant of the socket
-path, and a symlinked or non-regular `collector.lock`, is refused as
-`unsafe_root` before it is followed, truncated, or replaced. `collector.lock` is
-opened `O_NOFOLLOW`, stays a `0600` owner file, and is never unlinked or
-replaced, so every contender locks the same inode.
+a stale PID is never proof that a root is owned, and a PID naming a live
+collector of a *different* root does not block an unowned root. The diagnostic
+PID gate refuses only a live `archive.collector` started for this same root. The
+next successful start reclaims a stale socket left by a dead owner. Any other
+occupant of the socket path, and a symlinked, directory, socket, or other
+non-regular `collector.lock`, is refused as `unsafe_root` before it is followed,
+truncated, or replaced. `collector.lock` is opened `O_NOFOLLOW`, stays a `0600`
+owner file, and is never unlinked or replaced, so every contender locks the same
+inode.
 
 `collector stop` is the documented stop for the matching root and socket. It
 requests `shutdown`, waits briefly for the recorded collector PID, and escalates
