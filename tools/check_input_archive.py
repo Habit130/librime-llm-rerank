@@ -51,6 +51,10 @@ def quarantine_tail_inconsistent(file_bytes, watermark):
     return file_bytes > watermark
 
 
+def publication_matches_watermark(status_seq, query_seq, rows, persisted_seq, checkpoint_seq):
+    return status_seq == query_seq == persisted_seq == checkpoint_seq and rows == 0
+
+
 OVERSIZE_CJK = "你好世界输入法候选择词测试样本"
 # 10845 invented CJK units: producer raw budget fits max_event_bytes while the
 # canonical semantic size does not. This is the supported boundary that attempt 2
@@ -205,6 +209,16 @@ def run_self_test():
         failures.append("negative_quarantine_tail")
     if quarantine_tail_inconsistent(0, 0):
         failures.append("positive_quarantine_watermark")
+    if not publication_matches_watermark(1, 1, 0, 1, 1):
+        failures.append("positive_watermark_prefix")
+    for name, values in (
+        ("negative_watermark_status", (2, 1, 0, 1, 1)),
+        ("negative_watermark_query", (1, 2, 1, 1, 1)),
+        ("negative_watermark_rows", (1, 1, 1, 1, 1)),
+        ("negative_watermark_checkpoint", (1, 1, 0, 1, 2)),
+    ):
+        if publication_matches_watermark(*values):
+            failures.append(name)
     # An oversize refusal is only honest if it is observable. These controls fail
     # if the boundary fixture stops being an exact boundary, if the refusal stops
     # moving the owning counter, or if the fixture is refused for another reason.
@@ -769,6 +783,135 @@ class Suite(object):
         if status["discarded_unpublished_bytes"] <= 0:
             raise CheckFailure("no_unpublished_bytes")
         self._check_quarantine_tail()
+        self._check_watermark_publication()
+
+    def _check_watermark_publication(self):
+        # A real file fault, not an injected append error: existing JSONL bytes
+        # can be appended/fsynced while the watermark cannot be replaced.
+        root, sock, pid = self.start("watermark-fail", management_timeout_ms=500)
+        client = Client(sock, timeout=3)
+        self._require(client.set_policy("enabled", 0))
+        self._require(client.call("admit_batch", {"observations": [
+            _sample("watermark-source", sequence=1, process_id="kept")]}))
+        self._require(client.checkpoint())
+        state_path = os.path.join(root, "state.json")
+        obs_path = os.path.join(root, "observations.jsonl")
+        with open(state_path) as handle:
+            before = json.load(handle)
+        with open(obs_path, "rb") as handle:
+            prefix = handle.read()
+        producer = Producer(sock, source_instance_id="watermark-source",
+                            limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000})
+        immutable = sys.platform == "darwin"
+        try:
+            self._wait_enabled(producer)
+            if immutable:
+                subprocess.run(["chflags", "uchg", state_path], check=True, capture_output=True)
+            else:
+                os.chmod(root, 0o500)
+            result, waited = _watch(lambda: producer.admit(
+                _sample("watermark-source", sequence=2, process_id="unpublished")))
+            if waited or not result or not result.admitted:
+                raise CheckFailure("watermark_admission_waited")
+            if not _wait(lambda: client.status()["body"]["storage_failure"]):
+                raise CheckFailure("watermark_failure_not_disclosed")
+            status = client.status()["body"]
+            query = client.query("process", process_id="unpublished")["body"]
+            checkpoint = client.checkpoint()
+            with open(state_path) as handle:
+                persisted = json.load(handle)
+            with open(obs_path, "rb") as handle:
+                appended = handle.read()
+            self.counts.update({
+                "watermark_before_seq": before["durable_seq"],
+                "watermark_failed_status_seq": status["durable_seq"],
+                "watermark_failed_query_rows": query["returned"],
+                "watermark_persisted_seq": persisted["durable_seq"],
+                "watermark_appended_bytes": len(appended) - len(prefix),
+                "watermark_checkpoint_seq": checkpoint.get("body", {}).get("durable_seq"),
+            })
+            os.kill(pid, signal.SIGKILL)
+            self._wait_dead(pid)
+        finally:
+            producer.close()
+            if immutable:
+                subprocess.run(["chflags", "nouchg", state_path], check=True, capture_output=True)
+            os.chmod(root, 0o700)
+            os.chmod(state_path, 0o600)
+        root, sock, pid = self.start("watermark-fail")
+        reopened = Client(sock, timeout=3)
+        restart = reopened.status()["body"]
+        self.counts["watermark_reopened_seq"] = restart["durable_seq"]
+        self.counts["watermark_reopened_discarded_bytes"] = restart["discarded_unpublished_bytes"]
+        if len(appended) <= len(prefix) or not appended.startswith(prefix):
+            raise CheckFailure("watermark_append_did_not_succeed")
+        if persisted["durable_seq"] != before["durable_seq"] or persisted["durable_offset"] != before["durable_offset"]:
+            raise CheckFailure("watermark_fault_did_not_hold")
+        if not publication_matches_watermark(status["durable_seq"], query["as_of_durable_seq"], query["returned"], persisted["durable_seq"], status["durable_seq"]):
+            raise CheckFailure("watermark_unpersisted_publication")
+        if checkpoint.get("ok") and (checkpoint["body"]["durable_seq"] != persisted["durable_seq"] or not checkpoint["body"]["storage_failure"]):
+            raise CheckFailure("watermark_false_checkpoint")
+        if restart["durable_seq"] != before["durable_seq"] or restart["crash_tail"] != "unknown" or restart["known_dropped_units"] != before["known_dropped_units"]:
+            raise CheckFailure("watermark_restart_invented_durability_or_loss")
+        if restart["discarded_unpublished_bytes"] != len(appended) - len(prefix):
+            raise CheckFailure("watermark_restart_tail")
+        if reopened.query("process", process_id="kept")["body"]["returned"] != 1 or reopened.query("process", process_id="unpublished")["body"]["returned"]:
+            raise CheckFailure("watermark_restart_prefix")
+
+        # Hold the actual append/fsync-to-watermark interval. Concurrent public
+        # reads must remain at the committed prefix; producer admission stays free.
+        phase = self.root("watermark-held") + ".fifo"
+        fd = _open_fifo(phase)
+        try:
+            os.write(fd, b"x")
+            root, sock, pid = self.start("watermark-held", publication_phase_hold=phase,
+                                         management_timeout_ms=500)
+            client = Client(sock, timeout=3)
+            self._require(client.set_policy("enabled", 0))
+            self._require(client.call("admit_batch", {"observations": [
+                _sample("held-source", sequence=1, process_id="kept")]}))
+            self._require(client.checkpoint())
+            producer = Producer(sock, source_instance_id="held-source",
+                                limits={"heartbeat_interval_ms": 50, "freshness_window_ms": 5000})
+            try:
+                self._wait_enabled(producer)
+                result, waited = _watch(lambda: producer.admit(
+                    _sample("held-source", sequence=2, process_id="pending")))
+                if waited or not result.admitted:
+                    raise CheckFailure("held_watermark_admission_waited")
+                if not _wait(lambda: client.status()["body"]["publication_phase_hold"]):
+                    raise CheckFailure("watermark_hold_not_active")
+                checkpoints = []
+                thread = threading.Thread(target=lambda: checkpoints.append(client.checkpoint()))
+                thread.start()
+                result, waited = _watch(lambda: producer.admit(
+                    _sample("held-source", sequence=3, process_id="pending-next")))
+                if waited or not result.admitted:
+                    raise CheckFailure("held_watermark_concurrent_admission_waited")
+                for _ in range(8):
+                    status = client.status()["body"]
+                    query = client.query("process", process_id="pending")["body"]
+                    with open(os.path.join(root, "state.json")) as handle:
+                        disk = json.load(handle)
+                    if status["durable_seq"] != 1 or disk["durable_seq"] != 1 or query["returned"] or query["as_of_durable_seq"] != 1:
+                        raise CheckFailure("held_watermark_visible")
+                self.counts["watermark_held_public_reads"] = 8
+                thread.join(timeout=3)
+                if thread.is_alive() or not checkpoints or checkpoints[0].get("body", {}).get("durable_seq") != 1:
+                    raise CheckFailure("held_watermark_false_checkpoint")
+                os.write(fd, b"xx")
+                self._wait_durable(client, 3)
+                self._require(client.checkpoint())
+            finally:
+                producer.close()
+            self.stop_root(root, sock)
+            self._wait_dead(pid)
+            root, sock, pid = self.start("watermark-held")
+            client = Client(sock, timeout=3)
+            if client.status()["body"]["durable_seq"] != 3 or client.query("process", process_id="pending")["body"]["returned"] != 1:
+                raise CheckFailure("watermark_healthy_restart")
+        finally:
+            os.close(fd)
 
     def check_policy(self):
         root, sock, pid = self.start("policy", freshness_window_ms=400, heartbeat_interval_ms=50)

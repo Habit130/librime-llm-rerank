@@ -136,6 +136,7 @@ class Collector(object):
         self._cv = threading.Condition(self._lock)
         self._queue = []
         self._queue_bytes = 0
+        self._publishing_units = 0
         self._stop = False
         self._checkpoint_requested = False
         self._waiters = []
@@ -541,7 +542,7 @@ class Collector(object):
                 "legacy_switch_changed": False,
                 "acknowledgement_scope": "collector_durable_desired_policy",
                 "durable_seq": self._state["durable_seq"],
-                "received_unpublished": len(self._queue),
+                "received_unpublished": len(self._queue) + self._publishing_units,
                 "known_dropped_units": self._state["known_dropped_units"],
                 "storage_failed_units": self._state["storage_failed_units"],
                 "capacity_refused_units": self._state["capacity_refused_units"],
@@ -803,12 +804,14 @@ class Collector(object):
                 self._publication_hold_active = False
         while not self._stop or self._queue:
             batch, waiters = self._take_batch()
-            if batch:
-                self._publish(batch)
-            elif waiters:
-                self._persist_state()
-            for waiter in waiters:
-                waiter.set()
+            try:
+                if batch:
+                    self._publish(batch)
+                elif waiters:
+                    self._persist_state()
+            finally:
+                for waiter in waiters:
+                    waiter.set()
             if self._stop and not self._queue:
                 break
 
@@ -827,6 +830,7 @@ class Collector(object):
                 self._checkpoint_requested = False
                 return [], waiters
             batch = self._queue[:take]
+            self._publishing_units = len(batch)
             del self._queue[:take]
             self._queue_bytes -= sum(item["size"] for item in batch)
             waiters = []
@@ -890,12 +894,26 @@ class Collector(object):
             with self._lock:
                 self._state["storage_failure"] = True
                 self._state["storage_failed_units"] += len(observation_lines) + len(quarantine_lines)
+                self._publishing_units = 0
                 for record in metas:
                     identity = tuple(record["identity"]) if record.get("identity") else None
                     if identity in self._identities:
                         self._identities.pop(identity, None)
             self._persist_state()
             return
+        with self._lock:
+            # Stage a watermark, not a visible advance. Reads and admissions use
+            # the previous published prefix while the storage operation runs.
+            pending = dict(self._state)
+            offset = pending["durable_offset"]
+            pending["durable_offset"] += sum(map(len, observation_lines))
+            pending["durable_bytes"] += sum(map(len, observation_lines))
+            pending["quarantine_bytes"] += sum(map(len, quarantine_lines))
+            if metas:
+                pending["durable_seq"] = metas[-1]["durable_seq"]
+            used_now = pending["durable_bytes"] + pending["quarantine_bytes"]
+            pending["capacity_stop"] = pending["capacity_stop"] or used_now >= self.limits["archive_capacity_bytes"]
+            payload = canonical_bytes(pending) + b"\n"
         if self.phase_hold and (observation_lines or quarantine_lines):
             with self._lock:
                 self._phase_hold_active = True
@@ -905,20 +923,27 @@ class Collector(object):
             if self._stop:
                 self._truncate_file(self.observations_path, before_offset)
                 self._truncate_file(self.quarantine_path, before_quarantine)
+                with self._lock:
+                    self._publishing_units = 0
                 return
+        try:
+            atomic_write(self.state_path, payload)
+        except (OSError, UnsafeRoot):
+            with self._lock:
+                self._state["storage_failure"] = True
+                self._state["crash_tail"] = "unknown"
+                self._break_continuity_locked("storage_failure")
+            # The bytes may exist, but neither their durability nor their loss
+            # has been established. Leave the index/published prefix unchanged.
+            raise
         with self._lock:
-            offset = self._state["durable_offset"]
             for record, line in zip(metas, observation_lines):
                 self._remember(record, offset, len(line))
                 offset += len(line)
-                self._state["durable_seq"] = record["durable_seq"]
-                self._state["durable_bytes"] += len(line)
-            self._state["durable_offset"] = offset
-            self._state["quarantine_bytes"] += sum(len(line) for line in quarantine_lines)
-            used_now = self._state["durable_bytes"] + self._state["quarantine_bytes"]
-            if used_now >= self.limits["archive_capacity_bytes"]:
-                self._state["capacity_stop"] = True
-        self._persist_state()
+            for key in ("durable_seq", "durable_offset", "durable_bytes", "quarantine_bytes"):
+                self._state[key] = pending[key]
+            self._state["capacity_stop"] = self._state["capacity_stop"] or pending["capacity_stop"]
+            self._publishing_units = 0
 
     def _append(self, path, data):
         fd = open_nofollow(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY)
@@ -957,9 +982,18 @@ class Collector(object):
         self._publication.join(timeout=2.0)
 
     def _mark_clean(self):
+        # A timed-out join is not ownership transfer: the publisher may still
+        # be writing a watermark. Never race it with a stale shutdown snapshot.
+        if self._publication is not None and self._publication.is_alive():
+            return
         size = os.path.getsize(self.observations_path) if os.path.exists(self.observations_path) else 0
+        quarantine_size = os.path.getsize(self.quarantine_path) if os.path.exists(self.quarantine_path) else 0
         with self._lock:
-            self._state["clean_stop"] = size == self._state["durable_offset"]
+            self._state["clean_stop"] = (
+                not self._state["storage_failure"]
+                and size == self._state["durable_offset"]
+                and quarantine_size == self._state["quarantine_bytes"]
+            )
         self._persist_state()
 
     def _truncate_file(self, path, offset):

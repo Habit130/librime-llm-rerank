@@ -206,12 +206,32 @@ Messages are fixed and do not quote payloads. Stable codes:
 ## Durability and loss
 
 Captured and admitted positions are not durable positions.
-`received_unpublished` is a queue length. `durable_seq` advances only at the
+`received_unpublished` counts queued and currently publishing units (including
+an unresolved failed publication). `durable_seq` advances only at the
 publication point:
 
 1. Append complete JSONL lines.
 2. Flush and fsync that file.
 3. Write the new watermark to `state.json`, fsync it, and fsync the directory.
+
+The pending watermark and index rows stay separate from the published prefix.
+Status and queries continue to see the previous prefix during step 3; only its
+successful completion installs the new watermark and rows together. No disk I/O
+is performed under the admission/query state lock. If append/fsync succeeds but
+watermark publication fails, the collector reports `storage_failure` and an
+unknown tail without advancing the published prefix or inventing known drops.
+Publication stops; restoring writable storage does not itself acknowledge or
+publish that tail. Stop/restart preserves the last published prefix and restart
+discards the unpublished bytes. A failed store can still prevent graceful stop;
+fix the owned storage fault before restarting.
+
+`checkpoint` is a bounded request followed by a status snapshot, not a guarantee
+that every admitted unit is durable. A held or failed publication can return
+the unchanged durable prefix with backlog/failure disclosed. Callers must check
+the returned `durable_seq` and failure fields, not infer durability from `ok`.
+Shutdown does not write a competing watermark if the publication thread has not
+finished; neither an unresolved storage failure nor an unpublished observation
+or quarantine tail is marked as a clean stop.
 
 A crash before step 3 does not make those bytes durable. Restart truncates both
 the observation log and the quarantine file to their durable watermarks,
