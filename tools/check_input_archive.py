@@ -28,7 +28,12 @@ if REPO not in sys.path:
 
 from archive import Client, Producer  # noqa: E402
 from archive.collector import Collector  # noqa: E402
-from archive.interface import INTERFACE_VERSION, canonical_bytes, strip_content  # noqa: E402
+from archive.interface import (  # noqa: E402
+    INTERFACE_VERSION,
+    canonical_bytes,
+    parse_readiness,
+    strip_content,
+)
 from archive.limits import DEFAULTS  # noqa: E402
 from archive.producer import _budget_bytes  # noqa: E402
 from archive.synthetic import INVENTED_TEXT, scale_observation, supported_processes  # noqa: E402
@@ -53,6 +58,73 @@ def quarantine_tail_inconsistent(file_bytes, watermark):
 
 def publication_matches_watermark(status_seq, query_seq, rows, persisted_seq, checkpoint_seq):
     return status_seq == query_seq == persisted_seq == checkpoint_seq and rows == 0
+
+
+def start_outcome_is_exclusive(exits):
+    """Exactly one supported CLI start may claim ownership of one root."""
+    return sorted(exits) == [0, 1]
+
+
+def start_reported_ownership(stdout, pid):
+    """A claimed success must name this attempt's own ready owner."""
+    lines = [line.strip() for line in (stdout or "").splitlines()]
+    return (
+        "collector_started=true" in lines
+        and ("pid=%s" % pid) in lines
+        and ("owner_pid=%s" % pid) in lines
+    )
+
+
+def readiness_is_this_attempt(line, token, pid, kind="ready"):
+    """A readiness line counts only for the spawned token and child pid."""
+    parsed = parse_readiness(line, token, pid)
+    return parsed is not None and parsed[0] == kind
+
+
+def survivors_are_zero(count):
+    """A documented normal stop leaves no identified fixture collector."""
+    return count == 0
+
+
+def lock_identity_is_stable(before, after):
+    """Contention or restart must not unlink or replace the owner's lock path."""
+    return before is not None and before == after
+
+
+def ordinary_output_is_content_free(text):
+    return not any(marker in (text or "") for marker in (CANARY, EXCL, CONF, ESC_MARK))
+
+
+def _fixture_collectors(root):
+    """Bounded exact-fixture inventory of live collectors for one owned root.
+
+    Identity comes from the command line (`-m archive.collector` and this exact
+    `--root`), so a rejected child that never printed a PID is still counted.
+    This is process identity, not transient file handles: `lsof` absence never
+    proves exclusion. Returns None when the inventory itself is unavailable.
+    """
+    try:
+        listing = subprocess.check_output(["ps", "-Ao", "pid=,command="], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    found = []
+    for line in listing.splitlines():
+        if " -m archive.collector " not in line:
+            continue
+        if ("--root %s" % root) not in line and ("--root=%s" % root) not in line:
+            continue
+        try:
+            found.append(int(line.split()[0]))
+        except (IndexError, ValueError):
+            continue
+    return sorted(found)
+
+
+def _read_int(path):
+    try:
+        return int(open(path, "r").read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 OVERSIZE_CJK = "你好世界输入法候选择词测试样本"
@@ -236,6 +308,47 @@ def run_self_test():
         failures.append("negative_policy_stale_declaration")
     if _policy_observation_is_acknowledged(None, 1):
         failures.append("negative_policy_absent_declaration")
+    # Ownership/readiness/survivor predicates: each positive control must hold
+    # and each deliberately failing control (including the confirmed defect
+    # shape, two successful starts) must be rejected.
+    if not start_outcome_is_exclusive([0, 1]) or not start_outcome_is_exclusive([1, 0]):
+        failures.append("positive_start_exclusion")
+    if start_outcome_is_exclusive([0, 0]) or start_outcome_is_exclusive([1, 1]):
+        failures.append("negative_start_exclusion")
+    if not start_reported_ownership("collector_started=true\npid=7\nowner_pid=7\n", 7):
+        failures.append("positive_owned_success")
+    if start_reported_ownership("collector_started=true\npid=7\nowner_pid=8\n", 7):
+        failures.append("negative_borrowed_owner_pid")
+    if start_reported_ownership("collector_started=true\npid=7\n", 7):
+        failures.append("negative_unverified_owner_pid")
+    if not readiness_is_this_attempt("ready 4242 tok", "tok", 4242):
+        failures.append("positive_readiness")
+    for line in (
+        "ready 4242 other",
+        "ready 4243 tok",
+        "ready 4242",
+        "",
+        "refused 4242 tok collector_already_running",
+    ):
+        if readiness_is_this_attempt(line, "tok", 4242):
+            failures.append("negative_readiness")
+    if parse_readiness("refused 4242 tok collector_already_running", "tok", 4242) != (
+        "refused",
+        "collector_already_running",
+    ):
+        failures.append("positive_refusal")
+    if parse_readiness("refused 4242 tok not_a_code", "tok", 4242) != ("refused", "collector_unavailable"):
+        failures.append("negative_refusal_fail_closed")
+    if not survivors_are_zero(0) or survivors_are_zero(1):
+        failures.append("survivor_predicate")
+    if not lock_identity_is_stable(7, 7):
+        failures.append("positive_lock_identity")
+    if lock_identity_is_stable(7, 8) or lock_identity_is_stable(None, None):
+        failures.append("negative_lock_identity")
+    if not ordinary_output_is_content_free("code=collector_already_running"):
+        failures.append("positive_ownership_output")
+    if ordinary_output_is_content_free(CANARY):
+        failures.append("negative_ownership_output")
     if failures:
         sys.stdout.write("self-test fail %s\n" % ",".join(failures))
         return 1
@@ -274,6 +387,7 @@ class Suite(object):
                 self.results[criterion].append(name + ":unexpected")
             finally:
                 self.stop_owned()
+        self.check_ownership_lifecycle()
         return self.report()
 
     def report(self):
@@ -382,6 +496,91 @@ class Suite(object):
                 except OSError:
                     pass
         self.pids.clear()
+
+    def start_async(self, root, sock, timeout=8):
+        """A supported CLI start that is not waited for yet (concurrent race)."""
+        command = [
+            sys.executable, "-m", "archive.cli",
+            "--root", root, "--socket", sock, "--timeout", str(timeout),
+            "collector", "start",
+        ]
+        return subprocess.Popen(
+            command, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
+    def start_pair(self, root, sock, timeout=8):
+        """Two concurrent supported CLI starts on one root, both waited out."""
+        procs = [self.start_async(root, sock, timeout), self.start_async(root, sock, timeout)]
+        results = []
+        for proc in procs:
+            try:
+                stdout, stderr = proc.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                raise CheckFailure("start_timeout")
+            self._ordinary(stdout, stderr)
+            results.append((proc.returncode, stdout, stderr))
+        return results
+
+    def direct_entry(self, root, sock, timeout=15):
+        """The supported direct collector entry, not the CLI adapter."""
+        return subprocess.run(
+            [sys.executable, "-m", "archive.collector", "--root", root, "--socket", sock],
+            cwd=REPO, capture_output=True, text=True, timeout=timeout,
+        )
+
+    def fixture_collectors(self, root):
+        found = _fixture_collectors(root)
+        if found is None:
+            raise CheckFailure("inventory_unavailable")
+        for pid in found:
+            self.pids.add(pid)
+        return found
+
+    def wait_no_fixture_collectors(self, root, timeout=5):
+        return _wait(lambda: _fixture_collectors(root) == [], timeout=timeout)
+
+    def fresh_private_root(self, name):
+        root = self.root(name)
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        os.makedirs(root, 0o700)
+        os.chmod(root, 0o700)
+        return root
+
+    def _race(self, root, sock):
+        """Race two supported starts and return the winner/loser evidence."""
+        results = self.start_pair(root, sock)
+        exits = sorted(item[0] for item in results)
+        if not start_outcome_is_exclusive(exits):
+            raise CheckFailure(
+                "race_not_exclusive:%s" % ",".join(str(value) for value in exits)
+            )
+        success = [item for item in results if item[0] == 0][0]
+        loser = [item for item in results if item[0] != 0][0]
+        if not ordinary_output_is_content_free(success[1] + success[2] + loser[1] + loser[2]):
+            raise CheckFailure("race_content_leak")
+        if "collector_started=true" in loser[1]:
+            raise CheckFailure("race_loser_claimed_success")
+        if "code=collector_already_running" not in loser[2]:
+            raise CheckFailure("race_loser_code")
+        pid = _pid_from_text(success[1])
+        if pid is None or not start_reported_ownership(success[1], pid):
+            raise CheckFailure("race_success_identity")
+        live = self.fixture_collectors(root)
+        if live != [pid]:
+            raise CheckFailure("race_live_set")
+        if _read_int(os.path.join(root, "collector.pid")) != pid:
+            raise CheckFailure("race_pid_metadata")
+        client = Client(sock, timeout=5)
+        status = client.status()
+        self._require(status)
+        if status["body"].get("owner_pid") != pid:
+            raise CheckFailure("race_endpoint_owner")
+        if client.query("timeline", page_size=PAGE)["body"]["as_of_durable_seq"] != status["body"]["durable_seq"]:
+            raise CheckFailure("race_query")
+        return pid, success, loser, results
 
     def check_provenance(self):
         root, sock, _pid = self.start("provenance", freshness_window_ms=5000, heartbeat_interval_ms=50)
@@ -1271,6 +1470,431 @@ class Suite(object):
         if example.get("ok"):
             raise CheckFailure("fresh_still_running")
         self.counts["documented_defaults"] = len(DEFAULTS)
+
+    def check_ownership_lifecycle(self):
+        """SCN5: the repaired ownership/readiness/cleanup seam, over real
+        subprocesses and the public Interface."""
+        scenarios = [
+            ("SCN5-1", ("ARCH188-7",), self.scenario_reproduced_race),
+            ("SCN5-2", ("ARCH188-4", "ARCH188-3"), self.scenario_seeded_race),
+            ("SCN5-3", ("ARCH188-7",), self.scenario_incumbent_and_entrypoint),
+            ("SCN5-4", ("ARCH188-3",), self.scenario_killed_owner),
+            ("SCN5-5", ("ARCH188-7",), self.scenario_failed_startup),
+            ("SCN5-6", ("ARCH188-5",), self.scenario_artifact_safety),
+            ("SCN5-7", ("ARCH188-7",), self.scenario_root_locality),
+        ]
+        for name, criteria, fn in scenarios:
+            prefix = name.lower().replace("-", "")
+            try:
+                observation = fn() or {}
+                self.counts[prefix + "_executed"] = 1
+                for key, value in observation.items():
+                    self.counts[prefix + "_" + key] = value
+            except CheckFailure as exc:
+                for criterion in criteria:
+                    self.results[criterion].append("%s:%s" % (prefix, exc.code))
+            except Exception:
+                for criterion in criteria:
+                    self.results[criterion].append("%s:unexpected" % prefix)
+            finally:
+                self.stop_owned()
+        self.counts["ownership_scenarios_required"] = len(scenarios)
+
+    def scenario_reproduced_race(self):
+        """SCN5-1: five fresh roots, two concurrent supported starts each."""
+        rounds = 0
+        refusals = 0
+        for index in range(5):
+            name = "ownership/race-%d" % index
+            root = self.fresh_private_root(name)
+            sock = os.path.join(root, "collector.sock")
+            pid, _success, _loser, _results = self._race(root, sock)
+            stopped = self.stop_root(root, sock)
+            if stopped.returncode != 0:
+                raise CheckFailure("race_stop")
+            if not self.wait_no_fixture_collectors(root):
+                raise CheckFailure("race_survivor_after_stop")
+            restarted = self.start(name, freshness_window_ms=5000)
+            if self.fixture_collectors(root) != [restarted[2]]:
+                raise CheckFailure("race_restart_owners")
+            self.stop_root(root, sock)
+            if not self.wait_no_fixture_collectors(root):
+                raise CheckFailure("race_restart_survivor")
+            rounds += 1
+            refusals += 1
+        return {
+            "rounds": rounds,
+            "refusals": refusals,
+            "survivors_after_stop": 0,
+            "restarts": rounds,
+        }
+
+    def scenario_seeded_race(self):
+        """SCN5-2: a real durable commit and paused policy survive a raced start."""
+        name = "ownership/seeded"
+        root = self.fresh_private_root(name)
+        sock = os.path.join(root, "collector.sock")
+        _root, _sock, pid = self.start(name, freshness_window_ms=5000, heartbeat_interval_ms=50)
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        client.call(
+            "admit_batch",
+            {"observations": [_sample("seeded-source", sequence=1, process_id="proc-seeded", text=INVENTED_TEXT)]},
+        )
+        self._wait_durable(client, 1)
+        self.cli("--socket", sock, "policy", "pause", "--expect-revision", "1")
+        before = client.status()["body"]
+        rows_before = client.query("process", process_id="proc-seeded", page_size=PAGE)["body"]["observations"]
+        if not rows_before:
+            raise CheckFailure("seeded_prefix_missing")
+        self.stop_root(root, sock)
+        self._wait_dead(pid)
+        winner, _success, _loser, _results = self._race(root, sock)
+        after_client = Client(sock, timeout=5)
+        status = after_client.status()["body"]
+        if status["durable_seq"] != before["durable_seq"] or status["durable_bytes"] != before["durable_bytes"]:
+            raise CheckFailure("seeded_prefix_mutated")
+        if status["desired_policy"] != "paused" or status["desired_revision"] != before["desired_revision"]:
+            raise CheckFailure("seeded_policy_mutated")
+        if status["discarded_unpublished_bytes"] or status["discarded_quarantine_bytes"]:
+            raise CheckFailure("loser_reconciliation")
+        if status["storage_failure"] or status["crash_tail"] != "none":
+            raise CheckFailure("seeded_state_unhealthy")
+        rows_after = after_client.query("process", process_id="proc-seeded", page_size=PAGE)["body"]["observations"]
+        if len(rows_after) != len(rows_before) or rows_after[0]["durable_seq"] != rows_before[0]["durable_seq"]:
+            raise CheckFailure("seeded_record_lost")
+        refused = after_client.call(
+            "admit_batch",
+            {"observations": [_sample("seeded-source", sequence=2, process_id="proc-seeded-later")]},
+        )
+        if refused.get("body", {}).get("codes") != ["capture_disabled"]:
+            raise CheckFailure("seeded_pause_not_effective")
+        self.stop_root(root, sock)
+        self._wait_dead(winner)
+        again = self.start(name, freshness_window_ms=5000)
+        final = Client(sock, timeout=5).status()["body"]
+        if final["durable_seq"] != before["durable_seq"] or final["desired_policy"] != "paused":
+            raise CheckFailure("seeded_restart_lost")
+        if len(Client(sock, timeout=5).query("process", process_id="proc-seeded", page_size=PAGE)["body"]["observations"]) != len(rows_before):
+            raise CheckFailure("seeded_restart_record_lost")
+        return {
+            "durable_seq": before["durable_seq"],
+            "durable_bytes": before["durable_bytes"],
+            "policy_revision": before["desired_revision"],
+            "epoch_changed": int(final["collector_epoch"] != before["collector_epoch"]),
+            "loser_reconciliation": 0,
+            "restart_owner": again[2],
+        }
+
+    def scenario_incumbent_and_entrypoint(self):
+        """SCN5-3: incumbent plus duplicate CLI start and the direct entry."""
+        name = "ownership/incumbent"
+        root = self.fresh_private_root(name)
+        sock = os.path.join(root, "collector.sock")
+        _root, _sock, pid = self.start(name, freshness_window_ms=5000, heartbeat_interval_ms=50)
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        client.call(
+            "admit_batch",
+            {"observations": [_sample("incumbent-source", sequence=1, process_id="proc-incumbent", text=INVENTED_TEXT)]},
+        )
+        self._wait_durable(client, 1)
+        before = client.status()["body"]
+        inode_before = os.lstat(sock).st_ino
+        duplicate = self.start_async(root, sock)
+        try:
+            stdout, stderr = duplicate.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            duplicate.kill()
+            raise CheckFailure("duplicate_start_hung")
+        self._ordinary(stdout, stderr)
+        if duplicate.returncode == 0:
+            raise CheckFailure("duplicate_claimed_success")
+        if "collector_started=true" in stdout or _pid_from_text(stdout) is not None:
+            raise CheckFailure("duplicate_claimed_owner")
+        if "code=collector_already_running" not in stderr:
+            raise CheckFailure("duplicate_code")
+        direct = self.direct_entry(root, sock)
+        self._ordinary(direct.stdout, direct.stderr)
+        if direct.returncode == 0:
+            raise CheckFailure("direct_entry_accepted")
+        if "code=collector_already_running" not in direct.stderr:
+            raise CheckFailure("direct_entry_code")
+        if self.fixture_collectors(root) != [pid]:
+            raise CheckFailure("incumbent_not_alone")
+        if os.lstat(sock).st_ino != inode_before:
+            raise CheckFailure("incumbent_socket_replaced")
+        status = client.status()
+        self._require(status)
+        if status["body"].get("owner_pid") != pid:
+            raise CheckFailure("incumbent_owner_changed")
+        after = status["body"]
+        if after["durable_seq"] != before["durable_seq"] or after["desired_revision"] != before["desired_revision"]:
+            raise CheckFailure("incumbent_state_changed")
+        rows = client.query("process", process_id="proc-incumbent", page_size=PAGE)["body"]["observations"]
+        if len(rows) != 1:
+            raise CheckFailure("incumbent_prefix_lost")
+        self.stop_root(root, sock)
+        if not self.wait_no_fixture_collectors(root):
+            raise CheckFailure("incumbent_survivor")
+        return {
+            "duplicate_exit": duplicate.returncode,
+            "direct_entry_exit": direct.returncode,
+            "incumbent_socket_replaced": 0,
+            "survivors": 0,
+        }
+
+    def scenario_killed_owner(self):
+        """SCN5-4: SIGKILL the owner, leave stale metadata, restart normally."""
+        name = "ownership/killed"
+        root = self.fresh_private_root(name)
+        sock = os.path.join(root, "collector.sock")
+        _root, _sock, pid = self.start(name, freshness_window_ms=5000, heartbeat_interval_ms=50)
+        client = Client(sock, timeout=5)
+        self.cli("--socket", sock, "policy", "enable", "--expect-revision", "0")
+        client.call(
+            "admit_batch",
+            {"observations": [_sample("killed-source", sequence=1, process_id="proc-killed", text=INVENTED_TEXT)]},
+        )
+        self._wait_durable(client, 1)
+        before = client.status()["body"]
+        os.kill(pid, signal.SIGKILL)
+        self._wait_dead(pid)
+        # The product leaves its stale PID, socket, and lock artifacts in place.
+        for artifact in ("collector.pid", "collector.sock", "collector.lock"):
+            if not os.path.lexists(os.path.join(root, artifact)):
+                raise CheckFailure("stale_metadata_missing:" + artifact)
+        _root, _sock, new_pid = self.start(name, freshness_window_ms=5000)
+        if self.fixture_collectors(root) != [new_pid]:
+            raise CheckFailure("killed_reclaim_owners")
+        reopened = Client(sock, timeout=5)
+        status = reopened.status()
+        self._require(status)
+        body = status["body"]
+        if body["durable_seq"] != before["durable_seq"] or body["durable_bytes"] != before["durable_bytes"]:
+            raise CheckFailure("killed_prefix_mutated")
+        if body["crash_tail"] != "unknown" or not body["unclean_shutdown_observed"]:
+            raise CheckFailure("killed_tail_dishonest")
+        if body["desired_revision"] != before["desired_revision"] or body["storage_failure"]:
+            raise CheckFailure("killed_policy_lost")
+        rows = reopened.query("process", process_id="proc-killed", page_size=PAGE)["body"]["observations"]
+        if len(rows) != 1:
+            raise CheckFailure("killed_record_lost")
+        self.stop_root(root, sock)
+        if not self.wait_no_fixture_collectors(root):
+            raise CheckFailure("killed_restart_survivor")
+        return {
+            "durable_seq": before["durable_seq"],
+            "manual_unlock": 0,
+            "archive_edits": 0,
+            "crash_tail": body["crash_tail"],
+        }
+
+    def scenario_failed_startup(self):
+        """SCN5-5: one bounded real prepare/bind failure after ownership."""
+        name = "ownership/bind-fault"
+        root = self.fresh_private_root(name)
+        sock = os.path.join(root, "collector.sock")
+        os.mkdir(sock, 0o700)
+        direct = self.direct_entry(root, sock)
+        self._ordinary(direct.stdout, direct.stderr)
+        if direct.returncode == 0 or "code=unsafe_root" not in direct.stderr:
+            raise CheckFailure("bind_fault_accepted")
+        if not os.path.isdir(sock) or os.path.islink(sock):
+            raise CheckFailure("bind_fault_artifact_removed")
+        if self.fixture_collectors(root):
+            raise CheckFailure("bind_fault_orphan")
+        cli_attempt = self.start_async(root, sock)
+        try:
+            stdout, stderr = cli_attempt.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            cli_attempt.kill()
+            raise CheckFailure("bind_fault_start_hung")
+        self._ordinary(stdout, stderr)
+        if cli_attempt.returncode == 0 or "collector_started=true" in stdout:
+            raise CheckFailure("bind_fault_claimed_success")
+        if "code=unsafe_root" not in stderr:
+            raise CheckFailure("bind_fault_code")
+        if not os.path.isdir(sock):
+            raise CheckFailure("bind_fault_artifact_removed_cli")
+        if self.fixture_collectors(root):
+            raise CheckFailure("bind_fault_orphan_cli")
+        # Correct only the owned fault: exclusion was not leaked to a dead owner.
+        os.rmdir(sock)
+        recovered = self.start(name, freshness_window_ms=5000)
+        self.stop_root(root, sock)
+        if not self.wait_no_fixture_collectors(root):
+            raise CheckFailure("bind_fault_reclaim_survivor")
+        # An incumbent survives a contender whose own socket target is blocked.
+        incumbent_name = "ownership/incumbent-fault"
+        incumbent_root = self.fresh_private_root(incumbent_name)
+        incumbent_sock = os.path.join(incumbent_root, "collector.sock")
+        _root, _sock, incumbent = self.start(incumbent_name, freshness_window_ms=5000)
+        blocked = os.path.join(incumbent_root, "blocked.sock")
+        os.mkdir(blocked, 0o700)
+        contender = self.start_async(incumbent_root, blocked)
+        try:
+            contender_out, contender_err = contender.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            contender.kill()
+            raise CheckFailure("incumbent_contender_hung")
+        self._ordinary(contender_out, contender_err)
+        if contender.returncode == 0:
+            raise CheckFailure("incumbent_contender_accepted")
+        if self.fixture_collectors(incumbent_root) != [incumbent]:
+            raise CheckFailure("incumbent_contender_survivor")
+        if not os.path.isdir(blocked):
+            raise CheckFailure("incumbent_contender_removed_path")
+        self._require(Client(incumbent_sock, timeout=5).status())
+        self.stop_root(incumbent_root, incumbent_sock)
+        if not self.wait_no_fixture_collectors(incumbent_root):
+            raise CheckFailure("incumbent_fault_survivor")
+        return {
+            "phase": "socket_bind",
+            "child_exit": direct.returncode,
+            "cli_exit": cli_attempt.returncode,
+            "orphans": 0,
+            "reclaim_after_fix": recovered[2],
+        }
+
+    def scenario_artifact_safety(self):
+        """SCN5-6: the ownership artifact is private, regular, and non-aliased."""
+        parent = self.fresh_private_root("ownership/artifact")
+        target = os.path.join(parent, "alias-target")
+        fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+        os.write(fd, b"SEED")
+        os.close(fd)
+        os.chmod(target, 0o644)
+        alias_root = self.fresh_private_root("ownership/artifact/alias-root")
+        lock = os.path.join(alias_root, "collector.lock")
+        os.symlink(target, lock)
+        attempt = self.start_async(alias_root, os.path.join(alias_root, "collector.sock"))
+        try:
+            stdout, stderr = attempt.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            attempt.kill()
+            raise CheckFailure("lock_alias_start_hung")
+        self._ordinary(stdout, stderr)
+        if attempt.returncode == 0:
+            raise CheckFailure("lock_alias_accepted")
+        if "code=unsafe_root" not in stderr:
+            raise CheckFailure("lock_alias_code")
+        if not os.path.islink(lock):
+            raise CheckFailure("lock_alias_replaced")
+        if open(target, "rb").read() != b"SEED" or stat.S_IMODE(os.lstat(target).st_mode) != 0o644:
+            raise CheckFailure("lock_alias_target_mutated")
+        if self.fixture_collectors(alias_root):
+            raise CheckFailure("lock_alias_orphan")
+        fifo_root = self.fresh_private_root("ownership/artifact/fifo-root")
+        fifo_lock = os.path.join(fifo_root, "collector.lock")
+        os.mkfifo(fifo_lock, 0o600)
+        fifo = self.direct_entry(fifo_root, os.path.join(fifo_root, "collector.sock"))
+        self._ordinary(fifo.stdout, fifo.stderr)
+        if fifo.returncode == 0 or "code=unsafe_root" not in fifo.stderr:
+            raise CheckFailure("lock_fifo_accepted")
+        if not stat.S_ISFIFO(os.lstat(fifo_lock).st_mode):
+            raise CheckFailure("lock_fifo_replaced")
+        name = "ownership/artifact/stable"
+        stable_root = self.fresh_private_root(name)
+        stable_sock = os.path.join(stable_root, "collector.sock")
+        _root, _sock, pid = self.start(name, freshness_window_ms=5000)
+        stable_lock = os.path.join(stable_root, "collector.lock")
+        inode_before = os.lstat(stable_lock).st_ino
+        contender = self.start_async(stable_root, stable_sock)
+        try:
+            contender.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            contender.kill()
+            raise CheckFailure("lock_contender_hung")
+        if not lock_identity_is_stable(inode_before, os.lstat(stable_lock).st_ino):
+            raise CheckFailure("lock_inode_moved_on_contention")
+        self.stop_root(stable_root, stable_sock)
+        self._wait_dead(pid)
+        self.start(name, freshness_window_ms=5000)
+        if not lock_identity_is_stable(inode_before, os.lstat(stable_lock).st_ino):
+            raise CheckFailure("lock_inode_moved_on_restart")
+        info = os.lstat(stable_lock)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.geteuid():
+            raise CheckFailure("lock_artifact_mode")
+        self._assert_modes(stable_root)
+        self.stop_root(stable_root, stable_sock)
+        if not self.wait_no_fixture_collectors(stable_root):
+            raise CheckFailure("lock_restart_survivor")
+        return {
+            "alias_refused": 1,
+            "non_regular_refused": 1,
+            "inode_stable": 1,
+            "mode": "0600",
+        }
+
+    def scenario_root_locality(self):
+        """SCN5-7: distinct roots are independent, and the healthy flow holds."""
+        name_a = "ownership/locality-a"
+        name_b = "ownership/locality-b"
+        root_a = self.fresh_private_root(name_a)
+        sock_a = os.path.join(root_a, "collector.sock")
+        root_b = self.fresh_private_root(name_b)
+        sock_b = os.path.join(root_b, "collector.sock")
+        _root, _sock, pid_a = self.start(name_a, freshness_window_ms=5000, heartbeat_interval_ms=50)
+        _root, _sock, pid_b = self.start(name_b, freshness_window_ms=5000, heartbeat_interval_ms=50)
+        if pid_a == pid_b:
+            raise CheckFailure("locality_shared_owner")
+        if self.fixture_collectors(root_a) != [pid_a] or self.fixture_collectors(root_b) != [pid_b]:
+            raise CheckFailure("locality_owners")
+        client_a = Client(sock_a, timeout=5)
+        client_b = Client(sock_b, timeout=5)
+        self.cli("--socket", sock_a, "policy", "enable", "--expect-revision", "0")
+        client_a.call(
+            "admit_batch",
+            {"observations": [_sample("locality-a", sequence=1, process_id="proc-a", text=INVENTED_TEXT)]},
+        )
+        self._wait_durable(client_a, 1)
+        other = client_b.status()["body"]
+        if other["durable_seq"] != 0 or other["desired_revision"] != 0 or other["desired_policy"] != "off":
+            raise CheckFailure("locality_leaked")
+        self.stop_root(root_a, sock_a)
+        self._wait_dead(pid_a)
+        if not _alive(pid_b) or self.fixture_collectors(root_b) != [pid_b]:
+            raise CheckFailure("locality_stop_crossed")
+        self._require(client_b.status())
+        self.cli("--socket", sock_b, "policy", "enable", "--expect-revision", "0")
+        client_b.call(
+            "admit_batch",
+            {"observations": [_sample("locality-b", sequence=1, process_id="proc-b", text=INVENTED_TEXT)]},
+        )
+        checkpoint = client_b.checkpoint()
+        self._require(checkpoint)
+        if checkpoint["body"]["durable_seq"] < 1:
+            raise CheckFailure("locality_checkpoint")
+        self.cli("--socket", sock_b, "policy", "pause", "--expect-revision", "1")
+        adapter = self.cli("--socket", sock_b, "status")
+        if adapter.returncode != 0:
+            raise CheckFailure("locality_adapter")
+        _tui_session(sock_b, ["quit"])
+        if not _alive(pid_b):
+            raise CheckFailure("adapter_close_stopped_collector")
+        if Client(sock_b, timeout=3).status()["body"]["desired_policy"] != "paused":
+            raise CheckFailure("adapter_changed_policy")
+        self.stop_root(root_b, sock_b)
+        self._wait_dead(pid_b)
+        if not self.wait_no_fixture_collectors(root_a) or not self.wait_no_fixture_collectors(root_b):
+            raise CheckFailure("locality_survivors")
+        _root, _sock, _pid = self.start(name_b, freshness_window_ms=5000)
+        reopened = Client(sock_b, timeout=5)
+        status = reopened.status()["body"]
+        if status["durable_seq"] < 1 or status["desired_policy"] != "paused":
+            raise CheckFailure("locality_restart_lost")
+        if len(reopened.query("process", process_id="proc-b", page_size=PAGE)["body"]["observations"]) != 1:
+            raise CheckFailure("locality_restart_record_lost")
+        self.stop_root(root_b, sock_b)
+        if not self.wait_no_fixture_collectors(root_b):
+            raise CheckFailure("locality_restart_survivor")
+        return {
+            "roots": 2,
+            "cross_root_effect": 0,
+            "stopped_roots": 2,
+            "restart_retained": 1,
+        }
 
     def _check_invalid_admission(self, sock):
         producer = Producer(

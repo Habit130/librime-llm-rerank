@@ -14,6 +14,7 @@ observation storage.
 | --- | --- |
 | Language | Python 3.9+ standard library only. No project venv and no extra install. |
 | Transport | Unix domain socket inside the archive root. One length-prefixed JSON frame per connection. Bind/connect use the socket basename so a long checkout path still fits macOS `sun_path`. |
+| Ownership | One collector per root, via a non-blocking exclusive `fcntl.flock` on the private regular `collector.lock`, held for the collector lifetime. See "Ownership and lifecycle". |
 | Storage | Append-only `observations.jsonl` plus a fsynced `state.json` watermark. Quarantine is a separate file. |
 | TUI | Line-oriented Overview/Timeline adapter. No third-party TUI library and no five-view claim. |
 | Index | Rebuildable offset index of durable records. Payloads are not kept as a resident history copy. |
@@ -55,9 +56,66 @@ Stop only the collector pid this checkout started. Do not signal an unrelated
 process. Closing the CLI or TUI does not stop the collector and does not change
 policy unless a control command was issued.
 
+`collector start` exits `0` only for a collector it confirmed as the ready owner
+of that root; a duplicate start on an owned root exits `1` with
+`code=collector_already_running` on stderr. The ownership, readiness, and
+reclaim rules are in "Ownership and lifecycle".
+
 Capture starts disabled. A merge does not enable capture. This slice does not
 certify frontend latency, ranking benefit, annotation, export, or the five-view
 TUI.
+
+## Ownership and lifecycle
+
+One collector owns one archive root. Ownership is an OS-backed, non-blocking,
+exclusive descriptor lock (`fcntl.flock`) on the private regular artifact
+`collector.lock`. A collector acquires it before it loads policy or state,
+reconciles a durable tail, writes its PID, or binds the socket. Both supported
+entries are gated this way: `archive.cli ... collector start` and the direct
+`python -m archive.collector` entry.
+
+The owner holds that lock for its whole lifetime, through the final checkpoint,
+clean-stop marking, and socket cleanup. A second start on the same root is
+refused immediately and exits nonzero with `code=collector_already_running`; it
+does not wait, does not reload, reconcile, truncate, or rebind the winner's
+paths, and leaves no collector process behind. Different roots are independent.
+
+`collector start` reports success only for the child it spawned. The collector
+receives an inherited pipe and a per-start token and writes `ready` on it only
+after it owns the root, is listening, and is serving its own publication path.
+The CLI additionally requires that the answering endpoint reports the same pid
+in `owner_pid` and that `collector.pid` names that pid. A refused, failed, or
+unverified start prints `code=<reason>` on stderr, never prints
+`collector_started=true`, and reaps the child it spawned. A start whose
+readiness deadline passes is also reaped, so no unconfirmed collector is left
+running.
+
+Exit codes: `collector start` returns `0` started, `1` refused or failed startup
+with the stderr `code` naming the reason, `2` invalid or unsafe request. The
+collector process returns `0` after a normal stop, `1` when it refused
+ownership, and `2` for an unsafe or invalid request.
+
+Ownership is released by the kernel when the owning process ends. A normal stop,
+a contained prepare/bind failure after acquisition, and `SIGKILL` all let the
+next legitimate start proceed without deleting archive content, editing state,
+or clearing a live owner's lock. Stale `collector.pid`, `collector.sock`, and
+`collector.lock` files are metadata, not ownership, and need no manual cleanup;
+a stale PID is never proof that a root is owned. The next successful start
+reclaims a stale socket left by a dead owner. Any other occupant of the socket
+path, and a symlinked or non-regular `collector.lock`, is refused as
+`unsafe_root` before it is followed, truncated, or replaced. `collector.lock` is
+opened `O_NOFOLLOW`, stays a `0600` owner file, and is never unlinked or
+replaced, so every contender locks the same inode.
+
+`collector stop` is the documented stop for the matching root and socket. It
+requests `shutdown`, waits briefly for the recorded collector PID, and escalates
+to `SIGTERM` only when that PID is still a live `archive.collector`. It never
+signals an unrelated process.
+
+This is finite single-machine ownership for one account, not a distributed
+lock or a same-account adversary defense. It does not repair the unrelated
+root/socket stop mismatch: passing a socket from one root with another root's
+PID metadata is still contradictory operator input.
 
 ## Interface
 
@@ -88,6 +146,10 @@ Frame layout: 4-byte big-endian length, then UTF-8 JSON. Requests:
 
 Ops: `status`, `query`, `set_policy`, `checkpoint`, `admit_batch`,
 `policy_observe`, `shutdown`. Unknown ops return `invalid_request`.
+
+`status` reports `owner_pid`, the process currently serving this socket. It is
+the collector's own pid and is content-free; `collector start` uses it to bind a
+claimed success to the child it spawned.
 
 ### Admission
 
@@ -254,8 +316,9 @@ pressure still refuses.
 
 ## Privacy
 
-Archive roots are local and owner-only: directories `0700`, files and the
-socket `0600`. Unsafe roots are rejected before writing: symlink components,
+Archive roots are local and owner-only: directories `0700`, files (including
+`collector.lock`, `collector.pid`, and the logs) and the socket `0600`. Unsafe
+roots are rejected before writing: symlink components,
 non-owner paths, and path components naming known synchronized destinations
 (`CloudStorage`, `Dropbox`, `OneDrive`, `Mobile Documents`, `iCloud`,
 `Google Drive`, `com~apple~CloudDocs`, `Box Sync`, `SynologyDrive`). The
@@ -320,6 +383,16 @@ publication.
 ## Test limitations
 
 The contract checker drives this Interface with invented text in a ticket-owned
-root. It does not prove real frontend behavior, p95/p99 input latency, model
-application, ranking benefit, annotation, dataset export, backup, deletion, or
-legacy-history access. Skipped required checks are failures, not passes.
+root. Its ownership pass starts real CLI and direct-entry subprocesses: two
+concurrent starts per fresh root over five rounds, a seeded durable commit and
+paused policy across a raced restart, an incumbent against a duplicate start and
+the direct entry, a SIGKILL reclaim, one real socket-bind failure after
+ownership, the lock artifact's alias/non-regular/mode/inode rules, and
+different-root independence with the healthy start/admit/checkpoint/pause/
+stop/restart flow. It counts fixture collectors by exact command line, so a
+rejected child that never printed a PID is still counted; a stable repeated
+sample supports the exclusion argument but is not a mathematical zero-race
+guarantee. The checker does not prove real frontend behavior, p95/p99 input
+latency, model application, ranking benefit, annotation, dataset export,
+backup, deletion, or legacy-history access. Skipped required checks are
+failures, not passes.

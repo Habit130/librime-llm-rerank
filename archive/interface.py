@@ -131,6 +131,47 @@ def read_frame(conn, max_bytes=None):
     return obj
 
 
+READY_KIND = "ready"
+REFUSED_KIND = "refused"
+
+
+def readiness_line(kind, pid, token, code=""):
+    """One content-free ASCII line for the collector -> starting-CLI channel.
+
+    The starting CLI owns the read end of an inherited pipe and a per-start
+    token, so only the child it spawned can report for this attempt.
+    """
+    parts = [kind, str(int(pid)), token]
+    if code:
+        parts.append(code)
+    return (" ".join(parts) + "\n").encode("ascii", "replace")
+
+
+def parse_readiness(line, token, expected_pid):
+    """Return (kind, code) for this attempt, or None if the line is not ours.
+
+    A line is ours only when the token matches and the reported pid is the
+    child this CLI spawned. Any other line is not evidence about this attempt.
+    """
+    if not isinstance(line, str) or not isinstance(token, str) or not token:
+        return None
+    parts = line.split()
+    if len(parts) < 3 or parts[0] not in (READY_KIND, REFUSED_KIND):
+        return None
+    if parts[2] != token:
+        return None
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        return None
+    if pid != expected_pid:
+        return None
+    if parts[0] == READY_KIND:
+        return READY_KIND, ""
+    code = parts[3] if len(parts) > 3 and parts[3] in ERROR_MESSAGES else "collector_unavailable"
+    return REFUSED_KIND, code
+
+
 def strip_content(value):
     """Return a copy with payload-bearing keys removed."""
     if isinstance(value, list):
@@ -160,7 +201,10 @@ def bind_unix_socket(abs_path):
         try:
             os.chdir(directory)
             if os.path.lexists(name):
-                if stat.S_ISLNK(os.lstat(name).st_mode):
+                # Only a stale socket of a dead owner may be reclaimed. Any
+                # other occupant is refused rather than unlinked, so a failing
+                # or refused start cannot remove a path it does not own.
+                if not stat.S_ISSOCK(os.lstat(name).st_mode):
                     raise InterfaceError("unsafe_root")
                 os.unlink(name)
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

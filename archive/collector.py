@@ -27,14 +27,17 @@ from archive.interface import (
     INTERFACE_VERSION,
     ORDERING,
     SUPPORTED_SCHEMA,
+    InterfaceError,
     bind_unix_socket,
     canonical_bytes,
     encode_frame,
     error_body,
     failure,
     read_frame,
+    readiness_line,
 )
 from archive.limits import resolve
+from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
 from archive.safety import (
     UnsafeRoot,
     atomic_write,
@@ -132,6 +135,9 @@ class Collector(object):
         self.state_path = os.path.join(root, "state.json")
         self.policy_path = os.path.join(root, "policy.json")
         self.pid_path = os.path.join(root, "collector.pid")
+        self.lock_path = os.path.join(root, LOCK_NAME)
+        self._ownership = OwnerLock(self.lock_path)
+        self._owner_pid = os.getpid()
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._queue = []
@@ -159,15 +165,33 @@ class Collector(object):
         ensure_private_dir(self.root)
         self._validate_socket()
         self._refuse_managed_aliases()
-        self._reject_foreign_collector()
-        self._load_policy()
-        self._load_state()
-        self._prepare_files()
-        self._rebuild_index()
-        self._persist_state()
+        self.acquire_ownership()
+        try:
+            self._reject_foreign_collector()
+            self._load_policy()
+            self._load_state()
+            self._prepare_files()
+            self._rebuild_index()
+            self._persist_state()
+        except BaseException:
+            # Ownership precedes every managed read and mutation, so a refused
+            # or partially prepared contender has nothing of the winner's to
+            # clean up. No publication thread exists yet, so releasing here
+            # cannot race a writer; a served collector keeps exclusion until
+            # process exit instead.
+            self.release_ownership()
+            raise
+
+    def acquire_ownership(self):
+        """Take root-local exclusion before any managed state is touched."""
+        self._ownership.acquire()
+
+    def release_ownership(self):
+        self._ownership.release()
 
     def _refuse_managed_aliases(self):
         for path in (
+            self.lock_path,
             self.observations_path,
             self.quarantine_path,
             self.state_path,
@@ -186,6 +210,12 @@ class Collector(object):
             raise UnsafeRoot("symlink_socket")
 
     def _reject_foreign_collector(self):
+        """Second, diagnostic gate behind the ownership lock.
+
+        A live `archive.collector` named by `collector.pid` is refused even if
+        exclusion was bypassed (for example a manually removed lock path). The
+        PID check is diagnostic, never the exclusion primitive.
+        """
         reject_alias(self.pid_path)
         if not os.path.lexists(self.pid_path):
             return
@@ -198,7 +228,7 @@ class Collector(object):
             return
         command = _pid_command(pid)
         if "archive.collector" in command:
-            raise UnsafeRoot("collector_already_running")
+            raise OwnershipRefused()
 
     def _load_policy(self):
         reject_alias(self.policy_path)
@@ -393,13 +423,17 @@ class Collector(object):
         if isinstance(process_id, str) and isinstance(kind, str):
             self._process_kinds.setdefault(process_id, set()).add(kind)
 
-    def serve(self):
+    def serve(self, on_ready=None):
         self._sock = bind_unix_socket(self.socket_path)
         os.chmod(self.socket_path, 0o600)
         self._sock.listen(128)
         self._sock.settimeout(0.1)
         self._publication = threading.Thread(target=self._publication_loop, name="archive-publication", daemon=True)
         self._publication.start()
+        if on_ready is not None:
+            # This attempt owns the root, is listening, and is serving its own
+            # publication thread: readiness belongs to this start only.
+            on_ready()
         sys.stdout.write("ready\n")
         sys.stdout.flush()
         while not self._stop:
@@ -416,11 +450,22 @@ class Collector(object):
             self._sock.close()
         except OSError:
             pass
-        if os.path.lexists(self.socket_path):
-            try:
-                os.unlink(self.socket_path)
-            except OSError:
-                pass
+        self._unlink_own_socket()
+
+    def _unlink_own_socket(self):
+        """Remove only this owner's socket, and only while it is a socket.
+
+        Ownership is retained through this cleanup: a replacement owner cannot
+        acquire the root until this process ends.
+        """
+        if not os.path.lexists(self.socket_path):
+            return
+        try:
+            if not stat.S_ISSOCK(os.lstat(self.socket_path).st_mode):
+                return
+            os.unlink(self.socket_path)
+        except OSError:
+            pass
 
     def _handle(self, conn):
         try:
@@ -534,6 +579,7 @@ class Collector(object):
                 "collector_effective": collector_effective,
                 "collector_epoch": self._state["collector_epoch"],
                 "continuity_epoch": self._state["continuity_epoch"],
+                "owner_pid": self._owner_pid,
                 "continuity_broken": True,
                 "continuity_break_reasons": list(self._state["continuity_break_reasons"]),
                 "globally_effective": globally,
@@ -1229,6 +1275,8 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description="Input-archive collector")
     parser.add_argument("--root", required=True)
     parser.add_argument("--socket", required=True)
+    parser.add_argument("--ready-fd", dest="ready_fd", type=int, default=-1)
+    parser.add_argument("--ready-token", dest="ready_token", default="")
     parser.add_argument("--no-auto-checkpoint", action="store_true")
     parser.add_argument("--publication-hold", default="")
     parser.add_argument("--publication-phase-hold", default="")
@@ -1281,8 +1329,41 @@ def limits_from_args(args):
     return resolve(overrides)
 
 
+class ReadyChannel(object):
+    """Content-free readiness/refusal channel for the starting CLI.
+
+    The CLI passes an inherited pipe write end and a per-start token. Exactly
+    one line is written: `ready` after this process holds ownership and is
+    serving, or `refused <code>` when this start did not become the owner. The
+    direct `python -m archive.collector` entry has no channel and is a no-op.
+    """
+
+    def __init__(self, fd, token):
+        self._fd = fd if isinstance(fd, int) and fd >= 0 else None
+        self._token = token if isinstance(token, str) else ""
+
+    def ready(self):
+        self._write("ready")
+
+    def refused(self, code):
+        self._write("refused", code)
+
+    def _write(self, kind, code=""):
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        try:
+            os.write(fd, readiness_line(kind, os.getpid(), self._token, code))
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    ready = ReadyChannel(args.ready_fd, args.ready_token)
     try:
         root = validate_root(args.root)
         limits = limits_from_args(args)
@@ -1296,18 +1377,33 @@ def main(argv=None):
             control_hold=args.control_hold,
         )
         collector.prepare()
+    except OwnershipRefused as exc:
+        ready.refused(exc.code)
+        sys.stderr.write("code=%s\n" % exc.code)
+        return 1
     except UnsafeRoot as exc:
+        ready.refused(exc.code)
+        sys.stderr.write("code=%s\n" % exc.code)
+        return 2
+    except InterfaceError as exc:
+        ready.refused(exc.code)
         sys.stderr.write("code=%s\n" % exc.code)
         return 2
     except (KeyError, ValueError):
+        ready.refused("invalid_request")
         sys.stderr.write("code=invalid_request\n")
         return 2
     def _term(_signum, _frame):
         collector._stop = True
     signal.signal(signal.SIGTERM, _term)
     try:
-        collector.serve()
+        collector.serve(on_ready=ready.ready)
     except UnsafeRoot as exc:
+        ready.refused(exc.code)
+        sys.stderr.write("code=%s\n" % exc.code)
+        return 2
+    except InterfaceError as exc:
+        ready.refused(exc.code)
         sys.stderr.write("code=%s\n" % exc.code)
         return 2
     return 0

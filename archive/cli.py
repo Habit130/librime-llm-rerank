@@ -9,12 +9,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
+import select
 import signal
 import subprocess
 import sys
 import time
 
-from archive.interface import INTERFACE_VERSION, Client, strip_content
+from archive.interface import (
+    INTERFACE_VERSION,
+    Client,
+    InterfaceError,
+    parse_readiness,
+    strip_content,
+)
 from archive.producer import Producer
 from archive.safety import UnsafeRoot, escape_terminal_data, open_nofollow, validate_root
 
@@ -146,31 +154,125 @@ def _start(args):
             os.close(out_fd)
         sys.stderr.write("code=unsafe_root\n")
         return 2
+    read_fd, write_fd = _readiness_pipe()
+    token = secrets.token_hex(16)
     command = [sys.executable, "-m", "archive.collector", "--root", args.root, "--socket", args.socket]
     command.extend(_forward_flags(args))
-    proc = subprocess.Popen(command, stdout=out_fd, stderr=err_fd, start_new_session=True)
+    command.extend(["--ready-fd", str(write_fd), "--ready-token", token])
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=out_fd,
+            stderr=err_fd,
+            start_new_session=True,
+            pass_fds=(write_fd,),
+        )
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        os.close(out_fd)
+        os.close(err_fd)
+        sys.stderr.write("code=collector_unavailable\n")
+        return 1
     os.close(out_fd)
     os.close(err_fd)
-    deadline = time.time() + args.timeout
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            sys.stderr.write("code=collector_unavailable\n")
-            return 1
-        try:
-            client = Client(args.socket, timeout=0.2)
-            response = client.status()
-            if response.get("ok"):
-                sys.stdout.write("interface_version=%s\n" % INTERFACE_VERSION)
-                sys.stdout.write("collector_started=true\n")
-                sys.stdout.write("capture_enabled=false\n")
-                sys.stdout.write("pid=%s\n" % proc.pid)
-                sys.stdout.write("content_included=false\n")
-                return 0
-        except OSError:
-            pass
-        time.sleep(0.05)
-    sys.stderr.write("code=collector_unavailable\n")
+    os.close(write_fd)
+    try:
+        outcome, code = _await_readiness(proc, read_fd, token, args.timeout)
+    finally:
+        os.close(read_fd)
+    if outcome == "ready" and _confirm_owner(args, proc.pid):
+        sys.stdout.write("interface_version=%s\n" % INTERFACE_VERSION)
+        sys.stdout.write("collector_started=true\n")
+        sys.stdout.write("capture_enabled=false\n")
+        sys.stdout.write("pid=%s\n" % proc.pid)
+        sys.stdout.write("owner_pid=%s\n" % proc.pid)
+        sys.stdout.write("content_included=false\n")
+        return 0
+    if outcome == "ready":
+        # The child reported readiness but the endpoint or PID metadata does
+        # not describe it. Never claim success for an unverified owner.
+        code = "collector_unavailable"
+    _reap(proc, args.timeout)
+    sys.stderr.write("code=%s\n" % code)
     return 1
+
+
+def _readiness_pipe():
+    """A pipe whose read end stays with this CLI and write end goes to the child."""
+    read_fd, write_fd = os.pipe()
+    return _high_fd(read_fd), _high_fd(write_fd)
+
+
+def _high_fd(fd):
+    while fd < 3:
+        spare = os.dup(fd)
+        os.close(fd)
+        fd = spare
+    return fd
+
+
+def _await_readiness(proc, read_fd, token, timeout):
+    """Bounded wait for this attempt's own readiness or refusal line."""
+    deadline = time.time() + max(0.5, timeout)
+    buffer = b""
+    while time.time() < deadline:
+        remaining = max(0.0, deadline - time.time())
+        readable, _, _ = select.select([read_fd], [], [], min(0.05, remaining))
+        if readable:
+            chunk = os.read(read_fd, 256)
+            if not chunk:
+                break
+            buffer += chunk
+            if b"\n" in buffer:
+                break
+            continue
+        if proc.poll() is not None:
+            break
+    line = buffer.split(b"\n", 1)[0].decode("ascii", "replace") if buffer else ""
+    parsed = parse_readiness(line, token, proc.pid)
+    if parsed is None:
+        return "failed", "collector_unavailable"
+    return parsed
+
+
+def _confirm_owner(args, pid):
+    """Confirm the answering endpoint, root metadata and this child agree."""
+    try:
+        response = Client(args.socket, timeout=0.2).status()
+    except (OSError, InterfaceError):
+        return False
+    body = response.get("body") or {}
+    if not response.get("ok") or body.get("owner_pid") != pid:
+        return False
+    return _read_pid(args.root) == pid
+
+
+def _reap(proc, timeout):
+    """Reap only the child this CLI spawned; never the root's incumbent."""
+    bound = min(2.0, max(0.5, timeout))
+    try:
+        proc.wait(timeout=bound)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=bound)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=bound)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _forward_flags(args):
