@@ -439,7 +439,21 @@ def _print(args, response, private=False):
 def _print_human(value, prefix=""):
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"payload", "text", "composition", "candidates", "committed_text"}:
+            if key in {
+                "payload",
+                "text",
+                "composition",
+                "candidates",
+                "committed_text",
+                "preceding_text",
+                "candidate_text",
+                "input",
+                "context",
+                "groups",
+                "raw",
+                "preedit",
+                "comment",
+            }:
                 continue
             _print_human(item, prefix + key + ".")
         return

@@ -438,6 +438,7 @@ bool LlmScorer::SendRequest(const string& context,
 bool LlmScorer::ScoreBatch(const ScoringRequest& request,
                            const vector<an<Candidate>>& candidates,
                            vector<ScoreComponents>* batch_scores) {
+  exchange_ = ExchangeRecord();
   if (!batch_scores || request.candidate_texts.size() != candidates.size())
     return false;
   for (size_t i = 0; i < candidates.size(); ++i) {
@@ -452,6 +453,9 @@ bool LlmScorer::ScoreBatch(const ScoringRequest& request,
   static std::atomic<uint64_t> next_request{0};
   const string request_id = "llm-score-request-v1:" + std::to_string(getpid()) +
                             ":" + std::to_string(next_request++);
+  exchange_.attempted = true;
+  exchange_.request_id = request_id;
+  exchange_.candidate_texts = request.candidate_texts;
   string response;
   if (!SendRequest(request.preceding_text, request.candidate_texts, request_id,
                    request.plan_identity, request.baseline_policy_id,
@@ -466,6 +470,8 @@ bool LlmScorer::ScoreBatch(const ScoringRequest& request,
     return false;
   }
 
+  exchange_.succeeded = true;
+  exchange_.raw_scores = scores;
   vector<ScoreComponents> result;
   result.reserve(scores.size());
   for (double score : scores)

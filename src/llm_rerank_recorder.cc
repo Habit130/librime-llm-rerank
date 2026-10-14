@@ -128,6 +128,11 @@ LlmRerankRecorder::LlmRerankRecorder(const Ticket& ticket)
         [this](Context* c, const KeyEvent& key) { OnUnhandledKey(c, key); });
   }
   UpdateStatusProperties();
+  if (ticket.schema && ticket.schema->config()) {
+    const string socket = ReadInputArchiveSocket(ticket.schema->config());
+    if (!socket.empty())
+      archive_session_ = InputArchiveRegistry::Acquire(engine_, socket);
+  }
 }
 
 LlmRerankRecorder::~LlmRerankRecorder() {
@@ -136,10 +141,16 @@ LlmRerankRecorder::~LlmRerankRecorder() {
   abort_connection_.disconnect();
   update_connection_.disconnect();
   unhandled_key_connection_.disconnect();
+  if (archive_session_) {
+    InputArchiveRegistry::Release(engine_);
+    archive_session_.reset();
+  }
   RecorderSessionRegistry::Unregister(engine_);
 }
 
 ProcessResult LlmRerankRecorder::ProcessKeyEvent(const KeyEvent& key_event) {
+  if (!key_event.release() && archive_session_)
+    archive_session_->NoteInputKey(IsPlainBackspace(key_event));
   // A new key means the previous key's processing has finished; the select
   // notifier can only fire synchronously during the triggering key's
   // processing (mouse clicks and API selections fire outside any key event).
@@ -169,6 +180,8 @@ ProcessResult LlmRerankRecorder::ProcessKeyEvent(const KeyEvent& key_event) {
 }
 
 void LlmRerankRecorder::OnSelect(Context* ctx) {
+  if (archive_session_)
+    archive_session_->ObserveTemporarySelection(engine_, ctx);
   if (!recording_enabled_ || !session_)
     return;
   if (!ctx)
@@ -268,6 +281,8 @@ void LlmRerankRecorder::OnSelect(Context* ctx) {
 }
 
 void LlmRerankRecorder::OnCommit(Context* ctx) {
+  if (archive_session_)
+    archive_session_->ObserveCommit(engine_, ctx);
   if (!recording_enabled_ || !session_)
     return;
   if (!ctx || session_->pending.empty()) {
@@ -355,6 +370,8 @@ void LlmRerankRecorder::OnCommit(Context* ctx) {
 }
 
 void LlmRerankRecorder::OnAbort(Context* ctx) {
+  if (archive_session_)
+    archive_session_->ObserveAbort(engine_, ctx);
   if (!session_)
     return;
   session_->DropPending();
@@ -362,6 +379,8 @@ void LlmRerankRecorder::OnAbort(Context* ctx) {
 }
 
 void LlmRerankRecorder::OnContextUpdate(Context* ctx) {
+  if (archive_session_)
+    archive_session_->ObserveUpdate(engine_, ctx);
   if (!session_ || !ctx)
     return;
   if (ctx->composition().empty()) {
@@ -373,6 +392,8 @@ void LlmRerankRecorder::OnContextUpdate(Context* ctx) {
 }
 
 void LlmRerankRecorder::OnUnhandledKey(Context* ctx, const KeyEvent& key) {
+  if (!key.release() && archive_session_)
+    archive_session_->ObserveRetraction(engine_);
   if (key.release())
     return;  // press-only: the confirming key's release must not trigger
   if (!retraction_pending_ || !retraction_armed_)

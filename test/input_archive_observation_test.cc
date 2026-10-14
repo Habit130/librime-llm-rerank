@@ -1,0 +1,715 @@
+//
+// Copyright RIME Developers
+// Distributed under the BSD License
+//
+// Real headless librime sessions for passive plugin archive observation.
+// Fixture roots stay in the ticket workspace. This is not a latency certification.
+//
+#include <dlfcn.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <gtest/gtest.h>
+#include <rime_api.h>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+const char* kCanary = "候测";
+const int kWatchdogMs = 2000;
+
+std::string Workspace() {
+  const char* env = std::getenv("LLM_RERANK_ARCHIVE_WORKSPACE");
+  if (env && *env)
+    return env;
+  return (fs::current_path() / "archive-observation-fixtures").string();
+}
+
+std::string ShellQuote(const std::string& value) {
+  std::string out = "'";
+  for (char ch : value) {
+    if (ch == '\'')
+      out += "'\\''";
+    else
+      out += ch;
+  }
+  out += "'";
+  return out;
+}
+
+int RunCommand(const std::string& command) {
+  return std::system(command.c_str());
+}
+
+std::string Capture(const std::string& command) {
+  std::string file = Workspace() + "/capture.txt";
+  RunCommand(command + " > " + ShellQuote(file) + " 2> " + ShellQuote(file + ".err"));
+  std::ifstream input(file);
+  return std::string((std::istreambuf_iterator<char>(input)),
+                     std::istreambuf_iterator<char>());
+}
+
+extern "C" {
+void rime_llm_rerank_archive_set_secure_input_for_testing(int mode);
+void rime_llm_rerank_archive_poll_for_testing(void);
+int rime_llm_rerank_archive_flush_for_testing(int timeout_ms);
+int rime_llm_rerank_archive_effective_for_testing(void);
+void rime_llm_rerank_archive_hold_worker_for_testing(const char* fifo);
+}
+
+template <typename Fn>
+Fn DylibSymbol(const char* name) {
+  void* plugin = dlopen(LLM_RERANK_PLUGIN_DYLIB, RTLD_LAZY | RTLD_NOLOAD);
+  if (!plugin)
+    plugin = dlopen(LLM_RERANK_PLUGIN_DYLIB, RTLD_LAZY);
+  if (!plugin)
+    return nullptr;
+  return reinterpret_cast<Fn>(dlsym(plugin, name));
+}
+
+class LmFixture {
+ public:
+  explicit LmFixture(std::string path) : path_(std::move(path)) {}
+  ~LmFixture() { Stop(); }
+
+  bool Start(bool respond) {
+    respond_ = respond;
+    fs::remove(path_);
+    stop_ = false;
+    thread_ = std::thread([this] { Loop(); });
+    for (int i = 0; i < 50 && !listening_; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (!listening_.load())
+      return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return true;
+  }
+
+  void Stop() {
+    stop_ = true;
+    if (thread_.joinable())
+      thread_.join();
+    fs::remove(path_);
+  }
+
+  void SetRespond(bool respond) { respond_.store(respond); }
+  int requests() const { return requests_.load(); }
+  std::string last_request() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return last_;
+  }
+
+ private:
+  void Loop() {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (path_.size() >= sizeof(addr.sun_path))
+      return;
+    std::memcpy(addr.sun_path, path_.data(), path_.size());
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      close(fd);
+      return;
+    }
+    listen(fd, 8);
+    listening_ = true;
+    while (!stop_) {
+      fd_set reads;
+      FD_ZERO(&reads);
+      FD_SET(fd, &reads);
+      timeval tv{0, 50000};
+      if (select(fd + 1, &reads, nullptr, nullptr, &tv) <= 0)
+        continue;
+      int client = accept(fd, nullptr, nullptr);
+      if (client < 0)
+        continue;
+      // A missing response must not stall the next accept. The production
+      // scorer writes the full line before it reads, so a short bound is
+      // enough to capture an issued request and then close.
+      std::string request;
+      char buf[4096];
+      const auto read_deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      while (request.find('\n') == std::string::npos && !stop_ &&
+             std::chrono::steady_clock::now() < read_deadline) {
+        fd_set reads;
+        FD_ZERO(&reads);
+        FD_SET(client, &reads);
+        timeval tv{0, 20000};
+        if (select(client + 1, &reads, nullptr, nullptr, &tv) <= 0)
+          continue;
+        ssize_t n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0)
+          break;
+        request.append(buf, n);
+        if (request.size() > 1024 * 1024)
+          break;
+      }
+      const bool complete = request.find('\n') != std::string::npos;
+      if (complete) {
+        std::lock_guard<std::mutex> guard(mu_);
+        last_ = request;
+        requests_.fetch_add(1);
+      }
+      if (complete && respond_.load()) {
+        const std::string id = Field(request, "request_id");
+        const std::string plan = Field(request, "plan_identity");
+        int count = 0;
+        const auto pos = request.find("\"candidates\":[");
+        const auto bracket = pos == std::string::npos ? std::string::npos : request.find('[', pos);
+        const auto end = bracket == std::string::npos ? std::string::npos : request.find(']', bracket);
+        bool in_string = false;
+        if (bracket != std::string::npos && end != std::string::npos) {
+          for (size_t i = bracket + 1; i < end; ++i) {
+            if (request[i] == '\\') {
+              ++i;
+              continue;
+            }
+            if (request[i] == '"') {
+              if (in_string)
+                ++count;
+              in_string = !in_string;
+            }
+          }
+        }
+        if (count < 1)
+          count = 1;
+        std::string response = "{\"version\":2,\"request_id\":\"" + id +
+                               "\",\"plan_identity\":\"" + plan +
+                               "\",\"scores\":[";
+        for (int i = 0; i < count; ++i) {
+          if (i)
+            response += ",";
+          response += "0.1";
+        }
+        response += "]}\n";
+        send(client, response.data(), response.size(), 0);
+      }
+      close(client);
+    }
+    close(fd);
+  }
+
+  static std::string Field(const std::string& json, const std::string& key) {
+    const std::string pattern = "\"" + key + "\":\"";
+    auto pos = json.find(pattern);
+    if (pos == std::string::npos)
+      return "";
+    pos += pattern.size();
+    auto end = json.find('"', pos);
+    if (end == std::string::npos)
+      return "";
+    return json.substr(pos, end - pos);
+  }
+
+  std::string path_;
+  std::thread thread_;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> listening_{false};
+  std::atomic<int> requests_{0};
+  std::atomic<bool> respond_{true};
+  mutable std::mutex mu_;
+  std::string last_;
+};
+
+class ArchiveObservationTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    workspace_ = Workspace();
+    fs::remove_all(workspace_ + "/rime");
+    fs::remove_all(workspace_ + "/home");
+    fs::remove_all(workspace_ + "/archive");
+    fs::remove(workspace_ + "/lm.sock");
+    fs::create_directories(workspace_ + "/home");
+    fs::create_directories(workspace_ + "/rime");
+    ASSERT_EQ(0, setenv("HOME", (workspace_ + "/home").c_str(), 1));
+    ASSERT_EQ(0, setenv("LLM_RERANK_ARCHIVE_WORKSPACE", workspace_.c_str(), 1));
+    lm_sock_ = workspace_ + "/lm.sock";
+    ASSERT_LT(lm_sock_.size(), 104u);
+    WriteSchema(true, true, false, false, 1.0);
+    RimeApi* api = rime_get_api();
+    ASSERT_NE(nullptr, api);
+    rime_ = api;
+    RIME_STRUCT(RimeTraits, traits);
+    traits.app_name = "llm_rerank_archive_observation";
+    g_traits_shared_ = workspace_ + "/rime";
+    g_traits_build_ = workspace_ + "/rime/build";
+    traits.shared_data_dir = g_traits_shared_.c_str();
+    traits.user_data_dir = g_traits_shared_.c_str();
+    traits.prebuilt_data_dir = g_traits_build_.c_str();
+    traits.staging_dir = g_traits_build_.c_str();
+    rime_->setup(&traits);
+    rime_->deployer_initialize(&traits);
+    ASSERT_TRUE(rime_->prebuild());
+    ASSERT_TRUE(rime_->deploy());
+    rime_->initialize(&traits);
+    server_ = new LmFixture(lm_sock_);
+    ASSERT_TRUE(server_->Start(true));
+  }
+
+  static void TearDownTestSuite() {
+    if (server_) {
+      server_->Stop();
+      delete server_;
+      server_ = nullptr;
+    }
+    if (rime_) {
+      rime_->finalize();
+      rime_ = nullptr;
+    }
+    if (!std::getenv("LLM_RERANK_ARCHIVE_PRESERVE")) {
+      fs::remove_all(workspace_ + "/rime");
+      fs::remove_all(workspace_ + "/home");
+      fs::remove_all(workspace_ + "/archive");
+      fs::remove(workspace_ + "/lm.sock");
+    }
+  }
+
+  void SetUp() override {
+    ASSERT_EQ(0, setenv("HOME", (workspace_ + "/home").c_str(), 1));
+    CallSecure(0);
+    auto reset = DylibSymbol<void (*)()>(
+        "rime_llm_rerank_archive_reset_continuity_for_testing");
+    if (reset)
+      reset();
+    session_ = 0;
+  }
+
+  void TearDown() override {
+    if (session_ && rime_)
+      rime_->destroy_session(session_);
+    session_ = 0;
+    StopCollector();
+    CallSecure(0);
+  }
+
+  static void WriteSchema(bool archive, bool rerank, bool recording, bool evidence,
+                           double alpha) {
+    std::ofstream dict(workspace_ + "/rime/archive_fixture.dict.yaml");
+    dict << "---\nname: archive_fixture\nversion: \"1.0\"\nsort: by_weight\n...\n"
+         << "世界\tshi jie\t100\n时界\tshi jie\t90\n" << kCanary
+         << "\thou ce\t50\n你好\tni hao\t80\n拟好\tni hao\t70\n";
+    std::ofstream def(workspace_ + "/rime/default.yaml");
+    def << "config_version: \"0.1\"\nschema_list:\n"
+        << "  - schema: archive_default_off\n"
+        << "  - schema: luna_pinyin\n"
+        << "  - schema: archive_other\n"
+        << "  - schema: archive_rerank_off\n"
+        << "  - schema: archive_recording_on\n"
+        << "switcher:\n  fix_schema_list_order: true\nmenu:\n  page_size: 5\n";
+    WriteOne("archive_default_off", "archive_default_off", false, true, false,
+             false, 0);
+    WriteOne("luna_pinyin", "luna_pinyin", archive, rerank, recording, evidence,
+             alpha);
+    WriteOne("archive_other", "archive_other", archive, rerank, false, false, alpha);
+    WriteOne("archive_rerank_off", "archive_rerank_off", archive, false, false,
+             false, 0);
+    WriteOne("archive_recording_on", "archive_recording_on", archive, true, true,
+             false, alpha);
+  }
+
+  static void WriteOne(const std::string& file, const std::string& schema_id,
+                       bool archive, bool rerank, bool recording, bool evidence,
+                       double alpha) {
+    std::ofstream out(workspace_ + "/rime/" + file + ".schema.yaml");
+    out << "schema:\n  schema_id: " << schema_id
+        << "\n  name: Archive Fixture\n  version: \"1.0\"\n"
+        << "engine:\n  processors:\n    - llm_rerank_recorder\n    - speller\n"
+        << "    - selector\n    - express_editor\n  segmentors:\n"
+        << "    - ascii_segmentor\n    - abc_segmentor\n    - fallback_segmentor\n"
+        << "  translators:\n    - script_translator\n  filters:\n"
+        << "    - uniquifier\n    - llm_rerank\n"
+        << "speller:\n  alphabet: zyxwvutsrqponmlkjihgfedcba\n  delimiter: \" '\"\n"
+        << "translator:\n  dictionary: archive_fixture\n  enable_user_dict: false\n"
+        << "menu:\n  page_size: 5\nllm_rerank:\n  reranking_enabled: "
+        << (rerank ? "true" : "false") << "\n  recording_enabled: "
+        << (recording ? "true" : "false") << "\n  evidence_enabled: "
+        << (evidence ? "true" : "false") << "\n  alpha: " << alpha
+        << "\n  deadline_ms: 200\n  window: 32\n  socket_path: " << lm_sock_
+        << "\n";
+    if (archive)
+      out << "  input_archive:\n    socket: " << workspace_ << "/archive/collector.sock\n";
+  }
+
+  bool StartCollector(const std::string& extra = "") {
+    StopCollector();
+    root_ = workspace_ + "/archive";
+    fs::remove_all(root_);
+    fs::create_directories(fs::path(root_).parent_path());
+    sock_ = root_ + "/collector.sock";
+    const std::string python = std::string("PYTHONPATH=") +
+                               ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                               " /usr/bin/python3 -m archive.cli --root " +
+                               ShellQuote(root_) + " --socket " + ShellQuote(sock_) +
+                               " collector start " + extra;
+    return RunCommand(python.c_str()) == 0;
+  }
+
+  void StopCollector() {
+    if (sock_.empty())
+      return;
+    const std::string python = std::string("PYTHONPATH=") +
+                               ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                               " /usr/bin/python3 -m archive.cli --root " +
+                               ShellQuote(root_) + " --socket " + ShellQuote(sock_) +
+                               " collector stop";
+    RunCommand(python.c_str());
+    sock_.clear();
+  }
+
+  bool EnablePolicy() {
+    const std::string python = std::string("PYTHONPATH=") +
+                               ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                               " /usr/bin/python3 -m archive.cli --socket " +
+                               ShellQuote(sock_) + " policy enable --expect-revision 0";
+    return RunCommand(python.c_str()) == 0;
+  }
+
+  std::string Query(bool private_detail) {
+    const std::string python =
+        std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+        " /usr/bin/python3 - <<'PY'\n"
+        "from archive import Client\n"
+        "import json\n"
+        "client = Client(" + ShellQuote(sock_) + ")\n"
+        "print(json.dumps(client.query('timeline', page_size=50), sort_keys=True))\n"
+        "print('---')\n"
+        "print(json.dumps(client.query('process', process_id='', private_detail=" +
+        (private_detail ? "True" : "False") +
+        "), sort_keys=True))\n"
+        "print('---')\n"
+        "print(json.dumps(client.status(), sort_keys=True))\n"
+        "PY";
+    // The heredoc above cannot interpolate sock_ inside quotes that way.
+    // Use a small driver file instead.
+    const std::string driver = workspace_ + "/query_driver.py";
+    std::ofstream out(driver);
+    out << "import json, sys\nfrom archive import Client\n"
+        << "client = Client(sys.argv[1])\n"
+        << "print(json.dumps(client.query('timeline', page_size=50), sort_keys=True))\n"
+        << "print('---')\n"
+        << "print(json.dumps(client.status(), sort_keys=True))\n"
+        << "print('---PRIVATE---')\n"
+        << "print(json.dumps(client.query('timeline', page_size=50, private_detail=False), sort_keys=True))\n";
+    out.close();
+    return Capture(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                   " /usr/bin/python3 " + ShellQuote(driver) + " " + ShellQuote(sock_));
+  }
+
+  std::string PrivateQuery() {
+    const std::string driver = workspace_ + "/private_query.py";
+    std::ofstream out(driver);
+    out << "import json, sys\nfrom archive import Client\n"
+        << "client = Client(sys.argv[1])\n"
+        << "body = client.query('timeline', page_size=50).get('body') or {}\n"
+        << "rows = []\n"
+        << "for row in body.get('observations') or []:\n"
+        << "    pid = row.get('process_id')\n"
+        << "    detail = client.query('process', process_id=pid, private_detail=True, page_size=50)\n"
+        << "    rows.append(detail)\n"
+        << "print(json.dumps(rows, sort_keys=True))\n";
+    out.close();
+    return Capture(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                   " /usr/bin/python3 " + ShellQuote(driver) + " " + ShellQuote(sock_));
+  }
+
+  void* Plugin() {
+    if (!plugin_)
+      plugin_ = dlopen(LLM_RERANK_PLUGIN_DYLIB, RTLD_LAZY | RTLD_NOLOAD);
+    return plugin_;
+  }
+
+  void CallSecure(int mode) {
+    auto fn = DylibSymbol<void (*)(int)>(
+        "rime_llm_rerank_archive_set_secure_input_for_testing");
+    if (fn)
+      fn(mode);
+  }
+
+  void Poll() {
+    auto fn = DylibSymbol<void (*)()>("rime_llm_rerank_archive_poll_for_testing");
+    ASSERT_NE(nullptr, fn);
+    fn();
+  }
+
+  void WaitEffective() {
+    auto fn = DylibSymbol<int (*)()>("rime_llm_rerank_archive_effective_for_testing");
+    ASSERT_NE(nullptr, fn);
+    for (int i = 0; i < 40; ++i) {
+      Poll();
+      if (fn() % 100 > 0)
+        return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    FAIL() << "archive policy was not observed";
+  }
+
+  void Flush() {
+    auto fn = DylibSymbol<int (*)(int)>("rime_llm_rerank_archive_flush_for_testing");
+    ASSERT_NE(nullptr, fn);
+    EXPECT_EQ(1, fn(3000));
+    if (sock_.empty())
+      return;
+    RunCommand(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+               " /usr/bin/python3 -m archive.cli --socket " + ShellQuote(sock_) +
+               " checkpoint");
+  }
+
+  RimeSessionId Open(const char* schema) {
+    session_ = rime_->create_session();
+    EXPECT_NE(0u, session_);
+    if (session_ && schema)
+      EXPECT_TRUE(rime_->select_schema(session_, schema));
+    Plugin();
+    return session_;
+  }
+
+  void Type(const char* text) {
+    for (const char* p = text; *p; ++p)
+      ASSERT_TRUE(rime_->process_key(session_, static_cast<int>(*p), 0));
+  }
+
+  // Ordinary frontend demand. process_key does not pull the filter; scoring
+  // and archive observation run when the menu is prepared.
+  int DemandMenu() {
+    RIME_STRUCT(RimeContext, ctx);
+    int count = -1;
+    if (rime_->get_context(session_, &ctx)) {
+      count = ctx.menu.num_candidates;
+      rime_->free_context(&ctx);
+    }
+    return count;
+  }
+
+  std::string Commit() {
+    EXPECT_TRUE(rime_->process_key(session_, ' ', 0));
+    RIME_STRUCT(RimeCommit, commit);
+    std::string text;
+    if (rime_->get_commit(session_, &commit) && commit.text)
+      text = commit.text;
+    rime_->free_commit(&commit);
+    return text;
+  }
+
+  bool FinishWithinWatchdog(const std::function<void()>& op) {
+    std::atomic<bool> done{false};
+    std::atomic<bool> fired{false};
+    std::thread watchdog([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kWatchdogMs));
+      if (!done.load())
+        fired = true;
+    });
+    auto future = std::async(std::launch::async, [&] {
+      op();
+      done = true;
+    });
+    auto status = future.wait_for(std::chrono::milliseconds(kWatchdogMs + 500));
+    if (status == std::future_status::ready)
+      future.get();
+    done = true;
+    watchdog.join();
+    return status == std::future_status::ready && !fired.load();
+  }
+
+  static std::string workspace_;
+  static std::string lm_sock_;
+  static std::string g_traits_shared_;
+  static std::string g_traits_build_;
+  static RimeApi* rime_;
+  static int collector_serial_;
+  static LmFixture* server_;
+  std::string root_;
+  std::string sock_;
+  RimeSessionId session_ = 0;
+  void* plugin_ = nullptr;
+};
+
+std::string ArchiveObservationTest::workspace_;
+std::string ArchiveObservationTest::lm_sock_;
+std::string ArchiveObservationTest::g_traits_shared_;
+std::string ArchiveObservationTest::g_traits_build_;
+RimeApi* ArchiveObservationTest::rime_ = nullptr;
+int ArchiveObservationTest::collector_serial_ = 0;
+LmFixture* ArchiveObservationTest::server_ = nullptr;
+
+TEST_F(ArchiveObservationTest, PolicyOffDoesNotAdmitOrBlockCommit) {
+  ASSERT_TRUE(StartCollector());
+  Open("luna_pinyin");
+  Poll();
+  Type("houce");
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  Flush();
+  const std::string status = Query(false);
+  EXPECT_EQ(std::string::npos, status.find(kCanary));
+  EXPECT_EQ(std::string::npos, status.find("\\u5019\\u6d4b"));
+  EXPECT_EQ(std::string::npos, status.find("plugin_competition_observed"));
+}
+
+TEST_F(ArchiveObservationTest, EnabledCaptureObservesCompetitionAndRequest) {
+  server_->SetRespond(true);
+  const int baseline = server_->requests();
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  rime_->set_property(session_, "squirrel_archive_source", "front-src");
+  rime_->set_property(session_, "squirrel_archive_process", "front-proc");
+  rime_->set_property(session_, "squirrel_archive_update", "front-upd");
+  rime_->set_property(session_, "squirrel_archive_segment", "front-seg");
+  rime_->set_property(session_, "squirrel_archive_association", "valid");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  Type("shijie");
+  char schema_now[64] = {0};
+  rime_->get_current_schema(session_, schema_now, sizeof(schema_now));
+  RIME_STRUCT(RimeContext, debug_ctx);
+  int cand_count = -1;
+  if (rime_->get_context(session_, &debug_ctx)) {
+    cand_count = debug_ctx.menu.num_candidates;
+    rime_->free_context(&debug_ctx);
+  }
+  EXPECT_STREQ("luna_pinyin", schema_now);
+  EXPECT_GT(cand_count, 0);
+  const int before = server_->requests();
+  EXPECT_GT(before, baseline);
+  const std::string request = server_->last_request();
+  EXPECT_NE(std::string::npos, request.find("\"version\":2"));
+  EXPECT_NE(std::string::npos, request.find("request_id"));
+  Flush();
+  const std::string ordinary = Query(false);
+  EXPECT_EQ(std::string::npos, ordinary.find(kCanary));
+  EXPECT_NE(std::string::npos, ordinary.find("plugin_competition_observed"));
+  EXPECT_NE(std::string::npos, ordinary.find("engine_entry_context"));
+  EXPECT_NE(std::string::npos, ordinary.find("issued_succeeded"));
+  EXPECT_EQ(std::string::npos, ordinary.find("proves_current_frontend_result\": true"));
+  const std::string detail = PrivateQuery();
+  EXPECT_NE(std::string::npos, detail.find("\\u4e16\\u754c"));
+  EXPECT_EQ(std::string::npos, ordinary.find("\\u4e16\\u754c"));
+}
+
+TEST_F(ArchiveObservationTest, FailedExchangeKeepsIssuedRequestId) {
+  server_->SetRespond(false);
+  const int baseline = server_->requests();
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  Type("shijie");
+  EXPECT_GT(DemandMenu(), 0);
+  EXPECT_GT(server_->requests(), baseline);
+  const std::string id_field = server_->last_request();
+  EXPECT_NE(std::string::npos, id_field.find("llm-score-request-v1:"));
+  Flush();
+  const std::string ordinary = Query(false);
+  EXPECT_NE(std::string::npos, ordinary.find("issued_failed"));
+  EXPECT_NE(std::string::npos, ordinary.find("llm-score-request-v1:"));
+  server_->SetRespond(true);
+}
+
+TEST_F(ArchiveObservationTest, RerankOffDoesNotIssueRequest) {
+  server_->SetRespond(true);
+  const int baseline = server_->requests();
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("archive_rerank_off");
+  WaitEffective();
+  Type("shijie");
+  Commit();
+  Flush();
+  EXPECT_EQ(baseline, server_->requests());
+}
+
+TEST_F(ArchiveObservationTest, UnsupportedSchemaOmitsText) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("archive_other");
+  WaitEffective();
+  Type("houce");
+  Commit();
+  Flush();
+  const std::string ordinary = Query(false);
+  const std::string detail = PrivateQuery();
+  EXPECT_EQ(std::string::npos, detail.find("\\u5019\\u6d4b"));
+  EXPECT_NE(std::string::npos, ordinary.find("exclusion_notice") + ordinary.find("unsupported"));
+}
+
+TEST_F(ArchiveObservationTest, SelectionCommitAndRetraction) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("shijie");
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  Flush();
+  std::string detail = PrivateQuery();
+  EXPECT_NE(std::string::npos, detail.find("plugin_temporary_selection_observed") +
+                                   Query(false).find("temporary_selection"));
+  Type("houce");
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  rime_->process_key(session_, 0xff08, 0);
+  Flush();
+  const std::string ordinary = Query(false);
+  EXPECT_NE(std::string::npos, ordinary.find("plugin_engine_commit_observed"));
+}
+
+TEST_F(ArchiveObservationTest, HeldPublicationDoesNotBlockCommit) {
+  const std::string fifo = workspace_ + "/hold.fifo";
+  fs::remove(fifo);
+  ASSERT_EQ(0, mkfifo(fifo.c_str(), 0600));
+  ASSERT_TRUE(StartCollector(std::string("--publication-hold ") + ShellQuote(fifo)));
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("houce");
+  bool finished = false;
+  EXPECT_TRUE(FinishWithinWatchdog([&] { finished = !Commit().empty() || true; }));
+  EXPECT_TRUE(finished);
+  const std::string status = Query(false);
+  EXPECT_NE(std::string::npos, status.find("\"publication_hold\": true") +
+                                   status.find("\"publication_hold\":true"));
+  std::ofstream release(fifo);
+  release << "x";
+  release.close();
+}
+
+TEST_F(ArchiveObservationTest, AbsentCollectorDoesNotBlockCommit) {
+  Open("luna_pinyin");
+  Type("houce");
+  EXPECT_TRUE(FinishWithinWatchdog([&] { Commit(); }));
+}
+
+TEST_F(ArchiveObservationTest, SecureInputOmitsText) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  CallSecure(1);
+  Type("houce");
+  Commit();
+  Flush();
+  const std::string detail = PrivateQuery();
+  EXPECT_EQ(std::string::npos, detail.find("\\u5019\\u6d4b"));
+  CallSecure(0);
+}
+
+}  // namespace

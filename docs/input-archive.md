@@ -405,3 +405,123 @@ guarantee. The checker does not prove real frontend behavior, p95/p99 input
 latency, model application, ranking benefit, annotation, dataset export,
 backup, deletion, or legacy-history access. Skipped required checks are
 failures, not passes.
+
+## Plugin observation
+
+This section is the passive plugin path for Habit130/squirrel#190. Install and
+merge do not enable capture. A running collector is not permission to record.
+The legacy recording, evidence, and reranking switches are unchanged by archive
+policy. Status still reports
+`legacy_selection_recording=separately_configured_may_continue` and
+`legacy_switch_changed=false`.
+
+### Opt-in
+
+Both are required before any candidate or commit text is admitted:
+
+1. `llm_rerank/input_archive/socket` in the schema, an absolute local socket.
+   There is no HOME default. A relative path, a symlink component, or a known
+   synchronized destination stays off. The scoring `socket_path` is not this
+   socket.
+2. A fresh observation that the collector desired policy is `enabled`. Initial,
+   unknown, stale, `off`, and `paused` observations do not admit text. Freshness
+   is 2000 ms from the producer's last policy poll. The poll runs on the worker,
+   every 500 ms, not on the input path. An older in-flight poll cannot replace a
+   newer observation.
+
+`llm_rerank` and `llm_rerank_recorder` must both be registered for the full
+passive path. The filter observes already-materialized competition and actual
+emission. The recorder observes select, commit, abort, update, and known
+immediate retraction through the existing notifiers. Subscriptions are released
+with the owning component. This is not a new frontend integration and not
+SYS-05/16 certification.
+
+### Representation
+
+`interface_version` remains `input-archive-v1`. Envelope and content versions
+remain 1. Plugin observations use the additive kind `plugin_observation` with
+`plugin_observation_version` 1. An absent, non-integer, or other version is
+`unsupported_plugin_observation`. It is not coerced to `unknown_outcome` and is
+not a successful current semantic result. A `coverage=complete` claim is stored
+only with basis `captured_group_members_and_target`, equal positive captured and
+group member counts, and `target_membership` `present` or `absent`. Any other
+complete claim, including a legacy snapshot boolean, is `invalid_request`.
+Query repeats that check as `coverage_claim_accepted`.
+
+`association_role=engine_entry_context` is an engine-entry property snapshot
+(`squirrel_archive_source`, `squirrel_archive_process`, `squirrel_archive_update`,
+`squirrel_archive_segment`, `squirrel_archive_association`). It is not this
+operation's new frontend result update. `proves_current_frontend_result` and
+`frontend_terminal` stay false / `unknown`. Query reports `valid_reference`
+only when those tokens match a stored non-plugin observation, `stale` when the
+process exists but the update does not, and `unmatched` otherwise. Missing or
+malformed properties stay `absent` / `malformed` / `invalid`.
+
+Stages: `competition`, `emission`, `temporary_selection`, `commit`,
+`cancellation`, `retraction`, `loss`, `exclusion`. Apply states: `applied`,
+`unchanged`, `fallback`, `not_applicable`. `unchanged` means a plan was applied
+and emission order matched upstream order. That is not ranking benefit.
+`lm_request_state` is `issued_succeeded`, `issued_failed`, or `no_request`.
+The request id is the native scorer id from the exchange that was actually
+attempted. Evidence request ids, pid, time, and equal text are not substitutes.
+No request id is stored when no LM request was issued.
+
+Weight is `phrase.weight` in log space when the candidate is a system or user
+dictionary word. Quality is `candidate.quality` in probability space. LM score
+is the protocol v2 raw log score before alpha, only for candidates in a
+successful exchange. Retrieval evidence is the evidence term in log space, only
+when that evidence call succeeded. Unavailable components are `unknown`, not a
+fabricated zero. Overlapping spans and different categories stay separate
+groups. A truncated window or a legacy complete flag is not group-complete
+competition.
+
+### Bounds, faults, and continuity
+
+The input path copies an owned snapshot and `try_lock`s the producer queue. It
+does not serialize, compress, connect, read, wait, or retry. The worker does
+transport. Retries of a retryable send are at most 3, on the worker. Queue
+count 256, queue bytes 1048576, event budget 65536, batch 64. A failed
+`try_lock` refuses `queue_saturated`. Commit, cancellation, retraction, loss,
+and exclusion outrank competition and emission snapshots.
+
+A held publication, absent collector, saturated queue, capacity stop, or
+blocked control call must not stop emission, selection, or commit. The fault
+watchdog is 2000 ms. It detects a dependency; it is not a p95/p99 certification.
+No quiet-machine or plugin-cost certification is claimed. #189 timing is
+frontend evidence only.
+
+Pause survives producer recreation because policy is durable in the collector.
+Resume does not backfill an excluded prefix. Retarget and destruction drop
+queued snapshots instead of sending them to a new socket. Engine recreation
+uses a new source instance. Schema, secure input, and an ineligible prefix cut
+continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
+resolved; if that gate cannot be resolved, text is not admitted. That is not a
+universal sensitive detector. Invalid frontend association is not sensitivity
+clearance. Archive failure must not terminate input: sockets set
+`SO_NOSIGPIPE`, and a refused admission is not a commit failure.
+
+### Checks
+
+From the plugin checkout, after an isolated `make librime` in the Squirrel
+build host:
+
+```sh
+"$PYTHON" tools/check_input_archive_plugin.py --self-test
+"$PYTHON" tools/check_input_archive_plugin.py --suite contract \
+  --native-build "$HOST/librime/build" \
+  --root .local-work/ac190-a1/plugin-check \
+  --report .local-work/ac190-a1/plugin-report.json
+```
+
+The checker is an orchestration entry, not a replacement plugin. It binds the
+built dylib and source, runs the registered native observation cases, and
+preserves primary evidence. Ordinary status, errors, and the report are
+content-free. Private text is only in a deliberate detail query. Stop only the
+collector that check started:
+
+```sh
+"$PYTHON" -m archive.cli --root "$ROOT" --socket "$ROOT/collector.sock" collector stop
+```
+
+This slice does not certify pixels, host persistence, ranking benefit, added
+plugin cost, or integrated SYS acceptance. **Merge never enables capture.**
