@@ -37,6 +37,9 @@ REQUIRED_CASES = (
     "HeldPublicationDoesNotBlockCommit",
     "AbsentCollectorDoesNotBlockCommit",
     "SecureInputOmitsText",
+    "OrdinaryDemandSurvivesCommitAndAbort",
+    "PausedCommitIsNotBackfilled",
+    "LossNoticeSurvivesFailedTransport",
 )
 WATCHDOG_MS = 2000
 
@@ -303,8 +306,9 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         if args.self_test:
-            root = args.root or os.path.join(REPO, ".local-work", "ac190-a1", "plugin-self-test")
-            return self_test(root)
+            if not args.root:
+                raise CheckFailure("invalid_request")
+            return self_test(args.root)
         if args.suite == "contract":
             if not args.root or not args.report or not args.native_build:
                 raise CheckFailure("invalid_request")

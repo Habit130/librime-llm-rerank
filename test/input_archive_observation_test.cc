@@ -297,6 +297,14 @@ class ArchiveObservationTest : public ::testing::Test {
     if (session_ && rime_)
       rime_->destroy_session(session_);
     session_ = 0;
+    auto limits = DylibSymbol<void (*)(int, int)>(
+        "rime_llm_rerank_archive_set_queue_limits_for_testing");
+    if (limits)
+      limits(256, 1048576);
+    auto hold = DylibSymbol<void (*)(const char*)>(
+        "rime_llm_rerank_archive_hold_worker_for_testing");
+    if (hold)
+      hold("");
     StopCollector();
     CallSecure(0);
   }
@@ -377,11 +385,114 @@ class ArchiveObservationTest : public ::testing::Test {
   }
 
   bool EnablePolicy() {
+    return SetPolicy("enable", 0);
+  }
+
+  bool SetPolicy(const char* action, int revision) {
     const std::string python = std::string("PYTHONPATH=") +
                                ShellQuote(LLM_RERANK_SOURCE_DIR) +
                                " /usr/bin/python3 -m archive.cli --socket " +
-                               ShellQuote(sock_) + " policy enable --expect-revision 0";
+                               ShellQuote(sock_) + " policy " + action +
+                               " --expect-revision " + std::to_string(revision);
     return RunCommand(python.c_str()) == 0;
+  }
+
+  bool WaitNotEffective() {
+    for (int i = 0; i < 30; ++i) {
+      Poll();
+      auto fn = DylibSymbol<int (*)()>(
+          "rime_llm_rerank_archive_effective_for_testing");
+      if (fn && fn() % 100 == 0)
+        return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
+  }
+
+  // Stop the live collector without deleting the root or forgetting the socket
+  // path. A later in-place start reloads the durable policy.
+  void StopCollectorKeepRoot() {
+    if (sock_.empty())
+      return;
+    const std::string python = std::string("PYTHONPATH=") +
+                               ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                               " /usr/bin/python3 -m archive.cli --root " +
+                               ShellQuote(root_) + " --socket " + ShellQuote(sock_) +
+                               " collector stop";
+    RunCommand(python.c_str());
+  }
+
+  bool StartCollectorInPlace() {
+    const std::string python = std::string("PYTHONPATH=") +
+                               ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                               " /usr/bin/python3 -m archive.cli --root " +
+                               ShellQuote(root_) + " --socket " + ShellQuote(sock_) +
+                               " collector start";
+    return RunCommand(python.c_str()) == 0;
+  }
+
+  void HoldWorker(const std::string& fifo) {
+    auto fn = DylibSymbol<void (*)(const char*)>(
+        "rime_llm_rerank_archive_hold_worker_for_testing");
+    ASSERT_NE(nullptr, fn);
+    fn(fifo.c_str());
+  }
+
+  void SetQueueLimit(int count) {
+    auto fn = DylibSymbol<void (*)(int, int)>(
+        "rime_llm_rerank_archive_set_queue_limits_for_testing");
+    ASSERT_NE(nullptr, fn);
+    fn(count, 1048576);
+  }
+
+  void Checkpoint() {
+    if (sock_.empty())
+      return;
+    RunCommand(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+               " /usr/bin/python3 -m archive.cli --socket " + ShellQuote(sock_) +
+               " checkpoint");
+  }
+
+  void RestoreLunaSchema() {
+    if (session_ && rime_) {
+      rime_->destroy_session(session_);
+      session_ = 0;
+    }
+    WriteOne("luna_pinyin", "luna_pinyin", true, true, false, false, 1.0);
+    if (rime_)
+      rime_->deploy();
+  }
+
+  struct LunaRerankRestore {
+    ArchiveObservationTest* test = nullptr;
+    ~LunaRerankRestore() {
+      if (test)
+        test->RestoreLunaSchema();
+    }
+  };
+
+  std::string StageReport() {
+    const std::string driver = workspace_ + "/stage_report.py";
+    std::ofstream out(driver);
+    out << "import json, sys\nfrom archive import Client\n"
+        << "client = Client(sys.argv[1])\n"
+        << "canary = " << "\"候测\"" << "\n"
+        << "body = client.query('timeline', page_size=50).get('body') or {}\n"
+        << "for row in body.get('observations') or []:\n"
+        << "    stage = row.get('plugin_stage') or '-'\n"
+        << "    kind = row.get('observation_kind') or '-'\n"
+        << "    pid = row.get('process_id') or ''\n"
+        << "    detail = client.query('process', process_id=pid, private_detail=True, page_size=50)\n"
+        << "    hit = False\n"
+        << "    for item in (detail.get('body') or {}).get('observations') or []:\n"
+        << "        if item.get('source_local_sequence') != row.get('source_local_sequence'):\n"
+        << "            continue\n"
+        << "        if canary in json.dumps(item, ensure_ascii=False):\n"
+        << "            hit = True\n"
+        << "    print('stage=%s kind=%s canary=%s' % (stage, kind, 'yes' if hit else 'no'))\n";
+    out.close();
+    return Capture(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                   " /usr/bin/python3 " + ShellQuote(driver) + " " + ShellQuote(sock_));
   }
 
   std::string Query(bool private_detail) {
@@ -895,6 +1006,186 @@ TEST_F(ArchiveObservationTest, WorldWritableParentDoesNotReceiveCommit) {
   EXPECT_EQ(0, accepts.load());
   const std::string detail = PrivateQuery();
   EXPECT_EQ(std::string::npos, detail.find("\\u5019\\u6d4b"));
+}
+
+class RejectingSocket {
+ public:
+  bool Start(const std::string& path, std::atomic<int>* accepts) {
+    path_ = path;
+    accepts_ = accepts;
+    fs::remove(path_);
+    fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd_ < 0)
+      return false;
+    sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (path_.size() >= sizeof(addr.sun_path)) {
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    std::memcpy(addr.sun_path, path_.data(), path_.size());
+    if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    if (chmod(path_.c_str(), 0600) != 0 || listen(fd_, 8) != 0) {
+      close(fd_);
+      fd_ = -1;
+      fs::remove(path_);
+      return false;
+    }
+    stop_ = false;
+    thread_ = std::thread([this] { Loop(); });
+    return true;
+  }
+
+  void Stop() {
+    stop_ = true;
+    if (thread_.joinable())
+      thread_.join();
+    if (fd_ >= 0)
+      close(fd_);
+    fd_ = -1;
+    fs::remove(path_);
+  }
+
+ private:
+  void Loop() {
+    while (!stop_) {
+      fd_set reads;
+      FD_ZERO(&reads);
+      FD_SET(fd_, &reads);
+      timeval tv{0, 20000};
+      if (select(fd_ + 1, &reads, nullptr, nullptr, &tv) <= 0)
+        continue;
+      int client = accept(fd_, nullptr, nullptr);
+      if (client < 0)
+        continue;
+      if (accepts_)
+        accepts_->fetch_add(1);
+      close(client);
+    }
+  }
+
+  std::string path_;
+  std::atomic<int>* accepts_ = nullptr;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+  int fd_ = -1;
+};
+
+TEST_F(ArchiveObservationTest, OrdinaryDemandSurvivesCommitAndAbort) {
+  LunaRerankRestore restore{this};
+  WriteOne("luna_pinyin", "luna_pinyin", true, false, false, false, 0.0);
+  ASSERT_TRUE(rime_->deploy());
+  server_->SetRespond(true);
+  const int baseline = server_->requests();
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const int ctor = DemandPulls(
+      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing");
+  Type("shijie");
+  EXPECT_EQ(ctor, DemandPulls(
+                      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing"));
+  EXPECT_GT(DemandMenu(), 0);
+  EXPECT_EQ(ctor, DemandPulls(
+                      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing"));
+  EXPECT_GT(DemandPulls(
+                "rime_llm_rerank_archive_demand_consumer_pulls_for_testing"),
+            0);
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  Flush();
+  EXPECT_EQ(baseline, server_->requests());
+  const std::string orders = EmissionOrders();
+  EXPECT_NE(std::string::npos, orders.find("[0"));
+  EXPECT_EQ(std::string::npos, orders.find("[]"));
+  const std::string after_commit = PrivateQuery();
+  EXPECT_NE(std::string::npos, after_commit.find("\\u4e16\\u754c"));
+  EXPECT_NE(std::string::npos, Query(false).find("plugin_competition_observed"));
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  EXPECT_TRUE(rime_->process_key(session_, 0xff1b, 0));
+  Flush();
+  const std::string after_abort = Query(false);
+  EXPECT_NE(std::string::npos, after_abort.find("plugin_cancellation_observed") +
+                                   after_abort.find("plugin_competition_observed"));
+  EXPECT_EQ(baseline, server_->requests());
+}
+
+TEST_F(ArchiveObservationTest, PausedCommitIsNotBackfilled) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(SetPolicy("pause", 1));
+  ASSERT_TRUE(WaitNotEffective());
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  ASSERT_TRUE(SetPolicy("resume", 2));
+  WaitEffective();
+  EXPECT_TRUE(rime_->process_key(session_, 0xff08, 0));
+  Flush();
+  const std::string stages = StageReport();
+  EXPECT_NE(std::string::npos, stages.find("stage=retraction"));
+  EXPECT_EQ(std::string::npos, stages.find("stage=retraction kind=plugin_observation canary=yes"));
+  EXPECT_NE(std::string::npos, stages.find("stage=retraction kind=exclusion_notice canary=no"));
+  EXPECT_EQ(std::string::npos, stages.find("stage=commit kind=plugin_observation canary=yes"));
+}
+
+TEST_F(ArchiveObservationTest, LossNoticeSurvivesFailedTransport) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const std::string fifo = workspace_ + "/loss-hold.fifo";
+  fs::remove(fifo);
+  ASSERT_EQ(0, mkfifo(fifo.c_str(), 0600));
+  HoldWorker(fifo);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  SetQueueLimit(1);
+  Type("shijie");
+  EXPECT_GT(DemandMenu(), 0);
+  Type("houce");
+  DemandMenu();
+  StopCollectorKeepRoot();
+  std::atomic<int> accepts{0};
+  RejectingSocket rejector;
+  ASSERT_TRUE(rejector.Start(sock_, &accepts));
+  HoldWorker("");
+  for (int i = 0; i < 40 && accepts.load() < 2; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_GE(accepts.load(), 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  rejector.Stop();
+  ASSERT_TRUE(StartCollectorInPlace());
+  bool saw_loss = false;
+  for (int i = 0; i < 40; ++i) {
+    Poll();
+    auto flush = DylibSymbol<int (*)(int)>("rime_llm_rerank_archive_flush_for_testing");
+    if (flush)
+      flush(500);
+    Checkpoint();
+    const std::string ordinary = Query(false);
+    if (ordinary.find("loss_notice") != std::string::npos ||
+        ordinary.find("known_loss") != std::string::npos) {
+      saw_loss = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_TRUE(saw_loss);
+  const std::string ordinary = Query(false);
+  EXPECT_EQ(std::string::npos, ordinary.find(kCanary));
+  EXPECT_EQ(std::string::npos, ordinary.find("\\u4e16\\u754c"));
+  EXPECT_EQ(std::string::npos, ordinary.find("\\u5019\\u6d4b"));
 }
 
 TEST_F(ArchiveObservationTest, SecureInputOmitsText) {

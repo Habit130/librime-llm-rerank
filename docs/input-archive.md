@@ -438,10 +438,14 @@ passive path. The filter observes already-materialized competition and the
 emission queue before it is spliced into the menu cache, so `emission_order`
 is the order actually handed to the menu. With reranking off, the demand
 wrapper does not pull upstream at construction; the menu's Peek/Next is the
-pull. The recorder observes select, commit, abort, update, and known
-immediate retraction through the existing notifiers. Subscriptions are released
-with the owning component. This is not a new frontend integration and not
-SYS-05/16 certification.
+pull. Commit, abort, and an empty-composition update flush those already
+demanded candidates before composition state is cleared. The translation
+destructor still flushes a window the menu released without a notifier.
+Clearing the demand buffer first would drop competition and emission for a
+completed composition. The recorder observes select, commit, abort, update,
+and known immediate retraction through the existing notifiers. Subscriptions
+are released with the owning component. This is not a new frontend integration
+and not SYS-05/16 certification.
 
 Only `luna_pinyin` content is admitted. Production direct input is
 `ascii_composer` returning the key unhandled while `ascii_mode` is on and
@@ -495,7 +499,11 @@ competition.
 
 The input path copies an owned snapshot and `try_lock`s the producer queue. It
 does not serialize, compress, connect, read, wait, or retry. The worker does
-transport. Retries of a retryable send are at most 3, on the worker. Queue
+transport. Retries of a retryable send are at most 3, on the worker. A failed
+loss-notice send is restored to that same bounded queue; it is not discarded.
+After the retry cap, one continuity notice is held and delivered on the next
+successful policy exchange or content send. That is not a tight retry loop,
+and a generation change or abandon drops it instead of retargeting it. Queue
 count 256, queue bytes 1048576, event budget 65536, batch 64. A failed
 `try_lock` refuses `queue_saturated`. Commit, cancellation, retraction, loss,
 and exclusion outrank competition and emission snapshots.
@@ -507,8 +515,11 @@ No quiet-machine or plugin-cost certification is claimed. #189 timing is
 frontend evidence only.
 
 Pause survives producer recreation because policy is durable in the collector.
-Resume does not backfill an excluded prefix. Retarget and destruction drop
-queued snapshots instead of sending them to a new socket. Engine recreation
+A commit or cancellation while the producer is not locally effective — paused,
+off, stale, or not yet observed — is an excluded prefix. Its text is not
+retained for a later retraction, and resume does not backfill that text.
+Resume does not backfill any other excluded prefix either. Retarget and
+destruction drop queued snapshots instead of sending them to a new socket. Engine recreation
 uses a new process-lifetime source instance; a destroyed engine's id is not
 recycled. Schema, secure input, and an ineligible prefix cut continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
 resolved; if that gate cannot be resolved, text is not admitted. That is not a
@@ -522,12 +533,17 @@ From the plugin checkout, after an isolated `make librime` in the Squirrel
 build host:
 
 ```sh
-"$PYTHON" tools/check_input_archive_plugin.py --self-test
+"$PYTHON" tools/check_input_archive_plugin.py --self-test \
+  --root "$RUNTIME/p-self"
 "$PYTHON" tools/check_input_archive_plugin.py --suite contract \
   --native-build "$HOST/librime/build" \
-  --root .local-work/ac190-a1/plugin-check \
-  --report .local-work/ac190-a1/plugin-report.json
+  --root "$RUNTIME/pc/run" \
+  --report "$EVIDENCE/plugin-report.json"
 ```
+
+`--self-test` requires an explicit fresh root. It does not fall back to an
+older attempt directory. The contract suite derives its native workspace from
+the root's parent, so keep that parent separate from the self-test leaf.
 
 The checker is an orchestration entry, not a replacement plugin. It binds the
 built dylib and source, runs the registered native observation cases, and

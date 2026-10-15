@@ -78,7 +78,7 @@ class InputArchiveSession {
   void ObserveRetraction(Engine* engine);
 
   InputArchiveProducer* producer() const { return producer_.get(); }
-  void CloseCompositionForTesting() { CloseComposition(); }
+  void CloseCompositionForTesting() { CloseComposition(nullptr); }
   const string& source_instance_id() const { return source_instance_id_; }
 
  private:
@@ -104,7 +104,7 @@ class InputArchiveSession {
   string SchemaId(Engine* engine) const;
   bool ContentEligible(Engine* engine, string* schema, bool* secure) const;
   void CutContinuity(const char* basis);
-  void CloseComposition();
+  void CloseComposition(Engine* engine);
   int64_t NextSequence();
   string NextToken(const char* prefix);
   void FillEntry(InputArchiveObservation* observation, const EntryContext& entry) const;

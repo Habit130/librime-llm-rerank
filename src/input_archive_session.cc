@@ -83,7 +83,11 @@ void InputArchiveSession::CutContinuity(const char* basis) {
   (void)basis;
 }
 
-void InputArchiveSession::CloseComposition() {
+void InputArchiveSession::CloseComposition(Engine* engine) {
+  // The recorder notifier runs while the menu still owns the demand
+  // translation. Flush before clearing, or the later destructor flush sees
+  // an empty window and the completed composition loses competition/emission.
+  FlushDemand(engine);
   composition_open_ = false;
   content_excluded_ = false;
   explicit_selection_ = false;
@@ -91,6 +95,7 @@ void InputArchiveSession::CloseComposition() {
   held_groups_.clear();
   window_have_plan_ = false;
   demand_.clear();
+  demand_exhausted_ = false;
   process_id_ = NextToken("pproc");
   parent_update_id_.clear();
 }
@@ -465,6 +470,7 @@ void InputArchiveSession::ObserveTemporarySelection(Engine* engine, Context* ctx
 void InputArchiveSession::ObserveCommit(Engine* engine, Context* ctx) {
   if (!ctx)
     return;
+  FlushDemand(engine);
   const string text = ctx->GetCommitText();
   if (text.empty()) {
     retraction_armed_ = false;
@@ -472,7 +478,10 @@ void InputArchiveSession::ObserveCommit(Engine* engine, Context* ctx) {
   }
   string schema;
   bool secure = false;
-  const bool eligible = ContentEligible(engine, &schema, &secure) && !content_excluded_;
+  const bool policy_effective = producer_->locally_effective();
+  const bool eligible = policy_effective &&
+                        ContentEligible(engine, &schema, &secure) &&
+                        !content_excluded_;
   InputArchiveObservation observation;
   observation.plugin_stage = "commit";
   observation.schema_id = eligible ? schema : "unknown";
@@ -492,7 +501,8 @@ void InputArchiveSession::ObserveCommit(Engine* engine, Context* ctx) {
   if (eligible)
     observation.payload_text = text;
   else
-    observation.reason = "deliberate_exclusion";
+    observation.reason =
+        policy_effective ? "deliberate_exclusion" : "policy_not_effective";
   if (explicit_selection_ && text == selected_text_) {
     for (const auto& group : held_groups_) {
       if (group.start == selected_start_ && group.end == selected_end_ &&
@@ -517,21 +527,27 @@ void InputArchiveSession::ObserveCommit(Engine* engine, Context* ctx) {
   }
   FillEntry(&observation, ReadEntry(engine));
   Admit(observation);
+  // An ineffective policy is an excluded prefix. Do not retain the commit
+  // text for a later retraction after resume; that would backfill it.
   last_commit_text_ = eligible ? text : string();
   last_commit_update_ = parent_update_id_;
   last_commit_process_ = process_id_;
   explicit_selection_ = false;
-  CloseComposition();
+  CloseComposition(engine);
   retraction_armed_ = true;
 }
 
 void InputArchiveSession::ObserveAbort(Engine* engine, Context* ctx) {
   (void)ctx;
-  if (!composition_open_ && !explicit_selection_)
+  if (!composition_open_ && !explicit_selection_ && demand_.empty())
     return;
+  FlushDemand(engine);
   string schema;
   bool secure = false;
-  const bool eligible = ContentEligible(engine, &schema, &secure) && !content_excluded_;
+  const bool policy_effective = producer_->locally_effective();
+  const bool eligible = policy_effective &&
+                        ContentEligible(engine, &schema, &secure) &&
+                        !content_excluded_;
   InputArchiveObservation observation;
   observation.plugin_stage = "cancellation";
   observation.observation_kind =
@@ -545,18 +561,20 @@ void InputArchiveSession::ObserveAbort(Engine* engine, Context* ctx) {
   observation.window_id = window_id_;
   if (eligible)
     observation.payload_text = selected_text_;
+  else if (!policy_effective)
+    observation.reason = "policy_not_effective";
   FillEntry(&observation, ReadEntry(engine));
   Admit(std::move(observation));
   retraction_armed_ = false;
-  CloseComposition();
+  CloseComposition(engine);
 }
 
 void InputArchiveSession::ObserveUpdate(Engine* engine, Context* ctx) {
   if (!ctx)
     return;
   if (ctx->input().empty() && ctx->composition().empty()) {
-    if (composition_open_ || content_excluded_)
-      CloseComposition();
+    if (composition_open_ || content_excluded_ || !demand_.empty())
+      CloseComposition(engine);
     return;
   }
   const string schema = SchemaId(engine);

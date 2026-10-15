@@ -675,6 +675,8 @@ struct InputArchiveProducer::Impl {
     std::lock_guard<std::mutex> guard(mu);
     queue.clear();
     losses.clear();
+    held_loss_pending = false;
+    held_loss = InputArchiveObservation();
     bytes = 0;
     binding_generation.fetch_add(1, std::memory_order_acq_rel);
   }
@@ -705,19 +707,22 @@ struct InputArchiveProducer::Impl {
           bytes -= item.budget_bytes;
       }
       if (!loss_batch.empty())
-        SendLosses(loss_batch, generation);
-      if (batch.empty()) {
-        {
-          std::lock_guard<std::mutex> guard(mu);
-          worker_busy = false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        continue;
+        SendLosses(std::move(loss_batch), generation);
+      if (!batch.empty()) {
+        const SendFate fate = SendBatch(batch, generation);
+        if (fate == SendFate::kRetry)
+          Requeue(batch);
+        else if (fate == SendFate::kSent)
+          MaybeDeliverHeldLoss(generation);
       }
-      if (!SendBatch(batch, generation))
-        Requeue(batch);
-      std::lock_guard<std::mutex> guard(mu);
-      worker_busy = false;
+      if (policy_exchange_ok.exchange(false, std::memory_order_acq_rel))
+        MaybeDeliverHeldLoss(generation);
+      {
+        std::lock_guard<std::mutex> guard(mu);
+        worker_busy = false;
+      }
+      if (batch.empty())
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 
@@ -800,13 +805,20 @@ struct InputArchiveProducer::Impl {
                             std::memory_order_release);
     observed_at_ns.store(SteadyNs(), std::memory_order_release);
     policy_valid.store(code != 0, std::memory_order_release);
+    if (code != 0)
+      policy_exchange_ok.store(true, std::memory_order_release);
   }
 
-  bool SendBatch(const vector<InputArchiveObservation>& batch, int generation) {
+  // kSent: collector accepted the transport. kRetry: transport failed; the
+  // caller must preserve the batch. kDropped: generation or destination no
+  // longer matches; do not retarget and do not treat that as a successful send.
+  enum class SendFate { kSent, kRetry, kDropped };
+
+  SendFate SendBatch(const vector<InputArchiveObservation>& batch, int generation) {
     if (generation != binding_generation.load(std::memory_order_acquire))
-      return true;  // dropped, do not retarget
+      return SendFate::kDropped;
     if (!destination_safe.load(std::memory_order_acquire))
-      return true;
+      return SendFate::kDropped;
     string body = "{\"observations\":[";
     for (size_t i = 0; i < batch.size(); ++i) {
       if (i)
@@ -816,14 +828,72 @@ struct InputArchiveProducer::Impl {
     body += "]}";
     string response = Exchange(socket_path, RequestFrame("admit_batch", body));
     if (ResponseUnavailable(response))
-      return false;
-    return true;
+      return SendFate::kRetry;
+    return SendFate::kSent;
   }
 
-  void SendLosses(const vector<InputArchiveObservation>& batch, int generation) {
+  void SendLosses(vector<InputArchiveObservation> batch, int generation) {
+    if (batch.empty())
+      return;
     if (generation != binding_generation.load(std::memory_order_acquire))
       return;
-    SendBatch(batch, generation);
+    if (SendBatch(batch, generation) == SendFate::kRetry)
+      RestoreLosses(std::move(batch));
+  }
+
+  void RestoreLosses(vector<InputArchiveObservation> batch) {
+    std::lock_guard<std::mutex> guard(mu);
+    for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+      if (it->binding_generation !=
+          binding_generation.load(std::memory_order_acquire))
+        continue;
+      it->retries += 1;
+      if (it->retries > kMaxRetries) {
+        HoldExhaustedLossLocked(std::move(*it));
+        continue;
+      }
+      losses.insert(losses.begin(), std::move(*it));
+    }
+    if (losses.size() > 64)
+      losses.erase(losses.begin(), losses.end() - 64);
+  }
+
+  void HoldExhaustedLossLocked(InputArchiveObservation loss) {
+    // One continuity boundary covers this outage. Later exhausted notices
+    // from the same failure are not a second interval and are not discarded
+    // without the held notice remaining.
+    if (held_loss_pending)
+      return;
+    loss.retries = 0;
+    if (loss.reason.empty())
+      loss.reason = "transport_exhausted";
+    held_loss = std::move(loss);
+    held_loss_pending = true;
+  }
+
+  void MaybeDeliverHeldLoss(int generation) {
+    InputArchiveObservation notice;
+    {
+      std::lock_guard<std::mutex> guard(mu);
+      if (!held_loss_pending)
+        return;
+      if (held_loss.binding_generation != generation) {
+        held_loss_pending = false;
+        held_loss = InputArchiveObservation();
+        return;
+      }
+      notice = held_loss;
+    }
+    if (SendBatch(vector<InputArchiveObservation>{notice}, generation) !=
+        SendFate::kSent)
+      return;
+    std::lock_guard<std::mutex> guard(mu);
+    if (held_loss_pending && held_loss.binding_generation == generation &&
+        held_loss.source_local_sequence == notice.source_local_sequence &&
+        held_loss.reason == notice.reason) {
+      held_loss_pending = false;
+      held_loss = InputArchiveObservation();
+    }
   }
 
   void Requeue(vector<InputArchiveObservation> batch) {
@@ -852,6 +922,8 @@ struct InputArchiveProducer::Impl {
   std::thread worker;
   vector<InputArchiveObservation> queue;
   vector<InputArchiveObservation> losses;
+  InputArchiveObservation held_loss;
+  bool held_loss_pending = false;
   int bytes = 0;
   int64_t capture_seq = 0;
   int known_dropped = 0;
@@ -869,6 +941,7 @@ struct InputArchiveProducer::Impl {
   std::atomic<int> observed_revision{-1};
   std::atomic<int64_t> observed_at_ns{0};
   std::atomic<bool> policy_valid{false};
+  std::atomic<bool> policy_exchange_ok{false};
   std::atomic<int> contended{0};
 };
 
@@ -932,7 +1005,8 @@ bool InputArchiveProducer::FlushForTesting(int timeout_ms) {
     bool idle = false;
     {
       std::lock_guard<std::mutex> guard(impl_->mu);
-      idle = impl_->queue.empty() && impl_->losses.empty() && !impl_->worker_busy;
+      idle = impl_->queue.empty() && impl_->losses.empty() &&
+             !impl_->held_loss_pending && !impl_->worker_busy;
     }
     if (idle && impl_->policy_valid.load(std::memory_order_acquire))
       return true;
@@ -941,7 +1015,8 @@ bool InputArchiveProducer::FlushForTesting(int timeout_ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   std::lock_guard<std::mutex> guard(impl_->mu);
-  return impl_->queue.empty() && impl_->losses.empty();
+  return impl_->queue.empty() && impl_->losses.empty() &&
+         !impl_->held_loss_pending;
 }
 
 void InputArchiveProducer::SetQueueLimitsForTesting(int count, int bytes) {
