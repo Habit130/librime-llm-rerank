@@ -922,7 +922,9 @@ class Collector(object):
         if not isinstance(kind, str):
             return "invalid_request"
         plugin = None
-        if excluded:
+        # A declared loss notice stays a loss notice. Excluded content is an
+        # exclusion; reclassifying a loss would hide the continuity break.
+        if excluded and kind != "loss_notice":
             kind = "exclusion_notice"
         elif kind == "plugin_observation":
             plugin = _validate_plugin(observation)

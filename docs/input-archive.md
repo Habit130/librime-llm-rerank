@@ -501,6 +501,8 @@ The input path copies an owned snapshot and `try_lock`s the producer queue. It
 does not serialize, compress, connect, read, wait, or retry. The worker does
 transport. Retries of a retryable send are at most 3, on the worker. A failed
 loss-notice send is restored to that same bounded queue; it is not discarded.
+The collector keeps `observation_kind=loss_notice` even when the notice carries
+no content. It is not rewritten to an exclusion notice.
 After the retry cap, one continuity notice is held and delivered on the next
 successful policy exchange or content send. That is not a tight retry loop,
 and a generation change or abandon drops it instead of retargeting it. Queue

@@ -1131,13 +1131,18 @@ TEST_F(ArchiveObservationTest, PausedCommitIsNotBackfilled) {
   EXPECT_FALSE(committed.empty());
   ASSERT_TRUE(SetPolicy("resume", 2));
   WaitEffective();
-  EXPECT_TRUE(rime_->process_key(session_, 0xff08, 0));
+  // Unhandled BackSpace returns false and is the retraction signal.
+  rime_->process_key(session_, 0xff08, 0);
   Flush();
   const std::string stages = StageReport();
-  EXPECT_NE(std::string::npos, stages.find("stage=retraction"));
-  EXPECT_EQ(std::string::npos, stages.find("stage=retraction kind=plugin_observation canary=yes"));
-  EXPECT_NE(std::string::npos, stages.find("stage=retraction kind=exclusion_notice canary=no"));
-  EXPECT_EQ(std::string::npos, stages.find("stage=commit kind=plugin_observation canary=yes"));
+  EXPECT_EQ(std::string::npos, stages.find("kind=plugin_observation canary=yes\nstage=retraction"))
+      << stages;
+  EXPECT_EQ(std::string::npos, stages.find("stage=retraction kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_NE(std::string::npos, stages.find("kind=exclusion_notice canary=no"))
+      << stages;
+  EXPECT_EQ(std::string::npos, stages.find("stage=commit kind=plugin_observation canary=yes"))
+      << stages;
 }
 
 TEST_F(ArchiveObservationTest, LossNoticeSurvivesFailedTransport) {

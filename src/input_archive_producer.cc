@@ -662,7 +662,10 @@ struct InputArchiveProducer::Impl {
     loss.source_local_sequence = dropped.source_local_sequence;
     loss.process_id = dropped.process_id.empty() ? "loss" : dropped.process_id;
     loss.reason = reason;
-    loss.eligibility = "excluded";
+    // Keep the kind. Marking this excluded makes the collector rewrite it to
+    // an exclusion notice, which hides the continuity break.
+    loss.eligibility = "included";
+    loss.outcome = "unknown";
     loss.binding_generation = dropped.binding_generation;
     loss.budget_bytes = 128;
     losses.push_back(std::move(loss));
