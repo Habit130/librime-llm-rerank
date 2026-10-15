@@ -31,6 +31,8 @@ Release the workflow runs the model-free daemon and eval suites, builds with
 `BUILD_TEST=ON`, installs a pinned `rime/librime-predict` checkout so the C++
 prediction e2e can run, runs `llm_rerank_test`, and fails closed unless
 `lipo` reports both `arm64` and `x86_64`. A failed gate publishes no asset.
+The fingerprint, permission, path, and evidence limits of that gate are in
+`docs/model-free-gates.md`.
 Actions are pinned to commit SHAs; Boost and the librime deps archive are
 SHA-256 verified. Squirrel's `action-install.sh` downloads the artifact by
 tag and verifies its sha256 on the fast build path; the from-source build

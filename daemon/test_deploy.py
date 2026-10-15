@@ -19,6 +19,29 @@ CHECKOUT = os.path.dirname(HERE)
 HABIT_PATH = re.compile(r"/Users/habit")
 
 
+def _declared_from_record(record):
+    runtime = record["runtime"]
+    checkout = record["checkout"]
+    return {
+        checkout,
+        record["interpreter"],
+        record["model"],
+        record["socket"],
+        os.path.join(checkout, "daemon", "server.py"),
+        os.path.join(runtime, "llm-rerank.log"),
+        os.path.join(runtime, "llm-rerank.err"),
+        os.path.join(runtime, "facts"),
+    }
+
+
+def assert_only_declared_maintainer_paths(test, rendered, declared):
+    baked = [
+        path for path in deploy.maintainer_paths(rendered)
+        if path not in declared
+    ]
+    test.assertEqual([], baked)
+
+
 class PinAndTemplateTest(unittest.TestCase):
     def test_inference_pins_are_exact(self):
         path = os.path.join(HERE, "requirements-daemon.txt")
@@ -80,6 +103,80 @@ class PinAndTemplateTest(unittest.TestCase):
             self.assertIn(value, rendered)
         self.assertIn("--adapter", rendered)
         self.assertIn("LLM_RERANK_ADAPTER", rendered)
+
+    def test_render_plist_accepts_explicit_workspace_paths(self):
+        prefix = "/Users/habit/workspace"
+        values = {
+            "checkout": prefix + "/checkout",
+            "interpreter": prefix + "/checkout/daemon/.venv/bin/python",
+            "server": prefix + "/checkout/daemon/server.py",
+            "model": prefix + "/models/Qwen3-0.6B-Base",
+            "adapter": "",
+            "socket": prefix + "/run/llm-rerank.sock",
+            "log": prefix + "/run/llm-rerank.log",
+            "log_err": prefix + "/run/llm-rerank.err",
+            "facts_root": prefix + "/run/facts",
+        }
+        rendered = deploy.render_plist(
+            os.path.join(HERE, "com.squirrel.llm-rerank.plist"), values
+        )
+        self.assertNotRegex(rendered, r"__[A-Z0-9_]+__")
+        assert_only_declared_maintainer_paths(
+            self, rendered, set(deploy.declared_plist_values(values)))
+        for value in deploy.declared_plist_values(values):
+            self.assertIn(value, rendered)
+
+    def test_render_plist_rejects_unresolved_placeholder(self):
+        source = os.path.join(HERE, "com.squirrel.llm-rerank.plist")
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read() + "\n__NOT_A_DECLARED_VALUE__\n"
+        path = os.path.join(self._temp_dir(), "baked-placeholder.plist")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        values = {
+            "checkout": "/tmp/checkout",
+            "interpreter": "/tmp/python",
+            "server": "/tmp/server.py",
+            "model": "/tmp/model",
+            "adapter": "",
+            "socket": "/tmp/sock",
+            "log": "/tmp/out.log",
+            "log_err": "/tmp/err.log",
+            "facts_root": "/tmp/facts",
+        }
+        with self.assertRaisesRegex(
+                deploy.DeployError, "unresolved plist placeholders"):
+            deploy.render_plist(path, values)
+
+    def test_render_plist_rejects_undeclared_maintainer_path(self):
+        source = os.path.join(HERE, "com.squirrel.llm-rerank.plist")
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read().replace(
+                "</plist>",
+                "<string>/Users/habit/Models/baked-in</string>\n</plist>",
+            )
+        path = os.path.join(self._temp_dir(), "baked-habit.plist")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        values = {
+            "checkout": "/tmp/checkout",
+            "interpreter": "/tmp/python",
+            "server": "/tmp/server.py",
+            "model": "/tmp/model",
+            "adapter": "",
+            "socket": "/tmp/sock",
+            "log": "/tmp/out.log",
+            "log_err": "/tmp/err.log",
+            "facts_root": "/tmp/facts",
+        }
+        with self.assertRaisesRegex(
+                deploy.DeployError, "undeclared /Users/habit"):
+            deploy.render_plist(path, values)
+
+    def _temp_dir(self):
+        root = tempfile.mkdtemp(prefix="llm131-render-")
+        self.addCleanup(shutil.rmtree, root, True)
+        return root
 
     def test_render_plist_allows_empty_adapter(self):
         values = {
@@ -224,7 +321,11 @@ class IsolatedLifecycleTest(unittest.TestCase):
             self.assertIn("Version: 26.3", listing)
             with open(record["plist"], encoding="utf-8") as handle:
                 rendered = handle.read()
-            self.assertIsNone(HABIT_PATH.search(rendered))
+            assert_only_declared_maintainer_paths(
+                self, rendered, _declared_from_record(record))
+            self.assertIn(record["checkout"], rendered)
+            self.assertIn(record["interpreter"], rendered)
+            self.assertIn(record["socket"], rendered)
             info = os.lstat(os.path.dirname(record["socket"]))
             self.assertEqual(0o700, stat.S_IMODE(info.st_mode))
         finally:
@@ -247,7 +348,8 @@ class IsolatedLifecycleTest(unittest.TestCase):
             self.assertTrue(record["runtime"].startswith(work))
             with open(record["plist"], encoding="utf-8") as handle:
                 rendered = handle.read()
-            self.assertIsNone(HABIT_PATH.search(rendered))
+            assert_only_declared_maintainer_paths(
+                self, rendered, _declared_from_record(record))
             isolated_interpreter = os.path.join(
                 record["checkout"], "daemon", ".venv", "bin", "python"
             )

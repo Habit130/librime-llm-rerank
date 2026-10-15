@@ -91,9 +91,11 @@ python3 daemon/deploy.py render-plist \
 
 `deploy.py render-plist` substitutes `__ADAPTER__` and sets
 `LLM_RERANK_ADAPTER`. Isolated `verify` stays `--health-only` and does not
-need an adapter. Isolated render/verify refuse maintainer `/Users/habit`
-paths; the allocated-machine LaunchAgents plist is local, untracked, and
-carries the Established model/adapter pins.
+need an adapter. Isolated render/verify accept explicit declared paths
+even when they contain `/Users/habit`, and still refuse unresolved
+placeholders and undeclared baked-in `/Users/habit` paths. The
+allocated-machine LaunchAgents plist is local, untracked, and carries the
+Established model/adapter pins.
 
 Foreground start/health/stop remains the isolated and #184 proof path, not
 daily leave-on:

@@ -22,7 +22,11 @@ where each member contributes its as-is bytes in the fixed order DB, WAL,
 SHM and an absent sidecar contributes a zero length (so its absence is still
 covered by the fingerprint). The hash is computed from the SAME opened file
 descriptors that are copied, never from a re-stat of a path the user might
-have replaced between fingerprinting and copying (spec #57 seam 3).
+have replaced between fingerprinting and copying (spec #57 seam 3). Those
+descriptors are opened after quiesce. Sidecars that existed only because a
+live fact handle was open, and that SQLite removes when that handle closes,
+are absent at this boundary. A pre-quiesce directory snapshot is not
+substituted for it, and WAL/SHM are not omitted from the hash.
 
 Restore publishes a quarantine only inside the exclusive maintenance lease,
 after quiesce, and only after the fingerprint check passes. Any copy/verify/
