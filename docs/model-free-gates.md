@@ -75,7 +75,22 @@ python3 tools/check_model_free_gate_prerequisite.py \
   --root "$RUNTIME/contract" --report "$EVIDENCE/contract-report.json"
 ```
 
-Inherited model-only or optional skips in the full gate stay skips only when
-their own condition is unmet. They are not a blanket allowance, and they do
-not cover the required cases above. Identify each skip from the full-gate
-log. The gate makes no model, latency, or memory certification.
+Inherited model-only or optional skips stay skips only when their own
+condition is unmet. They are not a blanket allowance, and they do not cover
+the required cases above. On the Python 3.11.15 / SQLite 3.53.3 model-free
+interpreter, with MLX not installed and Apple vecLib present, the unmodified
+gate's skips are exactly:
+
+- `daemon/test_mlx.py` `MlxEquivalenceTests`, 13 cases:
+  `MLX not available; skipping MLX equivalence suite`. This is MLX
+  equivalence, not a maintenance, permission, or deploy case.
+- `eval/test_personal_lora_eval_objective.py` `BatchScoringTest`, 4 cases:
+  `the mlx runtime is not installed here`. This is the MLX batch scorer
+  against a numpy reference. It loads no model weights.
+- `daemon/test_accelerate.py` runs when vecLib is available. It is not a
+  skip on this host.
+- `eval/test_public_layer.py`
+  `test_committed_manifest_pins_and_counts_if_present` skips only when its
+  committed artifacts are absent. It ran here.
+
+The gate makes no model, latency, or memory certification.
