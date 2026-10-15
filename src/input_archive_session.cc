@@ -6,6 +6,7 @@
 
 #include <unistd.h>
 
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -22,6 +23,7 @@ namespace {
 std::mutex g_registry_mu;
 std::unordered_map<Engine*, std::pair<std::shared_ptr<InputArchiveSession>, int>>
     g_sessions;
+uint64_t g_next_source_ordinal = 0;
 
 bool SafeToken(const string& value) {
   if (value.empty() || value.size() > 128)
@@ -610,8 +612,11 @@ std::shared_ptr<InputArchiveSession> InputArchiveRegistry::Acquire(
     found->second.second += 1;
     return found->second.first;
   }
+  // Map size repeats ps<pid>e1 after sequential destroy/create and can
+  // collide with a live engine when a hole is reused. The ordinal is
+  // process-lifetime and only advances under the registry lock.
   string source = string("ps") + std::to_string(getpid()) + "e" +
-                  std::to_string(g_sessions.size() + 1);
+                  std::to_string(++g_next_source_ordinal);
   auto session = std::make_shared<InputArchiveSession>(socket_path, source);
   g_sessions[engine] = std::make_pair(session, 1);
   return session;

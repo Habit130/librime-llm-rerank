@@ -91,6 +91,27 @@ bool ExistingChainSafe(const string& path) {
     if (!is_leaf && !S_ISDIR(info.st_mode))
       return false;
   }
+  // Immediate parent and socket only. Ancestors above the archive root may
+  // be 0755; archive/safety.py likewise checks the root's parent ownership
+  // and then requires the root itself to be owner-only 0700. A world-writable
+  // or foreign parent can plant a collector before connect.
+  const string parent = path.substr(0, leaf);
+  struct stat parent_info;
+  if (lstat(parent.c_str(), &parent_info) != 0)
+    return false;
+  if (S_ISLNK(parent_info.st_mode) || !S_ISDIR(parent_info.st_mode))
+    return false;
+  if (parent_info.st_uid != static_cast<uid_t>(geteuid()) ||
+      (parent_info.st_mode & 077) != 0)
+    return false;
+  struct stat leaf_info;
+  if (lstat(path.c_str(), &leaf_info) != 0)
+    return errno == ENOENT;
+  if (S_ISLNK(leaf_info.st_mode) || !S_ISSOCK(leaf_info.st_mode))
+    return false;
+  if (leaf_info.st_uid != static_cast<uid_t>(geteuid()) ||
+      (leaf_info.st_mode & 077) != 0)
+    return false;
   return true;
 }
 

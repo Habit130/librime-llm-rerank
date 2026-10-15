@@ -421,8 +421,12 @@ Both are required before any candidate or commit text is admitted:
 
 1. `llm_rerank/input_archive/socket` in the schema, an absolute local socket.
    There is no HOME default. A relative path, a symlink component, or a known
-   synchronized destination stays off. The scoring `socket_path` is not this
-   socket.
+   synchronized destination stays off. Before connect, the socket's immediate
+   parent must be an owner-only directory (no group or other permission) and,
+   if the socket already exists, it must be an owner socket with no group or
+   other permission. A world-writable or foreign parent is not a collector.
+   Ancestors above that parent are checked only for symlinks and denied names.
+   The scoring `socket_path` is not this socket.
 2. A fresh observation that the collector desired policy is `enabled`. Initial,
    unknown, stale, `off`, and `paused` observations do not admit text. Freshness
    is 2000 ms from the producer's last policy poll. The poll runs on the worker,
@@ -430,11 +434,23 @@ Both are required before any candidate or commit text is admitted:
    newer observation.
 
 `llm_rerank` and `llm_rerank_recorder` must both be registered for the full
-passive path. The filter observes already-materialized competition and actual
-emission. The recorder observes select, commit, abort, update, and known
+passive path. The filter observes already-materialized competition and the
+emission queue before it is spliced into the menu cache, so `emission_order`
+is the order actually handed to the menu. With reranking off, the demand
+wrapper does not pull upstream at construction; the menu's Peek/Next is the
+pull. The recorder observes select, commit, abort, update, and known
 immediate retraction through the existing notifiers. Subscriptions are released
 with the owning component. This is not a new frontend integration and not
 SYS-05/16 certification.
+
+Only `luna_pinyin` content is admitted. Production direct input is
+`ascii_composer` returning the key unhandled while `ascii_mode` is on and
+there is no composition; that key never becomes an engine commit, so
+`ObserveCommit` does not archive it. This is not a character-script filter.
+Return raw finalization of a Chinese composition remains an engine commit
+observation. Engine recreation allocates a new `ps<pid>eN` source instance
+from a process-lifetime counter. Destroying an engine and creating another
+does not reuse the old id.
 
 ### Representation
 
@@ -493,8 +509,8 @@ frontend evidence only.
 Pause survives producer recreation because policy is durable in the collector.
 Resume does not backfill an excluded prefix. Retarget and destruction drop
 queued snapshots instead of sending them to a new socket. Engine recreation
-uses a new source instance. Schema, secure input, and an ineligible prefix cut
-continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
+uses a new process-lifetime source instance; a destroyed engine's id is not
+recycled. Schema, secure input, and an ineligible prefix cut continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
 resolved; if that gate cannot be resolved, text is not admitted. That is not a
 universal sensitive detector. Invalid frontend association is not sensitivity
 clearance. Archive failure must not terminate input: sockets set

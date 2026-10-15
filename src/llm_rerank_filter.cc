@@ -3,6 +3,7 @@
 // Distributed under the BSD License
 //
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -295,9 +296,11 @@ bool LlmRerankTranslation::Replenish() {
     // Reranking disabled: emit in original order, no synchronous scoring.
     for (auto& c : buffer)
       result.push_back(c);
-    cache_.splice(cache_.end(), result);
+    // Observe while result still holds the emitted nodes. splice moves them
+    // into cache_ and would otherwise record an empty emission order.
     if (archive_session_)
       ObserveWindow(buffer, result, truncated, false);
+    cache_.splice(cache_.end(), result);
     return !cache_.empty();
   }
   bool reranked = false;
@@ -330,9 +333,9 @@ bool LlmRerankTranslation::Replenish() {
           exchange.succeeded ? "issued_succeeded" : "issued_failed";
     }
   }
-  cache_.splice(cache_.end(), result);
   if (archive_session_)
     ObserveWindow(buffer, result, truncated, reranked);
+  cache_.splice(cache_.end(), result);
   return !cache_.empty();
 }
 
@@ -779,6 +782,9 @@ string LlmRerankFilter::BuildContext() {
   return suffix ? *suffix : result;
 }
 
+std::atomic<int> g_demand_constructor_pulls{0};
+std::atomic<int> g_demand_consumer_pulls{0};
+
 class ArchiveDemandTranslation : public Translation {
  public:
   ArchiveDemandTranslation(an<Translation> upstream,
@@ -787,13 +793,9 @@ class ArchiveDemandTranslation : public Translation {
       : upstream_(std::move(upstream)),
         session_(std::move(session)),
         engine_(engine) {
-    if (!upstream_ || upstream_->exhausted()) {
-      set_exhausted(true);
-      return;
-    }
-    auto current = upstream_->Peek();
-    if (current && session_)
-      session_->ObserveDemandCandidate(engine_, current);
+    // Do not peek. This wrapper sits after uniquifier; a construction-time
+    // pull dedups against a still-empty emitted list. The menu's first Peek
+    // is the ordinary demand.
   }
 
   ~ArchiveDemandTranslation() override {
@@ -802,26 +804,55 @@ class ArchiveDemandTranslation : public Translation {
   }
 
   bool Next() override {
+    g_demand_consumer_pulls.fetch_add(1, std::memory_order_relaxed);
     if (!upstream_ || !upstream_->Next()) {
       set_exhausted(true);
       if (session_)
         session_->NoteDemandExhausted(engine_, true);
+      noted_.reset();
       return false;
     }
-    if (session_)
-      session_->ObserveDemandCandidate(engine_, upstream_->Peek());
+    NoteHead();
     return true;
   }
 
   an<Candidate> Peek() override {
-    return upstream_ ? upstream_->Peek() : nullptr;
+    g_demand_consumer_pulls.fetch_add(1, std::memory_order_relaxed);
+    if (!upstream_) {
+      set_exhausted(true);
+      return nullptr;
+    }
+    auto current = upstream_->Peek();
+    if (!current && upstream_->exhausted())
+      set_exhausted(true);
+    NoteHead();
+    return current;
   }
 
  private:
+  void NoteHead() {
+    if (!upstream_ || !session_)
+      return;
+    auto current = upstream_->Peek();
+    if (!current || current == noted_)
+      return;
+    noted_ = current;
+    session_->ObserveDemandCandidate(engine_, current);
+  }
+
   an<Translation> upstream_;
   std::shared_ptr<InputArchiveSession> session_;
+  an<Candidate> noted_;
   Engine* engine_ = nullptr;
 };
+
+extern "C" int rime_llm_rerank_archive_demand_constructor_pulls_for_testing(void) {
+  return g_demand_constructor_pulls.load(std::memory_order_relaxed);
+}
+
+extern "C" int rime_llm_rerank_archive_demand_consumer_pulls_for_testing(void) {
+  return g_demand_consumer_pulls.load(std::memory_order_relaxed);
+}
 
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
                                        CandidateList* candidates) {

@@ -6,6 +6,7 @@
 // Fixture roots stay in the ticket workspace. This is not a latency certification.
 //
 #include <dlfcn.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -331,7 +332,8 @@ class ArchiveObservationTest : public ::testing::Test {
     std::ofstream out(workspace_ + "/rime/" + file + ".schema.yaml");
     out << "schema:\n  schema_id: " << schema_id
         << "\n  name: Archive Fixture\n  version: \"1.0\"\n"
-        << "engine:\n  processors:\n    - llm_rerank_recorder\n    - speller\n"
+        << "engine:\n  processors:\n    - ascii_composer\n"
+        << "    - llm_rerank_recorder\n    - speller\n"
         << "    - selector\n    - express_editor\n  segmentors:\n"
         << "    - ascii_segmentor\n    - abc_segmentor\n    - fallback_segmentor\n"
         << "  translators:\n    - script_translator\n  filters:\n"
@@ -408,6 +410,34 @@ class ArchiveObservationTest : public ::testing::Test {
         << "print(json.dumps(client.status(), sort_keys=True))\n"
         << "print('---PRIVATE---')\n"
         << "print(json.dumps(client.query('timeline', page_size=50, private_detail=False), sort_keys=True))\n";
+    out.close();
+    return Capture(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                   " /usr/bin/python3 " + ShellQuote(driver) + " " + ShellQuote(sock_));
+  }
+
+  int DemandPulls(const char* symbol) {
+    auto fn = DylibSymbol<int (*)()>(symbol);
+    return fn ? fn() : -1;
+  }
+
+  std::string EmissionOrders() {
+    const std::string driver = workspace_ + "/emission_query.py";
+    std::ofstream out(driver);
+    out << "import json, sys\nfrom archive import Client\n"
+        << "client = Client(sys.argv[1])\n"
+        << "body = client.query('timeline', page_size=50).get('body') or {}\n"
+        << "orders = []\n"
+        << "for row in body.get('observations') or []:\n"
+        << "    if row.get('plugin_stage') != 'emission':\n"
+        << "        continue\n"
+        << "    pid = row.get('process_id')\n"
+        << "    detail = client.query('process', process_id=pid, private_detail=True, page_size=50)\n"
+        << "    for item in (detail.get('body') or {}).get('observations') or []:\n"
+        << "        if item.get('plugin_stage') != 'emission':\n"
+        << "            continue\n"
+        << "        payload = item.get('payload') or {}\n"
+        << "        orders.append(payload.get('emission_order'))\n"
+        << "print(json.dumps(orders))\n";
     out.close();
     return Capture(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
                    " /usr/bin/python3 " + ShellQuote(driver) + " " + ShellQuote(sock_));
@@ -696,6 +726,175 @@ TEST_F(ArchiveObservationTest, AbsentCollectorDoesNotBlockCommit) {
   Open("luna_pinyin");
   Type("houce");
   EXPECT_TRUE(FinishWithinWatchdog([&] { Commit(); }));
+}
+
+TEST_F(ArchiveObservationTest, EmissionOrderIsTheMenuQueue) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("shijie");
+  EXPECT_GT(DemandMenu(), 1);
+  Flush();
+  const std::string orders = EmissionOrders();
+  EXPECT_NE(std::string::npos, orders.find("[0"));
+  EXPECT_EQ(std::string::npos, orders.find("[]"));
+  const std::string ordinary = Query(false);
+  EXPECT_EQ(std::string::npos, ordinary.find("\"apply_state\": \"fallback\""));
+}
+
+TEST_F(ArchiveObservationTest, RerankOffDoesNotPullBeforeMenuDemand) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("archive_rerank_off");
+  WaitEffective();
+  const int ctor = DemandPulls(
+      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing");
+  const int consumer = DemandPulls(
+      "rime_llm_rerank_archive_demand_consumer_pulls_for_testing");
+  ASSERT_GE(ctor, 0);
+  Type("shijie");
+  EXPECT_EQ(ctor, DemandPulls(
+                      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing"));
+  EXPECT_GT(DemandMenu(), 0);
+  EXPECT_EQ(ctor, DemandPulls(
+                      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing"));
+  EXPECT_GT(DemandPulls(
+                "rime_llm_rerank_archive_demand_consumer_pulls_for_testing"),
+            consumer);
+  // Destroy the demand translation so its destructor flushes the window
+  // the menu already pulled. Construction still must not have pulled.
+  Commit();
+  Flush();
+  // archive_rerank_off is not luna_pinyin, so the pulled window is an
+  // exclusion, not an included emission. The counters are the demand proof.
+  EXPECT_EQ(ctor, DemandPulls(
+                      "rime_llm_rerank_archive_demand_constructor_pulls_for_testing"));
+}
+
+TEST_F(ArchiveObservationTest, RecreatedEngineGetsANewSourceId) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("shijie");
+  Commit();
+  Flush();
+  const std::string first = Query(false);
+  const std::string marker = "\"source_instance_id\": \"";
+  const auto first_at = first.find(marker);
+  ASSERT_NE(std::string::npos, first_at);
+  const auto first_end = first.find('"', first_at + marker.size());
+  const std::string first_id =
+      first.substr(first_at + marker.size(), first_end - first_at - marker.size());
+  ASSERT_NE(std::string::npos, first_id.find("e"));
+  rime_->destroy_session(session_);
+  session_ = 0;
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("nihao");
+  Commit();
+  Flush();
+  const std::string second = Query(false);
+  EXPECT_NE(std::string::npos, second.find(marker + first_id));
+  int seen = 0;
+  for (std::string::size_type at = 0;
+       (at = second.find(marker, at)) != std::string::npos;) {
+    const auto end = second.find('"', at + marker.size());
+    const std::string id =
+        second.substr(at + marker.size(), end - at - marker.size());
+    if (id != first_id && id.find("ps") == 0)
+      ++seen;
+    at = end;
+  }
+  EXPECT_GE(seen, 1) << second;
+}
+
+TEST_F(ArchiveObservationTest, DirectInputDoesNotAdmitRawLatin) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  rime_->set_option(session_, "ascii_mode", True);
+  EXPECT_FALSE(rime_->process_key(session_, 'q', 0));
+  Flush();
+  const std::string during = PrivateQuery();
+  EXPECT_EQ(std::string::npos, during.find("\"payload_text\": \"q\""));
+  rime_->set_option(session_, "ascii_mode", False);
+  Type("shijie");
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  Flush();
+  const std::string after = PrivateQuery();
+  EXPECT_NE(std::string::npos, after.find("\\u4e16\\u754c"));
+}
+
+TEST_F(ArchiveObservationTest, WorldWritableParentDoesNotReceiveCommit) {
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const std::string dir = workspace_ + "/open";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  ASSERT_EQ(0, chmod(dir.c_str(), 0777));
+  const std::string leaf = "c.sock";
+  fs::remove(dir + "/" + leaf);
+  std::atomic<int> accepts{0};
+  std::atomic<bool> stop{false};
+  std::thread listener([&] {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+      return;
+    char previous[PATH_MAX];
+    if (!getcwd(previous, sizeof(previous)) || chdir(dir.c_str()) != 0) {
+      close(fd);
+      return;
+    }
+    sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, leaf.data(), leaf.size());
+    const int bound = bind(fd, reinterpret_cast<sockaddr*>(&addr),
+                           static_cast<socklen_t>(sizeof(addr)));
+    chdir(previous);
+    if (bound != 0) {
+      close(fd);
+      return;
+    }
+    chmod((dir + "/" + leaf).c_str(), 0666);
+    listen(fd, 4);
+    while (!stop.load()) {
+      fd_set reads;
+      FD_ZERO(&reads);
+      FD_SET(fd, &reads);
+      timeval tv{0, 50000};
+      if (select(fd + 1, &reads, nullptr, nullptr, &tv) <= 0)
+        continue;
+      int client = accept(fd, nullptr, nullptr);
+      if (client >= 0) {
+        accepts.fetch_add(1);
+        close(client);
+      }
+    }
+    close(fd);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  auto retarget = DylibSymbol<void (*)(const char*)>(
+      "rime_llm_rerank_archive_retarget_for_testing");
+  ASSERT_NE(nullptr, retarget);
+  retarget((dir + "/" + leaf).c_str());
+  Poll();
+  Type("houce");
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  Flush();
+  stop = true;
+  if (listener.joinable())
+    listener.join();
+  EXPECT_EQ(0, accepts.load());
+  const std::string detail = PrivateQuery();
+  EXPECT_EQ(std::string::npos, detail.find("\\u5019\\u6d4b"));
 }
 
 TEST_F(ArchiveObservationTest, SecureInputOmitsText) {
