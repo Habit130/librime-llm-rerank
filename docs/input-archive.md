@@ -517,11 +517,14 @@ No quiet-machine or plugin-cost certification is claimed. #189 timing is
 frontend evidence only.
 
 Pause survives producer recreation because policy is durable in the collector.
-A commit or cancellation while the producer is not locally effective — paused,
-off, stale, or not yet observed — is an excluded prefix. Its text is not
-retained for a later retraction, and resume does not backfill that text.
-Resume does not backfill any other excluded prefix either. Retarget and
-destruction drop queued snapshots instead of sending them to a new socket. Engine recreation
+A temporary selection observed while the producer is not locally effective —
+paused, off, stale, or not yet observed — is an excluded prefix, exactly like
+a window or demand observation: the tentative selection is cleared, its text
+is not admitted, and resume does not backfill it into a later commit. A commit
+or cancellation while the producer is not locally effective follows the same
+rule: its text is not retained for a later retraction, and resume does not
+backfill that text or any other excluded prefix. Retarget and destruction drop
+queued snapshots instead of sending them to a new socket. Engine recreation
 uses a new process-lifetime source instance; a destroyed engine's id is not
 recycled. Schema, secure input, and an ineligible prefix cut continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
 resolved; if that gate cannot be resolved, text is not admitted. That is not a
