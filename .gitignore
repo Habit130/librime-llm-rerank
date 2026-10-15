@@ -7,3 +7,5 @@ daemon/.local-run/
 .venv-release/
 .venv-embeddings/
 .venv-ac190/
+.venv-mfg201/
+.venv-ac190-a3/

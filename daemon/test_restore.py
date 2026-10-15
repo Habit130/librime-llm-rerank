@@ -1634,6 +1634,31 @@ class RestoreCliTests(RestoreEnv):
         self.assertTrue(ready.wait(timeout=10))
         self._threads.append(thread)
 
+    def _directory_fingerprint(self):
+        """Pre-quiesce directory listing, including sidecars an open handle
+        created. This is not the protected #57 expectation."""
+        members = {}
+        for member in quarantine.QUARANTINE_MEMBERS:
+            path = os.path.join(self.root, member)
+            if os.path.exists(path):
+                with open(path, "rb") as stream:
+                    members[member] = stream.read()
+        return quarantine.fingerprint_bytes(members)
+
+    def _post_quiesce_fingerprint(self):
+        """Fingerprint at the post-quiesce opened-descriptor boundary.
+
+        The live control server holds a fact handle, so SQLite has created
+        WAL/SHM. Quiesce closes that handle. Python SQLite 3.53.3 then
+        removes those sidecars and does not rewrite the durable DB. The
+        product hashes the members opened after that close. A directory
+        snapshot taken while the handle is still open is a different set
+        and must not be supplied as the expectation.
+        """
+        with open(os.path.join(self.root, "facts.sqlite3"), "rb") as stream:
+            db_bytes = stream.read()
+        return quarantine.fingerprint_bytes({quarantine.FACTS_DB: db_bytes})
+
     def test_cli_restore_discard_current_end_to_end(self):
         live = self.make_live_store(seed=True)
         backup_root = os.path.join(self._tmp, "BackupMachineCli1")
@@ -1786,10 +1811,8 @@ class RestoreCliTests(RestoreEnv):
         with open(db_path, "rb+") as stream:
             stream.seek(4096)
             stream.write(b"\xff\xff\xff\xff")
-        fingerprint = quarantine.fingerprint_bytes({
-            member: open(os.path.join(self.root, member), "rb").read()
-            for member in quarantine.QUARANTINE_MEMBERS
-            if os.path.exists(os.path.join(self.root, member))})
+        fingerprint = self._post_quiesce_fingerprint()
+        self.assertNotEqual(fingerprint, self._directory_fingerprint())
         backup_root = os.path.join(self._tmp, "BackupMachineCli57a")
         backup_identity = self.helper.create_empty(backup_root)
         self.seed_backup(backup_root, backup_identity["store_epoch"])
@@ -1901,10 +1924,8 @@ class RestoreCliTests(RestoreEnv):
         with open(db_path, "rb+") as stream:
             stream.seek(4096)
             stream.write(b"\xff\xff\xff\xff")
-        fingerprint = quarantine.fingerprint_bytes({
-            member: open(os.path.join(self.root, member), "rb").read()
-            for member in quarantine.QUARANTINE_MEMBERS
-            if os.path.exists(os.path.join(self.root, member))})
+        fingerprint = self._post_quiesce_fingerprint()
+        self.assertNotEqual(fingerprint, self._directory_fingerprint())
         backup_root = os.path.join(self._tmp, "BackupMachineCli57e")
         backup_identity = self.helper.create_empty(backup_root)
         self.seed_backup(backup_root, backup_identity["store_epoch"])
@@ -1919,6 +1940,37 @@ class RestoreCliTests(RestoreEnv):
         self.assertEqual(0, code, stderr)
         self.assertIn("restore restored", stdout)
         self.assertIn("quarantined current store", stdout)
+
+    def test_cli_pre_quiesce_sidecar_snapshot_refused(self):
+        # The open-handle directory listing includes WAL/SHM that quiesce
+        # removes. That snapshot must still be refused, with no replace and
+        # no quarantine, so the post-quiesce check is observable.
+        self.make_live_store(seed=True)
+        self.start_control_server()
+        db_path = os.path.join(self.root, "facts.sqlite3")
+        with open(db_path, "rb+") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff\xff\xff\xff")
+        snapshot = self._directory_fingerprint()
+        self.assertNotEqual(snapshot, self._post_quiesce_fingerprint())
+        with open(db_path, "rb") as stream:
+            db_bytes = stream.read()
+        backup_root = os.path.join(self._tmp, "BackupMachineCli57f")
+        backup_identity = self.helper.create_empty(backup_root)
+        self.seed_backup(backup_root, backup_identity["store_epoch"])
+        backup, _result = self.make_backup_from_store(backup_root)
+        code, stdout, stderr = self.run_cli(
+            "restore", "--from", backup, "--discard-current",
+            "--yes", "--accept-unreadable-current",
+            "--expect-current-fingerprint", snapshot, "--json",
+            timeout=120)
+        self.assertEqual(1, code)
+        self.assertIn("fingerprint_mismatch", stdout + stderr)
+        with open(db_path, "rb") as stream:
+            self.assertEqual(db_bytes, stream.read())
+        rc, out, err = self.run_cli("quarantine", "list", "--json")
+        self.assertEqual(0, rc, err)
+        self.assertEqual(0, json.loads(out)["count"])
 
 
 if __name__ == "__main__":

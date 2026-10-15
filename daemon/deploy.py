@@ -4,7 +4,9 @@
 Project-local venv, pinned inference deps, and parameterized paths. Isolated
 verification uses a health-only stand-in when a real model directory is not
 configured. This tool never writes ~/Library/Rime or the live Squirrel
-semantic-memory root unless those paths are passed explicitly.
+semantic-memory root unless those paths are passed explicitly. Explicit
+declared paths may contain `/Users/habit`; an unresolved placeholder or a
+`/Users/habit` path that was not one of those values is still rejected.
 """
 
 import argparse
@@ -27,6 +29,12 @@ PLIST_NAME = "com.squirrel.llm-rerank.plist"
 SERVER_NAME = "server.py"
 RUNTIME_NAME = ".local-run"
 PLACEHOLDER = re.compile(r"__[A-Z0-9_]+__")
+MAINTAINER_PREFIX = "/Users/habit"
+_PATH_BOUNDARY = set(" \t\n\r\"'<>")
+_DECLARED_PATH_KEYS = (
+    "checkout", "interpreter", "server", "model", "adapter",
+    "socket", "log", "log_err", "facts_root",
+)
 MIN_PYTHON = (3, 10)
 HEALTH_REQUEST = {
     "version": 2,
@@ -227,6 +235,49 @@ def paths_from_args(args):
     }
 
 
+def maintainer_paths(text):
+    """Return each `/Users/habit...` path token in `text`.
+
+    A token ends at XML or shell whitespace, so a declared value cannot hide
+    a longer baked-in path that merely shares its prefix.
+    """
+    found = []
+    start = 0
+    while True:
+        index = text.find(MAINTAINER_PREFIX, start)
+        if index < 0:
+            return found
+        end = index
+        while end < len(text) and text[end] not in _PATH_BOUNDARY:
+            end += 1
+        found.append(text[index:end])
+        start = end
+
+
+def declared_plist_values(values):
+    """Explicit paths the caller supplied for placeholder substitution."""
+    declared = []
+    for key in _DECLARED_PATH_KEYS:
+        value = values.get(key) or ""
+        if value:
+            declared.append(value)
+    return declared
+
+
+def reject_undeclared_maintainer_paths(rendered, values):
+    """Refuse a leftover maintainer path that was not an explicit argument.
+
+    An explicit checkout, interpreter, socket, or other declared value may
+    live under `/Users/habit` without being an unexpanded template default.
+    A hardcoded path that is not one of those values is still rejected.
+    """
+    declared = set(declared_plist_values(values))
+    baked = [path for path in maintainer_paths(rendered) if path not in declared]
+    if baked:
+        raise DeployError(
+            "rendered plist contains an undeclared /Users/habit path")
+
+
 def render_plist(template_path, values):
     with open(template_path, encoding="utf-8") as handle:
         text = handle.read()
@@ -249,8 +300,7 @@ def render_plist(template_path, values):
     leftover = PLACEHOLDER.findall(rendered)
     if leftover:
         raise DeployError("unresolved plist placeholders: %s" % leftover)
-    if "/Users/habit" in rendered:
-        raise DeployError("rendered plist still contains /Users/habit")
+    reject_undeclared_maintainer_paths(rendered, values)
     return rendered
 
 
@@ -545,8 +595,7 @@ def isolated_verify(source_checkout, work_dir=None, install_pins=True,
             cmd_render_plist(ns)
             with open(ns.output, encoding="utf-8") as handle:
                 rendered = handle.read()
-            if "/Users/habit" in rendered:
-                raise DeployError("rendered plist contains /Users/habit")
+            reject_undeclared_maintainer_paths(rendered, paths_from_args(ns))
             for token in (
                 ns.checkout, ns.interpreter, ns.model, ns.log, ns.socket
             ):
