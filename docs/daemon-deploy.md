@@ -71,7 +71,11 @@ isolated verification path. Owner-authorized daily leave-on (Squirrel#186)
 installs the phase-1 job with `RunAtLoad` / `KeepAlive`, the Established
 model/adapter pins, lazy load, and `IDLE_TIMEOUT=300`; see
 `docs/personal-lora-live.md`. Merge does not self-enable. Isolated
-render/verify still refuse maintainer `/Users/habit` paths.
+render/verify still refuse unresolved placeholders and any `/Users/habit`
+path that was not an explicit declared value. An explicit checkout,
+interpreter, model, log, socket, or facts path under the owner workspace is
+not an unexpanded maintainer default merely because its text contains
+`/Users/habit`.
 
 ## Isolated verification
 

@@ -1,6 +1,7 @@
 import json
 import os
 import socket
+import stat
 import tempfile
 import threading
 import unittest
@@ -57,14 +58,22 @@ class ControlTest(unittest.TestCase):
             left.close()
 
     def test_rejects_non_owner_only_or_symlinked_control_root(self):
+        # mkdir(mode) is masked by umask, so the fixture sets and asserts the
+        # actual mode. Both umask 077 and 022 must see the same permissions.
         with tempfile.TemporaryDirectory() as temp:
             root = os.path.join(temp, "root")
-            os.mkdir(root, 0o755)
+            os.mkdir(root)
+            os.chmod(root, 0o755)
+            self.assertEqual(0o755, stat.S_IMODE(os.lstat(root).st_mode))
             with self.assertRaisesRegex(Exception, "control_root_unsafe"):
                 control.validate_control_path(os.path.join(root, "control.sock"))
             os.chmod(root, 0o700)
+            self.assertEqual(0o700, stat.S_IMODE(os.lstat(root).st_mode))
+            control.validate_control_path(os.path.join(root, "control.sock"))
             target = os.path.join(temp, "target")
-            os.mkdir(target, 0o700)
+            os.mkdir(target)
+            os.chmod(target, 0o700)
+            self.assertEqual(0o700, stat.S_IMODE(os.lstat(target).st_mode))
             linked = os.path.join(temp, "linked")
             os.symlink(target, linked)
             with self.assertRaisesRegex(Exception, "control_root"):

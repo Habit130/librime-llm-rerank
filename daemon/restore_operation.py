@@ -44,7 +44,13 @@ Health contract (spec #43 / #57):
   computed from the already-opened DB/WAL/SHM descriptors and the as-is
   bytes are copied into `quarantine/<operation_id>/`, verified and fsynced
   BEFORE the replace; any fingerprint mismatch or quarantine failure aborts
-  with no replace and no successful-looking quarantine.
+  with no replace and no successful-looking quarantine. The member set is
+  whatever still exists after the fact handle closes. On Python SQLite
+  3.53.3 that close removes WAL/SHM the open handle created and does not
+  rewrite the durable DB, so a pre-quiesce directory listing that includes
+  those sidecars is not the protected expectation and must not be treated
+  as equivalent. Absent sidecars still contribute a zero length; they are
+  not dropped from the hash to force a match.
 - A truly missing store is restored over ONLY with `--expect-no-store` (a
   distinct branch that never quarantines and never satisfies an unreadable
   file).
