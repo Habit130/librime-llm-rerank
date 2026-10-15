@@ -35,6 +35,12 @@ namespace {
 const char* kCanary = "候测";
 const int kWatchdogMs = 2000;
 
+// The retained-selection guard selects one segment while effective, then
+// materializes a second segment, pauses, and selects "拟好" (second candidate
+// of the prepared "ni hao" segment) while ineffective. The later single-key
+// confirm/commit produces the multi-segment commit "时界拟好".
+const char* kRetainedSelectionCommit = "时界拟好";
+
 std::string Workspace() {
   const char* env = std::getenv("LLM_RERANK_ARCHIVE_WORKSPACE");
   if (env && *env)
@@ -649,6 +655,40 @@ class ArchiveObservationTest : public ::testing::Test {
     return text;
   }
 
+  std::string ReadCommitText() {
+    RIME_STRUCT(RimeCommit, commit);
+    std::string text;
+    if (rime_->get_commit(session_, &commit) && commit.text)
+      text = commit.text;
+    rime_->free_commit(&commit);
+    return text;
+  }
+
+  // Content-free per-row flags: which stored observations carry the full
+  // multi-segment commit text as their own payload. Ordinary output only.
+  std::string CommitCarryReport() {
+    const std::string driver = workspace_ + "/commit_carry.py";
+    std::ofstream out(driver);
+    out << "import json, sys\nfrom archive import Client\n"
+        << "client = Client(sys.argv[1])\n"
+        << "marker = " << "\"时界拟好\"" << "\n"
+        << "body = client.query('timeline', page_size=50).get('body') or {}\n"
+        << "for row in body.get('observations') or []:\n"
+        << "    pid = row.get('process_id') or ''\n"
+        << "    detail = client.query('process', process_id=pid, private_detail=True, page_size=50)\n"
+        << "    for item in (detail.get('body') or {}).get('observations') or []:\n"
+        << "        if item.get('source_local_sequence') != row.get('source_local_sequence'):\n"
+        << "            continue\n"
+        << "        stage = item.get('plugin_stage') or '-'\n"
+        << "        kind = item.get('observation_kind') or '-'\n"
+        << "        text = ((item.get('payload') or {}).get('text') or '')\n"
+        << "        print('stage=%s kind=%s carried=%s' % (stage, kind, 'yes' if text == marker else 'no'))\n";
+    out.close();
+    return Capture(std::string("PYTHONPATH=") + ShellQuote(LLM_RERANK_SOURCE_DIR) +
+                   " /usr/bin/python3 " + ShellQuote(driver) + " " +
+                   ShellQuote(sock_));
+  }
+
   bool FinishWithinWatchdog(const std::function<void()>& op) {
     std::atomic<bool> done{false};
     std::atomic<bool> fired{false};
@@ -1143,6 +1183,101 @@ TEST_F(ArchiveObservationTest, PausedCommitIsNotBackfilled) {
       << stages;
   EXPECT_EQ(std::string::npos, stages.find("stage=commit kind=plugin_observation canary=yes"))
       << stages;
+}
+
+TEST_F(ArchiveObservationTest, PausedSelectionIsNotBackfilled) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  // express_editor commits as soon as a selection completes the composition,
+  // so retaining a selection across the pause needs the non-auto-commit
+  // confirm/commit flow that fluid_editor uses. The engine option is the only
+  // change; keys, session, plugin and collector are the production path.
+  rime_->set_option(session_, "_auto_commit", False);
+  // First segment selected while effective; its window is observed.
+  Type("shijie");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  // Second segment materialized while the policy is still effective.
+  Type("nihao");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(SetPolicy("pause", 1));
+  ASSERT_TRUE(WaitNotEffective());
+  // Temporary selection while ineffective: the segment is still selected by
+  // the engine, but it must not survive into the archive commit below.
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  ASSERT_TRUE(SetPolicy("resume", 2));
+  WaitEffective();
+  // A single confirm/commit key commits the completed two-segment
+  // composition: "时界拟好", which includes the paused-period selection.
+  ASSERT_TRUE(rime_->process_key(session_, ' ', 0));
+  const std::string committed = ReadCommitText();
+  EXPECT_FALSE(committed.empty());
+  EXPECT_TRUE(committed == kRetainedSelectionCommit) << "unexpected commit text";
+  Flush();
+  const std::string carry = CommitCarryReport();
+  EXPECT_EQ(std::string::npos, carry.find("carried=yes")) << carry;
+  const std::string detail = PrivateQuery();
+  EXPECT_NE(std::string::npos, detail.find("exclusion_notice"));
+}
+
+TEST_F(ArchiveObservationTest, StaleSelectionIsNotBackfilled) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  rime_->set_option(session_, "_auto_commit", False);
+  Type("shijie");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  Type("nihao");
+  EXPECT_GT(DemandMenu(), 0);
+  // Stop the collector so the producer's policy observation goes stale
+  // (freshness is 2000 ms), select, then recover.
+  StopCollectorKeepRoot();
+  std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+  ASSERT_TRUE(WaitNotEffective());
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  ASSERT_TRUE(StartCollectorInPlace());
+  WaitEffective();
+  ASSERT_TRUE(rime_->process_key(session_, ' ', 0));
+  const std::string committed = ReadCommitText();
+  EXPECT_FALSE(committed.empty());
+  EXPECT_TRUE(committed == kRetainedSelectionCommit) << "unexpected commit text";
+  Flush();
+  const std::string carry = CommitCarryReport();
+  EXPECT_EQ(std::string::npos, carry.find("carried=yes")) << carry;
+  const std::string detail = PrivateQuery();
+  EXPECT_NE(std::string::npos, detail.find("exclusion_notice"));
+}
+
+TEST_F(ArchiveObservationTest, EffectiveSelectionCommitIsIncluded) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  rime_->set_option(session_, "_auto_commit", False);
+  Type("shijie");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  Type("nihao");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(rime_->process_key(session_, '2', 0));
+  ASSERT_TRUE(rime_->process_key(session_, ' ', 0));
+  const std::string committed = ReadCommitText();
+  EXPECT_FALSE(committed.empty());
+  EXPECT_TRUE(committed == kRetainedSelectionCommit) << "unexpected commit text";
+  Flush();
+  const std::string carry = CommitCarryReport();
+  EXPECT_NE(std::string::npos,
+            carry.find("stage=commit kind=plugin_observation carried=yes"))
+      << carry;
+  const std::string detail = PrivateQuery();
+  EXPECT_NE(std::string::npos, detail.find("plugin_temporary_selection_observed"));
 }
 
 TEST_F(ArchiveObservationTest, LossNoticeSurvivesFailedTransport) {

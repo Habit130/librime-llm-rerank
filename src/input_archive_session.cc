@@ -403,8 +403,14 @@ void InputArchiveSession::ObserveTemporarySelection(Engine* engine, Context* ctx
     return;
   string schema;
   bool secure = false;
-  if (!ContentEligible(engine, &schema, &secure) || content_excluded_) {
-    AdmitExclusion(engine, secure ? "secure_input" : "excluded_prefix");
+  // An ineffective policy is an excluded prefix, exactly like the window and
+  // demand paths: clear the tentative selection instead of retaining it, or a
+  // later commit after resume would backfill the excluded interval.
+  if (!producer_->locally_effective() || !ContentEligible(engine, &schema, &secure) ||
+      content_excluded_) {
+    content_excluded_ = true;
+    if (producer_->locally_effective())
+      AdmitExclusion(engine, secure ? "secure_input" : "excluded_prefix");
     explicit_selection_ = false;
     return;
   }

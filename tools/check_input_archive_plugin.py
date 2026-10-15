@@ -39,6 +39,9 @@ REQUIRED_CASES = (
     "SecureInputOmitsText",
     "OrdinaryDemandSurvivesCommitAndAbort",
     "PausedCommitIsNotBackfilled",
+    "PausedSelectionIsNotBackfilled",
+    "StaleSelectionIsNotBackfilled",
+    "EffectiveSelectionCommitIsIncluded",
     "LossNoticeSurvivesFailedTransport",
 )
 WATCHDOG_MS = 2000
