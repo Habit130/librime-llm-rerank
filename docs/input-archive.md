@@ -510,6 +510,33 @@ count 256, queue bytes 1048576, event budget 65536, batch 64. A failed
 `try_lock` refuses `queue_saturated`. Commit, cancellation, retraction, loss,
 and exclusion outrank competition and emission snapshots.
 
+Admission results are per item. The worker parses the ordered `codes` array of
+the `admit_batch` reply and binds each code to the matching outstanding
+observation in the same batch and binding generation. Only `admitted`, or the
+collector's same-identity/same-content `duplicate`, establish semantic
+admission; `capture_disabled`, `event_too_large`, `invalid_request`,
+`unsupported_version`, `unsupported_plugin_observation`, `capacity_stop`,
+`storage_failure`, `identity_conflict`, and `queue_saturated` are definite
+refusals and are terminal for that observation. A reply whose per-item result
+is missing, malformed, or not exactly one code per item stays unknown; unknown
+content is not replayed and never becomes admitted. Envelope `ok:true`,
+transport success, queue position, counters, or a fresh local policy snapshot
+are not admission.
+
+Commit text is not retained by the session for a later retraction. A locally
+eligible commit registers at most one bounded worker-owned receipt (count cap
+8, oldest evicted); the immediate BackSpace queues a content-free reference
+intent. The worker sends that retraction only after the exact originating
+commit's per-item result resolved as admitted or same-content duplicate, and
+it attaches only that commit's approved content. A refused, unknown, absent,
+evicted, retargeted, or generation-mismatched result degrades the intent to a
+content-free exclusion notice (`retraction_commit_refused` or
+`retraction_commit_unknown`), and a later reply cannot revive it. Receipt
+payload content exists only for admitted commits and is released when the
+dependency is consumed or evicted. A pending intent does not wait on the
+input path; it waits inside the worker-owned queue, and an unknown result is
+bounded by the same retry and loss rules as any other observation.
+
 A held publication, absent collector, saturated queue, capacity stop, or
 blocked control call must not stop emission, selection, or commit. The fault
 watchdog is 2000 ms. It detects a dependency; it is not a p95/p99 certification.
@@ -522,9 +549,14 @@ paused, off, stale, or not yet observed — is an excluded prefix, exactly like
 a window or demand observation: the tentative selection is cleared, its text
 is not admitted, and resume does not backfill it into a later commit. A commit
 or cancellation while the producer is not locally effective follows the same
-rule: its text is not retained for a later retraction, and resume does not
-backfill that text or any other excluded prefix. Retarget and destruction drop
-queued snapshots instead of sending them to a new socket. Engine recreation
+rule. Commit text is not retained by the session; a later retraction is a
+content-free reference resolved by the worker against the collector's
+per-item result. Resume therefore backfills neither a locally excluded commit
+nor a commit the collector refused per item — for example `capture_disabled`
+while a pause races a still-fresh local policy snapshot. Retarget and
+destruction drop
+queued snapshots and receipts instead of sending them to a new socket. Engine
+recreation
 uses a new process-lifetime source instance; a destroyed engine's id is not
 recycled. Schema, secure input, and an ineligible prefix cut continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
 resolved; if that gate cannot be resolved, text is not admitted. That is not a
