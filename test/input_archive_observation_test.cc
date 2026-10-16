@@ -468,6 +468,10 @@ class ArchiveObservationTest : public ::testing::Test {
       session_ = 0;
     }
     WriteOne("luna_pinyin", "luna_pinyin", true, true, false, false, 1.0);
+    // The deployer skips recompiling when the source and compiled mtimes
+    // share a second. Remove the compiled copy so the restored
+    // reranking/archive config is guaranteed to reach the engine.
+    fs::remove(workspace_ + "/rime/build/luna_pinyin.schema.yaml");
     if (rime_)
       rime_->deploy();
   }
@@ -538,6 +542,17 @@ class ArchiveObservationTest : public ::testing::Test {
   int DemandPulls(const char* symbol) {
     auto fn = DylibSymbol<int (*)()>(symbol);
     return fn ? fn() : -1;
+  }
+
+  // Content-free diagnostics for a stalled relay seed (numbers only).
+  void ReportRelaySeed(const char* label, int policy_requests,
+                       int admit_requests, int menu_candidates) {
+    auto eff =
+        DylibSymbol<int (*)()>("rime_llm_rerank_archive_effective_for_testing");
+    ADD_FAILURE() << label << " relay seed timeout effective="
+                  << (eff ? eff() : -1) << " policy=" << policy_requests
+                  << " admit=" << admit_requests
+                  << " menu=" << menu_candidates;
   }
 
   std::string EmissionOrders() {
@@ -1437,6 +1452,10 @@ class ArchiveScheduleEndpoint {
     std::lock_guard<std::mutex> guard(mu_);
     return admit_requests_;
   }
+  int policy_requests() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return policy_requests_;
+  }
   int requests_with_canary() const {
     std::lock_guard<std::mutex> guard(mu_);
     return requests_with_canary_;
@@ -1567,6 +1586,8 @@ class ArchiveScheduleEndpoint {
         if (has_canary &&
             body.find("\"plugin_stage\":\"retraction\"") != std::string::npos)
           retraction_with_canary_ += 1;
+      } else if (op == "policy_observe") {
+        policy_requests_ += 1;
       }
       target = target_;
       mode = mode_;
@@ -1665,6 +1686,7 @@ class ArchiveScheduleEndpoint {
   int requests_with_canary_ = 0;
   int retraction_with_canary_ = 0;
   int exclusion_requests_ = 0;
+  int policy_requests_ = 0;
 };
 
 bool WaitFor(const std::function<bool()>& predicate, int timeout_ms) {
@@ -1753,7 +1775,11 @@ TEST_F(ArchiveObservationTest, HeldCommitResponseDefersDependentRetraction) {
   WaitEffective();
   Type("houce");
   EXPECT_GT(DemandMenu(), 0);
-  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 1; }, 2000));
+  if (!WaitFor([&] { return relay.admit_requests() >= 1; }, 2000)) {
+    ReportRelaySeed("r2", relay.policy_requests(), relay.admit_requests(),
+                    DemandMenu());
+    return;
+  }
   Poll();
   ASSERT_TRUE(SetPolicy("pause", 1));
   relay.HoldNextAdmitResponse();
@@ -1832,7 +1858,11 @@ TEST_F(ArchiveObservationTest, LostCommitReplyRetriesIdempotently) {
   WaitEffective();
   Type("houce");
   EXPECT_GT(DemandMenu(), 0);
-  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 1; }, 2000));
+  if (!WaitFor([&] { return relay.admit_requests() >= 1; }, 2000)) {
+    ReportRelaySeed("r4a", relay.policy_requests(), relay.admit_requests(),
+                    DemandMenu());
+    return;
+  }
   relay.DropNextAdmitResponse();
   const std::string committed = Commit();
   EXPECT_FALSE(committed.empty());
@@ -1921,7 +1951,11 @@ TEST_F(ArchiveObservationTest, RetargetedLateResultCannotResurrect) {
   WaitEffective();
   Type("houce");
   EXPECT_GT(DemandMenu(), 0);
-  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 1; }, 2000));
+  if (!WaitFor([&] { return relay.admit_requests() >= 1; }, 2000)) {
+    ReportRelaySeed("r5", relay.policy_requests(), relay.admit_requests(),
+                    DemandMenu());
+    return;
+  }
   relay.HoldNextAdmitResponse();
   const std::string committed = Commit();
   EXPECT_FALSE(committed.empty());
