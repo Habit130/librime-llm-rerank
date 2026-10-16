@@ -88,6 +88,13 @@ struct InputArchiveObservation {
   int binding_generation = 0;
   int retries = 0;
   int budget_bytes = 0;
+  // Internal worker-owned dependency markers; never serialized.
+  // retractable_commit marks a commit the session locally considered
+  // eligible so the worker can bind its per-item collector result to a
+  // possible immediate retraction. dependency_update_id marks a
+  // content-free retraction intent that references the originating commit.
+  bool retractable_commit = false;
+  string dependency_update_id;
 };
 
 struct InputArchiveAdmission {

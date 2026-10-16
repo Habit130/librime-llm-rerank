@@ -43,6 +43,12 @@ REQUIRED_CASES = (
     "StaleSelectionIsNotBackfilled",
     "EffectiveSelectionCommitIsIncluded",
     "LossNoticeSurvivesFailedTransport",
+    "RefusedRemoteCommitIsNotBackfilled",
+    "HeldCommitResponseDefersDependentRetraction",
+    "AdmittedCommitRetractionCarriesContent",
+    "LostCommitReplyRetriesIdempotently",
+    "MalformedAdmissionResultStaysUnknown",
+    "RetargetedLateResultCannotResurrect",
 )
 WATCHDOG_MS = 2000
 

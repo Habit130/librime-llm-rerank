@@ -108,7 +108,7 @@ class InputArchiveSession {
   int64_t NextSequence();
   string NextToken(const char* prefix);
   void FillEntry(InputArchiveObservation* observation, const EntryContext& entry) const;
-  void Admit(InputArchiveObservation observation);
+  InputArchiveAdmission Admit(InputArchiveObservation observation);
   void AdmitExclusion(Engine* engine, const char* basis);
   bool CompositionOpen() const { return composition_open_; }
 
@@ -129,7 +129,7 @@ class InputArchiveSession {
   size_t selected_start_ = 0;
   size_t selected_end_ = 0;
   string selected_category_;
-  string last_commit_text_;
+  bool retraction_dependency_ = false;
   string last_commit_update_;
   string last_commit_process_;
   string window_id_;

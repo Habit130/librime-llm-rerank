@@ -166,12 +166,13 @@ void InputArchiveSession::FillEntry(InputArchiveObservation* observation,
   observation->parent_update_id = parent_update_id_;
 }
 
-void InputArchiveSession::Admit(InputArchiveObservation observation) {
+InputArchiveAdmission InputArchiveSession::Admit(
+    InputArchiveObservation observation) {
   observation.source_local_sequence = NextSequence();
   observation.update_id = string("pupd-") + source_instance_id_ + "-" +
                           std::to_string(observation.source_local_sequence);
   parent_update_id_ = observation.update_id;
-  producer_->TryAdmit(std::move(observation));
+  return producer_->TryAdmit(std::move(observation));
 }
 
 void InputArchiveSession::AdmitExclusion(Engine* engine, const char* basis) {
@@ -531,11 +532,14 @@ void InputArchiveSession::ObserveCommit(Engine* engine, Context* ctx) {
       }
     }
   }
+  observation.retractable_commit = eligible;
   FillEntry(&observation, ReadEntry(engine));
-  Admit(observation);
-  // An ineffective policy is an excluded prefix. Do not retain the commit
-  // text for a later retraction after resume; that would backfill it.
-  last_commit_text_ = eligible ? text : string();
+  const InputArchiveAdmission admission = Admit(observation);
+  // An ineffective policy is an excluded prefix; a locally refused commit
+  // never entered the bounded queue. Only a queued locally eligible commit
+  // creates a dependency the worker resolves against the collector's
+  // per-item admission result before any content-bearing retraction.
+  retraction_dependency_ = eligible && admission.admitted;
   last_commit_update_ = parent_update_id_;
   last_commit_process_ = process_id_;
   explicit_selection_ = false;
@@ -608,22 +612,24 @@ void InputArchiveSession::ObserveRetraction(Engine* engine) {
   observation.coverage_basis = "known_immediate_retraction";
   observation.submission = "not_applicable";
   observation.parent_update_id = last_commit_update_;
-  if (!last_commit_text_.empty()) {
-    observation.schema_id = "luna_pinyin";
-    observation.payload_text = last_commit_text_;
-    observation.observation_kind = "plugin_observation";
+  FillEntry(&observation, ReadEntry(engine));
+  if (!last_commit_process_.empty())
+    observation.process_id = last_commit_process_;
+  observation.parent_update_id = last_commit_update_;
+  if (retraction_dependency_) {
+    // Content-free reference intent. The worker attaches the approved
+    // content only when the collector confirmed this exact commit; a
+    // refused, unknown or absent result becomes a content-free exclusion
+    // notice instead of a payload.
+    observation.dependency_update_id = last_commit_update_;
   } else {
     observation.observation_kind = "exclusion_notice";
     observation.schema_id = "unknown";
     observation.eligibility = "excluded";
     observation.reason = "deliberate_exclusion";
   }
-  FillEntry(&observation, ReadEntry(engine));
-  if (!last_commit_process_.empty())
-    observation.process_id = last_commit_process_;
-  observation.parent_update_id = last_commit_update_;
   Admit(std::move(observation));
-  last_commit_text_.clear();
+  retraction_dependency_ = false;
 }
 
 std::shared_ptr<InputArchiveSession> InputArchiveRegistry::Acquire(

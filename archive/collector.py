@@ -73,6 +73,10 @@ _REASONS = {
     "capacity_stop",
     "requeue_saturated",
     "collector_queue_saturated",
+    # A retraction whose originating commit the collector refused per item,
+    # or whose per-item result never resolved, is a content-free exclusion.
+    "retraction_commit_refused",
+    "retraction_commit_unknown",
 }
 _OUTCOMES = {
     "observed_attempt",

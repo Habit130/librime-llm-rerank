@@ -14,6 +14,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -239,6 +241,7 @@ class LmFixture {
 class ArchiveObservationTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
+    signal(SIGPIPE, SIG_IGN);
     workspace_ = Workspace();
     fs::remove_all(workspace_ + "/rime");
     fs::remove_all(workspace_ + "/home");
@@ -1340,6 +1343,603 @@ TEST_F(ArchiveObservationTest, SecureInputOmitsText) {
   const std::string detail = PrivateQuery();
   EXPECT_EQ(std::string::npos, detail.find("\\u5019\\u6d4b"));
   CallSecure(0);
+}
+
+// ---------------------------------------------------------------------------
+// Attempt5 remote-admission repair: private test-owned schedule endpoints.
+//
+// Forward mode is a transparent relay in front of the real collector that can
+// hold or drop one genuine admit_batch reply to schedule the dependent-event
+// race. It always forwards genuine collector frames; it never fabricates a
+// reply. Canned mode (no target) is a supplemental protocol control peer that
+// answers policy_observe as enabled and returns malformed/missing/wrong-count
+// admit_batch results. Request bodies are scanned in memory for content-free
+// booleans only.
+
+class ArchiveScheduleEndpoint {
+ public:
+  enum Mode { kForward, kGarble, kMissingCodes, kWrongCount };
+
+  ~ArchiveScheduleEndpoint() { Stop(); }
+
+  bool Start(const std::string& path, const std::string& target, Mode mode) {
+    path_ = path;
+    target_ = target;
+    mode_ = mode;
+    fs::remove(path_);
+    fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd_ < 0)
+      return false;
+    NoSigpipe(fd_);
+    sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (path_.size() >= sizeof(addr.sun_path)) {
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    std::memcpy(addr.sun_path, path_.data(), path_.size());
+    if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    if (chmod(path_.c_str(), 0600) != 0 || listen(fd_, 8) != 0) {
+      close(fd_);
+      fd_ = -1;
+      fs::remove(path_);
+      return false;
+    }
+    stop_ = false;
+    release_ = false;
+    thread_ = std::thread([this] { Loop(); });
+    return true;
+  }
+
+  void Stop() {
+    stop_ = true;
+    {
+      std::lock_guard<std::mutex> guard(mu_);
+      release_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable())
+      thread_.join();
+    if (fd_ >= 0)
+      close(fd_);
+    fd_ = -1;
+    if (!path_.empty())
+      fs::remove(path_);
+  }
+
+  void HoldNextAdmitResponse() {
+    std::lock_guard<std::mutex> guard(mu_);
+    hold_next_ = true;
+  }
+  void DropNextAdmitResponse() {
+    std::lock_guard<std::mutex> guard(mu_);
+    drop_next_ = true;
+  }
+  void Release() {
+    {
+      std::lock_guard<std::mutex> guard(mu_);
+      release_ = true;
+    }
+    cv_.notify_all();
+  }
+  void SetMode(Mode mode) {
+    std::lock_guard<std::mutex> guard(mu_);
+    mode_ = mode;
+  }
+
+  int admit_requests() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return admit_requests_;
+  }
+  int requests_with_canary() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return requests_with_canary_;
+  }
+  int admit_requests_with_canary() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return admit_with_canary_;
+  }
+  int retraction_requests_with_canary() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return retraction_with_canary_;
+  }
+  int exclusion_requests() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return exclusion_requests_;
+  }
+  bool holding() const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return holding_;
+  }
+
+ private:
+  static void NoSigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)fd;
+#endif
+  }
+
+  static std::string Field(const std::string& json, const std::string& key) {
+    const std::string pattern = "\"" + key + "\":\"";
+    auto pos = json.find(pattern);
+    if (pos == std::string::npos)
+      return "";
+    pos += pattern.size();
+    auto end = json.find('"', pos);
+    if (end == std::string::npos)
+      return "";
+    return json.substr(pos, end - pos);
+  }
+
+  bool ReadFrame(int fd, std::string* body) {
+    char header[4];
+    size_t got = 0;
+    while (got < sizeof(header)) {
+      ssize_t n = recv(fd, header + got, sizeof(header) - got, 0);
+      if (n <= 0)
+        return false;
+      got += static_cast<size_t>(n);
+    }
+    const uint32_t size = (static_cast<unsigned char>(header[0]) << 24) |
+                          (static_cast<unsigned char>(header[1]) << 16) |
+                          (static_cast<unsigned char>(header[2]) << 8) |
+                          static_cast<unsigned char>(header[3]);
+    if (size == 0 || size > 4 * 1024 * 1024)
+      return false;
+    body->resize(size);
+    got = 0;
+    while (got < size) {
+      ssize_t n = recv(fd, &(*body)[got], size - got, 0);
+      if (n <= 0)
+        return false;
+      got += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  static bool WriteFrame(int fd, const std::string& body) {
+    std::string frame(4, '\0');
+    const uint32_t size = static_cast<uint32_t>(body.size());
+    frame[0] = static_cast<char>((size >> 24) & 0xff);
+    frame[1] = static_cast<char>((size >> 16) & 0xff);
+    frame[2] = static_cast<char>((size >> 8) & 0xff);
+    frame[3] = static_cast<char>(size & 0xff);
+    frame += body;
+    size_t sent = 0;
+    while (sent < frame.size()) {
+      ssize_t n = send(fd, frame.data() + sent, frame.size() - sent, 0);
+      if (n <= 0)
+        return false;
+      sent += static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  static std::string OkBody(const std::string& body_json) {
+    return "{\"ok\":true,\"body\":" + body_json + ",\"content_included\":false}";
+  }
+
+  void Loop() {
+    while (!stop_.load()) {
+      fd_set reads;
+      FD_ZERO(&reads);
+      FD_SET(fd_, &reads);
+      timeval tv{0, 20000};
+      if (select(fd_ + 1, &reads, nullptr, nullptr, &tv) <= 0)
+        continue;
+      int client = accept(fd_, nullptr, nullptr);
+      if (client < 0)
+        continue;
+      NoSigpipe(client);
+      Handle(client);
+      close(client);
+    }
+  }
+
+  void Handle(int client) {
+    std::string body;
+    if (!ReadFrame(client, &body))
+      return;
+    const std::string op = Field(body, "op");
+    const bool has_canary = body.find(kCanary) != std::string::npos;
+    std::string target;
+    Mode mode;
+    {
+      std::lock_guard<std::mutex> guard(mu_);
+      if (has_canary)
+        requests_with_canary_ += 1;
+      if (op == "admit_batch") {
+        admit_requests_ += 1;
+        if (has_canary)
+          admit_with_canary_ += 1;
+        if (body.find("\"observation_kind\":\"exclusion_notice\"") !=
+            std::string::npos)
+          exclusion_requests_ += 1;
+        if (has_canary &&
+            body.find("\"plugin_stage\":\"retraction\"") != std::string::npos)
+          retraction_with_canary_ += 1;
+      }
+      target = target_;
+      mode = mode_;
+    }
+    if (!target.empty()) {
+      int up = socket(AF_UNIX, SOCK_STREAM, 0);
+      if (up < 0)
+        return;
+      NoSigpipe(up);
+      sockaddr_un addr;
+      std::memset(&addr, 0, sizeof(addr));
+      addr.sun_family = AF_UNIX;
+      if (target.size() >= sizeof(addr.sun_path)) {
+        close(up);
+        return;
+      }
+      std::memcpy(addr.sun_path, target.data(), target.size());
+      if (connect(up, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(up);
+        return;
+      }
+      if (!WriteFrame(up, body)) {
+        close(up);
+        return;
+      }
+      std::string reply;
+      const bool got = ReadFrame(up, &reply);
+      close(up);
+      if (!got)
+        return;  // genuine transport failure, not a fabricated reply
+      bool drop = false;
+      bool hold = false;
+      if (op == "admit_batch") {
+        std::lock_guard<std::mutex> guard(mu_);
+        if (drop_next_) {
+          drop_next_ = false;
+          drop = true;
+        } else if (hold_next_) {
+          hold_next_ = false;
+          hold = true;
+        }
+      }
+      if (drop)
+        return;  // simulate a lost reply; the collector processed it
+      if (hold) {
+        std::unique_lock<std::mutex> lock(mu_);
+        holding_ = true;
+        cv_.wait_for(lock, std::chrono::milliseconds(9000),
+                     [this] { return release_ || stop_.load(); });
+        holding_ = false;
+      }
+      WriteFrame(client, reply);
+      return;
+    }
+    if (op == "policy_observe") {
+      WriteFrame(client, OkBody("{\"desired_policy\":\"enabled\","
+                                "\"desired_revision\":1,"
+                                "\"freshness_window_ms\":2000}"));
+      return;
+    }
+    if (op == "admit_batch") {
+      switch (mode) {
+        case kGarble:
+          WriteFrame(client, "canned-protocol-control-not-an-envelope");
+          return;
+        case kMissingCodes:
+          WriteFrame(client,
+                     OkBody("{\"counts\":{\"admitted\":1},\"durable\":false}"));
+          return;
+        case kWrongCount:
+          WriteFrame(client, OkBody("{\"codes\":[\"admitted\","
+                                    "\"invalid_request\"],\"durable\":false}"));
+          return;
+        default:
+          WriteFrame(client, OkBody("{\"codes\":[],\"durable\":false}"));
+          return;
+      }
+    }
+    WriteFrame(client, "{\"ok\":false,\"error\":\"invalid_request\"}");
+  }
+
+  std::string path_;
+  std::string target_;
+  int fd_ = -1;
+  std::thread thread_;
+  std::atomic<bool> stop_{false};
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  Mode mode_ = kForward;
+  bool hold_next_ = false;
+  bool drop_next_ = false;
+  bool release_ = false;
+  bool holding_ = false;
+  int admit_requests_ = 0;
+  int admit_with_canary_ = 0;
+  int requests_with_canary_ = 0;
+  int retraction_with_canary_ = 0;
+  int exclusion_requests_ = 0;
+};
+
+bool WaitFor(const std::function<bool()>& predicate, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate())
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return predicate();
+}
+
+int CountOccurrences(const std::string& haystack, const std::string& needle) {
+  int count = 0;
+  for (std::string::size_type at = haystack.find(needle); at != std::string::npos;
+       at = haystack.find(needle, at + needle.size())) {
+    ++count;
+  }
+  return count;
+}
+
+// R1: a commit the collector refuses per item (pause races a still-fresh local
+// policy snapshot) must not backfill as an included retraction after resume.
+// The worker is held so the refused batch is guaranteed to be sent while the
+// collector policy is paused and the local snapshot is still fresh.
+TEST_F(ArchiveObservationTest, RefusedRemoteCommitIsNotBackfilled) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const std::string fifo = workspace_ + "/r1-hold.fifo";
+  fs::remove(fifo);
+  ASSERT_EQ(0, mkfifo(fifo.c_str(), 0600));
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  Poll();
+  HoldWorker(fifo);
+  ASSERT_TRUE(SetPolicy("pause", 1));
+  std::string committed;
+  EXPECT_TRUE(FinishWithinWatchdog([&] { committed = Commit(); }));
+  EXPECT_FALSE(committed.empty());
+  HoldWorker("");
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  ASSERT_TRUE(SetPolicy("resume", 2));
+  WaitEffective();
+  // Unhandled BackSpace: the immediate retraction of the just-committed text.
+  rime_->process_key(session_, 0xff08, 0);
+  Flush();
+  const std::string stages = StageReport();
+  EXPECT_EQ(std::string::npos,
+            stages.find("stage=retraction kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_EQ(std::string::npos,
+            stages.find("stage=commit kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_EQ(std::string::npos,
+            stages.find("stage=cancellation kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_NE(std::string::npos, stages.find("kind=exclusion_notice canary=no"))
+      << stages;
+}
+
+// R2: the dependent retraction runs while the real commit reply is withheld.
+// Input finishes under the watchdog; no content-bearing payload is sent before
+// the per-item result resolves; the refusal cannot backfill after release and
+// resume.
+TEST_F(ArchiveObservationTest, HeldCommitResponseDefersDependentRetraction) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const std::string dir = workspace_ + "/endpoint-r2";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  ASSERT_EQ(0, chmod(dir.c_str(), 0700));
+  ArchiveScheduleEndpoint relay;
+  ASSERT_TRUE(relay.Start(dir + "/relay.sock", sock_, ArchiveScheduleEndpoint::kForward));
+  auto retarget = DylibSymbol<void (*)(const char*)>(
+      "rime_llm_rerank_archive_retarget_for_testing");
+  ASSERT_NE(nullptr, retarget);
+  retarget((dir + "/relay.sock").c_str());
+  Poll();
+  WaitEffective();
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 1; }, 2000));
+  Poll();
+  ASSERT_TRUE(SetPolicy("pause", 1));
+  relay.HoldNextAdmitResponse();
+  std::string committed;
+  const bool input_done = FinishWithinWatchdog([&] {
+    committed = Commit();
+    // The dependent retraction runs while the commit reply is withheld.
+    rime_->process_key(session_, 0xff08, 0);
+  });
+  EXPECT_TRUE(input_done);
+  EXPECT_FALSE(committed.empty());
+  ASSERT_TRUE(WaitFor([&] { return relay.holding(); }, 1000));
+  EXPECT_EQ(0, relay.retraction_requests_with_canary())
+      << "payload sent before the commit result resolved";
+  relay.Release();
+  ASSERT_TRUE(SetPolicy("resume", 2));
+  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 3; }, 3000));
+  Flush();
+  EXPECT_EQ(0, relay.retraction_requests_with_canary())
+      << "refused commit backfilled through retraction";
+  const std::string stages = StageReport();
+  EXPECT_EQ(std::string::npos,
+            stages.find("stage=retraction kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_EQ(std::string::npos,
+            stages.find("stage=commit kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_NE(std::string::npos, stages.find("kind=exclusion_notice canary=no"))
+      << stages;
+  relay.Stop();
+}
+
+// R3: healthy contrast. A genuinely admitted commit keeps its truthful
+// immediate retraction with the correct content and identity.
+TEST_F(ArchiveObservationTest, AdmittedCommitRetractionCarriesContent) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  rime_->process_key(session_, 0xff08, 0);
+  Flush();
+  const std::string stages = StageReport();
+  EXPECT_NE(std::string::npos,
+            stages.find("stage=commit kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_NE(std::string::npos,
+            stages.find("stage=retraction kind=plugin_observation canary=yes"))
+      << stages;
+}
+
+// R4a: a lost reply is retried with the same identity; the collector's
+// duplicate outcome confirms admission, exactly one primary commit row is
+// stored, and the healthy retraction still carries the admitted content.
+TEST_F(ArchiveObservationTest, LostCommitReplyRetriesIdempotently) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const std::string dir = workspace_ + "/endpoint-r4a";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  ASSERT_EQ(0, chmod(dir.c_str(), 0700));
+  ArchiveScheduleEndpoint relay;
+  ASSERT_TRUE(relay.Start(dir + "/relay.sock", sock_, ArchiveScheduleEndpoint::kForward));
+  auto retarget = DylibSymbol<void (*)(const char*)>(
+      "rime_llm_rerank_archive_retarget_for_testing");
+  ASSERT_NE(nullptr, retarget);
+  retarget((dir + "/relay.sock").c_str());
+  Poll();
+  WaitEffective();
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 1; }, 2000));
+  relay.DropNextAdmitResponse();
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  rime_->process_key(session_, 0xff08, 0);
+  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 3; }, 3000));
+  Flush();
+  const std::string stages = StageReport();
+  EXPECT_EQ(1, CountOccurrences(
+                   stages, "stage=commit kind=plugin_observation canary=yes"))
+      << stages;
+  EXPECT_NE(std::string::npos,
+            stages.find("stage=retraction kind=plugin_observation canary=yes"))
+      << stages;
+  relay.Stop();
+}
+
+// R4b: missing, wrong-count and unparseable per-item result data stay unknown.
+// The commit itself is genuinely sent, no payload retraction is ever sent, and
+// the deferred retraction degrades to a content-free exclusion notice.
+// Supplemental protocol control: the peer is test-owned; the refusal/success
+// primaries run against the real collector above.
+TEST_F(ArchiveObservationTest, MalformedAdmissionResultStaysUnknown) {
+  server_->SetRespond(true);
+  Open("luna_pinyin");
+  const std::string dir = workspace_ + "/endpoint-r4b";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  ASSERT_EQ(0, chmod(dir.c_str(), 0700));
+  ArchiveScheduleEndpoint peer;
+  ASSERT_TRUE(peer.Start(dir + "/peer.sock", "", ArchiveScheduleEndpoint::kMissingCodes));
+  auto retarget = DylibSymbol<void (*)(const char*)>(
+      "rime_llm_rerank_archive_retarget_for_testing");
+  ASSERT_NE(nullptr, retarget);
+  retarget((dir + "/peer.sock").c_str());
+  Poll();
+  WaitEffective();
+  const ArchiveScheduleEndpoint::Mode modes[] = {
+      ArchiveScheduleEndpoint::kMissingCodes,
+      ArchiveScheduleEndpoint::kWrongCount,
+      ArchiveScheduleEndpoint::kGarble,
+  };
+  for (const auto mode : modes) {
+    peer.SetMode(mode);
+    const int admit_before = peer.admit_requests();
+    Type("houce");
+    EXPECT_GT(DemandMenu(), 0);
+    const std::string committed = Commit();
+    EXPECT_FALSE(committed.empty());
+    rime_->process_key(session_, 0xff08, 0);
+    ASSERT_TRUE(WaitFor([&] { return peer.admit_requests() > admit_before; }, 2000));
+    Flush();
+  }
+  EXPECT_GE(peer.admit_requests_with_canary(), 3);
+  EXPECT_EQ(0, peer.retraction_requests_with_canary());
+  EXPECT_GE(peer.exclusion_requests(), 3);
+  peer.Stop();
+}
+
+// R5: a result held across retarget cannot authorize the new destination or
+// resurrect refused content. The late reply from the old destination is
+// released only after the retarget; nothing content-bearing may reach the new
+// destination, and no receipt may be revived across the generation change.
+TEST_F(ArchiveObservationTest, RetargetedLateResultCannotResurrect) {
+  server_->SetRespond(true);
+  ASSERT_TRUE(StartCollector());
+  ASSERT_TRUE(EnablePolicy());
+  Open("luna_pinyin");
+  WaitEffective();
+  const std::string dir_old = workspace_ + "/endpoint-r5-old";
+  const std::string dir_new = workspace_ + "/endpoint-r5-new";
+  fs::remove_all(dir_old);
+  fs::remove_all(dir_new);
+  fs::create_directories(dir_old);
+  fs::create_directories(dir_new);
+  ASSERT_EQ(0, chmod(dir_old.c_str(), 0700));
+  ASSERT_EQ(0, chmod(dir_new.c_str(), 0700));
+  ArchiveScheduleEndpoint relay;
+  ASSERT_TRUE(relay.Start(dir_old + "/relay.sock", sock_, ArchiveScheduleEndpoint::kForward));
+  ArchiveScheduleEndpoint peer;
+  ASSERT_TRUE(peer.Start(dir_new + "/peer.sock", "", ArchiveScheduleEndpoint::kForward));
+  auto retarget = DylibSymbol<void (*)(const char*)>(
+      "rime_llm_rerank_archive_retarget_for_testing");
+  ASSERT_NE(nullptr, retarget);
+  retarget((dir_old + "/relay.sock").c_str());
+  Poll();
+  WaitEffective();
+  Type("houce");
+  EXPECT_GT(DemandMenu(), 0);
+  ASSERT_TRUE(WaitFor([&] { return relay.admit_requests() >= 1; }, 2000));
+  relay.HoldNextAdmitResponse();
+  const std::string committed = Commit();
+  EXPECT_FALSE(committed.empty());
+  ASSERT_TRUE(WaitFor([&] { return relay.holding(); }, 1000));
+  // Retarget while the commit's result is still in flight.
+  retarget((dir_new + "/peer.sock").c_str());
+  Poll();
+  WaitEffective();
+  rime_->process_key(session_, 0xff08, 0);
+  relay.Release();
+  ASSERT_TRUE(WaitFor([&] { return peer.admit_requests() >= 1; }, 3000));
+  Flush();
+  EXPECT_EQ(0, peer.requests_with_canary())
+      << "late result authorized content at the new destination";
+  EXPECT_EQ(0, relay.retraction_requests_with_canary());
+  EXPECT_EQ(0, peer.retraction_requests_with_canary());
+  relay.Stop();
+  peer.Stop();
 }
 
 }  // namespace

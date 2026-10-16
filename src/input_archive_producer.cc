@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -33,6 +34,11 @@ constexpr int kHeartbeatMs = 500;
 constexpr int kConnectTimeoutMs = 1000;
 constexpr int kMaxRetries = 3;
 constexpr int kBatchSize = 64;
+// Bounded worker-owned retraction receipts: the latest locally eligible
+// commits whose per-item collector result gates a possible immediate
+// retraction. Count is capped; payload content is only held for admitted
+// commits and is released when the dependency is consumed or evicted.
+constexpr size_t kMaxRetractionReceipts = 8;
 
 const char* kDenied[] = {
     "cloudstorage",   "dropbox",        "onedrive",
@@ -500,6 +506,78 @@ int JsonFindInt(const string& json, const string& key, int fallback) {
   return std::atoi(json.c_str() + pos);
 }
 
+bool JsonFindTrue(const string& json, const string& key) {
+  const string pattern = "\"" + key + "\"";
+  size_t pos = json.find(pattern);
+  if (pos == string::npos)
+    return false;
+  pos += pattern.size();
+  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+    ++pos;
+  if (pos >= json.size() || json[pos] != ':')
+    return false;
+  ++pos;
+  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+    ++pos;
+  return json.compare(pos, 4, "true") == 0;
+}
+
+// Ordered string array for the given key. Returns false when the array is
+// absent or malformed; callers then treat the whole result as unknown rather
+// than inferring an outcome from counters or substring matches.
+bool JsonFindStringArray(const string& json, const string& key,
+                         vector<string>* values) {
+  values->clear();
+  const string pattern = "\"" + key + "\"";
+  size_t pos = json.find(pattern);
+  if (pos == string::npos)
+    return false;
+  pos += pattern.size();
+  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+    ++pos;
+  if (pos >= json.size() || json[pos] != ':')
+    return false;
+  ++pos;
+  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+    ++pos;
+  if (pos >= json.size() || json[pos] != '[')
+    return false;
+  ++pos;
+  while (pos < json.size()) {
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
+                                 json[pos] == '\n' || json[pos] == '\r' ||
+                                 json[pos] == ','))
+      ++pos;
+    if (pos >= json.size())
+      return false;
+    if (json[pos] == ']')
+      return true;
+    if (json[pos] != '"')
+      return false;
+    ++pos;
+    string value;
+    bool closed = false;
+    while (pos < json.size()) {
+      const char ch = json[pos++];
+      if (ch == '\\') {
+        if (pos >= json.size())
+          return false;
+        value.push_back(json[pos++]);
+        continue;
+      }
+      if (ch == '"') {
+        closed = true;
+        break;
+      }
+      value.push_back(ch);
+    }
+    if (!closed)
+      return false;
+    values->push_back(std::move(value));
+  }
+  return false;
+}
+
 using SecureFn = unsigned char (*)();
 
 bool PlatformSecureInput() {
@@ -537,6 +615,8 @@ int InputArchiveBudgetBytes(const InputArchiveObservation& observation) {
   add(observation.input_text);
   add(observation.plan_identity);
   add(observation.lm_request_id);
+  add(observation.update_id);
+  add(observation.dependency_update_id);
   for (const auto& candidate : observation.candidates) {
     add(candidate.text);
     add(candidate.category);
@@ -590,6 +670,68 @@ struct InputArchiveProducer::Impl {
     return "policy_not_effective";
   }
 
+  // Worker-owned retraction receipts. Guarded by mu; accessed from the input
+  // path only while it already holds mu, and from the worker while resolving.
+  enum ReceiptState { kReceiptPending, kReceiptAdmitted, kReceiptRefused, kReceiptUnknown };
+
+  struct RetractionReceipt {
+    string update_id;
+    int generation = 0;
+    int state = kReceiptPending;
+    string schema_id;
+    string payload_text;
+  };
+
+  static bool KnownAdmissionCode(const string& code) {
+    return code == "admitted" || code == "duplicate";
+  }
+
+  static bool KnownRefusalCode(const string& code) {
+    return code == "capture_disabled" || code == "event_too_large" ||
+           code == "invalid_request" || code == "unsupported_version" ||
+           code == "unsupported_plugin_observation" ||
+           code == "storage_failure" || code == "capacity_stop" ||
+           code == "identity_conflict" || code == "queue_saturated";
+  }
+
+  int FindReceiptLocked(const string& update_id) {
+    if (update_id.empty())
+      return -1;
+    for (size_t i = 0; i < receipts.size(); ++i) {
+      if (receipts[i].update_id == update_id)
+        return static_cast<int>(i);
+    }
+    return -1;
+  }
+
+  void RegisterReceiptLocked(const InputArchiveObservation& item) {
+    if (!item.retractable_commit || item.update_id.empty())
+      return;
+    if (FindReceiptLocked(item.update_id) >= 0)
+      return;
+    RetractionReceipt receipt;
+    receipt.update_id = item.update_id;
+    receipt.generation = item.binding_generation;
+    receipt.state = kReceiptPending;
+    receipts.push_back(std::move(receipt));
+    while (receipts.size() > kMaxRetractionReceipts)
+      receipts.pop_front();
+  }
+
+  // A retractable commit that leaves the queue without a collector result
+  // can never authorize content; its dependency becomes unknown.
+  void MarkDependencyUnknownLocked(const string& update_id) {
+    const int index = FindReceiptLocked(update_id);
+    if (index < 0)
+      return;
+    RetractionReceipt& receipt = receipts[static_cast<size_t>(index)];
+    if (receipt.state != kReceiptPending)
+      return;
+    receipt.state = kReceiptUnknown;
+    receipt.schema_id.clear();
+    receipt.payload_text.clear();
+  }
+
   InputArchiveAdmission TryAdmit(InputArchiveObservation observation) {
     InputArchiveAdmission result;
     result.durable = false;
@@ -625,6 +767,7 @@ struct InputArchiveProducer::Impl {
     if (fits(observation.budget_bytes)) {
       queue.push_back(std::move(observation));
       bytes += queue.back().budget_bytes;
+      RegisterReceiptLocked(queue.back());
       result.admitted = true;
       result.code = "admitted";
       mu.unlock();
@@ -641,6 +784,7 @@ struct InputArchiveProducer::Impl {
           queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(i));
           queue.push_back(std::move(observation));
           bytes += queue.back().budget_bytes;
+          RegisterReceiptLocked(queue.back());
           result.admitted = true;
           result.code = "admitted";
           mu.unlock();
@@ -655,6 +799,7 @@ struct InputArchiveProducer::Impl {
   }
 
   void RememberLossLocked(InputArchiveObservation dropped, const char* reason) {
+    MarkDependencyUnknownLocked(dropped.update_id);
     InputArchiveObservation loss;
     loss.observation_kind = "loss_notice";
     loss.schema_id = "unknown";
@@ -678,10 +823,54 @@ struct InputArchiveProducer::Impl {
     std::lock_guard<std::mutex> guard(mu);
     queue.clear();
     losses.clear();
+    receipts.clear();
     held_loss_pending = false;
     held_loss = InputArchiveObservation();
     bytes = 0;
     binding_generation.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  // Resolves a queued retraction intent against the receipt of the exact
+  // originating commit. Returns false while that commit's per-item result is
+  // still outstanding. Content is attached only for a genuinely admitted (or
+  // same-content duplicate) commit; refused/unknown/absent results become a
+  // content-free exclusion notice. Called with mu held.
+  bool ResolveIntentLocked(InputArchiveObservation* intent) {
+    const int index = FindReceiptLocked(intent->dependency_update_id);
+    const int current = binding_generation.load(std::memory_order_acquire);
+    if (index >= 0) {
+      RetractionReceipt& receipt = receipts[static_cast<size_t>(index)];
+      if (receipt.state == kReceiptPending && receipt.generation == current)
+        return false;
+      if (receipt.state == kReceiptAdmitted && receipt.generation == current) {
+        intent->observation_kind = "plugin_observation";
+        intent->eligibility = "included";
+        intent->schema_id =
+            receipt.schema_id.empty() ? "luna_pinyin" : receipt.schema_id;
+        intent->payload_text = receipt.payload_text;
+        const int updated = InputArchiveBudgetBytes(*intent);
+        bytes += updated - intent->budget_bytes;
+        intent->budget_bytes = updated;
+        receipts.erase(receipts.begin() + index);
+        return true;
+      }
+      intent->reason = receipt.state == kReceiptRefused
+                           ? "retraction_commit_refused"
+                           : "retraction_commit_unknown";
+      receipts.erase(receipts.begin() + index);
+    } else {
+      intent->reason = "retraction_commit_unknown";
+    }
+    intent->observation_kind = "exclusion_notice";
+    intent->eligibility = "excluded";
+    intent->schema_id = "unknown";
+    intent->payload_text.clear();
+    intent->preceding_text.clear();
+    intent->input_text.clear();
+    const int updated = InputArchiveBudgetBytes(*intent);
+    bytes += updated - intent->budget_bytes;
+    intent->budget_bytes = updated;
+    return true;
   }
 
   void WorkerLoop() {
@@ -703,9 +892,22 @@ struct InputArchiveProducer::Impl {
         std::lock_guard<std::mutex> guard(mu);
         worker_busy = true;
         loss_batch.swap(losses);
-        size_t take = std::min(queue.size(), static_cast<size_t>(kBatchSize));
-        batch.insert(batch.end(), queue.begin(), queue.begin() + take);
-        queue.erase(queue.begin(), queue.begin() + take);
+        size_t take = 0;
+        while (take < queue.size() &&
+               batch.size() < static_cast<size_t>(kBatchSize)) {
+          InputArchiveObservation& item = queue[take];
+          // A retraction intent is sent only after the exact originating
+          // commit's per-item result resolved. While that result is
+          // outstanding the intent stays queued (the input path already
+          // returned); the worker keeps FIFO order for everything behind it.
+          if (!item.dependency_update_id.empty() &&
+              !ResolveIntentLocked(&item))
+            break;
+          batch.push_back(std::move(item));
+          ++take;
+        }
+        queue.erase(queue.begin(),
+                    queue.begin() + static_cast<std::ptrdiff_t>(take));
         for (const auto& item : batch)
           bytes -= item.budget_bytes;
       }
@@ -817,11 +1019,68 @@ struct InputArchiveProducer::Impl {
   // longer matches; do not retarget and do not treat that as a successful send.
   enum class SendFate { kSent, kRetry, kDropped };
 
+  // Binds ordered per-item admission codes to the matching outstanding
+  // observations. Only `admitted` and the collector's same-identity/same-
+  // content `duplicate` establish semantic admission; every definite refusal
+  // is terminal for that observation; anything unrecognized stays unknown.
+  // Never inferred from counters or substring matches.
+  void ApplyAdmissionCodesLocked(const vector<InputArchiveObservation>& batch,
+                                 const vector<string>& codes, int generation) {
+    if (generation != binding_generation.load(std::memory_order_acquire))
+      return;
+    for (size_t i = 0; i < batch.size() && i < codes.size(); ++i) {
+      const InputArchiveObservation& item = batch[i];
+      if (!item.retractable_commit)
+        continue;
+      const int index = FindReceiptLocked(item.update_id);
+      if (index < 0)
+        continue;
+      RetractionReceipt& receipt = receipts[static_cast<size_t>(index)];
+      if (KnownAdmissionCode(codes[i])) {
+        receipt.state = kReceiptAdmitted;
+        receipt.generation = item.binding_generation;
+        receipt.schema_id = item.schema_id;
+        receipt.payload_text = item.payload_text;
+      } else if (KnownRefusalCode(codes[i])) {
+        receipt.state = kReceiptRefused;
+        receipt.schema_id.clear();
+        receipt.payload_text.clear();
+      } else {
+        receipt.state = kReceiptUnknown;
+        receipt.schema_id.clear();
+        receipt.payload_text.clear();
+      }
+    }
+  }
+
+  // The response carried no usable per-item result. The batch is not
+  // replayed and no receipt may stay pending; unknown can never authorize
+  // content later.
+  void NoteBatchUnknownLocked(const vector<InputArchiveObservation>& batch,
+                              int generation) {
+    for (const auto& item : batch) {
+      if (!item.retractable_commit || item.binding_generation != generation)
+        continue;
+      const int index = FindReceiptLocked(item.update_id);
+      if (index < 0)
+        continue;
+      RetractionReceipt& receipt = receipts[static_cast<size_t>(index)];
+      if (receipt.state != kReceiptPending)
+        continue;
+      receipt.state = kReceiptUnknown;
+      receipt.schema_id.clear();
+      receipt.payload_text.clear();
+    }
+  }
+
   SendFate SendBatch(const vector<InputArchiveObservation>& batch, int generation) {
     if (generation != binding_generation.load(std::memory_order_acquire))
       return SendFate::kDropped;
-    if (!destination_safe.load(std::memory_order_acquire))
+    if (!destination_safe.load(std::memory_order_acquire)) {
+      std::lock_guard<std::mutex> guard(mu);
+      NoteBatchUnknownLocked(batch, generation);
       return SendFate::kDropped;
+    }
     string body = "{\"observations\":[";
     for (size_t i = 0; i < batch.size(); ++i) {
       if (i)
@@ -832,6 +1091,15 @@ struct InputArchiveProducer::Impl {
     string response = Exchange(socket_path, RequestFrame("admit_batch", body));
     if (ResponseUnavailable(response))
       return SendFate::kRetry;
+    vector<string> codes;
+    std::lock_guard<std::mutex> guard(mu);
+    if (JsonFindTrue(response, "ok") &&
+        JsonFindStringArray(response, "codes", &codes) &&
+        codes.size() == batch.size()) {
+      ApplyAdmissionCodesLocked(batch, codes, generation);
+    } else {
+      NoteBatchUnknownLocked(batch, generation);
+    }
     return SendFate::kSent;
   }
 
@@ -925,6 +1193,7 @@ struct InputArchiveProducer::Impl {
   std::thread worker;
   vector<InputArchiveObservation> queue;
   vector<InputArchiveObservation> losses;
+  std::deque<RetractionReceipt> receipts;
   InputArchiveObservation held_loss;
   bool held_loss_pending = false;
   int bytes = 0;
@@ -1039,6 +1308,7 @@ void InputArchiveProducer::RetargetForTesting(const string& socket_path) {
     std::lock_guard<std::mutex> guard(impl_->mu);
     impl_->queue.clear();
     impl_->losses.clear();
+    impl_->receipts.clear();
     impl_->bytes = 0;
     impl_->socket_path = socket_path;
     impl_->binding_generation.fetch_add(1, std::memory_order_acq_rel);
