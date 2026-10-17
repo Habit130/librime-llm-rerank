@@ -367,6 +367,7 @@ _ACCOUNTED_RESULTS = {
     "unsupported_version",
     "unsupported_schema",
     "unsupported_plugin_observation",
+    "unsupported_daemon_observation",
     "invalid_request",
     "excluded",
 }

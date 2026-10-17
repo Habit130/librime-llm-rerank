@@ -38,6 +38,10 @@ from staging import build_staging_machine_from_config
 from publish import (build_publisher_from_config, read_active_manifest)
 from evidence import (EVIDENCE_KIND, EvidenceError, EvidenceService,
                       build_evidence_service_from_config)
+from archive_observation import (  # noqa: E402
+    DaemonArchiveObserver,
+    monotonic_ms,
+)
 from personal_lora_live import (
     IdentityError,
     identify_adapter,
@@ -409,6 +413,12 @@ class ModelState:
         self.pad_id = None
         self.adapter_digest = None
         self._identity_fingerprint = None
+        # Passive archive observation (Squirrel#191). None keeps every hook a
+        # no-op; an observer never changes scoring behavior or responses.
+        self.observer = None
+        self.load_generation = 0
+        self.last_load_ms = None
+        self.identity_record = None
 
     def _pin_adapter_identity(self):
         fingerprint = identity_fingerprint(self.model_path, self.adapter_path)
@@ -417,6 +427,7 @@ class ModelState:
         record = pin_live_identities(self.model_path, self.adapter_path)
         self.adapter_digest = record["adapter"]["sha256"]
         self._identity_fingerprint = fingerprint
+        self.identity_record = record
         return record
 
     def load(self):
@@ -429,32 +440,80 @@ class ModelState:
                 if changed or self.model is None:
                     self._pin_adapter_identity()
                     if self.model is not None and changed:
-                        self.unload()
+                        self.unload(reason="identity_change")
             except IdentityError:
                 if self.model is not None:
-                    self.unload()
+                    self.unload(reason="identity_invalid")
                 raise
             if self.model is not None:
                 return
-            self.model, self.tokenizer = load_adapted_model(
-                self.model_path, self.adapter_path
-            )
+            started = self._note_load_started()
+            try:
+                self.model, self.tokenizer = load_adapted_model(
+                    self.model_path, self.adapter_path
+                )
+            except BaseException:
+                self._note_load_finished(started, False)
+                raise
+            self._note_load_finished(started, True)
             self.pad_id = self.tokenizer.pad_token_id
             if self.pad_id is None:
                 self.pad_id = self.tokenizer.eos_token_id
             return
         if self.model is not None:
             return
+        started = self._note_load_started()
+        try:
+            self._load_base_model()
+        except BaseException:
+            self._note_load_finished(started, False)
+            raise
+        self._note_load_finished(started, True)
+        self.pad_id = self.tokenizer.pad_token_id
+        if self.pad_id is None:
+            self.pad_id = self.tokenizer.eos_token_id
+
+    def _load_base_model(self):
         import mlx.core as mx
         from mlx_lm.utils import load
 
         self.model, self.tokenizer = load(self.model_path)
         mx.eval(self.model.parameters())
-        self.pad_id = self.tokenizer.pad_token_id
-        if self.pad_id is None:
-            self.pad_id = self.tokenizer.eos_token_id
 
-    def unload(self):
+    def _note_load_started(self):
+        """A real load attempt begins: name the edge and bump the generation.
+
+        Lazy scheduling alone is not completed work; only an attempted load
+        increments `load_generation` and is reported as completed or failed.
+        An observation fault never fails the load.
+        """
+        self.load_generation += 1
+        self.last_load_ms = None
+        started = monotonic_ms()
+        observer = self.observer
+        if observer is not None:
+            try:
+                observer.note_load_started()
+            except Exception:  # noqa: BLE001 - observation is never fatal
+                pass
+        return started
+
+    def _note_load_finished(self, started_ms, ok):
+        self.last_load_ms = max(0.0, monotonic_ms() - started_ms)
+        observer = self.observer
+        if observer is not None:
+            try:
+                observer.note_load_finished(started_ms, ok, self)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def unload(self, reason="unspecified"):
+        observer = self.observer
+        if observer is not None and self.model is not None:
+            try:
+                observer.note_unload(reason, self)
+            except Exception:  # noqa: BLE001
+                pass
         self.model = None
         self.tokenizer = None
         self._identity_fingerprint = None
@@ -1067,7 +1126,72 @@ def handle_request(state, data, coordinator=None, completion_sink=None):
             plan_identity=req["plan_identity"],
         )
 
+    # Passive archive observation (Squirrel#191). The observed window starts
+    # at an accepted scoring request and ends at the decided response. The
+    # observer never changes the response: an observation fault only disables
+    # that observation.
+    observer = getattr(state, "observer", None)
+    process_id = None
+    request_edges = None
+    if observer is not None:
+        try:
+            process_id = observer.next_process_id()
+            request_edges = observer.observe_request(
+                req, state, process_id,
+                POLICY_ID_BY_STRATEGY.get(strategy),
+            )
+        except Exception:
+            observer = None
+            process_id = None
+            request_edges = None
+
+    scoring = {
+        "started": False,
+        "started_ms": None,
+        "ms": None,
+        "load_included": False,
+        "load_ms": None,
+    }
+
+    def observe_outcome(response):
+        if observer is None or request_edges is None:
+            return
+        try:
+            edges = dict(request_edges)
+            if scoring["started_ms"] is not None:
+                edges["scoring_started"] = scoring["started_ms"]
+            if scoring["ms"] is not None:
+                edges["scoring_completed"] = (
+                    scoring["started_ms"] + scoring["ms"]
+                )
+            edges["outcome_decided"] = monotonic_ms()
+            error = response.get("error") if isinstance(response, dict) else None
+            if isinstance(error, dict):
+                code = error.get("code")
+                phase = error.get("phase")
+            else:
+                code = "ok"
+                phase = None
+            scores = response.get("scores") if isinstance(response, dict) else None
+            observer.observe_scoring_outcome({
+                "process_id": process_id,
+                "request_id": req["request_id"],
+                "outcome_code": code,
+                "error_phase": phase,
+                "scoring_started": scoring["started"],
+                "load_included": scoring["load_included"],
+                "scoring_ms": scoring["ms"],
+                "load_ms": scoring["load_ms"],
+                "scores_returned": (
+                    len(scores) if isinstance(scores, list) else None
+                ),
+                "edges": edges,
+            })
+        except Exception:
+            pass
+
     def finish(response):
+        observe_outcome(response)
         if lease is not None:
             try:
                 completion_sink(lease)
@@ -1076,8 +1200,22 @@ def handle_request(state, data, coordinator=None, completion_sink=None):
                 raise
         return response
 
+    def run_scoring():
+        scoring["started"] = True
+        scoring["started_ms"] = monotonic_ms()
+        load_generation_before = getattr(state, "load_generation", 0)
+        try:
+            return state.score(req["context"], req["candidates"])
+        finally:
+            scoring["ms"] = max(0.0, monotonic_ms() - scoring["started_ms"])
+            scoring["load_included"] = (
+                getattr(state, "load_generation", 0) > load_generation_before
+            )
+            if scoring["load_included"]:
+                scoring["load_ms"] = getattr(state, "last_load_ms", None)
+
     try:
-        scores = state.score(req["context"], req["candidates"])
+        scores = run_scoring()
     except TimeoutError:
         return finish(protocol_error(
             "inference_failed",
@@ -1200,19 +1338,27 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
                cache_limit_mb=CACHE_LIMIT_MB,
                scoring_strategy=SCORING_STRATEGY_MEAN_TOKEN, test_mode=False,
                control_socket=None, facts_root=None, evidence_config=None,
-               health_only=False, adapter_path=""):
+               health_only=False, adapter_path="", archive_socket="",
+               state=None):
     adapter_path = adapter_path or ""
     if adapter_path and not health_only:
         pin_live_identities(model_path, adapter_path)
-    if not health_only:
+    if not health_only and cache_limit_mb > 0:
         import mlx.core as mx
 
-        if cache_limit_mb > 0:
-            mx.set_cache_limit(cache_limit_mb * 10**6)
+        mx.set_cache_limit(cache_limit_mb * 10**6)
 
-    state = ModelState(
-        model_path, context_window, scoring_strategy, adapter_path=adapter_path
-    )
+    if state is None:
+        state = ModelState(
+            model_path, context_window, scoring_strategy, adapter_path=adapter_path
+        )
+    observer = None
+    if archive_socket:
+        try:
+            observer = DaemonArchiveObserver(archive_socket)
+        except Exception:  # noqa: BLE001 - observation is never fatal
+            observer = None
+    state.observer = observer
     if adapter_path:
         try:
             state.adapter_digest = identify_adapter(adapter_path)["sha256"]
@@ -1429,6 +1575,8 @@ def run_server(sock_path, model_path, context_window=CONTEXT_WINDOW,
         pass
     finally:
         srv.close()
+        if observer is not None:
+            observer.close()
         if control_thread is not None:
             control_stop.set()
             try:
@@ -1550,6 +1698,14 @@ if __name__ == "__main__":
         help="local LoRA adapter directory; set LLM_RERANK_ADAPTER or pass "
         "this flag. Empty keeps base-only scoring. Not a schema key.",
     )
+    parser.add_argument(
+        "--archive-socket",
+        default=os.environ.get("LLM_RERANK_ARCHIVE_SOCKET") or "",
+        help="absolute path of the local input-archive collector socket. "
+        "Absent keeps passive daemon archive observation off. Not a "
+        "schema key; capture is admitted only while the collector's "
+        "desired policy is fresh and enabled.",
+    )
     parser.add_argument("--facts-root")
     parser.add_argument("--control-socket")
     parser.add_argument(
@@ -1593,6 +1749,9 @@ if __name__ == "__main__":
     if args.cache_limit_mb < 0:
         parser.error("--cache-limit-mb must be >= 0")
 
+    if args.archive_socket and not args.archive_socket.startswith("/"):
+        parser.error("--archive-socket must be an absolute path")
+
     if args.test:
         ok = self_test(args.socket, args.model)
         sys.exit(0 if ok else 1)
@@ -1607,4 +1766,5 @@ if __name__ == "__main__":
             args.scoring, test_mode=True, control_socket=args.control_socket,
             facts_root=args.facts_root, evidence_config=evidence_config,
             health_only=args.health_only, adapter_path=args.adapter,
+            archive_socket=args.archive_socket,
         )

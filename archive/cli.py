@@ -70,7 +70,7 @@ def main(argv=None):
     policy.add_argument("--expect-revision", type=int)
 
     query = sub.add_parser("query")
-    query.add_argument("view", choices=("overview", "timeline", "process", "losses", "status"))
+    query.add_argument("view", choices=("overview", "timeline", "process", "losses", "status", "daemon"))
     query.add_argument("--process-id", default="")
     query.add_argument("--private-detail", action="store_true")
     query.add_argument("--page-size", type=int)
