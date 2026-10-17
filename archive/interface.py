@@ -42,6 +42,7 @@ ERROR_MESSAGES = {
     "admission_refused": "admission was refused",
     "shutdown": "collector is shutting down",
     "unsupported_plugin_observation": "plugin observation version is not supported",
+    "unsupported_daemon_observation": "daemon observation version is not supported",
 }
 
 CONTENT_KEYS = {

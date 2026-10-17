@@ -262,6 +262,10 @@ returned only for `query` view `process` with `private_detail: true`.
 
 Timeline summaries include incompleteness. They are not host documents.
 
+The `daemon` view is the passive last-observed daemon state; see "Daemon
+observation". It reads durable daemon observation summaries at the published
+watermark and never queries or probes the daemon.
+
 ### Errors
 
 Error objects are `{code, message, retryable, content_included: false}`.
@@ -272,7 +276,8 @@ Messages are fixed and do not quote payloads. Stable codes:
 `stale_revision`, `identity_conflict`, `queue_saturated`, `capacity_stop`,
 `storage_failure`, `collector_unavailable`, `unsafe_root`, `not_found`,
 `invalid_request`, `page_bound`, `collector_already_running`,
-`admission_refused`.
+`admission_refused`, `unsupported_plugin_observation`,
+`unsupported_daemon_observation`.
 
 ## Durability and loss
 
@@ -594,3 +599,194 @@ collector that check started:
 
 This slice does not certify pixels, host persistence, ranking benefit, added
 plugin cost, or integrated SYS acceptance. **Merge never enables capture.**
+
+## Daemon observation
+
+This section is the passive daemon path for Habit130/squirrel#191. It observes
+actual scoring requests, effective scoring conditions, completed work and
+lifecycle through the same archive Interface. Install and merge do not enable
+capture; a running collector is not permission to record, and the daemon
+scoring wire, scoring results, deadline, fallback and idle policy are
+unchanged.
+
+### Opt-in
+
+Both are required before any daemon content is admitted:
+
+1. The daemon was started with an absolute `--archive-socket` (or
+   `LLM_RERANK_ARCHIVE_SOCKET`). There is no HOME default. The socket's
+   immediate parent must be an owner-only directory and, when it exists, the
+   socket itself must be an owner socket with no group or other permission.
+   This is re-checked before every admission; a foreign or non-socket occupant
+   is refused and no content is held. A daemon started while the configured
+   destination fails this check stays off for that process. The scoring
+   `socket_path` is not this socket.
+2. A fresh observation that the collector desired policy is `enabled`. Initial,
+   unknown, stale, `off`, and `paused` observations do not admit text. The
+   observer re-checks the producer's local policy snapshot before building a
+   payload; transport and storage happen on the producer worker, never on the
+   request path.
+
+### Observed window and representation
+
+`interface_version` remains `input-archive-v1`. Envelope and content versions
+remain 1. Daemon observations use the additive kind `daemon_observation` with
+`daemon_observation_version` 1. An absent, non-integer, or other version is
+`unsupported_daemon_observation`. It is not coerced to `unknown_outcome` and
+is not a successful current semantic result. Malformed field content (bad wall
+time, negative durations, edges outside the stage's named set, out-of-range
+counts, non-hex digests) is `invalid_request`.
+
+The observed window starts when the daemon has accepted a scoring request for
+scoring (protocol and policy valid, serving lease acquired). It ends at the
+decided response. Requests refused before scoring — malformed JSON, missing or
+extra fields, policy mismatch, maintenance quiesce — are not daemon
+observations; the daemon is not scoring them. Health requests are never
+observed. A transport-level failure after the response decision (for example a
+client that never finishes its request frame) has no observation.
+
+Stages and their content-free fields:
+
+- `request` — `request_id` and `plan_identity` as safe tokens (a value outside
+  the token alphabet is reported absent, not guessed), `effective_policy_id`
+  (the daemon's own canonical policy id for its scoring strategy),
+  `declared_policy_digest` (SHA-256 of the wire `baseline_policy_id`) and
+  `declared_policy_exact`, the scoring strategy and the named rules
+  `context_window_rule=unicode_char_tail` and
+  `attribution_rule=decode_prefix_reconstruction`, `context_window_chars`,
+  `requested_context_chars`, `effective_context_chars`, `context_truncated`,
+  `candidate_count`, `candidate_chars`, `model_identity`,
+  `model_identity_basis`, `adapter_present`, `adapter_digest`.
+- `scoring` — `outcome_code` (`ok` or the protocol error code), `error_phase`
+  when failed, `scoring_started`, `load_included`, `scoring_ms`, `load_ms`
+  (only when a load actually happened inside this request), `scores_returned`,
+  and the named edges `request_accepted`, `scoring_started`,
+  `scoring_completed`, `outcome_decided`.
+- `load` — `load_outcome` (`completed`/`failed`), `load_ms`,
+  `model_identity`, `tokenizer_identity` (null, basis
+  `unverified_from_scoring_process`), `adapter_present`, `adapter_digest`,
+  `model_weights_sha256`, `runtime_versions`, edges `load_started` /
+  `load_completed`.
+- `unload` — `unload_reason`, `unload_ms`, edges `unload_started` /
+  `unload_completed`. The reason enum reports what the unloading call site
+  itself declared: `identity_change` and `identity_invalid` for the adapter
+  identity paths, and `unspecified` for the production idle watchdog, which
+  unloads without a distinguished reason. Nothing is inferred from timing,
+  PID or wall clock.
+
+The requested context and the effective preceding-text window are preserved
+separately: counts and the truncation flag describe the request, the private
+payload carries both the wire `requested_context` and the
+`effective_context` actually scored (the last `context_window_chars` Unicode
+characters, default 64), plus the `candidates`. The daemon declares
+`schema_id` `unknown`: the scoring wire carries no schema identity, so the
+observation does not claim a schema interpretation.
+
+Clock domains are explicit. `observed_at_wall_ms` is absolute UTC wall
+milliseconds on `system_wall_utc_ms`, the only cross-process clock. Edges,
+durations and `monotonic_domain=daemon_process_relative_ms` values are
+monotonic milliseconds relative to that daemon process, bound to the
+observation's `source_instance_id`; they are not comparable across
+incarnations.
+
+Completed work is observed at real completion points only. A request that is
+merely scheduled does not increment the load generation; only an attempted
+load is reported, as `completed` or `failed`. The compute span
+(`scoring_ms`) includes tokenization, the forward pass and scalar extraction;
+`decomposition=combined_tokenize_forward_scalar_extraction` states that
+materialization is not separately timed. No fabricated subphase duration is
+reported, and no extra inference or evaluation is forced to fill a field.
+Daemon success is not plugin application, frontend display or host
+persistence; the archive publishes `host_persistence_proof=false` and
+`application_proof=false`.
+
+### Passive state
+
+`query` view `daemon` exposes the cached last-observed state from durable
+daemon observations at the published `as_of_durable_seq`:
+
+- `state` is `loaded`, `unloaded`, or `unknown`, derived only from the newest
+  durable lifecycle observation (`load`/`unload`); it is never inferred from
+  scoring activity, text, PID or wall time.
+- `freshness` is `fresh` while the state observation is younger than
+  `freshness_window_ms` (the archive's generic observation-freshness window),
+  `stale` afterwards, `unavailable` when the archive holds no daemon
+  observations, and `unknown` when the state or its timestamp cannot be
+  derived. `unknown_reason` names the reason.
+- `source_instance_id`, `state_observed_at_wall_ms`, `state_age_ms`,
+  `clock_domain`, `last_observation`, `last_request` and `last_scoring`
+  report the newest durable observations as content-free summaries.
+
+Reading this view never connects to the daemon: it does not call scoring or
+health, does not change the daemon's last-activity clock, and cannot load,
+unload, or extend the life of a model. The legacy health transport marks
+activity and is not a passive source; no new passive consumer uses it. The
+300-second idle policy is unchanged: observations follow real unload
+transitions, including a natural idle unload, and passive reads do not create
+activity or refresh the reported status.
+
+### Bounds, faults, and continuity
+
+The observer copies an owned snapshot on the real edge and attempts a bounded
+non-waiting `Producer.admit`; it never serializes, connects, retries, or waits.
+Producer queue count 256, queue bytes 1048576, batch 64, event budget 65536
+apply unchanged. Refusals are terminal and counted locally
+(`known_refused`, `refused_untrusted` in the daemon's local status); a refused
+snapshot is dropped and is never held for a later backfill. A snapshot that
+was authorized while the policy was fresh and enabled may still finish
+delivery later under the documented policy linearization: the collector
+re-checks the durable desired policy per item and a
+`capture_disabled`/`policy_not_effective`/`capacity_stop`/`storage_failure`
+refusal stays final. A malformed or missing peer result is never admission or
+durability.
+
+Archive availability is never an inference dependency. An absent, held,
+saturated, failed or malformed collector cannot change a scoring response,
+delay it past its own bounds, or leak input: observation faults are swallowed
+at every hook, and the scoring transport, response shapes, error codes,
+deadline and fallback are unchanged. The transient validation controls in the
+daemon checker cross the real daemon transport and a genuine collector; the
+2000 ms watchdog detects a dependency and is not a p95/p99 certification.
+
+### Checks
+
+From the plugin checkout, with a model-free Python for the contract suite and
+the approved scoring interpreter for the model suite:
+
+```sh
+"$PYTHON" tools/check_input_archive_daemon.py --self-test
+"$PYTHON" tools/check_input_archive_daemon.py --suite contract \
+  --root "$RUNTIME/dc/run" \
+  --report "$EVIDENCE/daemon-contract-report.json"
+"$SCORING_PYTHON" tools/check_input_archive_daemon.py --suite model \
+  --root "$RUNTIME/model/run" \
+  --report "$EVIDENCE/daemon-model-report.json" \
+  --model "$BASE" --adapter "$ADAPTER"
+```
+
+`--self-test` uses its own fresh private temporary root. The contract suite
+drives the real `run_server` handler over a real socket with a deterministic
+fixture state into a real collector and asserts every required case; missing
+or skipped required cases fail. Its controlled-clock fixture patches the
+daemon's `IDLE_TIMEOUT` module global inside the fixture process only, so the
+production default (`IDLE_TIMEOUT = 300`) and its source stay untouched while
+the idle watchdog is exercised quickly. The model suite runs the real daemon
+process with the approved local model and sealed adapter, observes a cold load
+and actual requests (long and empty preceding text), compares capture-off/on
+scores, and observes a natural idle unload while passive reads continue.
+Watchdogs: 60 s per cold/request exchange, 420 s for the natural idle
+observation, 2000 ms for model-free completion under archive faults. Exceeding
+them is a finite failed run with records, not permission for unbounded retry.
+
+The checker is an orchestration entry, not a replacement daemon. Ordinary
+stdout, stderr, status, errors and the report are content-free; private text
+is only in a deliberate private-detail query. Stop only the collector the
+check started:
+
+```sh
+"$PYTHON" -m archive.cli --root "$ROOT" --socket "$ROOT/collector.sock" collector stop
+```
+
+This slice does not certify frontend pixels, host persistence, ranking
+benefit, plugin cost, latency percentiles or five-view completeness. **Merge
+never enables capture.**

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import select
 import signal
@@ -63,6 +64,7 @@ _KINDS = {
     "exclusion_notice",
     "provenance",
     "plugin_observation",
+    "daemon_observation",
 }
 _INTERMEDIATE = {"input_change", "replacement", "temporary_selection", "start"}
 _REASONS = {
@@ -101,6 +103,38 @@ _HIGH = {
 }
 _CONTENT_FREE_KINDS = {"loss_notice", "exclusion_notice"}
 PLUGIN_OBSERVATION_VERSION = 1
+DAEMON_OBSERVATION_VERSION = 1
+_DAEMON_STAGES = {"request", "scoring", "load", "unload"}
+_DAEMON_OUTCOME_CODES = {
+    "ok",
+    "inference_failed",
+    "identity_mismatch",
+    "token_attribution_failed",
+    "non_finite_score",
+    "invalid_score_result",
+    "score_count_mismatch",
+}
+_DAEMON_ERROR_PHASES = {"validate", "score", "transport"}
+_DAEMON_LOAD_OUTCOMES = {"completed", "failed"}
+_DAEMON_UNLOAD_REASONS = {
+    "idle",
+    "identity_change",
+    "identity_invalid",
+    "unspecified",
+}
+_DAEMON_STRATEGIES = {"mean_token", "legacy_sum"}
+_DAEMON_EDGE_NAMES = {
+    "request": {"request_accepted"},
+    "scoring": {
+        "request_accepted",
+        "scoring_started",
+        "scoring_completed",
+        "outcome_decided",
+    },
+    "load": {"load_started", "load_completed"},
+    "unload": {"unload_started", "unload_completed"},
+}
+_DAEMON_RUNTIME_DISTRIBUTIONS = {"mlx", "mlx-lm", "numpy"}
 _PLUGIN_STAGES = {
     "competition",
     "emission",
@@ -136,12 +170,242 @@ def _hash(semantic):
     return hashlib.sha256(canonical_bytes(semantic)).hexdigest()
 
 
+def _hex_digest(value):
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return False
+    return value
+
+
 def _optional_count(value):
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return False
     return value
+
+
+def _optional_duration(value):
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return False
+    return float(value)
+
+
+def _validate_daemon(observation):
+    """Return a content-free daemon dict, or an error code.
+
+    An unsupported daemon observation version is refused explicitly; it is
+    not coerced to unknown_outcome and is not a successful current semantic
+    result. Timestamps are absolute UTC wall milliseconds; monotonic edges
+    are process-relative milliseconds bound to the source incarnation.
+    """
+    version = observation.get("daemon_observation_version")
+    payload = observation.get("payload")
+    if isinstance(payload, dict) and "daemon_observation_version" in payload:
+        if payload.get("daemon_observation_version") != version:
+            return "unsupported_daemon_observation"
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != DAEMON_OBSERVATION_VERSION
+    ):
+        return "unsupported_daemon_observation"
+    stage = observation.get("daemon_stage")
+    if stage not in _DAEMON_STAGES:
+        return "invalid_request"
+    observed_at = observation.get("observed_at_wall_ms")
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at <= 0
+        or observed_at >= 4102444800000
+    ):
+        return "invalid_request"
+    edges = observation.get("edges")
+    if (
+        not isinstance(edges, dict)
+        or not edges
+        or not set(edges).issubset(_DAEMON_EDGE_NAMES[stage])
+    ):
+        return "invalid_request"
+    canonical_edges = {}
+    for name, value in edges.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            return "invalid_request"
+        canonical_edges[name] = float(value)
+    daemon = {
+        "daemon_observation_version": DAEMON_OBSERVATION_VERSION,
+        "daemon_stage": stage,
+        "observed_at_wall_ms": observed_at,
+        "clock_domain": "system_wall_utc_ms",
+        "monotonic_domain": "daemon_process_relative_ms",
+        "edges": canonical_edges,
+    }
+    if stage == "request":
+        for name in ("request_id", "plan_identity", "effective_policy_id"):
+            token = safe_token(observation.get(name))
+            if token is None:
+                return "invalid_request"
+            daemon[name] = token
+        digest = _hex_digest(observation.get("declared_policy_digest"))
+        if digest is False:
+            return "invalid_request"
+        daemon["declared_policy_digest"] = digest
+        if not isinstance(observation.get("declared_policy_exact"), bool):
+            return "invalid_request"
+        daemon["declared_policy_exact"] = observation.get("declared_policy_exact")
+        strategy = observation.get("scoring_strategy")
+        if strategy not in _DAEMON_STRATEGIES:
+            return "invalid_request"
+        daemon["scoring_strategy"] = strategy
+        if observation.get("context_window_rule") != "unicode_char_tail":
+            return "invalid_request"
+        daemon["context_window_rule"] = "unicode_char_tail"
+        if observation.get("attribution_rule") != "decode_prefix_reconstruction":
+            return "invalid_request"
+        daemon["attribution_rule"] = "decode_prefix_reconstruction"
+        window = _optional_count(observation.get("context_window_chars"))
+        requested = _optional_count(observation.get("requested_context_chars"))
+        effective = _optional_count(observation.get("effective_context_chars"))
+        candidates = _optional_count(observation.get("candidate_count"))
+        candidate_chars = _optional_count(observation.get("candidate_chars"))
+        if window is False or not window:
+            return "invalid_request"
+        for count in (requested, effective, candidates, candidate_chars):
+            if count is False:
+                return "invalid_request"
+        if requested is None or effective is None:
+            return "invalid_request"
+        if effective > requested:
+            return "invalid_request"
+        if candidates is None or candidate_chars is None:
+            return "invalid_request"
+        if not isinstance(observation.get("context_truncated"), bool):
+            return "invalid_request"
+        daemon["context_window_chars"] = window
+        daemon["requested_context_chars"] = requested
+        daemon["effective_context_chars"] = effective
+        daemon["context_truncated"] = observation.get("context_truncated")
+        daemon["candidate_count"] = candidates
+        daemon["candidate_chars"] = candidate_chars
+        if safe_token(observation.get("model_identity")) is None and observation.get("model_identity") is not None:
+            return "invalid_request"
+        daemon["model_identity"] = observation.get("model_identity")
+        if not isinstance(observation.get("adapter_present"), bool):
+            return "invalid_request"
+        daemon["adapter_present"] = observation.get("adapter_present")
+        adapter_digest = _hex_digest(observation.get("adapter_digest"))
+        if adapter_digest is False:
+            return "invalid_request"
+        daemon["adapter_digest"] = adapter_digest
+        daemon["model_identity_basis"] = "daemon_model_path_basename_unverified_content"
+    elif stage == "scoring":
+        request_id = observation.get("request_id")
+        if request_id is not None and safe_token(request_id) is None:
+            return "invalid_request"
+        daemon["request_id"] = request_id
+        code = observation.get("outcome_code")
+        if code not in _DAEMON_OUTCOME_CODES:
+            return "invalid_request"
+        daemon["outcome_code"] = code
+        if code == "ok":
+            if observation.get("error_phase") is not None:
+                return "invalid_request"
+            daemon["error_phase"] = None
+        else:
+            phase = observation.get("error_phase")
+            if phase not in _DAEMON_ERROR_PHASES:
+                return "invalid_request"
+            daemon["error_phase"] = phase
+        for name in ("scoring_started", "load_included"):
+            if not isinstance(observation.get(name), bool):
+                return "invalid_request"
+            daemon[name] = observation.get(name)
+        scoring_ms = _optional_duration(observation.get("scoring_ms"))
+        load_ms = _optional_duration(observation.get("load_ms"))
+        if scoring_ms is False or load_ms is False:
+            return "invalid_request"
+        if daemon["scoring_started"]:
+            if scoring_ms is None:
+                return "invalid_request"
+        elif scoring_ms is not None:
+            return "invalid_request"
+        if daemon["load_included"]:
+            if load_ms is None:
+                return "invalid_request"
+        elif load_ms is not None:
+            return "invalid_request"
+        daemon["scoring_ms"] = scoring_ms
+        daemon["load_ms"] = load_ms
+        scores_returned = _optional_count(observation.get("scores_returned"))
+        if scores_returned is False:
+            return "invalid_request"
+        daemon["scores_returned"] = scores_returned
+        if observation.get("decomposition") != "combined_tokenize_forward_scalar_extraction":
+            return "invalid_request"
+        daemon["decomposition"] = "combined_tokenize_forward_scalar_extraction"
+    elif stage == "load":
+        if observation.get("load_outcome") not in _DAEMON_LOAD_OUTCOMES:
+            return "invalid_request"
+        daemon["load_outcome"] = observation.get("load_outcome")
+        load_ms = _optional_duration(observation.get("load_ms"))
+        if load_ms is False or load_ms is None:
+            return "invalid_request"
+        daemon["load_ms"] = load_ms
+        for name in ("model_identity", "tokenizer_identity"):
+            value = observation.get(name)
+            if value is not None and safe_token(value) is None:
+                return "invalid_request"
+            daemon[name] = value
+        daemon["tokenizer_identity_basis"] = "unverified_from_scoring_process"
+        if not isinstance(observation.get("adapter_present"), bool):
+            return "invalid_request"
+        daemon["adapter_present"] = observation.get("adapter_present")
+        for name in ("adapter_digest", "model_weights_sha256"):
+            digest = _hex_digest(observation.get(name))
+            if digest is False:
+                return "invalid_request"
+            daemon[name] = digest
+        versions = observation.get("runtime_versions")
+        if versions is not None:
+            if not isinstance(versions, dict) or len(versions) > len(_DAEMON_RUNTIME_DISTRIBUTIONS):
+                return "invalid_request"
+            canonical_versions = {}
+            for name, value in versions.items():
+                if name not in _DAEMON_RUNTIME_DISTRIBUTIONS:
+                    return "invalid_request"
+                if value is not None and safe_token(value) is None:
+                    return "invalid_request"
+                canonical_versions[name] = value
+            daemon["runtime_versions"] = canonical_versions
+        else:
+            daemon["runtime_versions"] = None
+    elif stage == "unload":
+        if observation.get("unload_reason") not in _DAEMON_UNLOAD_REASONS:
+            return "invalid_request"
+        daemon["unload_reason"] = observation.get("unload_reason")
+        unload_ms = _optional_duration(observation.get("unload_ms"))
+        if unload_ms is False:
+            return "invalid_request"
+        daemon["unload_ms"] = unload_ms
+    return daemon
 
 
 def _validate_plugin(observation):
@@ -587,6 +851,7 @@ class Collector(object):
                 "clocks": record.get("clocks"),
                 "continuity_segment_id": record.get("continuity_segment_id"),
                 "plugin": record.get("plugin") if isinstance(record.get("plugin"), dict) else None,
+                "daemon": record.get("daemon") if isinstance(record.get("daemon"), dict) else None,
             }
         )
         identity = record.get("identity")
@@ -926,6 +1191,7 @@ class Collector(object):
         if not isinstance(kind, str):
             return "invalid_request"
         plugin = None
+        daemon = None
         # A declared loss notice stays a loss notice. Excluded content is an
         # exclusion; reclassifying a loss would hide the continuity break.
         if excluded and kind != "loss_notice":
@@ -934,6 +1200,10 @@ class Collector(object):
             plugin = _validate_plugin(observation)
             if isinstance(plugin, str):
                 return plugin
+        elif kind == "daemon_observation":
+            daemon = _validate_daemon(observation)
+            if isinstance(daemon, str):
+                return daemon
         elif kind not in _KINDS:
             kind = "unknown_outcome"
         source_id = observation.get("source_instance_id")
@@ -978,6 +1248,8 @@ class Collector(object):
         }
         if plugin is not None:
             semantic["plugin"] = plugin
+        if daemon is not None:
+            semantic["daemon"] = daemon
         priority = "high" if kind in _HIGH else "low"
         if plugin is not None and plugin.get("plugin_stage") in _PLUGIN_HIGH_STAGES:
             priority = "high"
@@ -1244,10 +1516,170 @@ class Collector(object):
         with self._lock:
             return bool(self._state["storage_failure"])
 
+    def _daemon_state(self):
+        """Passive last-observed daemon state derived from durable records.
+
+        This never queries or probes the daemon: it is a read over the durable
+        index at the published watermark. A missing, lifecycle-less, or
+        too-old observation is reported as unavailable/unknown/stale, never
+        inferred from text, PID or wall-clock proximity.
+        """
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            watermark = self._state["durable_seq"]
+            epoch = self._state["collector_epoch"]
+            index = list(self._index)
+        observations = [
+            entry
+            for entry in index
+            if entry.get("observation_kind") == "daemon_observation"
+            and entry.get("durable_seq", 0) <= watermark
+            and isinstance(entry.get("daemon"), dict)
+        ]
+        last = observations[-1] if observations else None
+        lifecycle = None
+        for entry in reversed(observations):
+            if entry["daemon"].get("daemon_stage") in {"load", "unload"}:
+                lifecycle = entry
+                break
+        last_request = None
+        last_scoring = None
+        for entry in reversed(observations):
+            stage = entry["daemon"].get("daemon_stage")
+            if last_request is None and stage == "request":
+                last_request = entry
+            if last_scoring is None and stage == "scoring":
+                last_scoring = entry
+            if last_request is not None and last_scoring is not None:
+                break
+        state = "unknown"
+        state_age_ms = None
+        state_observed_at = None
+        unknown_reason = None
+        if not observations:
+            freshness = "unavailable"
+            unknown_reason = "no_daemon_observations"
+        elif lifecycle is None:
+            freshness = "unknown"
+            unknown_reason = "no_lifecycle_observation"
+        else:
+            daemon = lifecycle["daemon"]
+            if daemon.get("daemon_stage") == "load":
+                state = (
+                    "loaded"
+                    if daemon.get("load_outcome") == "completed"
+                    else "unloaded"
+                )
+            else:
+                state = "unloaded"
+            observed_at = daemon.get("observed_at_wall_ms")
+            state_observed_at = observed_at if isinstance(observed_at, int) else None
+            if state_observed_at is None:
+                freshness = "unknown"
+                unknown_reason = "lifecycle_observation_has_no_wall_timestamp"
+            else:
+                state_age_ms = max(0, now_ms - state_observed_at)
+                freshness = (
+                    "fresh"
+                    if state_age_ms <= self.limits["freshness_window_ms"]
+                    else "stale"
+                )
+        return {
+            "view": "daemon",
+            "daemon_observation_version": DAEMON_OBSERVATION_VERSION,
+            "observation_kind": "daemon_observation",
+            "ordering": ORDERING,
+            "as_of_durable_seq": watermark,
+            "collector_epoch": epoch,
+            "daemon_observations": len(observations),
+            "state": state,
+            "freshness": freshness,
+            "freshness_window_ms": self.limits["freshness_window_ms"],
+            "freshness_basis": "age_of_newest_durable_lifecycle_observation",
+            "unknown_reason": unknown_reason,
+            "state_observed_at_wall_ms": state_observed_at,
+            "state_age_ms": state_age_ms,
+            "clock_domain": "system_wall_utc_ms",
+            "source_instance_id": (
+                ordinary_token(lifecycle.get("source_instance_id"))
+                if lifecycle is not None
+                else None
+            ),
+            "last_observation": (
+                self._daemon_entry_summary(last) if last is not None else None
+            ),
+            "last_request": (
+                self._daemon_entry_summary(last_request)
+                if last_request is not None
+                else None
+            ),
+            "last_scoring": (
+                self._daemon_entry_summary(last_scoring)
+                if last_scoring is not None
+                else None
+            ),
+            "live_probe": False,
+            "inference_dependency": False,
+            "application_proof": False,
+            "host_persistence_proof": False,
+            "content_included": False,
+        }
+
+    def _daemon_entry_summary(self, entry):
+        daemon = entry.get("daemon") or {}
+        summary = {
+            "durable_seq": entry.get("durable_seq"),
+            "source_instance_id": ordinary_token(entry.get("source_instance_id")),
+            "source_local_sequence": entry.get("source_local_sequence"),
+            "daemon_stage": daemon.get("daemon_stage"),
+            "observed_at_wall_ms": daemon.get("observed_at_wall_ms"),
+            "edges": daemon.get("edges"),
+            "content_included": False,
+        }
+        for name in (
+            "request_id",
+            "plan_identity",
+            "effective_policy_id",
+            "declared_policy_digest",
+            "declared_policy_exact",
+            "scoring_strategy",
+            "context_window_rule",
+            "attribution_rule",
+            "context_window_chars",
+            "requested_context_chars",
+            "effective_context_chars",
+            "context_truncated",
+            "candidate_count",
+            "candidate_chars",
+            "model_identity",
+            "model_identity_basis",
+            "adapter_present",
+            "adapter_digest",
+            "outcome_code",
+            "error_phase",
+            "scoring_started",
+            "load_included",
+            "scoring_ms",
+            "load_ms",
+            "decomposition",
+            "scores_returned",
+            "load_outcome",
+            "tokenizer_identity",
+            "model_weights_sha256",
+            "runtime_versions",
+            "unload_reason",
+            "unload_ms",
+        ):
+            if name in daemon:
+                summary[name] = daemon.get(name)
+        return summary
+
     def _query(self, op, request_id, body):
         view = body.get("view")
         if view in {"overview", "status"}:
             return self._ok(op, request_id, self.snapshot())
+        if view == "daemon":
+            return self._ok(op, request_id, self._daemon_state())
         if view not in {"timeline", "process", "losses"}:
             return failure(op, request_id, "invalid_request")
         page_size = body.get("page_size", self.limits["page_size_default"])
@@ -1359,7 +1791,11 @@ class Collector(object):
             "clocks": entry.get("clocks") or _clocks(None),
             "continuity_segment_id": ordinary_token(entry.get("continuity_segment_id")) if entry.get("continuity_segment_id") else None,
             "incompleteness": incompleteness,
-            "semantic_interpretation": _interpretation(entry.get("observation_kind"), entry.get("plugin")),
+            "semantic_interpretation": _interpretation(
+                entry.get("observation_kind"),
+                entry.get("plugin"),
+                entry.get("daemon"),
+            ),
             "content_included": False,
         }
         plugin = entry.get("plugin")
@@ -1397,6 +1833,51 @@ class Collector(object):
             summary["score_evidence_state"] = plugin.get("score_evidence_state")
             summary["captured_candidate_count"] = plugin.get("captured_candidate_count")
             summary["group_member_count"] = plugin.get("group_member_count")
+        daemon = entry.get("daemon")
+        if isinstance(daemon, dict):
+            for name in (
+                "daemon_observation_version",
+                "daemon_stage",
+                "observed_at_wall_ms",
+                "clock_domain",
+                "monotonic_domain",
+                "edges",
+                "request_id",
+                "plan_identity",
+                "effective_policy_id",
+                "declared_policy_digest",
+                "declared_policy_exact",
+                "scoring_strategy",
+                "context_window_rule",
+                "attribution_rule",
+                "context_window_chars",
+                "requested_context_chars",
+                "effective_context_chars",
+                "context_truncated",
+                "candidate_count",
+                "candidate_chars",
+                "model_identity",
+                "model_identity_basis",
+                "adapter_present",
+                "adapter_digest",
+                "outcome_code",
+                "error_phase",
+                "scoring_started",
+                "load_included",
+                "scoring_ms",
+                "load_ms",
+                "scores_returned",
+                "decomposition",
+                "load_outcome",
+                "tokenizer_identity",
+                "tokenizer_identity_basis",
+                "model_weights_sha256",
+                "runtime_versions",
+                "unload_reason",
+                "unload_ms",
+            ):
+                if name in daemon:
+                    summary[name] = daemon.get(name)
         if private:
             payload = self._read_payload(entry)
             summary["payload"] = payload
@@ -1473,7 +1954,7 @@ def _host_claim(value):
     return "unrecognized"
 
 
-def _interpretation(kind, plugin=None):
+def _interpretation(kind, plugin=None, daemon=None):
     if kind == "plugin_observation":
         stage = plugin.get("plugin_stage") if isinstance(plugin, dict) else None
         return {
@@ -1485,6 +1966,16 @@ def _interpretation(kind, plugin=None):
             "retraction": "plugin_retraction_observed",
             "loss": "plugin_loss_observed",
             "exclusion": "plugin_exclusion_observed",
+        }.get(stage, "uninterpreted")
+    if kind == "daemon_observation":
+        stage = daemon.get("daemon_stage") if isinstance(daemon, dict) else None
+        if stage == "load":
+            loaded = daemon.get("load_outcome") == "completed"
+            return "daemon_model_loaded" if loaded else "daemon_model_load_failed"
+        return {
+            "request": "daemon_request_observed",
+            "scoring": "daemon_scoring_observed",
+            "unload": "daemon_model_unloaded",
         }.get(stage, "uninterpreted")
     return {
         "start": "process_started",
