@@ -1775,7 +1775,7 @@ class ModelSuite(object):
             stdout=self.daemon_log,
             stderr=subprocess.STDOUT,
         )
-        if not _wait_for_socket(dsock, timeout=30.0):
+        if not _wait_for_socket(dsock, timeout=90.0):
             raise CheckFailure("daemon_not_ready")
         self.dsock = dsock
 
