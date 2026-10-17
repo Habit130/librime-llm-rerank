@@ -8,6 +8,11 @@ storage happen on the producer's background sender. Admission is refused when
 the observed policy is not fresh and enabled, and a refused snapshot is
 dropped, never held for a later backfill.
 
+Archive package imports are deferred to observer construction so this module
+(and `daemon/server.py`) stays importable in a `daemon/`-only deployment where
+the archive package is not present; an enabled archive socket then fails that
+single construction and observation stays off.
+
 Text content exists only inside the deliberately private payload of a request
 observation and only while an admission attempt is in flight. Ordinary
 records, local status, and this module's output are content-free. The daemon
@@ -25,16 +30,13 @@ import threading
 import time
 import uuid
 
+# The daemon is started as `python daemon/server.py`, so only the daemon
+# directory is on sys.path by default. Add the checkout root so the shared
+# archive package is importable when it exists; a `daemon/`-only deployment
+# simply fails the lazy import inside DaemonArchiveObserver.__init__.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-
-from archive.interface import (  # noqa: E402
-    CONTENT_VERSION,
-    ENVELOPE_VERSION,
-)
-from archive.producer import Producer  # noqa: E402
-from archive.safety import safe_token  # noqa: E402
 
 DAEMON_OBSERVATION_VERSION = 1
 DAEMON_STAGES = ("request", "scoring", "load", "unload")
@@ -58,6 +60,12 @@ def wall_ms():
     return int(time.time() * 1000)
 
 
+def _safe_token(value):
+    from archive.safety import safe_token
+
+    return safe_token(value)
+
+
 def _hex_or_none(value):
     if (
         isinstance(value, str)
@@ -69,7 +77,7 @@ def _hex_or_none(value):
 
 
 def _token_or_none(value):
-    return safe_token(value) if isinstance(value, str) else None
+    return _safe_token(value) if isinstance(value, str) else None
 
 
 def _trust_problem(socket_path):
@@ -126,14 +134,22 @@ def _runtime_versions(record):
             source = {}
     for name in _RUNTIME_DISTRIBUTIONS:
         value = source.get(name)
-        versions[name] = value if safe_token(value) else None
+        versions[name] = value if _safe_token(value) else None
     return versions
 
 
 class DaemonArchiveObserver(object):
-    """One observer per daemon process; safe to call from any daemon thread."""
+    """One observer per daemon process; safe to call from any daemon thread.
+
+    Construction resolves the archive package: in a `daemon/`-only deployment
+    without the archive package, construction fails and the caller leaves
+    observation off; every hook then stays a no-op.
+    """
 
     def __init__(self, socket_path, source_instance_id=None, limits=None):
+        from archive.interface import CONTENT_VERSION, ENVELOPE_VERSION
+        from archive.producer import Producer
+
         self.socket_path = socket_path
         self.source_instance_id = source_instance_id or (
             "daemon-%s-%s" % (os.getpid(), uuid.uuid4().hex[:8])
@@ -143,6 +159,8 @@ class DaemonArchiveObserver(object):
             # Refuse to hold content for a destination that is not owner-only
             # at daemon start; capture stays off for this process.
             self.disabled_reason = "unsafe_archive_socket"
+        self._envelope_version = ENVELOPE_VERSION
+        self._content_version = CONTENT_VERSION
         self._lock = threading.Lock()
         self._sequence = 0
         self._process_counter = 0
@@ -202,8 +220,8 @@ class DaemonArchiveObserver(object):
 
     def _base_frame(self, stage, process_id):
         return {
-            "envelope_version": ENVELOPE_VERSION,
-            "content_version": CONTENT_VERSION,
+            "envelope_version": self._envelope_version,
+            "content_version": self._content_version,
             "schema_id": _UNKNOWN_SCHEMA,
             "source_instance_id": self.source_instance_id,
             "source_local_sequence": self._next_sequence(),
