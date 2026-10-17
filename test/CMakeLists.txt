@@ -18,6 +18,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
     recorder_e2e_test.cc
     recorder_coordinator_test.cc
     llm_rerank_recorder_test.cc
+    input_archive_observation_test.cc
     $<TARGET_OBJECTS:rime-llm-rerank-objs>)
   target_link_libraries(llm_rerank_test
     ${rime_library}
@@ -43,6 +44,7 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
   endif()
   target_compile_definitions(llm_rerank_test PRIVATE
     LLM_RERANK_DAEMON_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../daemon"
+    LLM_RERANK_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
     LLM_RERANK_PYTHON="${Python3_EXECUTABLE}"
     LLM_RERANK_PLUGIN_DYLIB="$<TARGET_FILE:${llm_rerank_runtime_target}>"
     LLM_RERANK_BUILD_PREDICT="${_llm_rerank_build_predict}"

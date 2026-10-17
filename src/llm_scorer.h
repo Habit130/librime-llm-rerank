@@ -66,6 +66,17 @@ class LlmScorer : public Scorer {
                   const vector<an<Candidate>>& candidates,
                   vector<ScoreComponents>* scores) override;
 
+  struct ExchangeRecord {
+    bool attempted = false;
+    bool succeeded = false;
+    string request_id;
+    vector<string> candidate_texts;
+    vector<double> raw_scores;
+  };
+
+  void ClearExchange() { exchange_ = ExchangeRecord(); }
+  const ExchangeRecord& last_exchange() const { return exchange_; }
+
  private:
   bool SendRequest(const string& context,
                    const vector<string>& candidates,
@@ -78,6 +89,7 @@ class LlmScorer : public Scorer {
   double alpha_;
   bool verbose_;
   int deadline_ms_;
+  ExchangeRecord exchange_;
 };
 
 }  // namespace rime

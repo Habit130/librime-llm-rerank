@@ -16,9 +16,12 @@
 #include "recorder_session.h"
 #include "rerank_plan.h"
 
+#include <memory>
+
 namespace rime {
 
 class Context;
+class InputArchiveSession;
 class LlmScorer;
 
 struct ScoreComponents {
@@ -165,6 +168,8 @@ class LlmRerankFilter : public Filter {
   connection commit_connection_;
   connection commit_text_connection_;
   std::shared_ptr<RecorderSession> recorder_session_;
+  std::shared_ptr<InputArchiveSession> archive_session_;
+  string archive_socket_;
   string last_word_;
   string preceding_text_;
   bool preceding_text_valid_ = true;

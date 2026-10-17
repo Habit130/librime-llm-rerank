@@ -62,6 +62,7 @@ _KINDS = {
     "loss_notice",
     "exclusion_notice",
     "provenance",
+    "plugin_observation",
 }
 _INTERMEDIATE = {"input_change", "replacement", "temporary_selection", "start"}
 _REASONS = {
@@ -72,6 +73,10 @@ _REASONS = {
     "capacity_stop",
     "requeue_saturated",
     "collector_queue_saturated",
+    # A retraction whose originating commit the collector refused per item,
+    # or whose per-item result never resolved, is a content-free exclusion.
+    "retraction_commit_refused",
+    "retraction_commit_unknown",
 }
 _OUTCOMES = {
     "observed_attempt",
@@ -95,10 +100,175 @@ _HIGH = {
     "provenance",
 }
 _CONTENT_FREE_KINDS = {"loss_notice", "exclusion_notice"}
+PLUGIN_OBSERVATION_VERSION = 1
+_PLUGIN_STAGES = {
+    "competition",
+    "emission",
+    "temporary_selection",
+    "commit",
+    "cancellation",
+    "retraction",
+    "loss",
+    "exclusion",
+}
+_PLUGIN_HIGH_STAGES = {"commit", "cancellation", "retraction", "loss", "exclusion"}
+_PLUGIN_ROLES = {"engine_entry_context", "absent", "invalid", "unknown"}
+_PLUGIN_READS = {"claimed_valid", "absent", "invalid", "malformed", "unknown"}
+_PLUGIN_COVERAGE = {"complete", "incomplete", "unknown"}
+_PLUGIN_COMPLETE_BASIS = "captured_group_members_and_target"
+_PLUGIN_LM = {"issued_succeeded", "issued_failed", "no_request"}
+_PLUGIN_APPLY = {"applied", "unchanged", "fallback", "not_applicable", "unknown"}
+_PLUGIN_SUBMISSION = {"explicit", "default", "unknown", "not_applicable"}
+_PLUGIN_TARGET = {"present", "absent", "unknown"}
+_PLUGIN_SCORE = {"observed", "unknown"}
+_PLUGIN_TOKENS = (
+    "window_id",
+    "group_id",
+    "plan_identity",
+    "referenced_source_id",
+    "referenced_process_id",
+    "referenced_update_id",
+    "referenced_segment_id",
+)
 
 
 def _hash(semantic):
     return hashlib.sha256(canonical_bytes(semantic)).hexdigest()
+
+
+def _optional_count(value):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return False
+    return value
+
+
+def _validate_plugin(observation):
+    """Return a content-free plugin dict, or an error code.
+
+    An unsupported plugin observation version is refused. It is not coerced to
+    unknown_outcome and is not a successful current semantic result.
+    """
+    version = observation.get("plugin_observation_version")
+    payload = observation.get("payload")
+    if isinstance(payload, dict) and "plugin_observation_version" in payload:
+        if payload.get("plugin_observation_version") != version:
+            return "unsupported_plugin_observation"
+    if isinstance(version, bool) or not isinstance(version, int) or version != PLUGIN_OBSERVATION_VERSION:
+        return "unsupported_plugin_observation"
+    stage = observation.get("plugin_stage")
+    if stage not in _PLUGIN_STAGES:
+        return "invalid_request"
+    role = observation.get("association_role") or "unknown"
+    if role not in _PLUGIN_ROLES:
+        return "invalid_request"
+    association_read = observation.get("association_read") or "unknown"
+    if association_read not in _PLUGIN_READS:
+        return "invalid_request"
+    coverage = observation.get("coverage") or "unknown"
+    if coverage not in _PLUGIN_COVERAGE:
+        return "invalid_request"
+    basis = observation.get("coverage_basis") or "unspecified"
+    if safe_token(basis) is None:
+        return "invalid_request"
+    target = observation.get("target_membership") or "unknown"
+    if target not in _PLUGIN_TARGET:
+        return "invalid_request"
+    captured = _optional_count(observation.get("captured_candidate_count"))
+    members = _optional_count(observation.get("group_member_count"))
+    if captured is False or members is False:
+        return "invalid_request"
+    if coverage == "complete":
+        if basis != _PLUGIN_COMPLETE_BASIS or target not in {"present", "absent"}:
+            return "invalid_request"
+        if captured is None or members is None or captured < 1 or captured != members:
+            return "invalid_request"
+    lm_state = observation.get("lm_request_state") or "no_request"
+    if lm_state not in _PLUGIN_LM:
+        return "invalid_request"
+    request_id = observation.get("lm_request_id")
+    if lm_state == "no_request":
+        if request_id:
+            return "invalid_request"
+        request_id = None
+    elif safe_token(request_id) is None:
+        return "invalid_request"
+    apply_state = observation.get("apply_state") or "unknown"
+    if apply_state not in _PLUGIN_APPLY:
+        return "invalid_request"
+    submission = observation.get("submission") or "not_applicable"
+    if submission not in _PLUGIN_SUBMISSION:
+        return "invalid_request"
+    plugin = {
+        "plugin_observation_version": PLUGIN_OBSERVATION_VERSION,
+        "plugin_stage": stage,
+        "association_role": role,
+        "association_read": association_read,
+        "coverage": coverage,
+        "coverage_basis": basis,
+        "target_membership": target,
+        "lm_request_state": lm_state,
+        "lm_request_id": request_id,
+        "apply_state": apply_state,
+        "submission": submission,
+        "frontend_terminal": "unknown",
+        "proves_current_frontend_result": False,
+        "order_changed": observation.get("order_changed") is True,
+        "emission_matches_upstream": observation.get("emission_matches_upstream") is not False,
+    }
+    if captured is not None:
+        plugin["captured_candidate_count"] = captured
+    if members is not None:
+        plugin["group_member_count"] = members
+    for name in ("score_weight_state", "score_quality_state", "score_lm_state", "score_evidence_state"):
+        state = observation.get(name) or "unknown"
+        if state not in _PLUGIN_SCORE:
+            return "invalid_request"
+        plugin[name] = state
+    for name in _PLUGIN_TOKENS:
+        value = observation.get(name)
+        if value is None or value == "":
+            plugin[name] = None
+            continue
+        token = safe_token(value)
+        if token is None:
+            return "invalid_request"
+        plugin[name] = token
+    return plugin
+
+
+def _accept_plugin_coverage(plugin):
+    if not isinstance(plugin, dict):
+        return "unknown", False
+    if plugin.get("coverage") != "complete":
+        return plugin.get("coverage") or "unknown", False
+    if plugin.get("coverage_basis") != _PLUGIN_COMPLETE_BASIS:
+        return "unknown", False
+    if plugin.get("target_membership") not in {"present", "absent"}:
+        return "unknown", False
+    captured = plugin.get("captured_candidate_count")
+    members = plugin.get("group_member_count")
+    if not isinstance(captured, int) or isinstance(captured, bool) or captured < 1 or captured != members:
+        return "unknown", False
+    return "complete", True
+
+
+def _interpret_association(plugin, frontend_refs, frontend_processes):
+    if not isinstance(plugin, dict):
+        return "unknown", "unknown"
+    role = plugin.get("association_role") or "unknown"
+    read = plugin.get("association_read") or "unknown"
+    if read != "claimed_valid":
+        return role if role in _PLUGIN_ROLES else "unknown", read if read in _PLUGIN_READS else "unknown"
+    source = plugin.get("referenced_source_id")
+    process = plugin.get("referenced_process_id")
+    update = plugin.get("referenced_update_id")
+    if (source, process, update) in frontend_refs:
+        return "engine_entry_context", "valid_reference"
+    if process in frontend_processes:
+        return "engine_entry_context", "stale"
+    return "engine_entry_context", "unmatched"
 
 
 def _block_fifo(path, stop_flag):
@@ -416,6 +586,7 @@ class Collector(object):
                 "client_supplied_host_claim": record.get("client_supplied_host_claim"),
                 "clocks": record.get("clocks"),
                 "continuity_segment_id": record.get("continuity_segment_id"),
+                "plugin": record.get("plugin") if isinstance(record.get("plugin"), dict) else None,
             }
         )
         identity = record.get("identity")
@@ -754,8 +925,15 @@ class Collector(object):
         kind = observation.get("observation_kind")
         if not isinstance(kind, str):
             return "invalid_request"
-        if excluded:
+        plugin = None
+        # A declared loss notice stays a loss notice. Excluded content is an
+        # exclusion; reclassifying a loss would hide the continuity break.
+        if excluded and kind != "loss_notice":
             kind = "exclusion_notice"
+        elif kind == "plugin_observation":
+            plugin = _validate_plugin(observation)
+            if isinstance(plugin, str):
+                return plugin
         elif kind not in _KINDS:
             kind = "unknown_outcome"
         source_id = observation.get("source_instance_id")
@@ -798,12 +976,17 @@ class Collector(object):
             "payload": payload,
             "client_supplied_host_claim": _host_claim(observation.get("host_persistence")),
         }
+        if plugin is not None:
+            semantic["plugin"] = plugin
+        priority = "high" if kind in _HIGH else "low"
+        if plugin is not None and plugin.get("plugin_stage") in _PLUGIN_HIGH_STAGES:
+            priority = "high"
         return {
             "semantic": semantic,
             "kind": kind,
             "identity": (source_id, sequence),
             "content_hash": _hash(semantic),
-            "priority": "high" if kind in _HIGH else "low",
+            "priority": priority,
         }
 
     def _queue_locked(self, prepared, size, quarantine):
@@ -1102,7 +1285,20 @@ class Collector(object):
             selected.append(entry)
             if len(selected) >= page_size:
                 break
-        rows = [self._summary(entry, update_ids, process_kinds, private) for entry in selected]
+        frontend_refs = set()
+        frontend_processes = set()
+        for entry in index:
+            if entry.get("observation_kind") == "plugin_observation":
+                continue
+            frontend_refs.add(
+                (entry.get("source_instance_id"), entry.get("process_id"), entry.get("update_id"))
+            )
+            if entry.get("process_id"):
+                frontend_processes.add(entry.get("process_id"))
+        rows = [
+            self._summary(entry, update_ids, process_kinds, private, frontend_refs, frontend_processes)
+            for entry in selected
+        ]
         next_cursor = selected[-1]["durable_seq"] if len(selected) >= page_size else None
         response = {
             "view": view,
@@ -1129,7 +1325,7 @@ class Collector(object):
             }
         return self._ok(op, request_id, response)
 
-    def _summary(self, entry, update_ids, process_kinds, private):
+    def _summary(self, entry, update_ids, process_kinds, private, frontend_refs=None, frontend_processes=None):
         parent = entry.get("parent_update_id")
         if parent is None:
             parent_status = "absent"
@@ -1163,9 +1359,44 @@ class Collector(object):
             "clocks": entry.get("clocks") or _clocks(None),
             "continuity_segment_id": ordinary_token(entry.get("continuity_segment_id")) if entry.get("continuity_segment_id") else None,
             "incompleteness": incompleteness,
-            "semantic_interpretation": _interpretation(entry.get("observation_kind")),
+            "semantic_interpretation": _interpretation(entry.get("observation_kind"), entry.get("plugin")),
             "content_included": False,
         }
+        plugin = entry.get("plugin")
+        if isinstance(plugin, dict):
+            coverage, accepted = _accept_plugin_coverage(plugin)
+            role, state = _interpret_association(plugin, frontend_refs or set(), frontend_processes or set())
+            summary["plugin_observation_version"] = plugin.get("plugin_observation_version")
+            summary["plugin_stage"] = plugin.get("plugin_stage")
+            summary["association_role"] = role
+            summary["association_state"] = state
+            summary["association_read"] = plugin.get("association_read")
+            summary["coverage"] = coverage
+            summary["submitted_coverage"] = plugin.get("coverage")
+            summary["coverage_basis"] = plugin.get("coverage_basis")
+            summary["coverage_claim_accepted"] = accepted
+            summary["target_membership"] = plugin.get("target_membership")
+            summary["lm_request_state"] = plugin.get("lm_request_state")
+            summary["lm_request_id"] = plugin.get("lm_request_id")
+            summary["apply_state"] = plugin.get("apply_state")
+            summary["submission"] = plugin.get("submission")
+            summary["frontend_terminal"] = "unknown"
+            summary["proves_current_frontend_result"] = False
+            summary["window_id"] = plugin.get("window_id")
+            summary["group_id"] = plugin.get("group_id")
+            summary["plan_identity"] = plugin.get("plan_identity")
+            summary["referenced_source_id"] = plugin.get("referenced_source_id")
+            summary["referenced_process_id"] = plugin.get("referenced_process_id")
+            summary["referenced_update_id"] = plugin.get("referenced_update_id")
+            summary["referenced_segment_id"] = plugin.get("referenced_segment_id")
+            summary["order_changed"] = plugin.get("order_changed") is True
+            summary["emission_matches_upstream"] = plugin.get("emission_matches_upstream") is not False
+            summary["score_weight_state"] = plugin.get("score_weight_state")
+            summary["score_quality_state"] = plugin.get("score_quality_state")
+            summary["score_lm_state"] = plugin.get("score_lm_state")
+            summary["score_evidence_state"] = plugin.get("score_evidence_state")
+            summary["captured_candidate_count"] = plugin.get("captured_candidate_count")
+            summary["group_member_count"] = plugin.get("group_member_count")
         if private:
             payload = self._read_payload(entry)
             summary["payload"] = payload
@@ -1242,7 +1473,19 @@ def _host_claim(value):
     return "unrecognized"
 
 
-def _interpretation(kind):
+def _interpretation(kind, plugin=None):
+    if kind == "plugin_observation":
+        stage = plugin.get("plugin_stage") if isinstance(plugin, dict) else None
+        return {
+            "competition": "plugin_competition_observed",
+            "emission": "plugin_emission_observed",
+            "temporary_selection": "plugin_temporary_selection_observed",
+            "commit": "plugin_engine_commit_observed",
+            "cancellation": "plugin_cancellation_observed",
+            "retraction": "plugin_retraction_observed",
+            "loss": "plugin_loss_observed",
+            "exclusion": "plugin_exclusion_observed",
+        }.get(stage, "uninterpreted")
     return {
         "start": "process_started",
         "input_change": "input_change_observed",

@@ -8,6 +8,7 @@
 #include <rime/registry.h>
 #include <rime_api.h>
 
+#include "input_archive_session.h"
 #include "llm_rerank_filter.h"
 #include "llm_rerank_recorder.h"
 #include "recorder_coordinator.h"
@@ -22,6 +23,7 @@ static void rime_llm_rerank_initialize() {
 }
 
 static void rime_llm_rerank_finalize() {
+  rime::InputArchiveRegistry::ShutdownAll();
   rime::RecorderCoordinator::ShutdownAll();
 }
 
@@ -41,6 +43,39 @@ extern "C" void rime_llm_rerank_shutdown_recorder_for_testing() {
 extern "C" void rime_llm_rerank_set_io_hook_for_testing(int (*hook)(const char*)) {
   rime::RecorderCoordinator::SetIOHookForTesting(
       hook ? rime::RecorderIOHook(hook) : rime::RecorderIOHook());
+}
+
+extern "C" void rime_llm_rerank_archive_set_secure_input_for_testing(int mode) {
+  rime::InputArchiveRegistry::SetSecureInputOverrideForTesting(mode);
+}
+
+extern "C" void rime_llm_rerank_archive_set_queue_limits_for_testing(int count,
+                                                                    int bytes) {
+  rime::InputArchiveRegistry::SetQueueLimitsForTesting(count, bytes);
+}
+
+extern "C" void rime_llm_rerank_archive_hold_worker_for_testing(const char* fifo) {
+  rime::InputArchiveRegistry::HoldWorkersForTesting(fifo ? fifo : "");
+}
+
+extern "C" void rime_llm_rerank_archive_poll_for_testing(void) {
+  rime::InputArchiveRegistry::PollForTesting();
+}
+
+extern "C" int rime_llm_rerank_archive_flush_for_testing(int timeout_ms) {
+  return rime::InputArchiveRegistry::FlushForTesting(timeout_ms) ? 1 : 0;
+}
+
+extern "C" int rime_llm_rerank_archive_effective_for_testing(void) {
+  return rime::InputArchiveRegistry::EffectiveForTesting();
+}
+
+extern "C" void rime_llm_rerank_archive_reset_continuity_for_testing(void) {
+  rime::InputArchiveRegistry::ResetContinuityForTesting();
+}
+
+extern "C" void rime_llm_rerank_archive_retarget_for_testing(const char* socket_path) {
+  rime::InputArchiveRegistry::RetargetForTesting(socket_path ? socket_path : "");
 }
 
 RIME_REGISTER_MODULE(llm_rerank)

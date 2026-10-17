@@ -9,6 +9,7 @@
 
 #include <memory>
 
+#include "input_archive_session.h"
 #include "recorder_session.h"
 
 namespace rime {
@@ -58,6 +59,7 @@ class LlmRerankRecorder : public Processor {
   void UpdateStatusProperties();
 
   std::shared_ptr<RecorderSession> session_;
+  std::shared_ptr<InputArchiveSession> archive_session_;
   connection select_connection_;
   connection commit_connection_;
   connection abort_connection_;

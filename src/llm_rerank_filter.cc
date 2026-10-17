@@ -3,6 +3,7 @@
 // Distributed under the BSD License
 //
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -25,6 +26,7 @@
 #include "apply_outcome.h"
 #include "evidence_scorer.h"
 #include "fact_store.h"
+#include "input_archive_session.h"
 #include "llm_rerank_filter.h"
 #include "llm_scorer.h"
 
@@ -164,7 +166,10 @@ class LlmRerankTranslation : public PrefetchTranslation {
                        std::shared_ptr<RecorderSession> recorder_session,
                        size_t segment_start,
                        bool record_snapshots,
-                       bool snapshot_only)
+                       bool snapshot_only,
+                       std::shared_ptr<InputArchiveSession> archive_session,
+                       Engine* engine,
+                       LlmScorer* llm_scorer)
       : PrefetchTranslation(translation),
         scorer_(scorer),
         evidence_scorer_(std::move(evidence_scorer)),
@@ -181,7 +186,10 @@ class LlmRerankTranslation : public PrefetchTranslation {
         recorder_session_(std::move(recorder_session)),
         segment_start_(segment_start),
         record_snapshots_(record_snapshots),
-        snapshot_only_(snapshot_only) {}
+        snapshot_only_(snapshot_only),
+        archive_session_(std::move(archive_session)),
+        engine_(engine),
+        llm_scorer_(llm_scorer) {}
 
  protected:
   virtual bool Replenish();
@@ -217,6 +225,23 @@ class LlmRerankTranslation : public PrefetchTranslation {
   vector<RecordedCandidate> materialized_;
   size_t next_merge_order_ = 0;
   bool fully_materialized_ = false;
+  std::shared_ptr<InputArchiveSession> archive_session_;
+  Engine* engine_ = nullptr;
+  LlmScorer* llm_scorer_ = nullptr;
+  vector<char> lm_known_;
+  vector<double> lm_raw_;
+  vector<char> evidence_known_;
+  vector<double> evidence_raw_;
+  string observed_request_id_;
+  string observed_request_state_ = "no_request";
+  string observed_plan_identity_;
+  bool observed_have_plan_ = false;
+  vector<ArchiveGroupFact> observed_groups_;
+
+  void ObserveWindow(const vector<an<Candidate>>& buffer,
+                     const CandidateQueue& emitted,
+                     bool truncated,
+                     bool rerank_attempted);
 };
 
 bool LlmRerankTranslation::Replenish() {
@@ -271,10 +296,25 @@ bool LlmRerankTranslation::Replenish() {
     // Reranking disabled: emit in original order, no synchronous scoring.
     for (auto& c : buffer)
       result.push_back(c);
+    // Observe while result still holds the emitted nodes. splice moves them
+    // into cache_ and would otherwise record an empty emission order.
+    if (archive_session_)
+      ObserveWindow(buffer, result, truncated, false);
     cache_.splice(cache_.end(), result);
     return !cache_.empty();
   }
   bool reranked = false;
+  if (archive_session_ && llm_scorer_)
+    llm_scorer_->ClearExchange();
+  lm_known_.assign(buffer.size(), 0);
+  lm_raw_.assign(buffer.size(), 0);
+  evidence_known_.assign(buffer.size(), 0);
+  evidence_raw_.assign(buffer.size(), 0);
+  observed_request_id_.clear();
+  observed_request_state_ = "no_request";
+  observed_plan_identity_.clear();
+  observed_have_plan_ = false;
+  observed_groups_.clear();
   if (!scorer_) {
     LogWindowFailure("scoring_unavailable", "score", buffer.size());
     RecordApply(kApplyStateFallback, "", {});
@@ -285,6 +325,16 @@ bool LlmRerankTranslation::Replenish() {
     for (auto& c : buffer)
       result.push_back(c);
   }
+  if (archive_session_ && llm_scorer_) {
+    const auto& exchange = llm_scorer_->last_exchange();
+    if (exchange.attempted) {
+      observed_request_id_ = exchange.request_id;
+      observed_request_state_ =
+          exchange.succeeded ? "issued_succeeded" : "issued_failed";
+    }
+  }
+  if (archive_session_)
+    ObserveWindow(buffer, result, truncated, reranked);
   cache_.splice(cache_.end(), result);
   return !cache_.empty();
 }
@@ -313,6 +363,25 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     RecordApply(kApplyStateFallback, "", {});
     return false;
   }
+  if (archive_session_) {
+    observed_have_plan_ = true;
+    observed_plan_identity_ = *plan.identity;
+    observed_groups_.clear();
+    for (const auto& group : *plan.groups) {
+      if (!group.identity || !group.start || !group.end || !group.category ||
+          !group.candidate_indexes || !group.complete) {
+        continue;
+      }
+      ArchiveGroupFact stored;
+      stored.identity = *group.identity;
+      stored.start = *group.start;
+      stored.end = *group.end;
+      stored.category = *group.category;
+      stored.plan_complete = *group.complete;
+      stored.member_indexes = *group.candidate_indexes;
+      observed_groups_.push_back(std::move(stored));
+    }
+  }
   vector<string> request_ids;
   vector<size_t> scored_indexes;
   vector<an<Candidate>> scored_candidates;
@@ -334,6 +403,18 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
     LogWindowFailure("batch_scoring_failed", "score", buffer.size());
     RecordApply(kApplyStateFallback, *plan.identity, request_ids);
     return false;
+  }
+  if (archive_session_ && llm_scorer_) {
+    const auto& exchange = llm_scorer_->last_exchange();
+    if (exchange.succeeded && exchange.raw_scores.size() == scored_indexes.size()) {
+      for (size_t i = 0; i < scored_indexes.size(); ++i) {
+        const size_t index = scored_indexes[i];
+        if (index < lm_known_.size()) {
+          lm_known_[index] = 1;
+          lm_raw_[index] = exchange.raw_scores[i];
+        }
+      }
+    }
   }
   vector<ScoreComponents> scores(buffer.size());
   for (size_t i = 0; i < scored_indexes.size(); ++i)
@@ -395,9 +476,14 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
       const string request_id = evidence_scorer_->last_request_id();
       if (!request_id.empty() && request_id != request_id_before)
         request_ids.push_back(request_id);
-      for (size_t i = 0; i < group.candidate_indexes->size(); ++i)
-        scores[(*group.candidate_indexes)[i]].retrieval_evidence =
-            group_evidence[i];
+      for (size_t i = 0; i < group.candidate_indexes->size(); ++i) {
+        const size_t index = (*group.candidate_indexes)[i];
+        scores[index].retrieval_evidence = group_evidence[i];
+        if (archive_session_ && index < evidence_known_.size()) {
+          evidence_known_[index] = 1;
+          evidence_raw_[index] = group_evidence[i];
+        }
+      }
     }
   }
 
@@ -423,6 +509,83 @@ bool LlmRerankTranslation::RerankWindow(const vector<an<Candidate>>& buffer,
   for (size_t index : emission_order)
     out->push_back(buffer[index]);
   return true;
+}
+
+void LlmRerankTranslation::ObserveWindow(const vector<an<Candidate>>& buffer,
+                                        const CandidateQueue& emitted,
+                                        bool truncated,
+                                        bool rerank_attempted) {
+  if (!archive_session_)
+    return;
+  ArchiveWindowFact fact;
+  fact.truncated = truncated;
+  fact.rerank_attempted = rerank_attempted;
+  fact.have_plan = observed_have_plan_;
+  fact.plan_identity = observed_plan_identity_;
+  fact.groups = observed_groups_;
+  fact.input_text = input_;
+  fact.preceding_text = preceding_text_;
+  fact.lm_request_state = observed_request_state_;
+  fact.lm_request_id = observed_request_id_;
+  fact.upstream.reserve(buffer.size());
+  for (size_t i = 0; i < buffer.size(); ++i) {
+    if (!buffer[i])
+      continue;
+    ArchiveCandidateFact candidate;
+    candidate.merge_order = i;
+    candidate.start = buffer[i]->start();
+    candidate.end = buffer[i]->end();
+    auto phrase = As<Phrase>(Candidate::GetGenuineCandidate(buffer[i]));
+    const string source_type = phrase ? phrase->type() : buffer[i]->type();
+    candidate.category = CategoryOf(source_type);
+    candidate.text = buffer[i]->text();
+    if (phrase && (IsSysWordType(source_type) || IsUsrWordType(source_type))) {
+      candidate.weight_known = true;
+      candidate.weight = phrase->weight();
+    }
+    candidate.quality_known = true;
+    candidate.quality = buffer[i]->quality();
+    if (i < lm_known_.size() && lm_known_[i]) {
+      candidate.lm_known = true;
+      candidate.lm_score = lm_raw_[i];
+    }
+    if (i < evidence_known_.size() && evidence_known_[i]) {
+      candidate.evidence_known = true;
+      candidate.evidence = evidence_raw_[i];
+    }
+    fact.upstream.push_back(std::move(candidate));
+  }
+  bool same = emitted.size() == buffer.size();
+  size_t emission_index = 0;
+  for (const auto& cand : emitted) {
+    size_t found = buffer.size();
+    for (size_t i = 0; i < buffer.size(); ++i) {
+      if (buffer[i] == cand) {
+        found = i;
+        break;
+      }
+    }
+    fact.emission_order.push_back(found);
+    if (found != emission_index)
+      same = false;
+    ++emission_index;
+  }
+  if (snapshot_only_ || !rerank_attempted)
+    fact.apply_state = "not_applicable";
+  else if (!same && fact.emission_order.size() == buffer.size() &&
+           fact.apply_state.empty())
+    fact.apply_state = "applied";
+  if (snapshot_only_)
+    fact.apply_state = "not_applicable";
+  else if (!rerank_attempted)
+    fact.apply_state = "fallback";
+  else if (emitted.size() != buffer.size())
+    fact.apply_state = "fallback";
+  else if (same)
+    fact.apply_state = "unchanged";
+  else
+    fact.apply_state = "applied";
+  archive_session_->ObserveMaterializedWindow(engine_, fact);
 }
 
 void LlmRerankTranslation::RecordApply(const string& apply_state,
@@ -482,6 +645,7 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     config->GetInt(name_space_ + "/deadline_ms", &deadline_ms_);
     config->GetBool(name_space_ + "/verbose", &verbose_);
     config->GetString(name_space_ + "/socket_path", &socket_path_);
+    config->GetString(name_space_ + "/input_archive/socket", &archive_socket_);
     config->GetString(name_space_ + "/representation_id",
                       &representation_id_);
     config->GetDouble(name_space_ + "/tau", &tau_);
@@ -546,6 +710,9 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
     commit_text_connection_ = engine_->sink().connect(
         [this](const string& text) { OnCommitText(text); });
     recorder_session_ = RecorderSessionRegistry::GetForEngine(engine_);
+    if (!archive_socket_.empty() && archive_socket_[0] == '/')
+      archive_session_ =
+          InputArchiveRegistry::Acquire(engine_, archive_socket_);
   }
   LOG(INFO) << name_space_ << ": source = "
             << SwitchConfigSourceName(config_source_)
@@ -563,6 +730,10 @@ LlmRerankFilter::LlmRerankFilter(const Ticket& ticket) : Filter(ticket) {
 LlmRerankFilter::~LlmRerankFilter() {
   commit_connection_.disconnect();
   commit_text_connection_.disconnect();
+  if (archive_session_) {
+    InputArchiveRegistry::Release(engine_);
+    archive_session_.reset();
+  }
 }
 
 void LlmRerankFilter::OnCommit(Context* ctx) {
@@ -611,6 +782,78 @@ string LlmRerankFilter::BuildContext() {
   return suffix ? *suffix : result;
 }
 
+std::atomic<int> g_demand_constructor_pulls{0};
+std::atomic<int> g_demand_consumer_pulls{0};
+
+class ArchiveDemandTranslation : public Translation {
+ public:
+  ArchiveDemandTranslation(an<Translation> upstream,
+                           std::shared_ptr<InputArchiveSession> session,
+                           Engine* engine)
+      : upstream_(std::move(upstream)),
+        session_(std::move(session)),
+        engine_(engine) {
+    // Do not peek. This wrapper sits after uniquifier; a construction-time
+    // pull dedups against a still-empty emitted list. The menu's first Peek
+    // is the ordinary demand.
+  }
+
+  ~ArchiveDemandTranslation() override {
+    if (session_)
+      session_->FlushDemand(engine_);
+  }
+
+  bool Next() override {
+    g_demand_consumer_pulls.fetch_add(1, std::memory_order_relaxed);
+    if (!upstream_ || !upstream_->Next()) {
+      set_exhausted(true);
+      if (session_)
+        session_->NoteDemandExhausted(engine_, true);
+      noted_.reset();
+      return false;
+    }
+    NoteHead();
+    return true;
+  }
+
+  an<Candidate> Peek() override {
+    g_demand_consumer_pulls.fetch_add(1, std::memory_order_relaxed);
+    if (!upstream_) {
+      set_exhausted(true);
+      return nullptr;
+    }
+    auto current = upstream_->Peek();
+    if (!current && upstream_->exhausted())
+      set_exhausted(true);
+    NoteHead();
+    return current;
+  }
+
+ private:
+  void NoteHead() {
+    if (!upstream_ || !session_)
+      return;
+    auto current = upstream_->Peek();
+    if (!current || current == noted_)
+      return;
+    noted_ = current;
+    session_->ObserveDemandCandidate(engine_, current);
+  }
+
+  an<Translation> upstream_;
+  std::shared_ptr<InputArchiveSession> session_;
+  an<Candidate> noted_;
+  Engine* engine_ = nullptr;
+};
+
+extern "C" int rime_llm_rerank_archive_demand_constructor_pulls_for_testing(void) {
+  return g_demand_constructor_pulls.load(std::memory_order_relaxed);
+}
+
+extern "C" int rime_llm_rerank_archive_demand_consumer_pulls_for_testing(void) {
+  return g_demand_consumer_pulls.load(std::memory_order_relaxed);
+}
+
 an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
                                        CandidateList* candidates) {
   // With reranking off, the translation passes through untouched unless the
@@ -619,6 +862,9 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
   // on this path.
   const bool want_snapshots = recording_enabled_ && recorder_session_;
   if (!reranking_enabled_ && !want_snapshots) {
+    if (archive_session_) {
+      return New<ArchiveDemandTranslation>(translation, archive_session_, engine_);
+    }
     return translation;
   }
   const string preceding_text = BuildContext();
@@ -653,7 +899,8 @@ an<Translation> LlmRerankFilter::Apply(an<Translation> translation,
       evidence_active_ ? evidence_scorer_ : nullptr, evidence_active_,
       facts_root_, window_, deadline_ms_, now_, schema_id_, input,
       preceding_text, last_word_, scoring_policy, recorder_session_,
-      segment_start, want_snapshots, !reranking_enabled_);
+      segment_start, want_snapshots, !reranking_enabled_, archive_session_,
+      engine_, llm_scorer_.get());
 }
 
 }  // namespace rime

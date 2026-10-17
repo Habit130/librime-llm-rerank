@@ -41,6 +41,7 @@ ERROR_MESSAGES = {
     "collector_already_running": "a collector is already running for this root",
     "admission_refused": "admission was refused",
     "shutdown": "collector is shutting down",
+    "unsupported_plugin_observation": "plugin observation version is not supported",
 }
 
 CONTENT_KEYS = {
@@ -52,6 +53,11 @@ CONTENT_KEYS = {
     "raw",
     "preedit",
     "comment",
+    "preceding_text",
+    "candidate_text",
+    "input",
+    "context",
+    "groups",
 }
 
 

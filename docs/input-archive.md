@@ -405,3 +405,192 @@ guarantee. The checker does not prove real frontend behavior, p95/p99 input
 latency, model application, ranking benefit, annotation, dataset export,
 backup, deletion, or legacy-history access. Skipped required checks are
 failures, not passes.
+
+## Plugin observation
+
+This section is the passive plugin path for Habit130/squirrel#190. Install and
+merge do not enable capture. A running collector is not permission to record.
+The legacy recording, evidence, and reranking switches are unchanged by archive
+policy. Status still reports
+`legacy_selection_recording=separately_configured_may_continue` and
+`legacy_switch_changed=false`.
+
+### Opt-in
+
+Both are required before any candidate or commit text is admitted:
+
+1. `llm_rerank/input_archive/socket` in the schema, an absolute local socket.
+   There is no HOME default. A relative path, a symlink component, or a known
+   synchronized destination stays off. Before connect, the socket's immediate
+   parent must be an owner-only directory (no group or other permission) and,
+   if the socket already exists, it must be an owner socket with no group or
+   other permission. A world-writable or foreign parent is not a collector.
+   Ancestors above that parent are checked only for symlinks and denied names.
+   The scoring `socket_path` is not this socket.
+2. A fresh observation that the collector desired policy is `enabled`. Initial,
+   unknown, stale, `off`, and `paused` observations do not admit text. Freshness
+   is 2000 ms from the producer's last policy poll. The poll runs on the worker,
+   every 500 ms, not on the input path. An older in-flight poll cannot replace a
+   newer observation.
+
+`llm_rerank` and `llm_rerank_recorder` must both be registered for the full
+passive path. The filter observes already-materialized competition and the
+emission queue before it is spliced into the menu cache, so `emission_order`
+is the order actually handed to the menu. With reranking off, the demand
+wrapper does not pull upstream at construction; the menu's Peek/Next is the
+pull. Commit, abort, and an empty-composition update flush those already
+demanded candidates before composition state is cleared. The translation
+destructor still flushes a window the menu released without a notifier.
+Clearing the demand buffer first would drop competition and emission for a
+completed composition. The recorder observes select, commit, abort, update,
+and known immediate retraction through the existing notifiers. Subscriptions
+are released with the owning component. This is not a new frontend integration
+and not SYS-05/16 certification.
+
+Only `luna_pinyin` content is admitted. Production direct input is
+`ascii_composer` returning the key unhandled while `ascii_mode` is on and
+there is no composition; that key never becomes an engine commit, so
+`ObserveCommit` does not archive it. This is not a character-script filter.
+Return raw finalization of a Chinese composition remains an engine commit
+observation. Engine recreation allocates a new `ps<pid>eN` source instance
+from a process-lifetime counter. Destroying an engine and creating another
+does not reuse the old id.
+
+### Representation
+
+`interface_version` remains `input-archive-v1`. Envelope and content versions
+remain 1. Plugin observations use the additive kind `plugin_observation` with
+`plugin_observation_version` 1. An absent, non-integer, or other version is
+`unsupported_plugin_observation`. It is not coerced to `unknown_outcome` and is
+not a successful current semantic result. A `coverage=complete` claim is stored
+only with basis `captured_group_members_and_target`, equal positive captured and
+group member counts, and `target_membership` `present` or `absent`. Any other
+complete claim, including a legacy snapshot boolean, is `invalid_request`.
+Query repeats that check as `coverage_claim_accepted`.
+
+`association_role=engine_entry_context` is an engine-entry property snapshot
+(`squirrel_archive_source`, `squirrel_archive_process`, `squirrel_archive_update`,
+`squirrel_archive_segment`, `squirrel_archive_association`). It is not this
+operation's new frontend result update. `proves_current_frontend_result` and
+`frontend_terminal` stay false / `unknown`. Query reports `valid_reference`
+only when those tokens match a stored non-plugin observation, `stale` when the
+process exists but the update does not, and `unmatched` otherwise. Missing or
+malformed properties stay `absent` / `malformed` / `invalid`.
+
+Stages: `competition`, `emission`, `temporary_selection`, `commit`,
+`cancellation`, `retraction`, `loss`, `exclusion`. Apply states: `applied`,
+`unchanged`, `fallback`, `not_applicable`. `unchanged` means a plan was applied
+and emission order matched upstream order. That is not ranking benefit.
+`lm_request_state` is `issued_succeeded`, `issued_failed`, or `no_request`.
+The request id is the native scorer id from the exchange that was actually
+attempted. Evidence request ids, pid, time, and equal text are not substitutes.
+No request id is stored when no LM request was issued.
+
+Weight is `phrase.weight` in log space when the candidate is a system or user
+dictionary word. Quality is `candidate.quality` in probability space. LM score
+is the protocol v2 raw log score before alpha, only for candidates in a
+successful exchange. Retrieval evidence is the evidence term in log space, only
+when that evidence call succeeded. Unavailable components are `unknown`, not a
+fabricated zero. Overlapping spans and different categories stay separate
+groups. A truncated window or a legacy complete flag is not group-complete
+competition.
+
+### Bounds, faults, and continuity
+
+The input path copies an owned snapshot and `try_lock`s the producer queue. It
+does not serialize, compress, connect, read, wait, or retry. The worker does
+transport. Retries of a retryable send are at most 3, on the worker. A failed
+loss-notice send is restored to that same bounded queue; it is not discarded.
+The collector keeps `observation_kind=loss_notice` even when the notice carries
+no content. It is not rewritten to an exclusion notice.
+After the retry cap, one continuity notice is held and delivered on the next
+successful policy exchange or content send. That is not a tight retry loop,
+and a generation change or abandon drops it instead of retargeting it. Queue
+count 256, queue bytes 1048576, event budget 65536, batch 64. A failed
+`try_lock` refuses `queue_saturated`. Commit, cancellation, retraction, loss,
+and exclusion outrank competition and emission snapshots.
+
+Admission results are per item. The worker parses the ordered `codes` array of
+the `admit_batch` reply and binds each code to the matching outstanding
+observation in the same batch and binding generation. Only `admitted`, or the
+collector's same-identity/same-content `duplicate`, establish semantic
+admission; `capture_disabled`, `event_too_large`, `invalid_request`,
+`unsupported_version`, `unsupported_plugin_observation`, `capacity_stop`,
+`storage_failure`, `identity_conflict`, and `queue_saturated` are definite
+refusals and are terminal for that observation. A reply whose per-item result
+is missing, malformed, or not exactly one code per item stays unknown; unknown
+content is not replayed and never becomes admitted. Envelope `ok:true`,
+transport success, queue position, counters, or a fresh local policy snapshot
+are not admission.
+
+Commit text is not retained by the session for a later retraction. A locally
+eligible commit registers at most one bounded worker-owned receipt (count cap
+8, oldest evicted); the immediate BackSpace queues a content-free reference
+intent. The worker sends that retraction only after the exact originating
+commit's per-item result resolved as admitted or same-content duplicate, and
+it attaches only that commit's approved content. A refused, unknown, absent,
+evicted, retargeted, or generation-mismatched result degrades the intent to a
+content-free exclusion notice (`retraction_commit_refused` or
+`retraction_commit_unknown`), and a later reply cannot revive it. Receipt
+payload content exists only for admitted commits and is released when the
+dependency is consumed or evicted. A pending intent does not wait on the
+input path; it waits inside the worker-owned queue, and an unknown result is
+bounded by the same retry and loss rules as any other observation.
+
+A held publication, absent collector, saturated queue, capacity stop, or
+blocked control call must not stop emission, selection, or commit. The fault
+watchdog is 2000 ms. It detects a dependency; it is not a p95/p99 certification.
+No quiet-machine or plugin-cost certification is claimed. #189 timing is
+frontend evidence only.
+
+Pause survives producer recreation because policy is durable in the collector.
+A temporary selection observed while the producer is not locally effective —
+paused, off, stale, or not yet observed — is an excluded prefix, exactly like
+a window or demand observation: the tentative selection is cleared, its text
+is not admitted, and resume does not backfill it into a later commit. A commit
+or cancellation while the producer is not locally effective follows the same
+rule. Commit text is not retained by the session; a later retraction is a
+content-free reference resolved by the worker against the collector's
+per-item result. Resume therefore backfills neither a locally excluded commit
+nor a commit the collector refused per item — for example `capture_disabled`
+while a pause races a still-fresh local policy snapshot. Retarget and
+destruction drop
+queued snapshots and receipts instead of sending them to a new socket. Engine
+recreation
+uses a new process-lifetime source instance; a destroyed engine's id is not
+recycled. Schema, secure input, and an ineligible prefix cut continuity. Secure input uses `IsSecureEventInputEnabled` when it can be
+resolved; if that gate cannot be resolved, text is not admitted. That is not a
+universal sensitive detector. Invalid frontend association is not sensitivity
+clearance. Archive failure must not terminate input: sockets set
+`SO_NOSIGPIPE`, and a refused admission is not a commit failure.
+
+### Checks
+
+From the plugin checkout, after an isolated `make librime` in the Squirrel
+build host:
+
+```sh
+"$PYTHON" tools/check_input_archive_plugin.py --self-test \
+  --root "$RUNTIME/p-self"
+"$PYTHON" tools/check_input_archive_plugin.py --suite contract \
+  --native-build "$HOST/librime/build" \
+  --root "$RUNTIME/pc/run" \
+  --report "$EVIDENCE/plugin-report.json"
+```
+
+`--self-test` requires an explicit fresh root. It does not fall back to an
+older attempt directory. The contract suite derives its native workspace from
+the root's parent, so keep that parent separate from the self-test leaf.
+
+The checker is an orchestration entry, not a replacement plugin. It binds the
+built dylib and source, runs the registered native observation cases, and
+preserves primary evidence. Ordinary status, errors, and the report are
+content-free. Private text is only in a deliberate detail query. Stop only the
+collector that check started:
+
+```sh
+"$PYTHON" -m archive.cli --root "$ROOT" --socket "$ROOT/collector.sock" collector stop
+```
+
+This slice does not certify pixels, host persistence, ranking benefit, added
+plugin cost, or integrated SYS acceptance. **Merge never enables capture.**

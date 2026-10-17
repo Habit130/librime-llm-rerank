@@ -366,6 +366,7 @@ _ACCOUNTED_RESULTS = {
     "event_too_large",
     "unsupported_version",
     "unsupported_schema",
+    "unsupported_plugin_observation",
     "invalid_request",
     "excluded",
 }
