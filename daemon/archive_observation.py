@@ -245,6 +245,12 @@ class DaemonArchiveObserver(object):
         if not self.capture_effective():
             return edges
         try:
+            from server import (
+                SCORING_STRATEGY_LEGACY_SUM,
+                SCORING_STRATEGY_MEAN_TOKEN,
+                window_context,
+            )
+
             context = request.get("context")
             candidates = request.get("candidates")
             if not isinstance(context, str) or not isinstance(candidates, list):
@@ -252,13 +258,13 @@ class DaemonArchiveObserver(object):
             window = getattr(state, "context_window", 64)
             if not isinstance(window, int) or isinstance(window, bool) or window < 1:
                 window = 64
-            effective = context[-window:]
+            effective = window_context(context, window)
             clean_candidates = [
                 candidate for candidate in candidates if isinstance(candidate, str)
             ]
-            strategy = getattr(state, "scoring_strategy", "mean_token")
-            if strategy not in ("mean_token", "legacy_sum"):
-                strategy = "mean_token"
+            strategy = getattr(state, "scoring_strategy", SCORING_STRATEGY_MEAN_TOKEN)
+            if strategy not in (SCORING_STRATEGY_MEAN_TOKEN, SCORING_STRATEGY_LEGACY_SUM):
+                strategy = SCORING_STRATEGY_MEAN_TOKEN
             declared = request.get("baseline_policy_id")
             digest = None
             exact = False
@@ -389,7 +395,7 @@ class DaemonArchiveObserver(object):
         if not self.capture_effective():
             return
         try:
-            if reason not in ("idle", "identity_change", "identity_invalid", "unspecified"):
+            if reason not in ("identity_change", "identity_invalid", "unspecified"):
                 reason = "unspecified"
             finished = monotonic_ms()
             frame = self._base_frame("unload", "dunload-%s" % self.source_instance_id)

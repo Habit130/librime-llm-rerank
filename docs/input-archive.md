@@ -661,7 +661,9 @@ Stages and their content-free fields:
   when failed, `scoring_started`, `load_included`, `scoring_ms`, `load_ms`
   (only when a load actually happened inside this request), `scores_returned`,
   and the named edges `request_accepted`, `scoring_started`,
-  `scoring_completed`, `outcome_decided`.
+  `scoring_completed`, `outcome_decided`. `scoring_ms` spans the scoring call
+  itself; a cold request performs its load inside that span, which
+  `load_included`/`load_ms` report (the reduction is not split further).
 - `load` — `load_outcome` (`completed`/`failed`), `load_ms`,
   `model_identity`, `tokenizer_identity` (null, basis
   `unverified_from_scoring_process`), `adapter_present`, `adapter_digest`,
@@ -730,9 +732,10 @@ activity or refresh the reported status.
 The observer copies an owned snapshot on the real edge and attempts a bounded
 non-waiting `Producer.admit`; it never serializes, connects, retries, or waits.
 Producer queue count 256, queue bytes 1048576, batch 64, event budget 65536
-apply unchanged. Refusals are terminal and counted locally
-(`known_refused`, `refused_untrusted` in the daemon's local status); a refused
-snapshot is dropped and is never held for a later backfill. A snapshot that
+apply unchanged. Refusals are terminal and counted locally by the producer
+(`known_refused`) and the observer (`refused_untrusted`) for in-process
+inspection and tests; no new wire field reports them. A refused snapshot is
+dropped and is never held for a later backfill. A snapshot that
 was authorized while the policy was fresh and enabled may still finish
 delivery later under the documented policy linearization: the collector
 re-checks the durable desired policy per item and a

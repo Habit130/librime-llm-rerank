@@ -117,7 +117,6 @@ _DAEMON_OUTCOME_CODES = {
 _DAEMON_ERROR_PHASES = {"validate", "score", "transport"}
 _DAEMON_LOAD_OUTCOMES = {"completed", "failed"}
 _DAEMON_UNLOAD_REASONS = {
-    "idle",
     "identity_change",
     "identity_invalid",
     "unspecified",
@@ -135,6 +134,49 @@ _DAEMON_EDGE_NAMES = {
     "unload": {"unload_started", "unload_completed"},
 }
 _DAEMON_RUNTIME_DISTRIBUTIONS = {"mlx", "mlx-lm", "numpy"}
+# Content-free daemon observation fields surfaced in timeline/process summaries
+# and in the passive `daemon` view; kept in one place so both stay in sync.
+_DAEMON_SUMMARY_FIELDS = (
+    "daemon_observation_version",
+    "daemon_stage",
+    "observed_at_wall_ms",
+    "clock_domain",
+    "monotonic_domain",
+    "edges",
+    "request_id",
+    "plan_identity",
+    "effective_policy_id",
+    "declared_policy_digest",
+    "declared_policy_exact",
+    "scoring_strategy",
+    "context_window_rule",
+    "attribution_rule",
+    "context_window_chars",
+    "requested_context_chars",
+    "effective_context_chars",
+    "context_truncated",
+    "candidate_count",
+    "candidate_chars",
+    "model_identity",
+    "model_identity_basis",
+    "adapter_present",
+    "adapter_digest",
+    "outcome_code",
+    "error_phase",
+    "scoring_started",
+    "load_included",
+    "scoring_ms",
+    "load_ms",
+    "decomposition",
+    "scores_returned",
+    "load_outcome",
+    "tokenizer_identity",
+    "tokenizer_identity_basis",
+    "model_weights_sha256",
+    "runtime_versions",
+    "unload_reason",
+    "unload_ms",
+)
 _PLUGIN_STAGES = {
     "competition",
     "emission",
@@ -259,11 +301,17 @@ def _validate_daemon(observation):
         "edges": canonical_edges,
     }
     if stage == "request":
-        for name in ("request_id", "plan_identity", "effective_policy_id"):
-            token = safe_token(observation.get(name))
-            if token is None:
+        # Unknown identities degrade to absent: an id outside the token
+        # alphabet loses its field, never the whole observation.
+        for name in ("request_id", "plan_identity"):
+            value = observation.get(name)
+            if value is not None and safe_token(value) is None:
                 return "invalid_request"
-            daemon[name] = token
+            daemon[name] = value
+        policy_id = safe_token(observation.get("effective_policy_id"))
+        if policy_id is None:
+            return "invalid_request"
+        daemon["effective_policy_id"] = policy_id
         digest = _hex_digest(observation.get("declared_policy_digest"))
         if digest is False:
             return "invalid_request"
@@ -1636,40 +1684,7 @@ class Collector(object):
             "edges": daemon.get("edges"),
             "content_included": False,
         }
-        for name in (
-            "request_id",
-            "plan_identity",
-            "effective_policy_id",
-            "declared_policy_digest",
-            "declared_policy_exact",
-            "scoring_strategy",
-            "context_window_rule",
-            "attribution_rule",
-            "context_window_chars",
-            "requested_context_chars",
-            "effective_context_chars",
-            "context_truncated",
-            "candidate_count",
-            "candidate_chars",
-            "model_identity",
-            "model_identity_basis",
-            "adapter_present",
-            "adapter_digest",
-            "outcome_code",
-            "error_phase",
-            "scoring_started",
-            "load_included",
-            "scoring_ms",
-            "load_ms",
-            "decomposition",
-            "scores_returned",
-            "load_outcome",
-            "tokenizer_identity",
-            "model_weights_sha256",
-            "runtime_versions",
-            "unload_reason",
-            "unload_ms",
-        ):
+        for name in _DAEMON_SUMMARY_FIELDS:
             if name in daemon:
                 summary[name] = daemon.get(name)
         return summary
@@ -1835,47 +1850,7 @@ class Collector(object):
             summary["group_member_count"] = plugin.get("group_member_count")
         daemon = entry.get("daemon")
         if isinstance(daemon, dict):
-            for name in (
-                "daemon_observation_version",
-                "daemon_stage",
-                "observed_at_wall_ms",
-                "clock_domain",
-                "monotonic_domain",
-                "edges",
-                "request_id",
-                "plan_identity",
-                "effective_policy_id",
-                "declared_policy_digest",
-                "declared_policy_exact",
-                "scoring_strategy",
-                "context_window_rule",
-                "attribution_rule",
-                "context_window_chars",
-                "requested_context_chars",
-                "effective_context_chars",
-                "context_truncated",
-                "candidate_count",
-                "candidate_chars",
-                "model_identity",
-                "model_identity_basis",
-                "adapter_present",
-                "adapter_digest",
-                "outcome_code",
-                "error_phase",
-                "scoring_started",
-                "load_included",
-                "scoring_ms",
-                "load_ms",
-                "scores_returned",
-                "decomposition",
-                "load_outcome",
-                "tokenizer_identity",
-                "tokenizer_identity_basis",
-                "model_weights_sha256",
-                "runtime_versions",
-                "unload_reason",
-                "unload_ms",
-            ):
+            for name in _DAEMON_SUMMARY_FIELDS:
                 if name in daemon:
                     summary[name] = daemon.get(name)
         if private:

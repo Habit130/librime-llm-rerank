@@ -10,8 +10,11 @@ import json
 import os
 import socket
 import stat
+import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -27,6 +30,15 @@ from server import (  # noqa: E402
     make_request,
     window_context,
 )
+
+
+def _wait_until(predicate, timeout=5.0, interval=0.05):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
 
 
 class RecordingProducer(object):
@@ -255,10 +267,10 @@ class ObserverFrameTests(unittest.TestCase):
         self.assertEqual(frame["model_weights_sha256"], "a" * 64)
         self.assertIsNone(frame["tokenizer_identity"])
         self.assertEqual(frame["runtime_versions"]["mlx"], "0.32.0")
-        observer.note_unload("idle", state)
+        observer.note_unload("identity_change", state)
         frame = observer._producer.frames[1]
         self.assertEqual(frame["daemon_stage"], "unload")
-        self.assertEqual(frame["unload_reason"], "idle")
+        self.assertEqual(frame["unload_reason"], "identity_change")
         observer.note_unload("weird", state)
         self.assertEqual(observer._producer.frames[2]["unload_reason"],
                          "unspecified")
@@ -288,6 +300,99 @@ class ObserverFrameTests(unittest.TestCase):
         self.assertIn("request_accepted", response_edges)
         self.assertEqual(observer._producer.frames, [])
         self.assertEqual(observer.local_status()["refused_untrusted"], 0)
+
+    def test_malformed_collector_results_never_certify_persistence(self):
+        """A peer that answers well-formed frames with an empty body (no
+        per-item `codes`) must leave the observation unaccounted, counted as
+        refused, and never durable."""
+
+        class FakePeer(object):
+            def __init__(self, path):
+                self.path = path
+                self._stop = False
+                self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._sock.bind(path)
+                os.chmod(path, 0o600)
+                self._sock.listen(4)
+                self._sock.settimeout(0.2)
+                self._thread = threading.Thread(target=self._serve, daemon=True)
+                self._thread.start()
+
+            def _serve(self):
+                while not self._stop:
+                    try:
+                        conn, _ = self._sock.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    try:
+                        conn.settimeout(1.0)
+                        header = conn.recv(4)
+                        if len(header) < 4:
+                            continue
+                        (size,) = struct.unpack(">I", header)
+                        payload = b""
+                        while len(payload) < size:
+                            chunk = conn.recv(size - len(payload))
+                            if not chunk:
+                                break
+                            payload += chunk
+                        request = json.loads(payload.decode("utf-8"))
+                        body = {}
+                        if request.get("op") == "policy_observe":
+                            body = {
+                                "desired_policy": "enabled",
+                                "desired_revision": 7,
+                            }
+                        reply = json.dumps({
+                            "interface_version": "input-archive-v1",
+                            "envelope_version": 1,
+                            "op": request.get("op"),
+                            "ok": True,
+                            "body": body,
+                            "content_included": False,
+                        }).encode("utf-8")
+                        conn.sendall(struct.pack(">I", len(reply)) + reply)
+                    except Exception:
+                        pass
+                    finally:
+                        conn.close()
+
+            def stop(self):
+                self._stop = True
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+
+        root = os.path.realpath(tempfile.mkdtemp(prefix="ac191-peer-"))
+        os.chmod(root, 0o700)
+        peer = FakePeer(os.path.join(root, "collector.sock"))
+        try:
+            observer = DaemonArchiveObserver(
+                os.path.join(root, "collector.sock"),
+                source_instance_id="daemon-peer-test",
+            )
+            self.assertTrue(_wait_until(
+                lambda: observer.local_status()["observed_desired"] == "enabled",
+                timeout=5.0,
+            ))
+            result = observer.observe_request(
+                make_request("req-peer", "plan-peer", "\u540c\u4f34", ["\u540c\u4f34"]),
+                FakeState(), "dsr-test-1", "mean-token-lm-v1",
+            )
+            self.assertIsInstance(result, dict)
+            self.assertTrue(_wait_until(
+                lambda: observer.local_status()["known_refused"] >= 1,
+                timeout=5.0,
+            ))
+            status = observer.local_status()
+            self.assertGreaterEqual(status["known_refused"], 1)
+            self.assertNotIn("durable", status)
+            observer.close()
+        finally:
+            peer.stop()
 
     def test_foreign_socket_file_is_refused_per_admission(self):
         observer, root = self._observer()

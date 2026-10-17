@@ -832,6 +832,34 @@ class ContractSuite(object):
             raise CheckFailure("empty_effective")
         if empty_rows[0].get("context_truncated") is not False:
             raise CheckFailure("empty_truncated")
+        # An identity outside the token alphabet loses its field, never the
+        # whole observation.
+        unsafe = _send_request_raw(
+            main["daemon_sock"],
+            _scoring_request(
+                "req unsafe/unknown", "plan unknown", "\u672a\u77e5",
+                ["\u672a\u77e5\u8eab\u4efd"],
+            ),
+            timeout=10.0,
+        )
+        if not unsafe or "scores" not in unsafe:
+            raise CheckFailure("unsafe_id_score")
+        rows = _await_durable_rows(
+            main["client"],
+            lambda rows, status: any(
+                row.get("daemon_stage") == "request"
+                and row.get("request_id") is None
+                for row in rows
+            ),
+            timeout=10.0,
+        )
+        unknown_rows = [
+            row for row in (rows or [])
+            if row.get("daemon_stage") == "request"
+            and row.get("request_id") is None
+        ]
+        if not unknown_rows:
+            raise CheckFailure("unknown_identity_absent")
         unique = {
             (row.get("request_id"), row.get("source_local_sequence"))
             for row in rows
@@ -1019,8 +1047,37 @@ class ContractSuite(object):
         )
         if not response or "scores" not in response:
             raise CheckFailure("pause_expired_score")
+        # The collector's refusal is a genuine per-item reply: the same frame
+        # shape that is admissible while enabled is refused `capture_disabled`
+        # while paused and must not persist content.
+        refused_frame = _frame("request", 100)
+        refused_frame["payload"] = {
+            "requested_context": "genuine-refusal-191",
+            "effective_context": "genuine-refusal-191",
+            "candidates": ["\u771f\u5b9e\u62d2\u7edd"],
+        }
+        refused = main["client"].call(
+            "admit_batch", {"observations": [refused_frame]})
+        if _body(refused).get("codes") != ["capture_disabled"]:
+            raise CheckFailure("genuine_refusal_code")
+        _durable_now(main["client"])
+        if _scan_root_for(main["root"], ["genuine-refusal-191"]):
+            raise CheckFailure("refused_content_persisted")
         _enable_capture(main["client"])
         _await_producer_effective(main["client"])
+        admitted_frame = _frame("request", 101)
+        admitted_frame["payload"] = {
+            "requested_context": "genuine-refusal-191",
+            "effective_context": "genuine-refusal-191",
+            "candidates": ["\u771f\u5b9e\u62d2\u7edd"],
+        }
+        admitted = main["client"].call(
+            "admit_batch", {"observations": [admitted_frame]})
+        if _body(admitted).get("codes") != ["admitted"]:
+            raise CheckFailure("resumed_admit")
+        _durable_now(main["client"])
+        if not _scan_root_for(main["root"], ["genuine-refusal-191"]):
+            raise CheckFailure("resumed_content_missing")
         resumed_context = "%s resumed-ok" % CANARY
         response = _send_request_raw(
             main["daemon_sock"],
