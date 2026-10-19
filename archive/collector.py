@@ -39,6 +39,18 @@ from archive.interface import (
 )
 from archive.limits import resolve
 from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
+from archive.querying import (
+    QUERY_VERSION,
+    RelationContext,
+    choice_group_rollup,
+    collect_timing,
+    decode_cursor,
+    encode_cursor,
+    filter_fingerprint,
+    overview_body,
+    thin_timeline_row,
+    timing_from_payload,
+)
 from archive.safety import (
     UnsafeRoot,
     atomic_write,
@@ -512,6 +524,14 @@ def _validate_plugin(observation):
     submission = observation.get("submission") or "not_applicable"
     if submission not in _PLUGIN_SUBMISSION:
         return "invalid_request"
+    # A truncated window cannot claim complete competition: the completeness
+    # claim is a group-members-and-target claim, and a truncated capture is
+    # not that population.
+    truncated = observation.get("truncated")
+    if truncated is not None and not isinstance(truncated, bool):
+        return "invalid_request"
+    if truncated is True and coverage == "complete":
+        return "invalid_request"
     plugin = {
         "plugin_observation_version": PLUGIN_OBSERVATION_VERSION,
         "plugin_stage": stage,
@@ -524,6 +544,7 @@ def _validate_plugin(observation):
         "lm_request_id": request_id,
         "apply_state": apply_state,
         "submission": submission,
+        "truncated": truncated is True,
         "frontend_terminal": "unknown",
         "proves_current_frontend_result": False,
         "order_changed": observation.get("order_changed") is True,
@@ -556,6 +577,8 @@ def _accept_plugin_coverage(plugin):
     if plugin.get("coverage") != "complete":
         return plugin.get("coverage") or "unknown", False
     if plugin.get("coverage_basis") != _PLUGIN_COMPLETE_BASIS:
+        return "unknown", False
+    if plugin.get("truncated") is True:
         return "unknown", False
     if plugin.get("target_membership") not in {"present", "absent"}:
         return "unknown", False
@@ -775,9 +798,16 @@ class Collector(object):
             "storage_failure",
             "quarantine_bytes",
             "admission_refused_units",
+            "max_published_seq",
         ):
             if key in previous:
                 self._state[key] = previous[key]
+        # A cursor may only name a snapshot that this collector actually
+        # published; a state file from before this field existed is bounded by
+        # the durable prefix it declares.
+        self._state["max_published_seq"] = max(
+            self._state.get("max_published_seq", 0), self._state["durable_seq"]
+        )
         self._state["discarded_unpublished_bytes"] = discarded
         self._state["discarded_quarantine_bytes"] = quarantine_discarded
         if short:
@@ -791,6 +821,7 @@ class Collector(object):
             "durable_seq": 0,
             "durable_offset": 0,
             "durable_bytes": 0,
+            "max_published_seq": 0,
             "known_dropped_units": 0,
             "storage_failed_units": 0,
             "capacity_refused_units": 0,
@@ -972,7 +1003,19 @@ class Collector(object):
 
     def _send(self, conn, response):
         try:
-            conn.sendall(encode_frame(response, self.limits["max_frame_bytes"]))
+            frame = encode_frame(response, self.limits["max_frame_bytes"])
+            if not response.get("content_included", False) and len(frame) > self.limits["query_page_bytes_max"] + 64:
+                # A non-private response that exceeds the declared page byte
+                # bound is refused instead of silently delivering an oversized
+                # page; private deliberate detail is opted-in content and is
+                # only bounded by the frame limit.
+                response = failure(
+                    response.get("op", "unknown"),
+                    response.get("request_id", ""),
+                    "page_bytes_bound",
+                )
+                frame = encode_frame(response, self.limits["max_frame_bytes"])
+            conn.sendall(frame)
         except Exception:
             sys.stderr.write("code=malformed_frame\n")
 
@@ -1464,6 +1507,9 @@ class Collector(object):
             pending["quarantine_bytes"] += sum(map(len, quarantine_lines))
             if metas:
                 pending["durable_seq"] = metas[-1]["durable_seq"]
+                pending["max_published_seq"] = max(
+                    pending.get("max_published_seq", 0), pending["durable_seq"]
+                )
             used_now = pending["durable_bytes"] + pending["quarantine_bytes"]
             pending["capacity_stop"] = pending["capacity_stop"] or used_now >= self.limits["archive_capacity_bytes"]
             payload = canonical_bytes(pending) + b"\n"
@@ -1689,29 +1735,233 @@ class Collector(object):
                 summary[name] = daemon.get(name)
         return summary
 
+    def query_state(self):
+        """Content-free state used by the versioned query surface.
+
+        Contains the published prefix, epoch, durable policy and durable
+        counters; it never probes the daemon and never opens inference. All
+        values are read under one lock acquisition; this method must not call
+        helpers that take the same lock again.
+        """
+        now = time.monotonic()
+        with self._lock:
+            fresh_match = 0
+            stale = 0
+            for observed in self._producers.values():
+                age_ms = int((now - observed["seen"]) * 1000)
+                is_fresh = age_ms <= self.limits["freshness_window_ms"]
+                matches = (
+                    observed["revision"] is not None
+                    and observed["revision"] == self._policy["revision"]
+                )
+                if not is_fresh or not matches:
+                    stale += 1
+                else:
+                    fresh_match += 1
+            desired = self._policy["desired"]
+            if self._state["storage_failure"]:
+                collector_effective = "storage_failure"
+            elif self._state["capacity_stop"]:
+                collector_effective = "capacity_stop"
+            else:
+                collector_effective = desired
+            globally = (
+                desired == "enabled"
+                and collector_effective == "enabled"
+                and fresh_match >= 1
+                and stale == 0
+            )
+            return {
+                "durable_seq": self._state["durable_seq"],
+                "collector_epoch": self._state["collector_epoch"],
+                "continuity_epoch": self._state["continuity_epoch"],
+                "max_published_seq": self._state.get("max_published_seq", 0),
+                "durable_bytes": self._state["durable_bytes"],
+                "quarantine_bytes": self._state["quarantine_bytes"],
+                "capacity_bytes": self.limits["archive_capacity_bytes"],
+                "desired_policy": desired,
+                "desired_revision": self._policy["revision"],
+                "collector_effective": collector_effective,
+                "globally_effective": globally,
+                "received_unpublished": len(self._queue) + self._publishing_units,
+                "known_dropped_units": self._state["known_dropped_units"],
+                "admission_refused_units": self._state.get("admission_refused_units", 0),
+                "storage_failed_units": self._state["storage_failed_units"],
+                "capacity_refused_units": self._state["capacity_refused_units"],
+                "identity_conflicts": self._state["identity_conflicts"],
+                "crash_tail": self._state["crash_tail"],
+                "unclean_shutdown_observed": (
+                    "unclean_shutdown" in self._state["continuity_break_reasons"]
+                ),
+                "discarded_unpublished_bytes": self._state["discarded_unpublished_bytes"],
+                "discarded_quarantine_bytes": self._state.get("discarded_quarantine_bytes", 0),
+                "capacity_stop": self._state["capacity_stop"],
+                "storage_failure": self._state["storage_failure"],
+                "continuity_break_reasons": list(self._state["continuity_break_reasons"]),
+                "producer_observations": [
+                    dict(observed) for observed in self._producers.values()
+                ],
+            }
+
+    def _published_rows(self, state=None):
+        """Index rows at the published prefix, in durable_seq order.
+
+        Unpublished queued or in-flight work never appears here, so no cursor or
+        view can leak it.
+        """
+        state = state or self.query_state()
+        watermark = state["durable_seq"]
+        with self._lock:
+            return [
+                entry
+                for entry in self._index
+                if entry.get("durable_seq", 0) <= watermark
+            ]
+
+    def _payload_for_row(self, entry):
+        try:
+            return self._read_payload(entry)
+        except Exception:
+            return None
+
+    def _timing_summary(self, rows):
+        relevant = [
+            row
+            for row in rows
+            if (
+                row.get("observation_kind") == "provenance"
+                and row.get("stage") == "frontend_timing"
+            )
+            or (
+                row.get("observation_kind") == "plugin_observation"
+                and row.get("stage") == "frontend_timing"
+            )
+        ]
+        return collect_timing(relevant, self.limits, self._payload_for_row)
+
+    def _cursor_check(self, body, view, filters, state):
+        """Cursor tokens cannot cross incompatible versions, filters, roots or
+        unpublished positions."""
+        if body.get("cursor_token") in (None, ""):
+            return None
+        decoded = decode_cursor(body.get("cursor_token"))
+        if isinstance(decoded, str):
+            return decoded
+        if decoded.get("view") != view:
+            return "invalid_request"
+        if decoded.get("filters") != filter_fingerprint(filters):
+            return "invalid_request"
+        if decoded.get("epoch") != state["collector_epoch"]:
+            return "cursor_snapshot_unknown"
+        as_of = decoded.get("as_of")
+        if as_of > state.get("max_published_seq", state["durable_seq"]):
+            return "cursor_snapshot_unknown"
+        return None
+
+    def _paged_limits(self, body):
+        page_size = body.get("page_size", self.limits["page_size_default"])
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
+            return None, "invalid_request"
+        if page_size > self.limits["page_size_max"]:
+            return None, "page_bound"
+        return page_size, None
+
+    def _legacy_start_seq(self, body):
+        cursor = body.get("cursor")
+        if cursor in (None, ""):
+            return 0, None
+        if isinstance(cursor, bool):
+            return None, "invalid_request"
+        if isinstance(cursor, int):
+            if cursor < 0:
+                return None, "invalid_request"
+            return cursor, None
+        if isinstance(cursor, str) and cursor.isdigit():
+            return int(cursor), None
+        return None, "invalid_request"
+
     def _query(self, op, request_id, body):
         view = body.get("view")
-        if view in {"overview", "status"}:
+        if view == "status":
             return self._ok(op, request_id, self.snapshot())
         if view == "daemon":
             return self._ok(op, request_id, self._daemon_state())
+        if view in {"overview", "timing", "choice"}:
+            return self._query_versioned(op, request_id, body)
+        return self._query_legacy(op, request_id, body)
+
+    def _query_versioned(self, op, request_id, body):
+        state = self.query_state()
+        view = body.get("view")
+        now_wall_ms = int(time.time() * 1000)
+        rows = self._published_rows(state)
+        filters = {
+            "process_id": body.get("process_id"),
+            "source_instance_id": body.get("source_instance_id"),
+            "observation_kind": body.get("observation_kind"),
+            "segment_id": body.get("segment_id"),
+        }
+        if view == "overview":
+            timing = self._timing_summary(rows)
+            response = overview_body(
+                rows, state, self.limits, timing.body(state), now_wall_ms
+            )
+        elif view == "timing":
+            timing = self._timing_summary(rows)
+            response = timing.body(state)
+            response["collector_epoch"] = state["collector_epoch"]
+        elif view == "choice":
+            process_id = body.get("process_id")
+            if safe_token(process_id) is None:
+                return failure(op, request_id, "invalid_request")
+            filters = {
+                "view": "choice",
+                "process_id": process_id,
+                "group_id": body.get("group_id"),
+            }
+            response = choice_group_rollup(rows, process_id, self.limits)
+            response["view"] = "choice"
+            response["query_version"] = QUERY_VERSION
+            response["as_of_durable_seq"] = state["durable_seq"]
+            response["collector_epoch"] = state["collector_epoch"]
+        else:
+            return failure(op, request_id, "invalid_request")
+        error = self._cursor_check(body, view, filters, state)
+        if error is not None:
+            return failure(op, request_id, error)
+        response["cursor_token"] = encode_cursor(
+            view, filters, state["durable_seq"], state["collector_epoch"]
+        )
+        response["snapshot_lifetime"] = (
+            "immutable_at_as_of_durable_seq_until_collector_epoch_changes"
+        )
+        return self._ok(op, request_id, response)
+
+    def _query_legacy(self, op, request_id, body):
+        view = body.get("view")
         if view not in {"timeline", "process", "losses"}:
             return failure(op, request_id, "invalid_request")
-        page_size = body.get("page_size", self.limits["page_size_default"])
-        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
-            return failure(op, request_id, "invalid_request")
-        if page_size > self.limits["page_size_max"]:
-            return failure(op, request_id, "page_bound")
-        cursor = body.get("cursor")
-        start_seq = 0
-        if cursor not in (None, ""):
-            if isinstance(cursor, bool) or not isinstance(cursor, int):
-                if isinstance(cursor, str) and cursor.isdigit():
-                    start_seq = int(cursor)
-                else:
-                    return failure(op, request_id, "invalid_request")
-            else:
-                start_seq = cursor
+        page_size, error = self._paged_limits(body)
+        if error is not None:
+            return failure(op, request_id, error)
+        start_seq, error = self._legacy_start_seq(body)
+        if error is not None:
+            return failure(op, request_id, error)
+        filters = {
+            "view": view,
+            "process_id": body.get("process_id"),
+            "observation_kind": body.get("observation_kind"),
+            "source_instance_id": body.get("source_instance_id"),
+            "segment_id": body.get("segment_id"),
+            "application": body.get("application"),
+            "state": body.get("state"),
+            "since_ms": body.get("since_ms"),
+            "until_ms": body.get("until_ms"),
+        }
+        state = self.query_state()
+        error = self._cursor_check(body, view, filters, state)
+        if error is not None:
+            return failure(op, request_id, error)
         private = body.get("private_detail") is True and view == "process"
         with self._lock:
             watermark = self._state["durable_seq"]
@@ -1719,19 +1969,25 @@ class Collector(object):
             index = list(self._index)
             update_ids = set(self._update_ids)
             process_kinds = {key: set(value) for key, value in self._process_kinds.items()}
+        published = [
+            entry for entry in index if entry.get("durable_seq", 0) <= watermark
+        ]
         selected = []
-        for entry in index:
-            if entry["durable_seq"] <= start_seq or entry["durable_seq"] > watermark:
+        truncated = False
+        for entry in published:
+            if entry["durable_seq"] <= start_seq:
                 continue
             if view == "losses" and entry["observation_kind"] != "loss_notice":
                 continue
             if view == "process" and entry["process_id"] != body.get("process_id"):
                 continue
-            if view == "timeline" and entry["observation_kind"] == "loss_notice":
-                pass
+            if not self._row_matches_filters(entry, body):
+                continue
             selected.append(entry)
             if len(selected) >= page_size:
+                truncated = True
                 break
+        context = RelationContext(published)
         frontend_refs = set()
         frontend_processes = set()
         for entry in index:
@@ -1743,12 +1999,21 @@ class Collector(object):
             if entry.get("process_id"):
                 frontend_processes.add(entry.get("process_id"))
         rows = [
-            self._summary(entry, update_ids, process_kinds, private, frontend_refs, frontend_processes)
+            self._summary(
+                entry,
+                update_ids,
+                process_kinds,
+                private,
+                frontend_refs,
+                frontend_processes,
+                context=context,
+            )
             for entry in selected
         ]
-        next_cursor = selected[-1]["durable_seq"] if len(selected) >= page_size else None
+        next_cursor = selected[-1]["durable_seq"] if selected and truncated else None
         response = {
             "view": view,
+            "query_version": QUERY_VERSION,
             "ordering": ORDERING,
             "page_size": page_size,
             "cursor": start_seq,
@@ -1757,9 +2022,19 @@ class Collector(object):
             "collector_epoch": epoch,
             "observations": rows,
             "returned": len(rows),
+            "has_more": truncated,
+            "filters_applied": {
+                name: value for name, value in filters.items() if value is not None
+            },
             "content_included": private,
             "private_detail": private,
         }
+        response["cursor_token"] = encode_cursor(
+            view, filters, watermark, epoch
+        )
+        response["snapshot_lifetime"] = (
+            "immutable_at_as_of_durable_seq_until_collector_epoch_changes"
+        )
         if private:
             return {
                 "interface_version": INTERFACE_VERSION,
@@ -1772,7 +2047,48 @@ class Collector(object):
             }
         return self._ok(op, request_id, response)
 
-    def _summary(self, entry, update_ids, process_kinds, private, frontend_refs=None, frontend_processes=None):
+    def _row_matches_filters(self, entry, body):
+        observed_at = (entry.get("clocks") or {}).get("observation_time")
+        since_ms = body.get("since_ms")
+        until_ms = body.get("until_ms")
+        if since_ms is not None:
+            if (
+                isinstance(since_ms, bool)
+                or not isinstance(since_ms, (int, float))
+                or not isinstance(observed_at, (int, float))
+                or observed_at < since_ms
+            ):
+                return False
+        if until_ms is not None:
+            if (
+                isinstance(until_ms, bool)
+                or not isinstance(until_ms, (int, float))
+                or not isinstance(observed_at, (int, float))
+                or observed_at > until_ms
+            ):
+                return False
+        application = body.get("application")
+        if application is not None:
+            app = (entry.get("clocks") or {}).get("application")
+            if app != application:
+                return False
+        source = body.get("source_instance_id")
+        if source is not None and entry.get("source_instance_id") != source:
+            return False
+        segment = body.get("segment_id")
+        if segment is not None and entry.get("continuity_segment_id") != segment:
+            return False
+        kind = body.get("observation_kind")
+        if kind is not None and entry.get("observation_kind") != kind:
+            return False
+        state_filter = body.get("state")
+        if state_filter is not None:
+            observed_state = entry.get("outcome") or "unknown"
+            if observed_state != state_filter:
+                return False
+        return True
+
+    def _summary(self, entry, update_ids, process_kinds, private, frontend_refs=None, frontend_processes=None, context=None):
         parent = entry.get("parent_update_id")
         if parent is None:
             parent_status = "absent"
@@ -1853,11 +2169,70 @@ class Collector(object):
             for name in _DAEMON_SUMMARY_FIELDS:
                 if name in daemon:
                     summary[name] = daemon.get(name)
+        relations_version = None
+        if context is not None:
+            relations = context.row_relations(entry)
+            summary["relations"] = relations
+            summary["relations_summary"] = {}
+            for block in relations.values():
+                status = block.get("status")
+                summary["relations_summary"][status] = (
+                    summary["relations_summary"].get(status, 0) + 1
+                )
+            timing, timing_reason = self._row_timing(entry)
+            if timing is not None:
+                summary["frontend_timing"] = {
+                    "version": timing.get("version"),
+                    "operation": timing.get("operation"),
+                    "validity": timing.get("validity"),
+                    "duration_ns": (
+                        timing.get("declared_duration_ns")
+                        if timing.get("validity") == "valid"
+                        else None
+                    ),
+                    "endpoint": timing.get("endpoint"),
+                    "unknown_reason": timing.get("unknown_reason"),
+                    "clock_domain": timing.get("clock_domain"),
+                    "commit_call_validity": (
+                        (timing.get("commit_call") or {}).get("validity")
+                        if timing.get("commit_call")
+                        else None
+                    ),
+                }
+                relations_version = 1
+            elif timing_reason is not None:
+                summary["frontend_timing"] = {
+                    "version": None,
+                    "validity": "unavailable",
+                    "duration_ns": None,
+                    "unknown_reason": timing_reason,
+                    "clock_domain": None,
+                }
+            summary["timing_lane"] = "frontend_numeric_v1" if timing is not None else None
+        summary["relations_version"] = relations_version
         if private:
-            payload = self._read_payload(entry)
-            summary["payload"] = payload
+            try:
+                summary["payload"] = self._read_payload(entry)
+            except Exception:
+                summary["payload"] = None
             summary["content_included"] = True
         return summary
+
+    def _row_timing(self, entry):
+        """Canonical frontend timing for one durable row.
+
+        A declared timing payload is re-derived and compared; a row that
+        declares the timing stage without a usable payload is reported with an
+        explicit reason rather than a zero.
+        """
+        stage = entry.get("stage")
+        kind = entry.get("observation_kind")
+        if kind not in ("provenance", "plugin_observation"):
+            return None, None
+        if kind == "provenance" and stage != "frontend_timing":
+            return None, None
+        payload = self._payload_for_row(entry)
+        return timing_from_payload(payload, stage)
 
     def _read_payload(self, entry):
         with open(self.observations_path, "rb") as handle:
@@ -2010,6 +2385,11 @@ def parse_args(argv):
         "batch_size",
         "connect_timeout_ms",
         "management_timeout_ms",
+        "query_page_bytes_max",
+        "query_timing_rows_max",
+        "query_group_members_max",
+        "query_choice_groups_max",
+        "query_high_fanout_updates_max",
     ):
         parser.add_argument("--" + key.replace("_", "-"), dest=key, type=int)
     parser.add_argument("--warning-ratio", dest="warning_ratio", type=float)
@@ -2035,6 +2415,11 @@ def limits_from_args(args):
         "batch_size",
         "connect_timeout_ms",
         "management_timeout_ms",
+        "query_page_bytes_max",
+        "query_timing_rows_max",
+        "query_group_members_max",
+        "query_choice_groups_max",
+        "query_high_fanout_updates_max",
     ):
         value = getattr(args, key, None)
         if value is not None:

@@ -42,6 +42,8 @@ class TuiSession(object):
             self._overview()
         elif command == "timeline":
             self._timeline()
+        elif command == "timing":
+            self._timing()
         elif command == "expand" and len(parts) == 2:
             self._expand(parts[1])
         elif command == "pause":
@@ -80,6 +82,39 @@ class TuiSession(object):
                     row.get("observation_kind"),
                     missing,
                     row.get("host_persistence"),
+                )
+            )
+        self.stdout.flush()
+
+    def _timing(self):
+        response = self.client.query("timing")
+        self.stdout.write("SCREEN timing\n")
+        body = response.get("body") or {}
+        if not response.get("ok"):
+            code = (response.get("error") or {}).get("code", "collector_unavailable")
+            self.stdout.write("code=%s\ncontent_included=false\n" % code)
+            self.stdout.flush()
+            return
+        self.stdout.write("content_included=false\n")
+        self.stdout.write("frontend_timing_version=%s\n" % body.get("frontend_timing_version"))
+        self.stdout.write(
+            "unavailable_total=%s\n" % _plain(body.get("unavailable_total"))
+        )
+        for bucket in body.get("operations") or []:
+            distributions = bucket.get("distributions") or {}
+            valid = distributions.get("valid") or {}
+            percentiles_block = valid.get("percentiles") or {}
+            self.stdout.write(
+                "operation=%s valid=%s invalid=%s unknown=%s p50=%s p95=%s p99=%s small_n=%s\n"
+                % (
+                    _plain(bucket.get("operation")),
+                    _plain(bucket.get("valid_samples")),
+                    _plain(bucket.get("invalid_samples")),
+                    _plain(bucket.get("unknown_samples")),
+                    _plain(percentiles_block.get("p50")),
+                    _plain(percentiles_block.get("p95")),
+                    _plain(percentiles_block.get("p99")),
+                    _plain(valid.get("small_n")),
                 )
             )
         self.stdout.flush()
