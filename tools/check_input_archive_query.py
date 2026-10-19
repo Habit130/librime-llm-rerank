@@ -1518,7 +1518,15 @@ class ContractSuite(object):
 
     # -- C6 high fanout -----------------------------------------------------
     def c_high_fanout(self):
-        client, root, _sock = self.collector("fanout", query_choice_groups_max=16)
+        # The queue is sized to hold the fixture population: this case measures
+        # process-scoped page and expansion bounds, while pressure-driven drop
+        # accounting has its own held-collector case.
+        client, root, _sock = self.collector(
+            "fanout",
+            query_choice_groups_max=16,
+            collector_queue_count=1024,
+            collector_queue_bytes=8388608,
+        )
         observations = self._mixed_observations(
             1024, high_fanout_updates=512, plugin_process="p-fanout"
         )
@@ -2582,6 +2590,7 @@ def self_test(root):
             "entry_ticks": 10,
             "endpoint_ticks": 20,
             "duration_ns": 1,
+            "update_calls": [{"endpoint": "marked_text", "ticks": 20}],
         }
     )
     if forged_reason is not None or forged["validity"] != "invalid":

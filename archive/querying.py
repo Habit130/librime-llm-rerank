@@ -594,13 +594,21 @@ class RelationContext(object):
     def owners_evidence(self, owners):
         """Render an owner list under the configured high-fanout bound.
 
-        A reused token under very many owners is reported with its total count
-        and an explicit truncation reason instead of an unbounded list.
+        Owners may be (source, process) pairs (token relations) or plain source
+        identifiers (process ownership); both render as content-free labels. A
+        reused token under very many owners keeps its total count and an
+        explicit truncation reason instead of an unbounded list.
         """
-        rendered = sorted(
-            "%s/%s" % (source or "unknown", process or "unknown")
-            for source, process in owners
-        )
+        rendered = []
+        for owner in owners:
+            if isinstance(owner, tuple) and len(owner) == 2:
+                source, process = owner
+                rendered.append(
+                    "%s/%s" % (source or "unknown", process or "unknown")
+                )
+            else:
+                rendered.append(str(owner) if owner else "unknown")
+        rendered.sort()
         limit = self.owner_evidence_max
         if limit is not None and len(rendered) > limit:
             return {
