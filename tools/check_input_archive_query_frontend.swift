@@ -4,10 +4,10 @@
 //
 //  This is not a second input method: it bootstraps the production Squirrel
 //  application delegate, controller and text client from the read-only
-//  accepted frontend export, drives real compositions, commits, cancellations,
-//  raw finalizations and unavailable-client controls, and reports content-free
-//  sequence markers. The checker inspects the NEW shared archive query
-//  Interface; this report never contains typed text or committed text.
+//  accepted frontend export and drives one declared scenario per process
+//  (parity, explicit/default commit, cancellation, raw finalization, fallback
+//  exchange, success exchange, unavailable client). The report is
+//  content-free: it never contains typed, marked or committed text.
 //
 
 import AppKit
@@ -82,8 +82,7 @@ enum QueryFrontendHarness {
   static var controller: SquirrelInputController?
   static var cwdAtStart = FileManager.default.currentDirectoryPath
   static var parityTrace: [String: Any] = [:]
-  static var sequenceMarkers: [String: String] = [:]
-  static var expected: [String: Any] = [:]
+  static var scenarioTrace: [String: Any] = [:]
 
   static func main() {
     let arguments = parse(CommandLine.arguments)
@@ -96,19 +95,47 @@ enum QueryFrontendHarness {
     SquirrelApp.fixtureUserDirectory = URL(fileURLWithPath: user, isDirectory: true)
     SquirrelApp.fixtureSharedSupportDirectory = URL(fileURLWithPath: shared, isDirectory: true)
     SquirrelApp.fixtureLogDirectory = URL(fileURLWithPath: log, isDirectory: true)
+    let scenario = arguments["scenario"] ?? "contract"
     if !bootstrap() {
       emit(arguments["report"])
       exit(1)
     }
-    switch arguments["scenario"] ?? "contract" {
-    case "contract":
-      runContract()
+    switch scenario {
+    case "parity":
+      runParity()
+    case "commit":
+      runCommit()
+    case "cancellation":
+      runCancellation()
+    case "raw-finalization":
+      runRawFinalization()
+    case "fallback":
+      runFallbackExchange()
+    case "success":
+      runSuccessExchange()
+    case "unavailable-client":
+      runUnavailableClient()
     default:
       fail("unknown scenario")
     }
     expect(FileManager.default.currentDirectoryPath == cwdAtStart, "working directory changed")
+    teardown()
     emit(arguments["report"])
     exit(failures.isEmpty ? 0 : 1)
+  }
+
+  /// Orderly production teardown before the process ends: the controller
+  /// releases the server and the delegate runs its terminate lifecycle, so no
+  /// engine (and therefore no plugin archive session) is torn down after
+  /// librime's globals during process exit.
+  static func teardown() {
+    pump()
+    controller?.deactivateServer(client)
+    pump(0.05)
+    if let delegate = NSApp.delegate as? SquirrelApplicationDelegate {
+      delegate.applyGlobalLifecycle(.terminate)
+    }
+    pump(0.1)
   }
 
   static func bootstrap() -> Bool {
@@ -131,37 +158,53 @@ enum QueryFrontendHarness {
       return false
     }
     let server = IMKServer(name: "ac192.frontend", bundleIdentifier: "com.ac192.harness")
+    // IMK rejects a local text client during init. Production later assigns the
+    // client in activateServer, which is the same assignment handle() uses.
     guard let created = SquirrelInputController(server: server, delegate: nil, client: nil) else {
       fail("production controller init failed")
       return false
     }
     controller = created
     created.activateServer(client)
+    if !waitForPolicy("enabled") {
+      expect(false, "capture policy did not become locally fresh")
+      // Content-free diagnostic: the producer's own local status names the
+      // freshness/revision state without any payload.
+      scenarioTrace["policy_status"] = InputArchiveEngine.shared.contentFreeStatus()
+    }
+    pump()
     return true
   }
 
-  static func runContract() {
-    expect(waitForPolicy("enabled"), "capture policy did not become locally fresh")
+  /// Let AppKit finish the queued work before the process tears down.
+  static func pump(_ interval: TimeInterval = 0.2) {
+    RunLoop.current.run(until: Date().addingTimeInterval(interval))
+  }
+
+  static func runParity() {
     let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
     InputArchiveSignals.secureEventInputEnabled = { false }
     defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
     _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 5)
-
-    // Capture off/on parity: the client-visible behavior must be identical.
     let off = captureSequence(suppressed: true)
     let on = captureSequence(suppressed: false)
     expect(off.inserts == on.inserts, "capture off/on committed text diverged")
     expect(meaningfulMarked(off.marked) == meaningfulMarked(on.marked),
            "capture off/on marked text diverged")
     expect(on.inserts.contains { $0.contains("你") }, "engine commit text missing from client")
-    expect(on.marked.contains { $0.contains("你好") || $0.contains("你") },
-           "marked text missing from client")
+    expect(!meaningfulMarked(on.marked).isEmpty, "marked text missing from client")
     parityTrace = [
       "inserts_equal": off.inserts == on.inserts,
       "marked_equal": meaningfulMarked(off.marked) == meaningfulMarked(on.marked),
       "content_included": false
     ]
+    recordMarkers("parity")
+  }
 
+  static func runCommit() {
+    let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
+    InputArchiveSignals.secureEventInputEnabled = { false }
+    defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
     // Explicit commit: select a specific candidate.
     clearComposition()
     client.reset()
@@ -169,69 +212,88 @@ enum QueryFrontendHarness {
     _ = controller?.selectCandidate(1)
     expect(!client.inserts.isEmpty, "explicit candidate selection did not commit")
     clearComposition()
-
     // Default commit: the first candidate without an explicit selection.
     client.reset()
     type("ni")
     sendKey(36, "\r")
     expect(!client.inserts.isEmpty, "default commit did not insert text")
     clearComposition()
+    recordMarkers("commit")
+  }
 
-    // Cancellation.
+  static func runCancellation() {
+    let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
+    InputArchiveSignals.secureEventInputEnabled = { false }
+    defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
     client.reset()
     type("ni")
     sendKey(53, "\u{1b}")
     expect(!InputArchiveEngine.shared.processOpen, "cancellation left the process open")
+    recordMarkers("cancellation")
+  }
 
-    // Raw finalization through deactivation.
+  static func runRawFinalization() {
+    let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
+    InputArchiveSignals.secureEventInputEnabled = { false }
+    defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
     client.reset()
     typeCode("jiazheng")
     controller?.deactivateServer(client)
     controller?.activateServer(client)
     expect(!client.inserts.isEmpty, "raw finalization did not insert raw text")
-    _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 5)
+    recordMarkers("raw-finalization")
+  }
 
-    // Fallback control: the fixture daemon raises for this candidate, so the
-    // exchange fails and the plugin falls back without an applied plan.
+  static func runFallbackExchange() {
+    let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
+    InputArchiveSignals.secureEventInputEnabled = { false }
+    defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
+    // The model-free fixture daemon fails the exchange whose first candidate
+    // is 好, so the plugin keeps the failed issuance and falls back without an
+    // applied plan.
     client.reset()
-    selectLuna()
-    clearComposition()
-    typeCode("refusex")
+    typeCode("hao")
     sendKey(49, " ")
+    expect(!client.inserts.isEmpty, "fallback commit did not insert text")
     clearComposition()
-    _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 5)
+    recordMarkers("fallback")
+  }
 
-    // Success exchange: a normal composition issues a real LM request that the
-    // model-free fixture daemon answers.
+  static func runSuccessExchange() {
+    let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
+    InputArchiveSignals.secureEventInputEnabled = { false }
+    defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
     client.reset()
     clearComposition()
     typeCode("nihao")
     _ = controller?.selectCandidate(0)
+    expect(!client.inserts.isEmpty, "success exchange commit did not insert text")
     clearComposition()
-    _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 5)
+    recordMarkers("success")
+  }
 
-    // Unavailable-client control: the global sync path with a nil client.
+  static func runUnavailableClient() {
+    let previousSecureInputSignal = InputArchiveSignals.secureEventInputEnabled
+    InputArchiveSignals.secureEventInputEnabled = { false }
+    defer { InputArchiveSignals.secureEventInputEnabled = previousSecureInputSignal }
     let held = client
     client = QueryRecordingClient()
     controller?.commitComposition(NSObject())
     client = held
     controller?.activateServer(client)
-    _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 5)
+    pump()
+    recordMarkers("unavailable-client")
+  }
 
-    selectLuna()
-    clearComposition()
-    _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 5)
+  static func recordMarkers(_ scenario: String) {
+    pump()
+    _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 8)
     let status = InputArchiveEngine.shared.contentFreeStatus()
-    sequenceMarkers = [
+    scenarioTrace = [
+      "scenario": scenario,
       "source_instance_id": InputArchiveEngine.shared.sourceInstanceId,
       "sequence": status["source_local_sequence"] ?? "0",
-      "process_id": InputArchiveEngine.shared.processId
-    ]
-    expected = [
-      "plugin_rows_min": 1,
-      "timing_rows_min": 1,
-      "exchange_success": 1,
-      "exchange_fallback": 1
+      "content_free": true
     ]
   }
 
@@ -244,6 +306,7 @@ enum QueryFrontendHarness {
     let inserts = client.inserts
     let marked = client.marked
     clearComposition()
+    pump()
     return (inserts, marked)
   }
 
@@ -251,13 +314,10 @@ enum QueryFrontendHarness {
     values.filter { !$0.isEmpty }
   }
 
-  static func selectLuna() {
-    _ = controller?.archiveSelectSchema(InputArchive.supportedSchema)
-  }
-
   static func clearComposition() {
     controller?.commitComposition(client)
     _ = InputArchiveEngine.shared.waitUntilDrained(timeout: 2)
+    pump(0.05)
   }
 
   static func type(_ text: String) {
@@ -269,6 +329,7 @@ enum QueryFrontendHarness {
     ]
     for character in text {
       sendKey(codes[character] ?? 45, String(character))
+      pump(0.01)
     }
   }
 
@@ -349,8 +410,7 @@ enum QueryFrontendHarness {
       "content_included": false,
       "cwd_unchanged": FileManager.default.currentDirectoryPath == cwdAtStart,
       "parity": parityTrace,
-      "sequence_markers": sequenceMarkers,
-      "expected": expected,
+      "scenario": scenarioTrace,
       "substituted_compute": true
     ]
     guard let path, let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted]) else {

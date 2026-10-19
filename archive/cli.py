@@ -48,6 +48,11 @@ _COLLECTOR_FLAGS = (
     "batch_size",
     "connect_timeout_ms",
     "management_timeout_ms",
+    "query_page_bytes_max",
+    "query_timing_rows_max",
+    "query_group_members_max",
+    "query_choice_groups_max",
+    "query_high_fanout_updates_max",
 )
 
 
@@ -148,6 +153,11 @@ def _add_collector_flags(parser):
         "batch_size",
         "connect_timeout_ms",
         "management_timeout_ms",
+        "query_page_bytes_max",
+        "query_timing_rows_max",
+        "query_group_members_max",
+        "query_choice_groups_max",
+        "query_high_fanout_updates_max",
     ):
         parser.add_argument("--" + name.replace("_", "-"), dest=name, type=int)
     parser.add_argument("--warning-ratio", dest="warning_ratio", type=float)

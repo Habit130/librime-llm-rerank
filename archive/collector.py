@@ -42,6 +42,7 @@ from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
 from archive.querying import (
     QUERY_VERSION,
     RelationContext,
+    canonicalize_timing_payload,
     choice_group_rollup,
     collect_timing,
     decode_cursor,
@@ -49,7 +50,6 @@ from archive.querying import (
     filter_fingerprint,
     overview_body,
     thin_timeline_row,
-    timing_from_payload,
 )
 from archive.safety import (
     UnsafeRoot,
@@ -222,6 +222,20 @@ _PLUGIN_TOKENS = (
 
 def _hash(semantic):
     return hashlib.sha256(canonical_bytes(semantic)).hexdigest()
+
+
+def _fresh_join_state():
+    """Bounded incremental join indexes for the versioned query surface."""
+    return {
+        "updates": {},
+        "update_owners": {},
+        "process_sources": {},
+        "commit_owners": {},
+        "segment_owners": {},
+        "request_rows": {},
+        "plan_owners": {},
+        "request_plans": {},
+    }
 
 
 def _hex_digest(value):
@@ -655,6 +669,10 @@ class Collector(object):
         self._identities = {}
         self._update_ids = set()
         self._process_kinds = {}
+        # Incremental query join state: identity owners and daemon request/plan
+        # bindings are maintained as rows are published, so a query reads a
+        # bounded index instead of rebuilding the joins over the history.
+        self._join_state = _fresh_join_state()
         self._producers = {}
         self._publication_hold_active = False
         self._phase_hold_active = False
@@ -883,6 +901,7 @@ class Collector(object):
         self._identities = {}
         self._update_ids = set()
         self._process_kinds = {}
+        self._join_state = _fresh_join_state()
         if not os.path.exists(self.observations_path):
             return
         offset_limit = int(self._state.get("durable_offset", 0))
@@ -929,6 +948,11 @@ class Collector(object):
                 "client_supplied_host_claim": record.get("client_supplied_host_claim"),
                 "clocks": record.get("clocks"),
                 "continuity_segment_id": record.get("continuity_segment_id"),
+                "frontend_timing": (
+                    record.get("frontend_timing")
+                    if isinstance(record.get("frontend_timing"), dict)
+                    else None
+                ),
                 "plugin": record.get("plugin") if isinstance(record.get("plugin"), dict) else None,
                 "daemon": record.get("daemon") if isinstance(record.get("daemon"), dict) else None,
             }
@@ -941,6 +965,46 @@ class Collector(object):
             self._update_ids.add(update_id)
         if isinstance(process_id, str) and isinstance(kind, str):
             self._process_kinds.setdefault(process_id, set()).add(kind)
+        self._remember_join_state(seq, record)
+
+    def _remember_join_state(self, seq, record):
+        """Maintain the incremental query join indexes for one durable row."""
+        state = self._join_state
+        kind = record.get("observation_kind")
+        observer = kind in ("plugin_observation", "daemon_observation")
+        if not observer:
+            update = record.get("update_id")
+            if isinstance(update, str):
+                previous = state["updates"].get(update)
+                if previous is None or seq < previous:
+                    state["updates"][update] = seq
+                state["update_owners"].setdefault(update, set()).add(
+                    (record.get("source_instance_id"), record.get("process_id"))
+                )
+            process = record.get("process_id")
+            if isinstance(process, str):
+                state["process_sources"].setdefault(process, set()).add(
+                    record.get("source_instance_id")
+                )
+            commit = record.get("commit_id")
+            if isinstance(commit, str):
+                state["commit_owners"].setdefault(commit, set()).add(
+                    (record.get("source_instance_id"), record.get("process_id"))
+                )
+            segment = record.get("continuity_segment_id")
+            if isinstance(segment, str):
+                state["segment_owners"].setdefault(segment, set()).add(
+                    (record.get("source_instance_id"), record.get("process_id"))
+                )
+        daemon = record.get("daemon")
+        if isinstance(daemon, dict) and daemon.get("daemon_stage") == "request":
+            request_id = daemon.get("request_id")
+            if isinstance(request_id, str):
+                state["request_rows"].setdefault(request_id, []).append(seq)
+                plan = daemon.get("plan_identity")
+                if isinstance(plan, str):
+                    state["plan_owners"].setdefault(plan, set()).add(request_id)
+                    state["request_plans"].setdefault(request_id, set()).add(plan)
 
     def serve(self, on_ready=None):
         self._sock = bind_unix_socket(self.socket_path)
@@ -1318,6 +1382,15 @@ class Collector(object):
         payload = None if excluded or kind in _CONTENT_FREE_KINDS else observation.get("payload")
         if payload is not None and not isinstance(payload, (dict, list, str, int, float, bool)):
             payload = None
+        frontend_timing = None
+        if kind == "provenance" and isinstance(payload, dict):
+            # The frontend numeric v1 object is parsed at admission with its
+            # actual schema: an ill-typed structure is refused, and a
+            # well-typed object is stored canonicalized so no query trusts a
+            # claimed number and no query re-reads payloads for timing.
+            frontend_timing, refusal = canonicalize_timing_payload(payload)
+            if refusal is not None:
+                return "invalid_request"
         semantic = {
             "source_instance_id": source_id,
             "source_local_sequence": sequence,
@@ -1337,6 +1410,8 @@ class Collector(object):
             "payload": payload,
             "client_supplied_host_claim": _host_claim(observation.get("host_persistence")),
         }
+        if frontend_timing is not None:
+            semantic["frontend_timing"] = frontend_timing
         if plugin is not None:
             semantic["plugin"] = plugin
         if daemon is not None:
@@ -1803,6 +1878,34 @@ class Collector(object):
                 ],
             }
 
+    def _snapshot_join_state_locked(self):
+        """Copy the incremental join state. Caller holds the state lock."""
+        state = self._join_state
+        return {
+            "updates": dict(state["updates"]),
+            "update_owners": {
+                key: set(value) for key, value in state["update_owners"].items()
+            },
+            "process_sources": {
+                key: set(value) for key, value in state["process_sources"].items()
+            },
+            "commit_owners": {
+                key: set(value) for key, value in state["commit_owners"].items()
+            },
+            "segment_owners": {
+                key: set(value) for key, value in state["segment_owners"].items()
+            },
+            "request_rows": {
+                key: list(value) for key, value in state["request_rows"].items()
+            },
+            "plan_owners": {
+                key: set(value) for key, value in state["plan_owners"].items()
+            },
+            "request_plans": {
+                key: set(value) for key, value in state["request_plans"].items()
+            },
+        }
+
     def _published_rows(self, state=None):
         """Index rows at the published prefix, in durable_seq order.
 
@@ -1825,19 +1928,7 @@ class Collector(object):
             return None
 
     def _timing_summary(self, rows):
-        relevant = [
-            row
-            for row in rows
-            if (
-                row.get("observation_kind") == "provenance"
-                and row.get("stage") == "frontend_timing"
-            )
-            or (
-                row.get("observation_kind") == "plugin_observation"
-                and row.get("stage") == "frontend_timing"
-            )
-        ]
-        return collect_timing(relevant, self.limits, self._payload_for_row)
+        return collect_timing(rows, self.limits)
 
     def _cursor_check(self, body, view, filters, state):
         """Cursor tokens cannot cross incompatible versions, filters, roots or
@@ -1941,6 +2032,22 @@ class Collector(object):
         view = body.get("view")
         if view not in {"timeline", "process", "losses"}:
             return failure(op, request_id, "invalid_request")
+        if body.get("application") not in (None, ""):
+            # The archive holds no application metadata; a filter naming it is
+            # refused instead of silently matching nothing.
+            return failure(op, request_id, "invalid_request")
+        for name in ("since_ms", "until_ms"):
+            value = body.get(name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                return failure(op, request_id, "invalid_request")
+        if (
+            body.get("since_ms") is not None
+            and body.get("until_ms") is not None
+            and body["since_ms"] > body["until_ms"]
+        ):
+            return failure(op, request_id, "invalid_request")
         page_size, error = self._paged_limits(body)
         if error is not None:
             return failure(op, request_id, error)
@@ -1969,6 +2076,7 @@ class Collector(object):
             index = list(self._index)
             update_ids = set(self._update_ids)
             process_kinds = {key: set(value) for key, value in self._process_kinds.items()}
+            join_state = self._snapshot_join_state_locked()
         published = [
             entry for entry in index if entry.get("durable_seq", 0) <= watermark
         ]
@@ -1987,7 +2095,7 @@ class Collector(object):
             if len(selected) >= page_size:
                 truncated = True
                 break
-        context = RelationContext(published)
+        context = RelationContext(published, join_state)
         frontend_refs = set()
         frontend_processes = set()
         for entry in index:
@@ -2221,18 +2329,19 @@ class Collector(object):
     def _row_timing(self, entry):
         """Canonical frontend timing for one durable row.
 
-        A declared timing payload is re-derived and compared; a row that
-        declares the timing stage without a usable payload is reported with an
-        explicit reason rather than a zero.
+        The canonical object was parsed and compared at admission, so this is
+        a read over the durable index; a row that declares the timing stage
+        without a usable payload keeps an explicit reason rather than a zero.
         """
-        stage = entry.get("stage")
         kind = entry.get("observation_kind")
-        if kind not in ("provenance", "plugin_observation"):
+        if kind != "provenance":
             return None, None
-        if kind == "provenance" and stage != "frontend_timing":
+        if entry.get("stage") != "frontend_timing":
             return None, None
-        payload = self._payload_for_row(entry)
-        return timing_from_payload(payload, stage)
+        timing = entry.get("frontend_timing")
+        if isinstance(timing, dict):
+            return timing, None
+        return None, "timing_payload_absent"
 
     def _read_payload(self, entry):
         with open(self.observations_path, "rb") as handle:

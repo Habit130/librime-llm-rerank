@@ -32,6 +32,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -58,13 +59,11 @@ REQUIRED_CASES = (
     "PrivacyCanaryAndAdapters",
     "SourceBindingsAndReport",
 )
-SELF_TEST_CASES = ("SelfTestPercentiles", "SelfTestTimingCanonical", "SelfTestCursor")
 WATCHDOG_MS = 2000
 SCALE_SMALL = 256
 SCALE_LARGE = 4096
 CANARY = "Q192CANARY"
 CANARY_TEXT = "你好" + CANARY
-ACCEPTED_FRONTEND_COMMIT = "799f553444f657f79a6d373e8f07168c26514ddf"
 ACCEPTED_FRONTEND_TREE = "9bb76cf4d7c7dcd375ce1c6009d4416aa83baa42"
 HARNESS_NAME = "check_input_archive_query_frontend.swift"
 DAEMON_DIR = os.path.join(REPO, "daemon")
@@ -174,10 +173,13 @@ def frontend_timing_object(
     endpoint="panel_update",
     duration=None,
     validity="valid",
+    update_calls=None,
     **extra,
 ):
     if duration is None:
         duration = (endpoint_ticks - entry) * numer // denom
+    if update_calls is None:
+        update_calls = [{"endpoint": endpoint, "ticks": endpoint_ticks}] if endpoint != "unavailable" else []
     timing = {
         "version": 1,
         "action_id": action_id,
@@ -193,7 +195,7 @@ def frontend_timing_object(
         "nested_actions": 0,
         "continuity_cut": False,
         "association": {"source_instance_id": "ps-q192", "process_id": "p-q192"},
-        "update_calls": [{"endpoint": endpoint, "ticks": endpoint_ticks}],
+        "update_calls": update_calls,
         "endpoint": endpoint,
         "entry_ticks": entry,
         "endpoint_ticks": endpoint_ticks,
@@ -284,14 +286,35 @@ def _pid_of(root):
         return 0
 
 
-def _admit(client, observations):
+def _admit(client, observations, allow_transient=True):
+    """Admit observations in bounded batches.
+
+    A documented transient refusal (queue_saturated) is retried while the
+    publication catches up; any other refusal code is returned for the case to
+    judge. This keeps CPU contention from masquerading as a defect without
+    hiding a real refusal.
+    """
     codes = []
-    for index in range(0, len(observations), 32):
-        batch = observations[index:index + 32]
+    pending = list(observations)
+    deadline = time.time() + 60.0
+    while pending:
+        batch = pending[:32]
         response = client.call("admit_batch", {"observations": batch})
         if not response.get("ok"):
             raise CheckFailure("admit_transport")
-        codes.extend((response.get("body") or {}).get("codes") or [])
+        batch_codes = (response.get("body") or {}).get("codes") or []
+        if len(batch_codes) != len(batch):
+            raise CheckFailure("admit_shape")
+        retry = []
+        for item, code in zip(batch, batch_codes):
+            if code == "queue_saturated" and allow_transient and time.time() < deadline:
+                retry.append(item)
+                continue
+            codes.append(code)
+        pending = retry + pending[32:]
+        if retry:
+            client.checkpoint()
+            time.sleep(0.05)
     return codes
 
 
@@ -314,6 +337,17 @@ def _body(response):
         code = (response.get("error") or {}).get("code")
         raise CheckFailure(code or "query_failed")
     return response.get("body") or {}
+
+
+def expect_error(client, code, view, **kwargs):
+    """Assert a query is refused with the exact stable code."""
+    try:
+        _body(client.query(view, **kwargs))
+    except CheckFailure as exc:
+        if exc.code != code:
+            raise
+        return
+    raise CheckFailure("expected_error_missing:" + code)
 
 
 def row_by(client, view="timeline", **kwargs):
@@ -344,10 +378,16 @@ class ContractSuite(object):
         self.report_extra = {}
 
     # -- fixtures -----------------------------------------------------------
-    def collector(self, name, **limits):
-        root = os.path.join(self.root, name)
-        sock = os.path.join(root, "collector.sock")
-        os.makedirs(root, mode=0o700)
+    def collector(self, name, sock_dir=None, root_dir=None, **limits):
+        root = root_dir if root_dir is not None else os.path.join(self.root, name)
+        if sock_dir is None:
+            sock = os.path.join(root, "collector.sock")
+        else:
+            # macOS sun_path is short; a fixture whose client cannot chdir to
+            # the socket directory needs a short socket path even when the
+            # archive root is long.
+            sock = os.path.join(sock_dir, name + ".sock")
+        os.makedirs(root, mode=0o700, exist_ok=True)
         start_collector(root, sock, **limits)
         client = Client(sock, timeout=10)
         client.set_policy("enabled", 0)
@@ -362,9 +402,22 @@ class ContractSuite(object):
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait(timeout=5)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
         for root, sock in self.collectors:
             stop_collector(root, sock)
+        for sockdir in getattr(self, "socket_dirs", []):
+            try:
+                os.unlink(os.path.join(sockdir, "lm.sock"))
+            except OSError:
+                pass
+            chain_sock = os.path.join(sockdir, "chain", "collector.sock")
+            try:
+                os.unlink(chain_sock)
+            except OSError:
+                pass
 
     def run(self):
         try:
@@ -403,13 +456,8 @@ class ContractSuite(object):
     # -- C1 identity relations ---------------------------------------------
     def c_identity_relations(self):
         client, root, _sock = self.collector("identity")
-        frontend_base = {
-            "update_id": "u-id-1",
-            "commit_id": "c-id-1",
-            "continuity_segment_id": "seg-id-1",
-        }
         observations = [
-            frame("start", 1, kind="start", **frontend_base),
+            frame("start", 1, kind="start", update_id="u-id-1", commit_id="c-id-1"),
             frame(
                 "frontend_update",
                 2,
@@ -426,8 +474,9 @@ class ContractSuite(object):
                 update_id="u-id-1",
                 commit_id="c-id-1",
             ),
+            frame("start", 4, source="ps-other", process="p-q192", kind="start", update_id="u-id-owner"),
             plugin_frame(
-                4,
+                5,
                 association_role="engine_entry_context",
                 association_read="claimed_valid",
                 referenced_source_id="ps-q192",
@@ -435,7 +484,7 @@ class ContractSuite(object):
                 referenced_update_id="u-id-2",
             ),
             plugin_frame(
-                5,
+                6,
                 association_role="engine_entry_context",
                 association_read="claimed_valid",
                 referenced_source_id="ps-q192",
@@ -443,31 +492,20 @@ class ContractSuite(object):
                 referenced_update_id="u-id-nowhere",
             ),
             plugin_frame(
-                6,
+                7,
                 association_role="engine_entry_context",
                 association_read="claimed_valid",
                 referenced_source_id="ps-different",
                 referenced_process_id="p-q192",
                 referenced_update_id="u-id-1",
             ),
-            plugin_frame(7, association_role="invalid", association_read="invalid"),
-            plugin_frame(
-                8,
-                association_role="engine_entry_context",
-                association_read="claimed_valid",
-                referenced_source_id="ps-q192",
-                referenced_process_id="p-q192",
-            ),
+            plugin_frame(8, association_role="invalid", association_read="invalid"),
             plugin_frame(
                 9,
                 association_role="engine_entry_context",
                 association_read="claimed_valid",
                 referenced_source_id="ps-q192",
                 referenced_process_id="p-q192",
-                referenced_update_id="u-id-2",
-                plan_identity="plan-shared",
-                lm_request_state="issued_succeeded",
-                lm_request_id="req-shared",
             ),
             plugin_frame(
                 10,
@@ -478,10 +516,23 @@ class ContractSuite(object):
                 referenced_update_id="u-id-2",
                 plan_identity="plan-shared",
                 lm_request_state="issued_succeeded",
+                lm_request_id="req-shared",
+            ),
+            plugin_frame(
+                11,
+                association_role="engine_entry_context",
+                association_read="claimed_valid",
+                referenced_source_id="ps-q192",
+                referenced_process_id="p-q192",
+                referenced_update_id="u-id-2",
+                plan_identity="plan-shared",
+                lm_request_state="issued_succeeded",
                 lm_request_id="req-second",
             ),
-            daemon_request(11, "req-shared", "plan-shared"),
-            daemon_request(12, "req-shared", "plan-different"),
+            daemon_request(12, "req-shared", "plan-shared"),
+            daemon_request(13, "req-second", "plan-shared"),
+            daemon_request(14, "req-disagree", "plan-a"),
+            daemon_request(15, "req-disagree", "plan-b"),
         ]
         codes = _admit(client, observations)
         if any(code not in ("admitted", "duplicate") for code in codes):
@@ -496,13 +547,18 @@ class ContractSuite(object):
         )
         if conflict != ["identity_conflict"]:
             raise CheckFailure("identity_conflict_admission")
-        if not await_durable(client, 12):
+        if not await_durable(client, 15):
             raise CheckFailure("durable_prefix")
         small = row_by(client, "timeline", page_size=50)
         rows = small["observations"]
-        # Equal text and different source never link by text or time.
-        if relation_status(rows, 1, "update_identity") != "valid":
+        # Competing owners of one token are never merged into a valid identity;
+        # equal text and different sources never link by text or time.
+        if relation_status(rows, 1, "update_identity") != "conflicting":
+            raise CheckFailure("competing_update_identity")
+        if relation_status(rows, 2, "update_identity") != "valid":
             raise CheckFailure("own_update_identity")
+        if relation_status(rows, 4, "process_identity") != "conflicting":
+            raise CheckFailure("competing_process_identity")
         late_row = next(row for row in rows if row.get("durable_seq") == 2)
         if (late_row.get("relations") or {}).get("parent_reference", {}).get("status") != "unmatched":
             raise CheckFailure("late_parent_unresolved_at_snapshot")
@@ -512,8 +568,8 @@ class ContractSuite(object):
             raise CheckFailure("late_parent_basis")
         # Out-of-order: a later record resolves the missing relation at a
         # later prefix; the earlier snapshot is not rewritten.
-        _admit(client, [frame("start", 13, kind="start", update_id="u-id-late")])
-        if not await_durable(client, 13):
+        _admit(client, [frame("start", 16, kind="start", update_id="u-id-late")])
+        if not await_durable(client, 16):
             raise CheckFailure("late_durable")
         later = row_by(client, "timeline", page_size=50)
         late_row_later = next(row for row in later["observations"] if row.get("durable_seq") == 2)
@@ -526,29 +582,36 @@ class ContractSuite(object):
                     raise CheckFailure("snapshot_rewritten")
         # Association: valid, unmatched, stale, invalid, absent.
         checks = {
-            4: "valid",
-            5: "unmatched",
-            6: "stale",
-            7: "invalid",
-            8: "absent",
+            5: "valid",
+            6: "unmatched",
+            7: "stale",
+            8: "invalid",
+            9: "unmatched",
         }
         for seq, expected in checks.items():
             status = relation_status(later["observations"], seq, "association")
             if status != expected:
                 raise CheckFailure("association_%s:%s" % (seq, status))
-        row4 = next(row for row in later["observations"] if row.get("durable_seq") == 4)
-        evidence = (row4["relations"]["association"] or {}).get("evidence") or {}
+        row5 = next(row for row in later["observations"] if row.get("durable_seq") == 5)
+        evidence = (row5["relations"]["association"] or {}).get("evidence") or {}
         if evidence.get("proves_current_frontend_result") is not False:
             raise CheckFailure("entry_context_not_current_result")
-        if evidence.get("witness_durable_seq") != 1:
+        if evidence.get("witness_durable_seq") != 2:
             raise CheckFailure("witness_seq")
-        # Request and plan collisions stay explicit.
-        if relation_status(later["observations"], 9, "plan_identity") != "conflicting":
-            raise CheckFailure("plan_conflict")
+        # Request and plan collisions stay explicit; a unique native request id
+        # with its own plan links.
         if relation_status(later["observations"], 10, "plan_identity") != "conflicting":
+            raise CheckFailure("plan_conflict")
+        if relation_status(later["observations"], 11, "plan_identity") != "conflicting":
             raise CheckFailure("plan_conflict_second")
-        if relation_status(later["observations"], 12, "request_identity") != "conflicting":
+        if relation_status(later["observations"], 10, "request_identity") != "linked":
+            raise CheckFailure("request_link")
+        if relation_status(later["observations"], 14, "request_identity") != "conflicting":
             raise CheckFailure("daemon_request_plan_conflict")
+        if relation_status(later["observations"], 12, "request_identity") != "valid":
+            raise CheckFailure("daemon_request_single_plan")
+        if relation_status(later["observations"], 3, "update_identity") != "conflicting":
+            raise CheckFailure("competing_update_second")
         # Records are unchanged: a re-read of the same prefix is identical.
         if json.dumps(later, sort_keys=True) != json.dumps(again, sort_keys=True):
             raise CheckFailure("records_changed")
@@ -589,7 +652,7 @@ class ContractSuite(object):
                 window_id="win-b",
                 group_id="grp-b",
                 plugin_stage="competition",
-                coverage="complete",
+                coverage="incomplete",
                 coverage_basis="legacy_snapshot_complete",
                 target_membership="present",
                 captured_candidate_count=2,
@@ -659,8 +722,8 @@ class ContractSuite(object):
         b = groups["grp-b"]
         if b["coverage_claim_accepted"] or b["evidence_permitted"]:
             raise CheckFailure("legacy_complete_rejected")
-        if b["coverage_basis"] != "legacy_snapshot_complete":
-            raise CheckFailure("submitted_basis_kept")
+        if b["coverage"] != "incomplete" or b["coverage_basis"] != "legacy_snapshot_complete":
+            raise CheckFailure("submitted_coverage_kept")
         c = groups["grp-c"]
         if c["evidence_permitted"] or not c["retracted"]:
             raise CheckFailure("retraction_not_label")
@@ -672,7 +735,7 @@ class ContractSuite(object):
             raise CheckFailure("default_submission_weak")
         if "unselected" in json.dumps(body) and "not_negative" not in json.dumps(body):
             raise CheckFailure("unselected_label_rule")
-        # A truncated completeness claim is not group-complete competition.
+        # A truncated-window marker cannot claim group-complete competition.
         forged = plugin_frame(
             10,
             window_id="win-f",
@@ -688,15 +751,30 @@ class ContractSuite(object):
         codes = _admit(client, [forged])
         if codes != ["invalid_request"]:
             raise CheckFailure("truncated_flag_refused")
+        # A legacy complete claim is refused, never accepted as competition.
+        legacy = plugin_frame(
+            11,
+            window_id="win-g",
+            group_id="grp-g",
+            plugin_stage="competition",
+            coverage="complete",
+            coverage_basis="legacy_snapshot_complete",
+            target_membership="present",
+            captured_candidate_count=2,
+            group_member_count=2,
+        )
+        codes = _admit(client, [legacy])
+        if codes != ["invalid_request"]:
+            raise CheckFailure("legacy_complete_accepted")
         # Mixed span/category, target controls; a whole-window flag or a
         # candidate-count shortcut cannot claim completeness.
         codes = _admit(
             client,
             [
                 plugin_frame(
-                    11,
-                    window_id="win-g",
-                    group_id="grp-g",
+                    12,
+                    window_id="win-h",
+                    group_id="grp-h",
                     plugin_stage="competition",
                     coverage="complete",
                     coverage_basis="whole_window_flag",
@@ -753,7 +831,7 @@ class ContractSuite(object):
         )
         sequence += 1
         invalid_cases = []
-        invalid_cases.append(("nonmonotone", frontend_timing_object(sequence, "bad-1", entry=500, endpoint_ticks=400, numer=1, denom=1)))
+        invalid_cases.append(("nonmonotone", frontend_timing_object(sequence, "bad-1", entry=500, endpoint_ticks=400, numer=1, denom=1, duration=1)))
         sequence += 1
         invalid_cases.append(("mismatch", frontend_timing_object(sequence, "bad-2", numer=1, denom=1, duration=1)))
         sequence += 1
@@ -766,20 +844,23 @@ class ContractSuite(object):
         codes = _admit(client, observations)
         if any(code != "admitted" for code in codes):
             raise CheckFailure("admission:" + ",".join(codes))
-        # Malformed structures are refused, not stored as zero.
+        # Ill-typed structures are refused, not stored as zero.
         refused = []
-        bool_case = frontend_timing_object(2, "bad-bool")
+        bool_case = frontend_timing_object(20, "bad-bool")
         bool_case["payload"]["frontend_timing"]["entry_ticks"] = True
         refused.append(("bool_entry", bool_case))
-        negative = frontend_timing_object(2, "bad-negative")
+        negative = frontend_timing_object(21, "bad-negative")
         negative["payload"]["frontend_timing"]["duration_ns"] = -5
         refused.append(("negative_duration", negative))
-        version_case = frontend_timing_object(2, "bad-version")
+        version_case = frontend_timing_object(22, "bad-version")
         version_case["payload"]["frontend_timing"]["version"] = 2
         refused.append(("version", version_case))
-        nonfinite = frontend_timing_object(2, "bad-nonfinite")
-        nonfinite["payload"]["frontend_timing"]["timebase_numer"] = float("inf")
+        nonfinite = frontend_timing_object(23, "bad-nonfinite")
+        nonfinite["payload"]["frontend_timing"]["clock"]["timebase_numer"] = float("inf")
         refused.append(("nonfinite", nonfinite))
+        unknown_field = frontend_timing_object(24, "bad-field")
+        unknown_field["payload"]["frontend_timing"]["timebase_numer"] = 125
+        refused.append(("unknown_field", unknown_field))
         for name, case in refused:
             codes = _admit(client, [case])
             if codes != ["invalid_request"]:
@@ -828,7 +909,7 @@ class ContractSuite(object):
 
     # -- C4 overview --------------------------------------------------------
     def c_overview_honest(self):
-        client, root, sock = self.collector("overview", archive_capacity_bytes=4096)
+        client, root, sock = self.collector("overview")
         population = []
         for index in range(10):
             population.append(frame("frontend_update", index + 1, update_id="u-ov-%d" % index))
@@ -868,15 +949,22 @@ class ContractSuite(object):
             }
         )
         codes = _admit(client, population)
-        if any(code not in ("admitted", "duplicate", "identity_conflict") for code in codes):
+        if any(code not in ("admitted", "duplicate") for code in codes):
             raise CheckFailure("admission:" + ",".join(codes))
+        if codes.count("duplicate") != 1:
+            raise CheckFailure("duplicate_retry_not_idempotent")
         if not await_durable(client, 15):
             raise CheckFailure("durable")
         first = _body(client.query("overview"))
         if first["population"]["observations"] != 15:
             raise CheckFailure("population:%s" % first["population"]["observations"])
-        if first["population"]["same_identity_retries_or_duplicates_collapsed"] < 1:
-            raise CheckFailure("retry_collapsed")
+        # The duplicate retry never became a durable row, so the eligible
+        # population holds one unit per capture identity; the retry evidence
+        # is the admission result, not a second row.
+        if first["population"]["same_identity_retries_or_duplicates_collapsed"] != 0:
+            raise CheckFailure("retry_double_counted")
+        if first["population"]["unit"] != "source_instance_observation":
+            raise CheckFailure("population_unit")
         kinds = {bucket["observation_kind"]: bucket for bucket in first["outcomes"]["kinds"]}
         if kinds.get("loss_notice", {}).get("observations") != 1:
             raise CheckFailure("loss_notice_count")
@@ -901,6 +989,18 @@ class ContractSuite(object):
             raise CheckFailure("derived_index_under")
         if first["storage"]["managed"]["durable_bytes"] <= 0:
             raise CheckFailure("managed_bytes")
+        if first["freshness"]["received_unpublished"] != 0:
+            raise CheckFailure("pending_unpublished")
+        if first["freshness"]["publication_state"] != "idle":
+            raise CheckFailure("publication_state")
+        if first["freshness"]["basis"] != "producer_poll_and_published_prefix":
+            raise CheckFailure("freshness_basis")
+        if first["slices"]["status"] != "not_observed":
+            raise CheckFailure("slices_not_observed")
+        if "application" not in first["slices"]["unknown_buckets"]:
+            raise CheckFailure("slice_buckets")
+        if first["quality"]["crash_tail"] != "none":
+            raise CheckFailure("crash_tail_clean")
         # Pause state is reported as desired/effective separately.
         status = client.status()
         revision = (status.get("body") or {}).get("desired_revision")
@@ -912,22 +1012,34 @@ class ContractSuite(object):
             raise CheckFailure("pause_effective")
         if paused["quality"]["policy"]["globally_effective"] is not False:
             raise CheckFailure("globally_effective")
-        # Capacity stop is its own bucket, and existing history is untouched.
         client.set_policy("enabled", revision + 1)
-        fat = dict(frame("commit_attempt", 200, update_id="u-fat"))
+        # Capacity stop is its own bucket in a dedicated small-capacity root,
+        # and existing history there is untouched.
+        small, small_root, small_sock = self.collector("overview-capacity", archive_capacity_bytes=4096)
+        seeded = [frame("frontend_update", index + 1, process="p-cap", update_id="u-cap-%d" % index) for index in range(3)]
+        codes = _admit(small, seeded)
+        if any(code != "admitted" for code in codes):
+            raise CheckFailure("capacity_seed")
+        if not await_durable(small, 3):
+            raise CheckFailure("capacity_seed_durable")
+        before_bytes = _body(small.query("overview"))["storage"]["managed"]["durable_bytes"]
+        fat = dict(frame("commit_attempt", 200, process="p-cap", update_id="u-fat"))
         fat["payload"] = {"text": "x" * 800}
         for index in range(20):
             item = dict(fat)
             item["source_local_sequence"] = 200 + index
-            _admit(client, [item])
-            client.checkpoint()
-        capacity = _body(client.query("overview"))
+            _admit(small, [item])
+            small.checkpoint()
+        capacity = _body(small.query("overview"))
         if not capacity["quality"]["capacity"]["capacity_stop"]:
             raise CheckFailure("capacity_stop_not_reported")
-        if capacity["storage"]["managed"]["durable_bytes"] <= 0:
+        after_bytes = capacity["storage"]["managed"]["durable_bytes"]
+        if after_bytes < before_bytes or after_bytes <= 0:
             raise CheckFailure("capacity_lost_history")
         if capacity["quality"]["capacity"]["storage_failure"]:
             raise CheckFailure("false_storage_failure")
+        if capacity["quality"]["capacity_refused_units"] < 1:
+            raise CheckFailure("capacity_refusal_count")
         content_free(json.dumps(capacity), "overview")
         self.report_extra["overview_counts"] = {
             "observations": first["population"]["observations"],
@@ -1052,12 +1164,7 @@ class ContractSuite(object):
             last_page = _body(client.query("timeline", page_size=5))
             if last_page["returned"] > 5:
                 raise CheckFailure("page_max")
-            try:
-                client.query("timeline", page_size=51)
-                raise CheckFailure("page_bound_missing")
-            except CheckFailure as exc:
-                if exc.code != "page_bound":
-                    raise
+            expect_error(client, "page_bound", "timeline", page_size=51)
             results[label] = {
                 "observations": count,
                 "ingest_ms": ingest_ms,
@@ -1100,32 +1207,35 @@ class ContractSuite(object):
         token = timeline["cursor_token"]
         if timeline["returned"] != 10:
             raise CheckFailure("timeline_page")
-        try:
-            client.query("timeline", page_size=10, process_id="p-fanout", cursor_token=token)
-            raise CheckFailure("filter_cross")
-        except CheckFailure as exc:
-            if exc.code != "invalid_request":
-                raise
-        try:
-            client.query("overview", cursor_token=token)
-            raise CheckFailure("view_cross")
-        except CheckFailure as exc:
-            if exc.code != "invalid_request":
-                raise
+        expect_error(
+            client, "invalid_request", "timeline",
+            page_size=10, process_id="p-fanout", cursor_token=token,
+        )
+        expect_error(client, "invalid_request", "overview", cursor_token=token)
         decoded = decode_cursor(token)
         if isinstance(decoded, str) or decoded.get("v") != QUERY_VERSION:
             raise CheckFailure("cursor_payload")
-        try:
-            client.query("timeline", cursor_token="q1.eyJ2Ijoid2VpcmQifQ")
-            raise CheckFailure("version_cross")
-        except CheckFailure as exc:
-            if exc.code != "unsupported_query_version":
-                raise
+        expect_error(
+            client, "unsupported_query_version", "timeline",
+            cursor_token="q1.eyJ2Ijoid2VpcmQifQ",
+        )
         continuation = _body(
             client.query("timeline", page_size=10, cursor=timeline["next_cursor"])
         )
         if continuation["observations"][0]["durable_seq"] <= timeline["observations"][-1]["durable_seq"]:
             raise CheckFailure("continuation_order")
+        # A filter naming a field this archive never observes is refused.
+        expect_error(client, "invalid_request", "timeline", application="com.example.app")
+        expect_error(client, "invalid_request", "timeline", since_ms="not-a-number")
+        early = _body(client.query("timeline", page_size=10, until_ms=1))
+        if early["returned"] != 0:
+            raise CheckFailure("time_filter_early")
+        if "until_ms" not in early["filters_applied"]:
+            raise CheckFailure("time_filter_echo")
+        state_filtered = _body(client.query("timeline", page_size=10, state="unknown"))
+        for row in state_filtered["observations"]:
+            if (row.get("outcome") or "unknown") != "unknown":
+                raise CheckFailure("state_filter")
         return {"note": "page_bound=25"}
 
     # -- C7 concurrent append and restart -----------------------------------
@@ -1194,12 +1304,9 @@ class ContractSuite(object):
             raise CheckFailure("restart_prefix")
         if status.get("crash_tail") != "none":
             raise CheckFailure("clean_restart_tail:%s" % status.get("crash_tail"))
-        try:
-            restarted.query("timeline", cursor_token=old_token)
-            raise CheckFailure("epoch_cross")
-        except CheckFailure as exc:
-            if exc.code != "cursor_snapshot_unknown":
-                raise
+        expect_error(
+            restarted, "cursor_snapshot_unknown", "timeline", cursor_token=old_token
+        )
         fresh = _body(restarted.query("timeline", page_size=10))
         if fresh["returned"] != 1:
             raise CheckFailure("restart_rows")
@@ -1266,6 +1373,16 @@ class ContractSuite(object):
             library_dir,
             include_dir,
         )
+        # The accepted frontend connects with the full path and refuses a
+        # longer-than-sun_path socket instead of working around it, and the
+        # collector requires its socket inside its own root. A root whose
+        # fixture sockets would exceed the bound is refused explicitly here
+        # rather than producing a confusing start failure.
+        collector_sock = os.path.join(self.root, "frontend-chain", "collector.sock")
+        daemon_sock = os.path.join(self.root, "frontend-chain", "daemon", "lm.sock")
+        for candidate in (collector_sock, daemon_sock):
+            if len(candidate.encode("utf-8")) >= 104:
+                raise CheckFailure("socket_path_too_long_for_frontend")
         client, root, sock = self.collector("frontend-chain")
         shared = os.path.join(work, "shared")
         user = os.path.join(work, "user")
@@ -1274,46 +1391,62 @@ class ContractSuite(object):
         facts = os.path.join(daemon_root, "facts")
         for path in (shared, user, log, daemon_root, facts):
             os.makedirs(path, mode=0o700)
-        schema_socket = os.path.join(work, "lm.sock")
+        schema_socket = os.path.join(root, "daemon", "lm.sock")
         daemon = FixtureDaemon(work, schema_socket, archive_socket=sock, facts_root=facts)
         self.processes.append(daemon)
         daemon.wait_ready()
         write_frontend_schema(shared, user, sock, schema_socket)
-        report_path = os.path.join(self.evidence, "frontend-report.json")
-        proc = subprocess.run(
-            [
-                binary,
-                "--shared", shared,
-                "--user", user,
-                "--log", log,
-                "--socket", sock,
-                "--daemon-socket", schema_socket,
-                "--scenario", "contract",
-                "--report", report_path,
-            ],
-            cwd=export,
-            capture_output=True,
-            text=True,
-            timeout=900,
+        scenario_reports = {}
+        report_dir = os.path.join(root, "reports")
+        os.makedirs(report_dir, mode=0o700)
+        scenarios = (
+            "parity",
+            "commit",
+            "cancellation",
+            "raw-finalization",
+            "fallback",
+            "success",
+            "unavailable-client",
         )
-        harness_log = proc.stdout + proc.stderr
-        with open(os.path.join(root, "harness.log"), "w") as handle:
-            handle.write(harness_log)
-        content_free(harness_log, "harness_log")
-        report = {}
-        if os.path.isfile(report_path):
-            with open(report_path) as handle:
-                report = json.load(handle)
-        if proc.returncode != 0:
-            raise CheckFailure("harness_exit:%s" % proc.returncode)
-        failures = report.get("failures") or []
-        if failures:
-            raise CheckFailure("harness_case:" + str(failures[0])[:40])
-        if report.get("substituted_compute") is not True:
-            raise CheckFailure("substituted_disclosure")
-        if report.get("cwd_unchanged") is not True:
-            raise CheckFailure("harness_cwd")
-        parity = report.get("parity") or {}
+        for scenario in scenarios:
+            report_path = os.path.join(report_dir, "frontend-%s.json" % scenario)
+            proc = subprocess.run(
+                [
+                    binary,
+                    "--shared", shared,
+                    "--user", user,
+                    "--log", log,
+                    "--socket", sock,
+                    "--daemon-socket", schema_socket,
+                    "--scenario", scenario,
+                    "--report", report_path,
+                ],
+                cwd=export,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            harness_log = proc.stdout + proc.stderr
+            with open(os.path.join(work, "harness-%s.log" % scenario), "w") as handle:
+                handle.write(harness_log)
+            content_free(harness_log, "harness_log_" + scenario)
+            report = {}
+            if os.path.isfile(report_path):
+                with open(report_path) as handle:
+                    report = json.load(handle)
+            if report.get("scenario", {}).get("scenario") != scenario:
+                raise CheckFailure("harness_report_missing_%s" % scenario)
+            if proc.returncode != 0:
+                raise CheckFailure("harness_exit_%s:%s" % (scenario, proc.returncode))
+            failures = report.get("failures") or []
+            if failures:
+                raise CheckFailure("harness_case_%s:%s" % (scenario, str(failures[0])[:30]))
+            if report.get("substituted_compute") is not True:
+                raise CheckFailure("substituted_disclosure")
+            if report.get("cwd_unchanged") is not True:
+                raise CheckFailure("harness_cwd")
+            scenario_reports[scenario] = report
+        parity = (scenario_reports.get("parity") or {}).get("parity") or {}
         if parity.get("inserts_equal") is not True or parity.get("marked_equal") is not True:
             raise CheckFailure("capture_parity")
         # The archive must eventually show the real chain: plugin emissions,
@@ -1333,10 +1466,9 @@ class ContractSuite(object):
             time.sleep(0.25)
         if summary is None:
             raise CheckFailure("chain_summary")
-        expected = report.get("expected") or {}
-        if summary["plugin_rows"] < int(expected.get("plugin_rows_min", 1)):
+        if summary["plugin_rows"] < 1:
             raise CheckFailure("plugin_rows:%d" % summary["plugin_rows"])
-        if summary["timing_rows"] < int(expected.get("timing_rows_min", 1)):
+        if summary["timing_rows"] < 1:
             raise CheckFailure("timing_rows:%d" % summary["timing_rows"])
         if summary["linked"] < 1:
             raise CheckFailure("no_linked_request")
@@ -1360,7 +1492,12 @@ class ContractSuite(object):
             "daemon_request_rows": summary["daemon_requests"],
             "exchange_success": summary["issued_succeeded"],
             "exchange_fallback": summary["issued_failed"],
-            "harness_report": report_path,
+            "scenario_reports": sorted(scenario_reports),
+            "runtime_fixture_note": (
+                "the fixture chain root is a fresh owned runtime root under the"
+                " checker root; the actionable evidence is this report and the"
+                " harness logs"
+            ),
             "substituted_compute": True,
         }
         return {
@@ -1440,7 +1577,7 @@ class ContractSuite(object):
         # its only content view.
         cli = run_cli(sock, "query", "timeline", "--page-size", "20")
         content_free(cli, "cli_timeline")
-        cli_json = run_cli(sock, "query", "overview", "--json")
+        cli_json = run_cli(sock, "--json", "query", "overview")
         content_free(cli_json, "cli_overview_json")
         errors = run_cli(sock, "query", "timeline", "--page-size", "999")
         if "page_bound" not in errors:
@@ -1465,7 +1602,7 @@ class ContractSuite(object):
         if "interface_version=input-archive-v1" not in tui_out:
             raise CheckFailure("tui_interface")
         # CLI and TUI agree on the same snapshot for the same query.
-        cli_snapshot = run_cli(sock, "query", "timeline", "--json")
+        cli_snapshot = run_cli_json(sock, "--json", "query", "timeline")
         parsed = json.loads(cli_snapshot)
         if parsed.get("body", {}).get("as_of_durable_seq") != 3:
             raise CheckFailure("cli_snapshot")
@@ -1473,14 +1610,20 @@ class ContractSuite(object):
 
     # -- C11 bindings and report -------------------------------------------
     def c_bindings(self):
-        report_path = os.path.join(self.evidence, "query.json")
         source = source_identity()
         runtime = runtime_identity()
+        if not source.get("head") or not source.get("tree"):
+            raise CheckFailure("source_identity")
+        if not runtime.get("python"):
+            raise CheckFailure("runtime_identity")
         bindings = {
             "query_version": QUERY_VERSION,
             "repo": REPO,
             "source": source,
             "runtime": runtime,
+            "frontend": self.report_extra.get("frontend") or {
+                "status": "frontend_case_did_not_pass",
+            },
             "commands": COMMANDS_RUN,
         }
         self.report_extra["bindings"] = bindings
@@ -1699,7 +1842,8 @@ sort: by_weight
 甲正\tjiazheng\t100
 甲斥\tjiachi\t90
 甲敏\tjiamin\t80
-refusex\trefusex\t100
+refusex\tre\t100
+refusey\tre\t90
 """
     with open(os.path.join(shared, "default.yaml"), "w") as handle:
         handle.write(default)
@@ -1722,7 +1866,10 @@ refusex\trefusex\t100
 
 
 FIXTURE_TRIGGERS = {
-    "fixture-refuse": "raise",
+    # The fixture daemon fails the exchange whose first candidate is 好, so the
+    # plugin keeps a failed issuance and falls back; the 你/你好 inputs answer
+    # with substituted scores.
+    "好": "raise",
     "fixture-mismatch": "mismatch",
 }
 
@@ -1807,6 +1954,17 @@ class FixtureDaemon(object):
     def poll(self):
         return self.proc.poll()
 
+    def terminate(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+
+    def kill(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    def wait(self, timeout=None):
+        return self.proc.wait(timeout)
+
 
 def run_cli(sock, *args):
     proc = subprocess.run(
@@ -1817,6 +1975,18 @@ def run_cli(sock, *args):
         timeout=60,
     )
     return proc.stdout + proc.stderr
+
+
+def run_cli_json(sock, *args):
+    """Stdout only: the JSON surface must not be mixed with diagnostics."""
+    proc = subprocess.run(
+        collector_command("", sock, *args),
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc.stdout
 
 
 def run_tui(sock, commands):

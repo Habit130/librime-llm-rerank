@@ -32,60 +32,19 @@ import math
 from archive.interface import canonical_bytes
 
 QUERY_VERSION = "input-archive-query-v1"
-QUERY_VIEWS = (
-    "overview",
-    "timeline",
-    "process",
-    "choice",
-    "timing",
-    "losses",
-    "status",
-    "daemon",
-)
-_CURSOR_PREFIX = "q1."
 _SUPPORTED_QUERY_VERSIONS = (QUERY_VERSION,)
+_CURSOR_PREFIX = "q1."
 FRONTEND_TIMING_VERSION = 1
-# Version 1 frontend timing is a payload inside provenance/plugin observations.
-# Only a declared payload object drives this projection; the row's own stage
-# token is evidence of intent, not of a numeric sample.
-TIMING_STAGES = ("provenance", "plugin_observation")
+# Version 1 frontend timing is a payload inside provenance observations. Only a
+# declared payload object drives this projection; the row's own stage token is
+# evidence of intent, not of a numeric sample.
 CHOICE_PROJECTION_VERSION = 1
 CHOICE_COMPLETE_BASIS = "captured_group_members_and_target"
 PERCENTILE_METHOD = "nearest_rank_ceil_p_n_first_observed_value"
 PERCENTILE_FIELD = "percentiles.nearest_rank_ceil_p_n_first_observed_value"
 
-_IDENTITY_FIELDS = (
-    "source_instance_id",
-    "process_id",
-    "update_id",
-    "parent_update_id",
-    "commit_id",
-    "continuity_segment_id",
-)
-
-# Identity relation status vocabulary. ``unknown`` means the relation cannot be
-# read for this row; ``absent`` means there is nothing to resolve; the remaining
-# states name exactly what was found at this prefix.
-RELATION_STATUSES = (
-    "valid",
-    "stale",
-    "unmatched",
-    "not_observed",
-    "absent",
-    "unknown",
-    "conflicting",
-    "ambiguous",
-    "unknown_owner",
-    "malformed",
-    "invalid",
-    "not_issued",
-    "linked",
-)
-
 _VALIDITY_VALUES = {"valid", "invalid", "unknown"}
-_ENDPOINT_VALUES = ("unavailable", "marked_text", "panel_update")
 _TIMEBASE_MAX = (1 << 64) - 1
-_HEX_DIGITS = set("0123456789abcdef")
 _MAX_NESTED_ACTIONS = 255
 
 
@@ -184,12 +143,18 @@ def interval_ns(start, end, numer, denom):
     return conversion_ns(end - start, numer, denom)
 
 
-def _canonical_call(value):
+def _canonical_call(value, numer, denom):
     if not isinstance(value, dict):
         return "commit_call_not_object"
+    if set(value) - _TIMING_COMMIT_CALL_KEYS:
+        return "commit_call_unknown_field"
     endpoint = value.get("endpoint")
     if endpoint not in ("insert_text",):
         return "commit_call_endpoint"
+    if value.get("validity") is not None and value.get("validity") not in _VALIDITY_VALUES:
+        return "commit_call_validity"
+    if value.get("unknown_reason") is not None and not isinstance(value.get("unknown_reason"), str):
+        return "commit_call_unknown_reason"
     start = value.get("start_ticks")
     end = value.get("end_ticks")
     if start is not None and (not _is_int(start) or start < 0):
@@ -217,7 +182,7 @@ def _canonical_call(value):
         call["validity"] = "invalid"
         call["unknown_reason"] = "nonmonotone_commit_call"
         return call
-    computed = conversion_ns(end - start, value.get("_numer", 0), value.get("_denom", 1))
+    computed = conversion_ns(end - start, numer, denom)
     if computed is None:
         call["validity"] = "invalid"
         call["unknown_reason"] = "unrepresentable_commit_call"
@@ -236,18 +201,62 @@ def _canonical_call(value):
     return call
 
 
+_TIMING_OBJECT_KEYS = {
+    "version",
+    "action_id",
+    "action",
+    "operation",
+    "clock",
+    "event_queue_wait",
+    "nested_actions",
+    "continuity_cut",
+    "association",
+    "update_calls",
+    "endpoint",
+    "entry_ticks",
+    "endpoint_ticks",
+    "duration_ns",
+    "validity",
+    "unknown_reason",
+    "commit_call",
+}
+_TIMING_CLOCK_KEYS = {"domain", "unit", "timebase_numer", "timebase_denom"}
+_TIMING_ASSOCIATION_KEYS = {
+    "source_instance_id",
+    "process_id",
+    "continuity_segment_id",
+    "update_id",
+    "terminal_update_id",
+    "commit_id",
+}
+_TIMING_UPDATE_CALL_KEYS = {"endpoint", "ticks"}
+_TIMING_COMMIT_CALL_KEYS = {
+    "endpoint",
+    "start_ticks",
+    "end_ticks",
+    "duration_ns",
+    "validity",
+    "unknown_reason",
+}
+
+
 def canonical_frontend_timing(value):
     """Canonicalize one frontend timing object.
 
     Returns ``(None, reason_code)`` for a structure that must be refused, or
-    ``(timing, None)`` for a canonical self-identifying object. Numeric
-    validity is re-derived from ticks and the object's own timebase; a declared
+    ``(timing, None)`` for a canonical self-identifying object. The object is
+    parsed with its actual declared schema: an unknown key, a wrong type or an
+    out-of-range value is refused, while a well-typed but semantically invalid
+    pair is stored and classified with an explicit reason. Numeric validity is
+    re-derived from ticks and the object's own timebase; a declared
     ``duration_ns`` is compared rather than trusted.
     """
     if value is None:
         return None, "timing_absent"
     if not isinstance(value, dict):
         return None, "timing_not_object"
+    if set(value) - _TIMING_OBJECT_KEYS:
+        return None, "timing_unknown_field"
     version = value.get("version")
     if not _is_int(version) or version != FRONTEND_TIMING_VERSION:
         return None, "unsupported_frontend_timing_version"
@@ -256,6 +265,8 @@ def canonical_frontend_timing(value):
         return None, "timing_action_identity"
     clock = value.get("clock")
     if not isinstance(clock, dict):
+        return None, "timing_clock"
+    if set(clock) - _TIMING_CLOCK_KEYS:
         return None, "timing_clock"
     if clock.get("domain") != "mach_absolute_time":
         return None, "timing_clock_domain"
@@ -311,7 +322,7 @@ def canonical_frontend_timing(value):
         return None, "timing_update_calls"
     calls = []
     for call in update_calls:
-        if not isinstance(call, dict):
+        if not isinstance(call, dict) or set(call) - _TIMING_UPDATE_CALL_KEYS:
             return None, "timing_update_call"
         call_endpoint = call.get("endpoint")
         if call_endpoint not in ("marked_text", "panel_update"):
@@ -326,6 +337,8 @@ def canonical_frontend_timing(value):
         return None, "timing_association"
     association_fields = {}
     if isinstance(association, dict):
+        if set(association) - _TIMING_ASSOCIATION_KEYS:
+            return None, "timing_association"
         for name in ("source_instance_id", "process_id", "continuity_segment_id",
                      "update_id", "terminal_update_id", "commit_id"):
             field = association.get(name)
@@ -365,13 +378,16 @@ def canonical_frontend_timing(value):
     elif not timing["endpoint_ticks"]:
         timing["validity"] = "invalid"
         reason = "missing_endpoint"
+    elif timing["endpoint_ticks"] <= timing["entry_ticks"]:
+        timing["validity"] = "invalid"
+        reason = "nonmonotone_endpoint"
     else:
-        computed = interval_ns(
-            timing["entry_ticks"], timing["endpoint_ticks"], numer, denom
+        computed = conversion_ns(
+            timing["endpoint_ticks"] - timing["entry_ticks"], numer, denom
         )
         if computed is None:
             timing["validity"] = "invalid"
-            reason = "nonmonotone_endpoint"
+            reason = "unrepresentable_endpoint"
         elif timing["declared_duration_ns"] is None:
             timing["validity"] = "invalid"
             reason = "declared_duration_absent"
@@ -391,26 +407,33 @@ def canonical_frontend_timing(value):
         timing["unknown_reason"] = reason or declared_reason or "declared_unknown"
     if "commit_call" in value and value.get("commit_call") is not None:
         call = value.get("commit_call")
-        if isinstance(call, dict):
-            call = dict(call)
-            call["_numer"] = numer
-            call["_denom"] = denom
-            canonical_call = _canonical_call(call)
-        else:
-            canonical_call = _canonical_call(call)
+        canonical_call = _canonical_call(call, numer, denom)
         if isinstance(canonical_call, str):
             return None, canonical_call
         timing["commit_call"] = canonical_call
     return timing, None
 
 
+def canonicalize_timing_payload(payload):
+    """Canonicalize the ``frontend_timing`` object inside a payload.
+
+    Returns ``(timing, None)`` when the payload carries a canonical timing
+    object, ``(None, None)`` when it declares none, or ``(None, reason)`` for a
+    structure that must be refused at admission.
+    """
+    if not isinstance(payload, dict) or "frontend_timing" not in payload:
+        return None, None
+    timing, reason = canonical_frontend_timing(payload.get("frontend_timing"))
+    if timing is None:
+        return None, reason or "timing_not_object"
+    return timing, None
+
+
 def timing_from_payload(payload, stage):
     """Extract and canonicalize frontend timing from an observation payload.
 
-    Returns ``(timing, reason)``. ``stage`` is the row's own declared stage:
-    ``provenance`` rows and plugin rows with ``stage=frontend_timing`` carry
-    the frontend numeric interval; any other row has no timing lane. A row that
-    declares the timing stage without the payload is reported, never guessed.
+    Retained for callers that re-read a stored payload; the collector's own
+    query surface reads the canonical ``frontend_timing`` field instead.
     """
     timing_payload = None
     if isinstance(payload, dict):
@@ -489,41 +512,79 @@ class RelationContext(object):
     """Reverse indexes over the durable rows at one published prefix.
 
     Rows are the already-published index rows; unpublished work never reaches
-    this object.
+    this object. When the collector supplies its incremental join state, the
+    maps are copied rather than rebuilt from the row list, so a query reads a
+    bounded index instead of re-deriving the joins over the whole history.
     """
 
-    def __init__(self, rows):
+    def __init__(self, rows, join_state=None):
         self.rows = list(rows)
+        self.by_seq = {row.get("durable_seq"): row for row in self.rows}
+        if join_state is not None:
+            self.updates = dict(join_state["updates"])
+            self.update_owners = {
+                key: set(value) for key, value in join_state["update_owners"].items()
+            }
+            self.process_sources = {
+                key: set(value) for key, value in join_state["process_sources"].items()
+            }
+            self.commit_owners = {
+                key: set(value) for key, value in join_state["commit_owners"].items()
+            }
+            self.segment_owners = {
+                key: set(value) for key, value in join_state["segment_owners"].items()
+            }
+            self.request_rows = {
+                key: list(value) for key, value in join_state["request_rows"].items()
+            }
+            self.plan_owners = {
+                key: set(value) for key, value in join_state["plan_owners"].items()
+            }
+            self.request_plans = {
+                key: set(value) for key, value in join_state["request_plans"].items()
+            }
+            return
         self.updates = {}
         self.update_owners = {}
         self.process_sources = {}
         self.commit_owners = {}
+        self.segment_owners = {}
         self.request_rows = {}
         self.plan_owners = {}
         self.request_plans = {}
         for row in self.rows:
             seq = row.get("durable_seq")
-            update = row.get("update_id")
-            if isinstance(update, str):
-                self.updates[update] = min(self.updates.get(update, seq), seq)
-                self.update_owners.setdefault(update, set()).add(
-                    (row.get("source_instance_id"), row.get("process_id"))
-                )
-            process = row.get("process_id")
-            if isinstance(process, str):
-                self.process_sources.setdefault(process, set()).add(
-                    row.get("source_instance_id")
-                )
-            commit = row.get("commit_id")
-            if isinstance(commit, str):
-                self.commit_owners.setdefault(commit, set()).add(
-                    (row.get("source_instance_id"), row.get("process_id"))
-                )
+            # Identity relations are declared by the capture rows themselves:
+            # plugin and daemon rows are observers that reference a frontend
+            # token, so they never create a second owner for it.
+            observer = row.get("observation_kind") in ("plugin_observation", "daemon_observation")
+            if not observer:
+                update = row.get("update_id")
+                if isinstance(update, str):
+                    self.updates[update] = min(self.updates.get(update, seq), seq)
+                    self.update_owners.setdefault(update, set()).add(
+                        (row.get("source_instance_id"), row.get("process_id"))
+                    )
+                process = row.get("process_id")
+                if isinstance(process, str):
+                    self.process_sources.setdefault(process, set()).add(
+                        row.get("source_instance_id")
+                    )
+                commit = row.get("commit_id")
+                if isinstance(commit, str):
+                    self.commit_owners.setdefault(commit, set()).add(
+                        (row.get("source_instance_id"), row.get("process_id"))
+                    )
+                segment = row.get("continuity_segment_id")
+                if isinstance(segment, str):
+                    self.segment_owners.setdefault(segment, set()).add(
+                        (row.get("source_instance_id"), row.get("process_id"))
+                    )
             daemon = row.get("daemon")
             if isinstance(daemon, dict) and daemon.get("daemon_stage") == "request":
                 request_id = daemon.get("request_id")
                 if isinstance(request_id, str):
-                    self.request_rows.setdefault(request_id, []).append((seq, row))
+                    self.request_rows.setdefault(request_id, []).append(seq)
                     plan = daemon.get("plan_identity")
                     if isinstance(plan, str):
                         self.plan_owners.setdefault(plan, set()).add(request_id)
@@ -591,34 +652,23 @@ class RelationContext(object):
             return self.relation(
                 "process_identity", "not_observed", "no_durable_process_record"
             )
-        own_owner = row.get("source_instance_id")
-        if own_owner in owners:
-            # The row's own owner is internally consistent even when other
-            # sources recorded the same token; the extra owners stay visible
-            # instead of being silently merged or turned into a false claim of
-            # one shared process.
-            block = self.relation(
-                "process_identity", "valid", "exact_source_and_process_match"
-            )
-            if len(owners) > 1:
-                block["evidence"] = {
-                    "owners": sorted(owners),
-                    "note": (
-                        "process token also recorded under other source"
-                        " incarnations; ownership is not merged"
-                    ),
-                }
-            return block
-        if len(owners) > 1:
+        observer = row.get("observation_kind") in ("plugin_observation", "daemon_observation")
+        if len(owners) == 1:
+            owner = next(iter(owners))
+            if observer or row.get("source_instance_id") == owner:
+                return self.relation(
+                    "process_identity", "valid", "exact_source_and_process_match"
+                )
             return self.relation(
-                "process_identity",
-                "conflicting",
-                "process_token_recorded_under_multiple_source_incarnations",
-                sorted(owners),
+                "process_identity", "unmatched", "process_owner_is_a_different_source"
             )
-        return self.relation(
-            "process_identity", "unmatched", "process_owner_is_a_different_source"
+        block = self.relation(
+            "process_identity",
+            "conflicting",
+            "process_token_recorded_under_multiple_source_incarnations",
+            sorted(owners),
         )
+        return block
 
     def association(self, row, plugin):
         """The plugin's declared engine-entry context against durable records.
@@ -675,7 +725,7 @@ class RelationContext(object):
                 "no_durable_record_with_referenced_update_token",
                 evidence,
             )
-        witness_row = next((row for row in self.rows if row.get("durable_seq") == witness), None)
+        witness_row = self.by_seq.get(witness)
         witness_source = witness_row.get("source_instance_id") if witness_row else None
         witness_process = witness_row.get("process_id") if witness_row else None
         declared_source = reference.get("source_instance_id")
@@ -786,14 +836,14 @@ class RelationContext(object):
                 "request",
                 "ambiguous",
                 "multiple_daemon_requests_with_this_token",
-                [seq for seq, _ in records],
+                list(records),
             )
             return request_relation, plan_relation, evidence
         request_relation = self.relation(
             "request",
             "linked",
             "native_request_id_matches_one_durable_daemon_request",
-            records[0][0],
+            records[0],
         )
         return request_relation, plan_relation, evidence
 
@@ -813,33 +863,14 @@ class RelationContext(object):
             row, "parent_update_id", row.get("parent_update_id")
         )
         commit = row.get("commit_id")
-        if isinstance(commit, str):
-            owners = self.commit_owners.get(commit, set())
-            if len(owners) > 1 and self.owner(row) in owners:
-                block = self.relation(
-                    "commit_identity", "valid", "exact_token_match_durable_record"
-                )
-                block["evidence"] = {
-                    "owners": sorted(
-                        "%s/%s" % (source or "unknown", process or "unknown")
-                        for source, process in owners
-                    )
-                }
-                relations["commit_identity"] = block
-            else:
-                relations["commit_identity"] = self.token_relation(
-                    "commit_identity", commit, owners
-                )
-        else:
-            relations["commit_identity"] = self.relation(
-                "commit_identity", "absent", "no_commit_declared"
-            )
+        relations["commit_identity"] = self.token_relation(
+            "commit_identity", commit, self.commit_owners.get(commit) if isinstance(commit, str) else None
+        )
+        segment = row.get("continuity_segment_id")
         relations["segment_identity"] = self.token_relation(
             "segment_identity",
-            row.get("continuity_segment_id"),
-            None if row.get("continuity_segment_id") is None else {
-                (row.get("source_instance_id"), row.get("process_id"))
-            },
+            segment,
+            self.segment_owners.get(segment) if isinstance(segment, str) else None,
         )
         plugin = row.get("plugin")
         daemon = row.get("daemon")
@@ -1217,6 +1248,22 @@ def overview_body(rows, state, limits, timing, now_wall_ms):
         "inclusion": inclusion,
         "stages": stages,
         "timing": timing,
+        "slices": {
+            "status": "not_observed",
+            "available": [],
+            "unknown_buckets": [
+                "cold",
+                "hot",
+                "idle_resumption",
+                "application",
+                "input_size",
+            ],
+            "basis": "no_explicit_slice_evidence_in_this_archive",
+            "note": (
+                "no slice is inferred from timing, PID, text or arrival order;"
+                " missing slice metadata stays an explicit unknown bucket"
+            ),
+        },
         "outcomes": outcome_denominators(rows),
         "quality": quality_denominators(rows, state),
         "storage": storage_denominators(state, rows),
@@ -1368,24 +1415,24 @@ class TimingSummary(object):
         }
 
 
-def collect_timing(rows, limits, payload_reader):
+def collect_timing(rows, limits):
     """Build the timing summary from durable rows.
 
-    ``payload_reader(row)`` returns the stored payload for a row, or None when
-    it cannot be read; timing never trusts a claimed number without the
-    canonical re-derivation in this module.
+    Rows carry the canonical ``frontend_timing`` field parsed at admission, so
+    no query re-reads payloads for timing and a row that declares the timing
+    stage without a usable payload keeps an explicit reason.
     """
     summary = TimingSummary(limits)
     for row in rows:
-        kind = row.get("observation_kind")
-        stage = row.get("stage")
-        if kind not in TIMING_STAGES:
+        if row.get("observation_kind") != "provenance":
             continue
-        if kind == "provenance" and stage != "frontend_timing":
+        if row.get("stage") != "frontend_timing":
             continue
-        payload = payload_reader(row)
-        timing, reason = timing_from_payload(payload, stage)
-        summary.add(row, timing, reason)
+        timing = row.get("frontend_timing")
+        if timing is None:
+            summary.add(row, None, "timing_payload_absent")
+            continue
+        summary.add(row, timing, None)
     return summary
 
 
@@ -1455,6 +1502,7 @@ def choice_group_rollup(rows, process_id, limits):
                 "captured_candidate_count": None,
                 "group_member_count": None,
                 "member_durable_seqs": [],
+                "member_evidence_truncated": False,
                 "retracted": False,
                 "request_outcome": "unknown",
                 "association_status": None,
@@ -1486,16 +1534,19 @@ def choice_group_rollup(rows, process_id, limits):
             rollup["submission"] = plugin.get("submission")
         if plugin.get("target_membership") not in (None, "unknown"):
             rollup["target_membership"] = plugin.get("target_membership")
-        if plugin.get("coverage") == "complete" and not rollup["coverage_claim_accepted"]:
-            rollup["coverage"] = "complete"
+        if plugin.get("coverage") not in (None, "unknown"):
+            rollup["coverage"] = plugin.get("coverage")
             rollup["coverage_basis"] = plugin.get("coverage_basis")
-            rollup["coverage_claim_accepted"] = _coverage_accepted(plugin)
-            rollup["captured_candidate_count"] = plugin.get("captured_candidate_count")
-            rollup["group_member_count"] = plugin.get("group_member_count")
-            if plugin.get("truncated") is True and not rollup["coverage_claim_accepted"]:
+            if _coverage_accepted(plugin):
+                rollup["coverage_claim_accepted"] = True
+                rollup["captured_candidate_count"] = plugin.get("captured_candidate_count")
+                rollup["group_member_count"] = plugin.get("group_member_count")
+                if len(rollup["member_durable_seqs"]) < limits["query_group_members_max"]:
+                    rollup["member_durable_seqs"].append(row.get("durable_seq"))
+                else:
+                    rollup["member_evidence_truncated"] = True
+            elif plugin.get("coverage") == "complete" and plugin.get("truncated") is True:
                 rollup["completeness"]["why"] = "truncated_window_not_group_complete"
-            if rollup["coverage_claim_accepted"]:
-                rollup["member_durable_seqs"].append(row.get("durable_seq"))
         if stage == "commit":
             rollup["request_outcome"] = "engine_commit_observed"
         elif stage == "cancellation":
