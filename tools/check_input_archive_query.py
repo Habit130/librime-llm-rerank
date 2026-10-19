@@ -1282,14 +1282,50 @@ class ContractSuite(object):
         decoded = decode_cursor(held["cursor_token"])
         if decoded.get("as_of") != 0:
             raise CheckFailure("held_snapshot")
+        # Post-admission known loss: while publication is held, a burst beyond
+        # the collector queue is refused as queue_saturated and counted as a
+        # known drop; a reference whose record was never published stays
+        # unresolved rather than being reconstructed or silently linked. The
+        # reference row is queued before the burst so it is published on
+        # release while its target never is.
+        reference = plugin_frame(
+            1,
+            source="plug-hold",
+            process="p-hold",
+            plugin_stage="commit",
+            association_role="engine_entry_context",
+            association_read="claimed_valid",
+            referenced_source_id="ps-q192",
+            referenced_process_id="p-hold",
+            referenced_update_id="u-never-published",
+        )
+        codes = _admit(hold_client, [reference])
+        if codes != ["admitted"]:
+            raise CheckFailure("reference_admission")
+        burst = [
+            frame("frontend_update", 100 + index, process="p-hold", update_id="u-burst-%d" % index)
+            for index in range(400)
+        ]
+        codes = _admit(hold_client, burst, allow_transient=False)
+        dropped = sum(1 for code in codes if code == "queue_saturated")
+        if dropped < 1:
+            raise CheckFailure("known_loss_not_reported")
+        overflow = _body(hold_client.query("overview"))
+        if overflow["quality"]["known_dropped_units"] < 1:
+            raise CheckFailure("known_drop_not_counted")
+        if overflow["quality"]["loss_notice_relation"] is None:
+            raise CheckFailure("loss_relation_statement")
+        if overflow["quality"]["loss_notice_observations"] != 0:
+            # A known drop is not automatically a loss-notice row.
+            raise CheckFailure("loss_notice_conflated")
         hold_client.checkpoint()
         released = None
         with open(fifo, "w") as handle:
             handle.write("release\n")
-        if not await_durable(hold_client, 1):
+        if not await_durable(hold_client, 2):
             raise CheckFailure("release_prefix")
         released = _body(hold_client.query("timeline", page_size=10))
-        if released["returned"] != 1:
+        if released["returned"] < 2:
             raise CheckFailure("released_row")
         # Restart semantics: the published prefix survives, and a cursor from
         # the previous epoch is refused instead of silently crossing it.
@@ -1300,18 +1336,30 @@ class ContractSuite(object):
         self.collectors.append((hold_root, hold_sock))
         restarted = Client(hold_sock, timeout=10)
         status = restarted.status().get("body") or {}
-        if status.get("durable_seq") != 1:
+        durable_after = status.get("durable_seq")
+        if not isinstance(durable_after, int) or durable_after < 2:
             raise CheckFailure("restart_prefix")
         if status.get("crash_tail") != "none":
             raise CheckFailure("clean_restart_tail:%s" % status.get("crash_tail"))
         expect_error(
             restarted, "cursor_snapshot_unknown", "timeline", cursor_token=old_token
         )
-        fresh = _body(restarted.query("timeline", page_size=10))
-        if fresh["returned"] != 1:
-            raise CheckFailure("restart_rows")
-        content_free(json.dumps(fresh), "restart")
-        return {"note": "held+restart prefix preserved"}
+        reference_row = None
+        cursor = ""
+        for _ in range(20):
+            page = _body(restarted.query("timeline", page_size=10, cursor=cursor or None))
+            for row in page["observations"]:
+                if row.get("observation_kind") == "plugin_observation":
+                    reference_row = row
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                break
+        if reference_row is None:
+            raise CheckFailure("reference_row_missing")
+        if (reference_row.get("relations") or {}).get("association", {}).get("status") != "unmatched":
+            raise CheckFailure("post_admission_reference")
+        content_free(json.dumps(released), "restart")
+        return {"note": "held+restart prefix preserved; known loss counted"}
 
     # -- C8 no probe --------------------------------------------------------
     def c_no_probe(self):
@@ -1468,6 +1516,12 @@ class ContractSuite(object):
             raise CheckFailure("chain_summary")
         if summary["plugin_rows"] < 1:
             raise CheckFailure("plugin_rows:%d" % summary["plugin_rows"])
+        if summary["plugin_stages"].get("emission", 0) < 1:
+            # Candidate emission rows are the captured-candidate evidence of
+            # the real chain, not a harness flag.
+            raise CheckFailure("no_emission_rows")
+        if summary["plugin_stages"].get("competition", 0) < 1:
+            raise CheckFailure("no_competition_rows")
         if summary["timing_rows"] < 1:
             raise CheckFailure("timing_rows:%d" % summary["timing_rows"])
         if summary["linked"] < 1:
@@ -1489,6 +1543,7 @@ class ContractSuite(object):
             "linked_requests": summary["linked"],
             "timing_rows": summary["timing_rows"],
             "plugin_rows": summary["plugin_rows"],
+            "plugin_stages": summary["plugin_stages"],
             "daemon_request_rows": summary["daemon_requests"],
             "exchange_success": summary["issued_succeeded"],
             "exchange_fallback": summary["issued_failed"],
@@ -1513,6 +1568,7 @@ class ContractSuite(object):
             "issued_succeeded": 0,
             "issued_failed": 0,
             "daemon_requests": 0,
+            "plugin_stages": {},
         }
         cursor = ""
         for _ in range(200):
@@ -1524,6 +1580,11 @@ class ContractSuite(object):
                 relations = row.get("relations") or {}
                 if row.get("observation_kind") == "plugin_observation":
                     summary["plugin_rows"] += 1
+                    stage = row.get("plugin_stage")
+                    if isinstance(stage, str):
+                        summary["plugin_stages"][stage] = (
+                            summary["plugin_stages"].get(stage, 0) + 1
+                        )
                     state = row.get("lm_request_state")
                     if state == "issued_succeeded":
                         summary["issued_succeeded"] += 1
@@ -2138,10 +2199,16 @@ def main(argv):
         if args.self_test:
             if not args.root:
                 raise CheckFailure("invalid_request")
+            if os.path.lexists(args.root):
+                # A self-test root must be fresh; an existing root is refused
+                # with a stable code instead of a traceback.
+                raise CheckFailure("root_not_fresh")
             return self_test(args.root)
         if args.suite == "contract":
             if not args.root or not args.report:
                 raise CheckFailure("invalid_request")
+            if os.path.lexists(args.root):
+                raise CheckFailure("root_not_fresh")
             os.makedirs(os.path.dirname(os.path.abspath(args.report)), mode=0o700, exist_ok=True)
             evidence = os.path.dirname(os.path.abspath(args.report))
             os.makedirs(args.root, mode=0o700)

@@ -52,29 +52,11 @@ def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _is_number(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
-
-
 def _rate(numerator, denominator):
     """Exact count ratio, or None with no fabricated value."""
     if not denominator:
         return None
     return numerator / denominator
-
-
-def _rate_block(numerator, denominator, unit):
-    return {
-        "numerator": numerator,
-        "denominator": denominator,
-        "rate": _rate(numerator, denominator),
-        "rate_unavailable_reason": None if denominator else "zero_denominator",
-        "unit": unit,
-    }
 
 
 def percentiles(values):
@@ -429,26 +411,6 @@ def canonicalize_timing_payload(payload):
     return timing, None
 
 
-def timing_from_payload(payload, stage):
-    """Extract and canonicalize frontend timing from an observation payload.
-
-    Retained for callers that re-read a stored payload; the collector's own
-    query surface reads the canonical ``frontend_timing`` field instead.
-    """
-    timing_payload = None
-    if isinstance(payload, dict):
-        timing_payload = payload.get("frontend_timing")
-    if stage == "frontend_timing":
-        if timing_payload is None:
-            return None, "timing_payload_absent"
-        return canonical_frontend_timing(timing_payload)
-    if stage == "provenance" and timing_payload is not None:
-        return canonical_frontend_timing(timing_payload)
-    if stage == "provenance":
-        return None, "timing_payload_absent"
-    return None, None
-
-
 def encode_cursor(view, filters, as_of_durable_seq, epoch, query_version=QUERY_VERSION):
     payload = {
         "v": query_version,
@@ -589,9 +551,6 @@ class RelationContext(object):
                     if isinstance(plan, str):
                         self.plan_owners.setdefault(plan, set()).add(request_id)
                         self.request_plans.setdefault(request_id, set()).add(plan)
-
-    def owner(self, row):
-        return (row.get("source_instance_id"), row.get("process_id"))
 
     def relation(self, name, status, basis, evidence=None):
         block = {"relation": name, "status": status, "basis": basis}
@@ -928,7 +887,6 @@ def relation_summary(relations):
 # ---------------------------------------------------------------------------
 # Denominators and aggregate views
 
-
 def identity_key(row):
     """The capture identity of one observation: source instance plus the
     source-local sequence. A retry of the same capture carries the same key;
@@ -960,21 +918,6 @@ def eligible_population(rows):
         "same_identity_retries_or_duplicates_collapsed": duplicates,
         "identity_conflicting_units": conflicting,
     }
-
-
-def _row_category(row):
-    kind = row.get("observation_kind")
-    if kind == "plugin_observation":
-        return "plugin"
-    if kind == "daemon_observation":
-        return "daemon"
-    if kind == "loss_notice":
-        return "loss_notice"
-    if kind == "exclusion_notice":
-        return "exclusion_notice"
-    if kind == "provenance":
-        return "provenance"
-    return "frontend"
 
 
 def stage_denominators(rows):
@@ -1599,27 +1542,6 @@ def choice_group_rollup(rows, process_id, limits):
             "cancelled_retracted_raw_unavailable_unknown": "never_default_positive_label",
             "unselected": "not_negative",
         },
-        "content_included": False,
-    }
-
-
-def thin_timeline_row(row, relations):
-    """A bounded timeline row: no payload, explicit relation read."""
-    return {
-        "durable_seq": row.get("durable_seq"),
-        "observation_kind": row.get("observation_kind"),
-        "source_instance_id": row.get("source_instance_id"),
-        "source_local_sequence": row.get("source_local_sequence"),
-        "process_id": row.get("process_id"),
-        "update_id": row.get("update_id"),
-        "parent_update_id": row.get("parent_update_id"),
-        "commit_id": row.get("commit_id"),
-        "continuity_segment_id": row.get("continuity_segment_id"),
-        "stage": row.get("stage"),
-        "outcome": row.get("outcome"),
-        "reason": row.get("reason"),
-        "relations": relations,
-        "relations_summary": relation_summary(relations),
         "content_included": False,
     }
 

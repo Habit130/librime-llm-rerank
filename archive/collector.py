@@ -49,7 +49,6 @@ from archive.querying import (
     encode_cursor,
     filter_fingerprint,
     overview_body,
-    thin_timeline_row,
 )
 from archive.safety import (
     UnsafeRoot,
@@ -1920,12 +1919,6 @@ class Collector(object):
                 for entry in self._index
                 if entry.get("durable_seq", 0) <= watermark
             ]
-
-    def _payload_for_row(self, entry):
-        try:
-            return self._read_payload(entry)
-        except Exception:
-            return None
 
     def _timing_summary(self, rows):
         return collect_timing(rows, self.limits)
