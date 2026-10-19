@@ -1466,6 +1466,7 @@ class ContractSuite(object):
                     "--log", log,
                     "--socket", sock,
                     "--daemon-socket", schema_socket,
+                    "--plugin-dylib", plugin_dylib,
                     "--scenario", scenario,
                     "--report", report_path,
                 ],
@@ -1493,6 +1494,9 @@ class ContractSuite(object):
                 raise CheckFailure("substituted_disclosure")
             if report.get("cwd_unchanged") is not True:
                 raise CheckFailure("harness_cwd")
+            gate = report.get("secure_gate") or {}
+            if gate.get("hook") != "forced_not_secure":
+                raise CheckFailure("secure_gate_hook_%s" % gate.get("hook", "missing"))
             scenario_reports[scenario] = report
         parity = (scenario_reports.get("parity") or {}).get("parity") or {}
         if parity.get("inserts_equal") is not True or parity.get("marked_equal") is not True:
@@ -1548,6 +1552,7 @@ class ContractSuite(object):
             "exchange_success": summary["issued_succeeded"],
             "exchange_fallback": summary["issued_failed"],
             "scenario_reports": sorted(scenario_reports),
+            "secure_gate": (scenario_reports.get("parity") or {}).get("secure_gate"),
             "runtime_fixture_note": (
                 "the fixture chain root is a fresh owned runtime root under the"
                 " checker root; the actionable evidence is this report and the"

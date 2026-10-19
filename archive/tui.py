@@ -56,10 +56,49 @@ class TuiSession(object):
             self.stdout.write("SCREEN error\ncode=invalid_request\ncontent_included=false\n")
 
     def _overview(self):
-        response = self.client.query("overview")
+        # The overview screen is an Adapter over the shared Interface: the
+        # versioned overview supplies the honest counts and the status read
+        # supplies the durable policy/capacity keys the screen has always
+        # shown. Neither opens storage; neither probes the daemon.
+        status = self.client.status()
+        overview = self.client.query("overview")
         self.stdout.write("SCREEN overview\n")
         self.stdout.write("interface_version=%s\n" % INTERFACE_VERSION)
-        self._write_status(response)
+        self._write_status(status)
+        body = overview.get("body") or {}
+        if overview.get("ok"):
+            population = body.get("population") or {}
+            storage = body.get("storage") or {}
+            freshness = body.get("freshness") or {}
+            self.stdout.write(
+                "query_version=%s\n" % _plain(body.get("query_version"))
+            )
+            self.stdout.write(
+                "population.observations=%s\n" % _plain(population.get("observations"))
+            )
+            managed = storage.get("managed") or {}
+            self.stdout.write(
+                "storage.managed.total_bytes=%s\n" % _plain(managed.get("total_bytes"))
+            )
+            self.stdout.write(
+                "freshness.publication_state=%s\n"
+                % _plain(freshness.get("publication_state"))
+            )
+            self.stdout.write(
+                "freshness.received_unpublished=%s\n"
+                % _plain(freshness.get("received_unpublished"))
+            )
+            operations = (body.get("timing") or {}).get("operations") or []
+            for bucket in operations:
+                self.stdout.write(
+                    "timing.operation=%s valid=%s invalid=%s unknown=%s\n"
+                    % (
+                        _plain(bucket.get("operation")),
+                        _plain(bucket.get("valid_samples")),
+                        _plain(bucket.get("invalid_samples")),
+                        _plain(bucket.get("unknown_samples")),
+                    )
+                )
         self.stdout.write("inference_availability=not_observed\n")
         self.stdout.write("ranking_benefit=false\n")
         self.stdout.write("five_view_complete=false\n")

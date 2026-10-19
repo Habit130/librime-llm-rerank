@@ -15,8 +15,7 @@ import Darwin
 import Foundation
 import InputMethodKit
 
-final class QueryRecordingClient: NSObject, IMKTextInput {
-  var bundle = "com.ac192.fixture"
+final class QueryRecordingClient: NSObject, IMKTextInput {  var bundle = "com.ac192.fixture"
   var inserts: [String] = []
   var marked: [String] = []
 
@@ -83,6 +82,50 @@ enum QueryFrontendHarness {
   static var cwdAtStart = FileManager.default.currentDirectoryPath
   static var parityTrace: [String: Any] = [:]
   static var scenarioTrace: [String: Any] = [:]
+  static var secureGateTrace: [String: Any] = [:]
+
+  /// The plugin's own native test drives text admission through the
+  /// production secure-input gate with its testing hook (CallSecure(0)) and
+  /// tests the secure path separately. This fixture does the same: it records
+  /// the raw Carbon gate value this process sees (content-free) and then sets
+  /// the same override the accepted native suite uses, so the query chain
+  /// measures association/timing instead of a machine-level gate state. The
+  /// plugin contract suite keeps the secure-input refusal coverage.
+  static func bindSecureGate(pluginDylib: String) {
+    let raw = platformSecureInputValue()
+    secureGateTrace["carbon_gate_raw"] = raw
+    guard !pluginDylib.isEmpty else {
+      secureGateTrace["hook"] = "dylib_missing"
+      return
+    }
+    guard let handle = dlopen(pluginDylib, RTLD_NOW | RTLD_GLOBAL) else {
+      secureGateTrace["hook"] = "dlopen_failed"
+      return
+    }
+    typealias Setter = @convention(c) (Int32) -> Void
+    guard let symbol = dlsym(handle, "rime_llm_rerank_archive_set_secure_input_for_testing") else {
+      secureGateTrace["hook"] = "symbol_missing"
+      return
+    }
+    let setter = unsafeBitCast(symbol, to: Setter.self)
+    setter(0)
+    secureGateTrace["hook"] = "forced_not_secure"
+    secureGateTrace["content_included"] = false
+  }
+
+  private static func platformSecureInputValue() -> Bool {
+    guard let handle = dlopen(
+      "/System/Library/Frameworks/Carbon.framework/Carbon", RTLD_LAZY
+    ) else {
+      return true
+    }
+    typealias Query = @convention(c) () -> DarwinBoolean
+    guard let symbol = dlsym(handle, "IsSecureEventInputEnabled") else {
+      return true
+    }
+    let query = unsafeBitCast(symbol, to: Query.self)
+    return query().boolValue
+  }
 
   static func main() {
     let arguments = parse(CommandLine.arguments)
@@ -96,6 +139,7 @@ enum QueryFrontendHarness {
     SquirrelApp.fixtureSharedSupportDirectory = URL(fileURLWithPath: shared, isDirectory: true)
     SquirrelApp.fixtureLogDirectory = URL(fileURLWithPath: log, isDirectory: true)
     let scenario = arguments["scenario"] ?? "contract"
+    bindSecureGate(pluginDylib: arguments["plugin-dylib"] ?? "")
     if !bootstrap() {
       emit(arguments["report"])
       exit(1)
@@ -411,6 +455,7 @@ enum QueryFrontendHarness {
       "cwd_unchanged": FileManager.default.currentDirectoryPath == cwdAtStart,
       "parity": parityTrace,
       "scenario": scenarioTrace,
+      "secure_gate": secureGateTrace,
       "substituted_compute": true
     ]
     guard let path, let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted]) else {

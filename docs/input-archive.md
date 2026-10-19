@@ -583,6 +583,11 @@ DEFAULT max_frame_bytes=4194304
 DEFAULT batch_size=64
 DEFAULT connect_timeout_ms=1000
 DEFAULT management_timeout_ms=5000
+DEFAULT query_page_bytes_max=1048576
+DEFAULT query_timing_rows_max=4096
+DEFAULT query_group_members_max=256
+DEFAULT query_choice_groups_max=64
+DEFAULT query_high_fanout_updates_max=512
 
 ## Diagnostic holds
 
