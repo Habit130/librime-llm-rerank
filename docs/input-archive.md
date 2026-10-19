@@ -294,7 +294,11 @@ process, segment, observation kind and observed outcome state. An unavailable
 field is reported unknown, never invented: a row whose observation time is
 missing does not match a time filter, and a filter naming a field this archive
 never observes (application metadata) is refused with `invalid_request` rather
-than silently matching nothing. The response echoes `filters_applied`.
+than silently matching nothing. The same filters scope the aggregate views:
+`overview`, `timing` and `choice` count only the filtered rows, and the
+response echoes `filters_applied`. `choice` also accepts `group_id`, which
+projects exactly that captured group (so a requested group is returned even
+when the unfiltered projection would truncate first).
 
 Bounds. `page_size_max` (default 50) bounds a page; the encoded non-private
 response body is refused with `page_bytes_bound` above `query_page_bytes_max`
@@ -314,11 +318,12 @@ the canonical filter set, the snapshot (`as_of_durable_seq`) and the collector
 epoch. It is rejected with `invalid_request` when it names a different view or
 filter set, and with `cursor_snapshot_unknown` when it names an unpublished
 position or a previous collector epoch (restart). A snapshot is immutable: the
-same token returns the same page while the epoch is unchanged. `next_cursor` is
-the last returned `durable_seq` and continuation repeats no record and omits
-none inside the snapshot. Append, a held publication or a restart cannot leak
-unpublished work: reads always see the durable prefix only, and
-`received_unpublished` stays a separate figure.
+same token returns the same page while the epoch is unchanged, and a
+continuation reads the token's own as-of prefix rather than whatever has been
+published since. `next_cursor` is the last returned `durable_seq` and
+continuation repeats no record and omits none inside the snapshot. Append, a
+held publication or a restart cannot leak unpublished work: reads always see
+the durable prefix only, and `received_unpublished` stays a separate figure.
 
 ### Identity relations
 

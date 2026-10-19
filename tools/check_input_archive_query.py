@@ -363,6 +363,22 @@ def relation_status(rows, durable_seq, relation):
     return None
 
 
+def _count_rows(client, page_size=50, **filters):
+    """Count every row a filtered timeline view returns, page by page."""
+    total = 0
+    cursor = None
+    for _ in range(200):
+        body = _body(client.query("timeline", page_size=page_size, cursor=cursor, **filters))
+        rows = body["observations"]
+        if not rows:
+            break
+        total += len(rows)
+        cursor = body.get("next_cursor")
+        if cursor is None:
+            break
+    return total
+
+
 class ContractSuite(object):
     def __init__(self, root, frontend, native_build, evidence):
         self.root = root
@@ -1202,6 +1218,20 @@ class ContractSuite(object):
             raise CheckFailure("choice_bound")
         if choice["groups_truncation_reason"] != "choice_group_bound":
             raise CheckFailure("truncation_reason")
+        # A requested group is returned even beyond the truncation limit.
+        only = _body(
+            client.query("choice", process_id="p-fanout", group_id="grp-scale-937")
+        )
+        if only["group_id_filter"] != "grp-scale-937":
+            raise CheckFailure("choice_group_filter")
+        if only["groups_total"] != 1:
+            raise CheckFailure("choice_group_scope")
+        if only["groups"][0]["group_id"] != "grp-scale-937":
+            raise CheckFailure("choice_group_identity")
+        expect_error(
+            client, "invalid_request", "choice", process_id="p-fanout", group_id="bad group"
+        )
+        expect_error(client, "invalid_request", "choice", process_id="bad group")
         # Cursor cannot silently cross filters, views or an unknown version.
         timeline = _body(client.query("timeline", page_size=10))
         token = timeline["cursor_token"]
@@ -1224,19 +1254,74 @@ class ContractSuite(object):
         )
         if continuation["observations"][0]["durable_seq"] <= timeline["observations"][-1]["durable_seq"]:
             raise CheckFailure("continuation_order")
+        # A cursor token pins its snapshot: after new publications, continuing
+        # the old token must not reveal records outside the named prefix.
+        snapshot = _body(client.query("timeline", page_size=10))
+        snapshot_seq = snapshot["as_of_durable_seq"]
+        token = snapshot["cursor_token"]
+        _admit(
+            client,
+            [
+                frame("frontend_update", 9000 + index, process="p-late", update_id="u-late-%d" % index)
+                for index in range(5)
+            ],
+        )
+        if not await_durable(client, snapshot_seq + 5):
+            raise CheckFailure("late_append")
+        pinned = _body(
+            client.query("timeline", page_size=50, cursor_token=token, cursor=None)
+        )
+        if pinned["as_of_durable_seq"] != snapshot_seq:
+            raise CheckFailure("snapshot_watermark_drift")
+        if any(row["durable_seq"] > snapshot_seq for row in pinned["observations"]):
+            raise CheckFailure("snapshot_leak")
+        for _ in range(20):
+            page = _body(
+                client.query(
+                    "timeline",
+                    page_size=10,
+                    cursor_token=pinned["cursor_token"],
+                    cursor=pinned["next_cursor"] or pinned["cursor"],
+                )
+            )
+            if any(row["durable_seq"] > snapshot_seq for row in page["observations"]):
+                raise CheckFailure("snapshot_leak_page")
+            pinned = page
+            if page.get("next_cursor") is None:
+                break
+        # Filtered aggregates count only the filtered rows.
+        filtered_rows = _count_rows(client, source_instance_id="ps-scale")
+        overview_filtered = _body(client.query("overview", source_instance_id="ps-scale"))
+        if overview_filtered["population"]["observations"] != filtered_rows:
+            raise CheckFailure("overview_filter_scope")
+        if overview_filtered["population"]["observations"] >= _body(
+            client.query("overview")
+        )["population"]["observations"]:
+            raise CheckFailure("overview_filter_noop")
+        loss_rows = _count_rows(client, observation_kind="loss_notice")
+        if loss_rows != _body(client.query("overview", observation_kind="loss_notice"))[
+            "population"
+        ]["observations"]:
+            raise CheckFailure("overview_kind_filter")
+        state_rows = _count_rows(client, state="unknown")
+        if state_rows != _body(client.query("overview", state="unknown"))["population"][
+            "observations"
+        ]:
+            raise CheckFailure("overview_state_filter")
+        state_filtered = _body(client.query("timeline", page_size=10, state="unknown"))
+        for row in state_filtered["observations"]:
+            if (row.get("outcome") or "unknown") != "unknown":
+                raise CheckFailure("state_filter")
         # A filter naming a field this archive never observes is refused.
         expect_error(client, "invalid_request", "timeline", application="com.example.app")
+        expect_error(client, "invalid_request", "overview", application="com.example.app")
         expect_error(client, "invalid_request", "timeline", since_ms="not-a-number")
         early = _body(client.query("timeline", page_size=10, until_ms=1))
         if early["returned"] != 0:
             raise CheckFailure("time_filter_early")
         if "until_ms" not in early["filters_applied"]:
             raise CheckFailure("time_filter_echo")
-        state_filtered = _body(client.query("timeline", page_size=10, state="unknown"))
-        for row in state_filtered["observations"]:
-            if (row.get("outcome") or "unknown") != "unknown":
-                raise CheckFailure("state_filter")
-        return {"note": "page_bound=25"}
+        return {"note": "page_bound=25; snapshot pinned; filters scoped"}
 
     # -- C7 concurrent append and restart -----------------------------------
     def c_concurrent_and_restart(self):

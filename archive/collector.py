@@ -1613,7 +1613,13 @@ class Collector(object):
             for record, line in zip(metas, observation_lines):
                 self._remember(record, offset, len(line))
                 offset += len(line)
-            for key in ("durable_seq", "durable_offset", "durable_bytes", "quarantine_bytes"):
+            for key in (
+                "durable_seq",
+                "durable_offset",
+                "durable_bytes",
+                "quarantine_bytes",
+                "max_published_seq",
+            ):
                 self._state[key] = pending[key]
             self._state["capacity_stop"] = self._state["capacity_stop"] or pending["capacity_stop"]
             self._publishing_units = 0
@@ -1924,23 +1930,28 @@ class Collector(object):
         return collect_timing(rows, self.limits)
 
     def _cursor_check(self, body, view, filters, state):
-        """Cursor tokens cannot cross incompatible versions, filters, roots or
-        unpublished positions."""
+        """Return ``(error, decoded)`` for the request's cursor token.
+
+        A cursor token cannot cross incompatible versions, filters, roots or
+        unpublished positions, and the snapshot it names is pinned: continuing
+        a page reads the token's own as-of prefix rather than whatever has been
+        published since.
+        """
         if body.get("cursor_token") in (None, ""):
-            return None
+            return None, None
         decoded = decode_cursor(body.get("cursor_token"))
         if isinstance(decoded, str):
-            return decoded
+            return decoded, None
         if decoded.get("view") != view:
-            return "invalid_request"
+            return "invalid_request", None
         if decoded.get("filters") != filter_fingerprint(filters):
-            return "invalid_request"
+            return "invalid_request", None
         if decoded.get("epoch") != state["collector_epoch"]:
-            return "cursor_snapshot_unknown"
+            return "cursor_snapshot_unknown", None
         as_of = decoded.get("as_of")
         if as_of > state.get("max_published_seq", state["durable_seq"]):
-            return "cursor_snapshot_unknown"
-        return None
+            return "cursor_snapshot_unknown", None
+        return None, decoded
 
     def _paged_limits(self, body):
         page_size = body.get("page_size", self.limits["page_size_default"])
@@ -1974,47 +1985,92 @@ class Collector(object):
             return self._query_versioned(op, request_id, body)
         return self._query_legacy(op, request_id, body)
 
+    def _filter_validation(self, body):
+        """Validate the shared (legacy and versioned) filter fields."""
+        if body.get("application") not in (None, ""):
+            # The archive holds no application metadata; a filter naming it is
+            # refused instead of silently matching nothing.
+            return "invalid_request"
+        for name in ("since_ms", "until_ms"):
+            value = body.get(name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                return "invalid_request"
+        if (
+            body.get("since_ms") is not None
+            and body.get("until_ms") is not None
+            and body["since_ms"] > body["until_ms"]
+        ):
+            return "invalid_request"
+        return None
+
+    def _query_filters(self, view, body):
+        return {
+            "view": view,
+            "process_id": body.get("process_id"),
+            "observation_kind": body.get("observation_kind"),
+            "source_instance_id": body.get("source_instance_id"),
+            "segment_id": body.get("segment_id"),
+            "application": body.get("application"),
+            "state": body.get("state"),
+            "since_ms": body.get("since_ms"),
+            "until_ms": body.get("until_ms"),
+            "group_id": body.get("group_id"),
+        }
+
     def _query_versioned(self, op, request_id, body):
         state = self.query_state()
         view = body.get("view")
         now_wall_ms = int(time.time() * 1000)
-        rows = self._published_rows(state)
-        filters = {
-            "process_id": body.get("process_id"),
-            "source_instance_id": body.get("source_instance_id"),
-            "observation_kind": body.get("observation_kind"),
-            "segment_id": body.get("segment_id"),
-        }
+        error = self._filter_validation(body)
+        if error is not None:
+            return failure(op, request_id, error)
+        filters = self._query_filters(view, body)
+        error, decoded = self._cursor_check(body, view, filters, state)
+        if error is not None:
+            return failure(op, request_id, error)
+        # A cursor token pins the snapshot it names, so a continuation reads the
+        # original prefix rather than records published since.
+        watermark = (
+            decoded["as_of"] if decoded is not None else state["durable_seq"]
+        )
+        rows = [
+            entry
+            for entry in self._published_rows(state)
+            if entry.get("durable_seq", 0) <= watermark
+        ]
+        rows = [entry for entry in rows if self._row_matches_filters(entry, body)]
         if view == "overview":
             timing = self._timing_summary(rows)
             response = overview_body(
                 rows, state, self.limits, timing.body(state), now_wall_ms
             )
+            response["as_of_durable_seq"] = watermark
         elif view == "timing":
             timing = self._timing_summary(rows)
             response = timing.body(state)
             response["collector_epoch"] = state["collector_epoch"]
+            response["as_of_durable_seq"] = watermark
         elif view == "choice":
             process_id = body.get("process_id")
             if safe_token(process_id) is None:
                 return failure(op, request_id, "invalid_request")
-            filters = {
-                "view": "choice",
-                "process_id": process_id,
-                "group_id": body.get("group_id"),
-            }
-            response = choice_group_rollup(rows, process_id, self.limits)
+            group_id = body.get("group_id")
+            if group_id is not None and safe_token(group_id) is None:
+                return failure(op, request_id, "invalid_request")
+            response = choice_group_rollup(rows, process_id, self.limits, group_id)
             response["view"] = "choice"
             response["query_version"] = QUERY_VERSION
-            response["as_of_durable_seq"] = state["durable_seq"]
+            response["as_of_durable_seq"] = watermark
             response["collector_epoch"] = state["collector_epoch"]
         else:
             return failure(op, request_id, "invalid_request")
-        error = self._cursor_check(body, view, filters, state)
-        if error is not None:
-            return failure(op, request_id, error)
+        response["filters_applied"] = {
+            name: value for name, value in filters.items() if value is not None
+        }
         response["cursor_token"] = encode_cursor(
-            view, filters, state["durable_seq"], state["collector_epoch"]
+            view, filters, watermark, state["collector_epoch"]
         )
         response["snapshot_lifetime"] = (
             "immutable_at_as_of_durable_seq_until_collector_epoch_changes"
@@ -2025,47 +2081,28 @@ class Collector(object):
         view = body.get("view")
         if view not in {"timeline", "process", "losses"}:
             return failure(op, request_id, "invalid_request")
-        if body.get("application") not in (None, ""):
-            # The archive holds no application metadata; a filter naming it is
-            # refused instead of silently matching nothing.
-            return failure(op, request_id, "invalid_request")
-        for name in ("since_ms", "until_ms"):
-            value = body.get(name)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, (int, float))
-            ):
-                return failure(op, request_id, "invalid_request")
-        if (
-            body.get("since_ms") is not None
-            and body.get("until_ms") is not None
-            and body["since_ms"] > body["until_ms"]
-        ):
-            return failure(op, request_id, "invalid_request")
+        error = self._filter_validation(body)
+        if error is not None:
+            return failure(op, request_id, error)
         page_size, error = self._paged_limits(body)
         if error is not None:
             return failure(op, request_id, error)
         start_seq, error = self._legacy_start_seq(body)
         if error is not None:
             return failure(op, request_id, error)
-        filters = {
-            "view": view,
-            "process_id": body.get("process_id"),
-            "observation_kind": body.get("observation_kind"),
-            "source_instance_id": body.get("source_instance_id"),
-            "segment_id": body.get("segment_id"),
-            "application": body.get("application"),
-            "state": body.get("state"),
-            "since_ms": body.get("since_ms"),
-            "until_ms": body.get("until_ms"),
-        }
+        filters = self._query_filters(view, body)
         state = self.query_state()
-        error = self._cursor_check(body, view, filters, state)
+        error, decoded = self._cursor_check(body, view, filters, state)
         if error is not None:
             return failure(op, request_id, error)
+        # A cursor token pins the snapshot it names: a continuation reads the
+        # original prefix rather than records published since.
+        watermark = (
+            decoded["as_of"] if decoded is not None else state["durable_seq"]
+        )
+        epoch = state["collector_epoch"]
         private = body.get("private_detail") is True and view == "process"
         with self._lock:
-            watermark = self._state["durable_seq"]
-            epoch = self._state["collector_epoch"]
             index = list(self._index)
             update_ids = set(self._update_ids)
             process_kinds = {key: set(value) for key, value in self._process_kinds.items()}

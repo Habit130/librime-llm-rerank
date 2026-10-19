@@ -1397,7 +1397,7 @@ def _coverage_accepted(plugin):
     return captured == members
 
 
-def choice_group_rollup(rows, process_id, limits):
+def choice_group_rollup(rows, process_id, limits, group_id=None):
     """Per captured rerank group projection for one process.
 
     A group is (span AND category, source/window/group identity). Stage
@@ -1417,9 +1417,11 @@ def choice_group_rollup(rows, process_id, limits):
             continue
         if process_id is not None and row.get("process_id") != process_id:
             continue
+        if group_id is not None and plugin.get("group_id") != group_id:
+            continue
         window_id = plugin.get("window_id")
-        group_id = plugin.get("group_id")
-        key = (row.get("source_instance_id"), window_id, group_id)
+        row_group_id = plugin.get("group_id")
+        key = (row.get("source_instance_id"), window_id, row_group_id)
         rollup = groups.get(key)
         if rollup is None:
             if len(groups) >= limits["query_choice_groups_max"]:
@@ -1430,7 +1432,7 @@ def choice_group_rollup(rows, process_id, limits):
                 "source_instance_id": row.get("source_instance_id"),
                 "process_id": row.get("process_id"),
                 "window_id": window_id,
-                "group_id": group_id,
+                "group_id": row_group_id,
                 "stages": {},
                 "observations": 0,
                 "plan_identity": None,
@@ -1529,6 +1531,7 @@ def choice_group_rollup(rows, process_id, limits):
     return {
         "projection_version": CHOICE_PROJECTION_VERSION,
         "scope": "captured_rerank_group_span_and_category",
+        "group_id_filter": group_id,
         "groups": rollups,
         "groups_total": len(rollups),
         "groups_truncated": truncated,
