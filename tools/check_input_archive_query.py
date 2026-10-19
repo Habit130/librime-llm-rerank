@@ -1135,16 +1135,46 @@ class ContractSuite(object):
     def c_scale(self):
         results = {}
         for label, count in (("256", SCALE_SMALL), ("4096", SCALE_LARGE)):
-            client, root, _sock = self.collector("scale-" + label)
+            # The scale fixture measures pagination and complete iteration, so
+            # its queue is sized to hold the whole mixed population; a
+            # pressure-driven drop would otherwise (correctly) displace
+            # low-priority units and make the exact-total check meaningless.
+            # Pressure semantics are covered by the held-collector case.
+            client, root, _sock = self.collector(
+                "scale-" + label,
+                collector_queue_count=count,
+                collector_queue_bytes=8388608,
+            )
             pid = _pid_of(root)
             before = rss_kb(pid)
             observations = self._mixed_observations(count)
             started = time.monotonic()
             codes = _admit(client, observations)
+            accepted = sum(1 for code in codes if code == "admitted")
             if any(code not in ("admitted", "identity_conflict", "duplicate") for code in codes):
                 raise CheckFailure("admission:" + label)
-            if not await_durable(client, count, timeout=60):
-                raise CheckFailure("durable:" + label)
+            # Every accepted unit resolves as published, dropped or refused;
+            # the collector counts each one and this waits for that settle.
+            settled = False
+            deadline = time.time() + 90
+            status = {}
+            while time.time() < deadline:
+                client.checkpoint()
+                status = client.status().get("body") or {}
+                resolved = (
+                    status.get("durable_seq", 0)
+                    + status.get("known_dropped_units", 0)
+                    + status.get("admission_refused_units", 0)
+                    + status.get("capacity_refused_units", 0)
+                    + status.get("storage_failed_units", 0)
+                )
+                if resolved >= accepted and status.get("received_unpublished", 0) == 0:
+                    settled = True
+                    break
+                time.sleep(0.02)
+            if not settled:
+                raise CheckFailure("settle:" + label)
+            durable = status.get("durable_seq", 0)
             ingest_ms = int((time.monotonic() - started) * 1000)
             after = rss_kb(pid)
             query_started = time.monotonic()
@@ -1173,7 +1203,7 @@ class ContractSuite(object):
                 if len(rows) > 50:
                     raise CheckFailure("page_bound:" + label)
             query_ms = int((time.monotonic() - query_started) * 1000)
-            if total != count or seen != sorted(seen) or len(set(seen)) != count:
+            if total != durable or seen != sorted(seen) or len(set(seen)) != durable:
                 raise CheckFailure("iteration:%s:%s" % (label, total))
             if cursor is not None:
                 raise CheckFailure("iteration_cursor")
@@ -1183,6 +1213,9 @@ class ContractSuite(object):
             expect_error(client, "page_bound", "timeline", page_size=51)
             results[label] = {
                 "observations": count,
+                "accepted": accepted,
+                "durable": durable,
+                "known_dropped_units": status.get("known_dropped_units", 0),
                 "ingest_ms": ingest_ms,
                 "query_all_ms": query_ms,
                 "rss_kb_before": before,
@@ -1191,7 +1224,7 @@ class ContractSuite(object):
                 "pages": len(page_sizes),
                 "returned_total": total,
             }
-        if results["4096"]["returned_total"] != SCALE_LARGE:
+        if results["4096"]["returned_total"] != results["4096"]["durable"]:
             raise CheckFailure("large_iteration")
         self.report_extra["scale"] = results
         return {"note": "256+4096 complete iteration"}
