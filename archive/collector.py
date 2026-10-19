@@ -2003,20 +2003,40 @@ class Collector(object):
             and body["since_ms"] > body["until_ms"]
         ):
             return "invalid_request"
+        for name in (
+            "process_id",
+            "group_id",
+            "source_instance_id",
+            "segment_id",
+            "observation_kind",
+            "state",
+        ):
+            value = body.get(name)
+            if value in (None, ""):
+                continue
+            if safe_token(value) is None:
+                # A filter value outside the supported token alphabet cannot
+                # name an observation this archive stores; it is refused
+                # rather than silently matching nothing.
+                return "invalid_request"
         return None
 
     def _query_filters(self, view, body):
+        def declared(name):
+            value = body.get(name)
+            return value if value not in (None, "") else None
+
         return {
             "view": view,
-            "process_id": body.get("process_id"),
-            "observation_kind": body.get("observation_kind"),
-            "source_instance_id": body.get("source_instance_id"),
-            "segment_id": body.get("segment_id"),
-            "application": body.get("application"),
-            "state": body.get("state"),
-            "since_ms": body.get("since_ms"),
-            "until_ms": body.get("until_ms"),
-            "group_id": body.get("group_id"),
+            "process_id": declared("process_id"),
+            "observation_kind": declared("observation_kind"),
+            "source_instance_id": declared("source_instance_id"),
+            "segment_id": declared("segment_id"),
+            "application": declared("application"),
+            "state": declared("state"),
+            "since_ms": declared("since_ms"),
+            "until_ms": declared("until_ms"),
+            "group_id": declared("group_id"),
         }
 
     def _query_versioned(self, op, request_id, body):
@@ -2043,8 +2063,12 @@ class Collector(object):
         rows = [entry for entry in rows if self._row_matches_filters(entry, body)]
         if view == "overview":
             timing = self._timing_summary(rows)
+            timing_block = timing.body(state)
+            # The nested timing block describes the same snapshot as the
+            # overview it is nested in, even when a cursor pinned the prefix.
+            timing_block["as_of_durable_seq"] = watermark
             response = overview_body(
-                rows, state, self.limits, timing.body(state), now_wall_ms
+                rows, state, self.limits, timing_block, now_wall_ms
             )
             response["as_of_durable_seq"] = watermark
         elif view == "timing":
@@ -2084,6 +2108,10 @@ class Collector(object):
         error = self._filter_validation(body)
         if error is not None:
             return failure(op, request_id, error)
+        if view == "process" and safe_token(body.get("process_id")) is None:
+            # The process view is process-scoped; a request without a usable
+            # process filter is refused rather than answered with zero rows.
+            return failure(op, request_id, "invalid_request")
         page_size, error = self._paged_limits(body)
         if error is not None:
             return failure(op, request_id, error)
@@ -2117,15 +2145,15 @@ class Collector(object):
                 continue
             if view == "losses" and entry["observation_kind"] != "loss_notice":
                 continue
-            if view == "process" and entry["process_id"] != body.get("process_id"):
-                continue
             if not self._row_matches_filters(entry, body):
                 continue
             selected.append(entry)
             if len(selected) >= page_size:
                 truncated = True
                 break
-        context = RelationContext(published, join_state)
+        context = RelationContext(
+            published, join_state, self.limits["query_high_fanout_updates_max"]
+        )
         frontend_refs = set()
         frontend_processes = set()
         for entry in index:
@@ -2186,9 +2214,15 @@ class Collector(object):
         return self._ok(op, request_id, response)
 
     def _row_matches_filters(self, entry, body):
+        def declared(name):
+            # An empty string is an omitted filter, not a value that matches
+            # nothing.
+            value = body.get(name)
+            return value if value not in (None, "") else None
+
         observed_at = (entry.get("clocks") or {}).get("observation_time")
-        since_ms = body.get("since_ms")
-        until_ms = body.get("until_ms")
+        since_ms = declared("since_ms")
+        until_ms = declared("until_ms")
         if since_ms is not None:
             if (
                 isinstance(since_ms, bool)
@@ -2205,21 +2239,24 @@ class Collector(object):
                 or observed_at > until_ms
             ):
                 return False
-        application = body.get("application")
+        application = declared("application")
         if application is not None:
             app = (entry.get("clocks") or {}).get("application")
             if app != application:
                 return False
-        source = body.get("source_instance_id")
+        process = declared("process_id")
+        if process is not None and entry.get("process_id") != process:
+            return False
+        source = declared("source_instance_id")
         if source is not None and entry.get("source_instance_id") != source:
             return False
-        segment = body.get("segment_id")
+        segment = declared("segment_id")
         if segment is not None and entry.get("continuity_segment_id") != segment:
             return False
-        kind = body.get("observation_kind")
+        kind = declared("observation_kind")
         if kind is not None and entry.get("observation_kind") != kind:
             return False
-        state_filter = body.get("state")
+        state_filter = declared("state")
         if state_filter is not None:
             observed_state = entry.get("outcome") or "unknown"
             if observed_state != state_filter:

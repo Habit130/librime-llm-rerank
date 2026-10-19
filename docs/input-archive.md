@@ -292,26 +292,35 @@ other version in a cursor is `unsupported_query_version`. Views:
 Filters: available observed time (`since_ms`/`until_ms`), source instance,
 process, segment, observation kind and observed outcome state. An unavailable
 field is reported unknown, never invented: a row whose observation time is
-missing does not match a time filter, and a filter naming a field this archive
-never observes (application metadata) is refused with `invalid_request` rather
-than silently matching nothing. The same filters scope the aggregate views:
-`overview`, `timing` and `choice` count only the filtered rows, and the
-response echoes `filters_applied`. `choice` also accepts `group_id`, which
-projects exactly that captured group (so a requested group is returned even
-when the unfiltered projection would truncate first).
+missing does not match a time filter, a filter value outside the safe token
+alphabet is refused with `invalid_request`, and an empty-string filter is an
+omitted filter (never a value that matches nothing). A filter naming a field
+this archive never observes (application metadata) is refused rather than
+silently matching nothing. Every filter applies to actual rows before any
+aggregation or pagination: `overview`, `timing`, `timeline` and `choice` count
+and page only the filtered rows, including the `process_id` scope in the
+legacy views; the response echoes `filters_applied`, and the fingerprint binds
+the same scope into the cursor. The `process` view is process-scoped and
+refuses a request without a usable process filter. `choice` also accepts
+`group_id`, which projects exactly that captured group (so a requested group is
+returned even when the unfiltered projection would truncate first).
 
 Bounds. `page_size_max` (default 50) bounds a page; the encoded non-private
 response body is refused with `page_bytes_bound` above `query_page_bytes_max`
 (default 1 MiB) instead of silently delivering an oversized page. Deliberate
 private detail is bounded by `max_frame_bytes`. Expansion bounds are
 `query_timing_rows_max` (4096), `query_choice_groups_max` (64),
-`query_group_members_max` (256) and `query_high_fanout_updates_max` (512);
-each truncation is reported with its reason. Join/aggregate state is a
-rebuildable bounded index maintained incrementally as rows are published (the
-identity-owner and daemon request/plan maps; a declared row width times rows
-for the derived estimate), plus per-request streaming over the published
-prefix; no query loads the whole payload history, re-derives the joins over
-the history, or holds the admission lock over a disk scan.
+`query_group_members_max` (256) and `query_high_fanout_updates_max` (512).
+The high-fanout bound caps the rendered owner evidence of a reused token: the
+response keeps the total count and sets `owners_truncated` with
+`owners_truncation_reason=query_high_fanout_updates_max`; the other bounds
+report their truncation reason per response (group bound, member evidence,
+timing rows). Join/aggregate state is a rebuildable bounded index maintained
+incrementally as rows are published (the identity-owner and daemon
+request/plan maps; a declared row width times rows for the derived estimate),
+plus per-request streaming over the published prefix; no query loads the whole
+payload history, re-derives the joins over the history, or holds the admission
+lock over a disk scan.
 
 Cursors. A `cursor_token` is an opaque `q1.` base64url token naming the view,
 the canonical filter set, the snapshot (`as_of_durable_seq`) and the collector
@@ -320,7 +329,8 @@ filter set, and with `cursor_snapshot_unknown` when it names an unpublished
 position or a previous collector epoch (restart). A snapshot is immutable: the
 same token returns the same page while the epoch is unchanged, and a
 continuation reads the token's own as-of prefix rather than whatever has been
-published since. `next_cursor` is the last returned `durable_seq` and
+published since, and the response's nested blocks (for example the timing block
+nested in an overview) carry that same snapshot label. `next_cursor` is the last returned `durable_seq` and
 continuation repeats no record and omits none inside the snapshot. Append, a
 held publication or a restart cannot leak unpublished work: reads always see
 the durable prefix only, and `received_unpublished` stays a separate figure.
@@ -396,13 +406,22 @@ A `provenance` row with `stage: frontend_timing` carries
 declared schema: an object with an unknown key, a wrong-typed field, a
 non-integer timebase, a bounded-fold violation, a bad update-call or
 commit-call shape, or an unsupported version is refused at admission with
-`invalid_request`, while a well-typed object is stored canonicalized and its
-value re-derived from `entry_ticks`, `endpoint_ticks` and the object's own
-timebase with overflow-safe integer math. A declared `duration_ns` is
-compared, not trusted: a mismatch, a non-monotone endpoint, a
-zero/negative/absent endpoint, an unrepresentable conversion or a declared
-`unavailable` endpoint yields `validity: invalid`/`unknown` with an explicit
-`unknown_reason`, never a zero latency. The primary figure is the
+`invalid_request` — as is a nonempty primary `endpoint` outside the v1 domain
+(`marked_text`, `panel_update`, `unavailable`): `unsupported_frontend_endpoint`.
+A well-typed object is stored canonicalized and its value re-derived from
+`entry_ticks`, `endpoint_ticks` and the object's own timebase with
+overflow-safe integer math. A declared `duration_ns` is compared, not trusted:
+a mismatch, a non-monotone endpoint, a zero/negative/absent endpoint, an
+unrepresentable conversion or a declared `unavailable` endpoint yields
+`validity: invalid`/`unknown` with an explicit `unknown_reason`, never a zero
+latency. The declared primary endpoint must also be the operation's own last
+completed update call: a `marked_text`/`panel_update` endpoint with no
+completed call for that endpoint is invalid (`missing_primary_completion_call`),
+a tick value that is not that call's completion is
+`primary_endpoint_not_completed_call`, a later completed call than the declared
+one is `primary_endpoint_not_last_completed_call`, and an `unavailable`
+endpoint with completed calls is
+`endpoint_unavailable_with_completed_calls`. The primary figure is the
 operation-separated interval from the real action entry to the last
 `marked_text`/`panel_update` call completion; `commit_call` is a separate
 interval. A valid standalone frontend interval is retained when backend phases
@@ -410,7 +429,12 @@ or association rows are absent, and association quality is disclosed
 separately. Percentiles use the documented
 `nearest_rank_ceil_p_n_first_observed_value` method over observed integer
 nanoseconds, with p50/p95/p99 when samples exist and a small-N disclosure
-below 20 samples; there is no SLA or statistical-adequacy claim. Old flat
+below 20 samples; there is no SLA or statistical-adequacy claim. Overview
+counts the same canonical samples: `frontend_timing_valid` agrees with the
+timing view's valid samples for the same snapshot and filter, and
+`frontend_timing_invalid`/`frontend_timing_unknown`/`frontend_timing_unavailable`
+keep every other declared action visible in its own bucket (an action with no
+usable payload is `unavailable`). Old flat
 timing, #189 measurement scopes and backend daemon times are never mixed into
 this total. Available daemon scoring/load/unload durations keep their true
 scope (`scoring_ms` may include the load; no fabricated materialize/wait
@@ -440,7 +464,7 @@ annotation, dataset, partitioner, freeze or training step.
 
 From the plugin checkout, with an isolated `make librime` in the Squirrel build
 host and an own source export staged at
-`$HOST/librime/plugins/llm-rorank`-style path (`librime/plugins/llm-rerank`):
+`$HOST/librime/plugins/llm-rerank`-style path (`librime/plugins/llm-rerank`):
 
 ```sh
 "$PYTHON" tools/check_input_archive_query.py --self-test --root "$RUNTIME/q-self"

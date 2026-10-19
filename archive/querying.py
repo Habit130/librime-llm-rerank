@@ -44,6 +44,7 @@ PERCENTILE_METHOD = "nearest_rank_ceil_p_n_first_observed_value"
 PERCENTILE_FIELD = "percentiles.nearest_rank_ceil_p_n_first_observed_value"
 
 _VALIDITY_VALUES = {"valid", "invalid", "unknown"}
+_ENDPOINT_VALUES = ("unavailable", "marked_text", "panel_update")
 _TIMEBASE_MAX = (1 << 64) - 1
 _MAX_NESTED_ACTIONS = 255
 
@@ -264,6 +265,10 @@ def canonical_frontend_timing(value):
     endpoint = value.get("endpoint")
     if not isinstance(endpoint, str) or not endpoint:
         return None, "timing_endpoint_missing"
+    if endpoint not in _ENDPOINT_VALUES:
+        # The primary endpoint is part of the declared v1 schema; a nonempty
+        # endpoint outside its domain cannot be a successful semantic result.
+        return None, "unsupported_frontend_endpoint"
     endpoint_ticks = value.get("endpoint_ticks")
     if endpoint_ticks is not None and (
         not _is_int(endpoint_ticks) or endpoint_ticks <= 0
@@ -351,7 +356,34 @@ def canonical_frontend_timing(value):
         "association": association_fields,
     }
     reason = None
+    # The primary interval is the operation's own last completed marked_text/
+    # panel_update call completion. A declared endpoint with no matching
+    # completed call, a tick value that is not that call's completion, or a
+    # later completed call than the declared one is not a valid primary
+    # sample; the sample stays visible as invalid with an explicit reason.
+    call_ticks = {call["endpoint"]: call["ticks"] for call in calls}
+    primary_mismatch = None
     if endpoint == "unavailable":
+        if calls:
+            primary_mismatch = "endpoint_unavailable_with_completed_calls"
+    elif endpoint == "marked_text":
+        if "marked_text" not in call_ticks:
+            primary_mismatch = "missing_primary_completion_call"
+        elif timing["endpoint_ticks"] != call_ticks["marked_text"]:
+            primary_mismatch = "primary_endpoint_not_completed_call"
+        elif call_ticks.get("panel_update", 0) >= call_ticks["marked_text"]:
+            primary_mismatch = "primary_endpoint_not_last_completed_call"
+    elif endpoint == "panel_update":
+        if "panel_update" not in call_ticks:
+            primary_mismatch = "missing_primary_completion_call"
+        elif timing["endpoint_ticks"] != call_ticks["panel_update"]:
+            primary_mismatch = "primary_endpoint_not_completed_call"
+        elif call_ticks.get("marked_text", 0) > call_ticks["panel_update"]:
+            primary_mismatch = "primary_endpoint_not_last_completed_call"
+    if primary_mismatch is not None:
+        timing["validity"] = "invalid"
+        reason = primary_mismatch
+    elif endpoint == "unavailable":
         timing["validity"] = "unknown"
         reason = "no_update_call"
     elif not timing["entry_ticks"]:
@@ -479,9 +511,10 @@ class RelationContext(object):
     bounded index instead of re-deriving the joins over the whole history.
     """
 
-    def __init__(self, rows, join_state=None):
+    def __init__(self, rows, join_state=None, owner_evidence_max=None):
         self.rows = list(rows)
         self.by_seq = {row.get("durable_seq"): row for row in self.rows}
+        self.owner_evidence_max = owner_evidence_max
         if join_state is not None:
             self.updates = dict(join_state["updates"])
             self.update_owners = {
@@ -558,6 +591,30 @@ class RelationContext(object):
             block["evidence"] = evidence
         return block
 
+    def owners_evidence(self, owners):
+        """Render an owner list under the configured high-fanout bound.
+
+        A reused token under very many owners is reported with its total count
+        and an explicit truncation reason instead of an unbounded list.
+        """
+        rendered = sorted(
+            "%s/%s" % (source or "unknown", process or "unknown")
+            for source, process in owners
+        )
+        limit = self.owner_evidence_max
+        if limit is not None and len(rendered) > limit:
+            return {
+                "owners": rendered[:limit],
+                "owners_total": len(rendered),
+                "owners_truncated": True,
+                "owners_truncation_reason": "query_high_fanout_updates_max",
+            }
+        return {
+            "owners": rendered,
+            "owners_total": len(rendered),
+            "owners_truncated": False,
+        }
+
     def update_relation(self, row, field, value):
         if value is None:
             return self.relation(field, "absent", "no_declared_" + field)
@@ -592,12 +649,7 @@ class RelationContext(object):
                 name,
                 "conflicting",
                 "multiple_recorded_owners_for_this_token",
-                sorted(
-                    {
-                        "%s/%s" % (source or "unknown", process or "unknown")
-                        for source, process in owners
-                    }
-                ),
+                self.owners_evidence(owners),
             )
         if (None, None) in owners:
             return self.relation(name, "unmatched", "no_durable_record_with_this_token")
@@ -625,7 +677,7 @@ class RelationContext(object):
             "process_identity",
             "conflicting",
             "process_token_recorded_under_multiple_source_incarnations",
-            sorted(owners),
+            self.owners_evidence(owners),
         )
         return block
 
@@ -942,6 +994,9 @@ def stage_denominators(rows):
         "plugin_no_request": 0,
         "frontend_timing_actions": 0,
         "frontend_timing_valid": 0,
+        "frontend_timing_invalid": 0,
+        "frontend_timing_unknown": 0,
+        "frontend_timing_unavailable": 0,
         "commit_attempts": 0,
         "commit_attempts_unavailable_client": 0,
         "commit_host_persistence_known": 0,
@@ -973,8 +1028,22 @@ def stage_denominators(rows):
                     totals["plugin_applied_unchanged"] += 1
             elif apply_state == "fallback":
                 totals["plugin_fallback"] += 1
-        if kind == "provenance" and isinstance(row.get("stage"), str) and row.get("stage") == "frontend_timing":
+        if kind == "provenance" and row.get("stage") == "frontend_timing":
+            # Every declared timing action keeps its own bucket: a valid
+            # numerator agrees with the timing view's canonical valid samples
+            # for the same scope, and invalid/unknown/unavailable samples stay
+            # visible instead of disappearing or counting as valid.
             totals["frontend_timing_actions"] += 1
+            timing = row.get("frontend_timing")
+            validity = timing.get("validity") if isinstance(timing, dict) else None
+            if validity == "valid":
+                totals["frontend_timing_valid"] += 1
+            elif validity == "invalid":
+                totals["frontend_timing_invalid"] += 1
+            elif validity == "unknown":
+                totals["frontend_timing_unknown"] += 1
+            else:
+                totals["frontend_timing_unavailable"] += 1
         if kind == "commit_attempt":
             totals["commit_attempts"] += 1
             if (row.get("outcome") or "unknown") == "unavailable_client":

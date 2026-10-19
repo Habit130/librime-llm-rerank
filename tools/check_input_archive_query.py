@@ -52,6 +52,7 @@ REQUIRED_CASES = (
     "TimingNumericFixtures",
     "OverviewHonestCounts",
     "Scale256And4096",
+    "ProcessScopeAndFilterParity",
     "HighFanoutProcessBounds",
     "ConcurrentAppendAndRestartPrefix",
     "QueryNeverProbesOrLoads",
@@ -462,6 +463,7 @@ class ContractSuite(object):
         self.case("TimingNumericFixtures", self.c_timing_numeric)
         self.case("OverviewHonestCounts", self.c_overview_honest)
         self.case("Scale256And4096", self.c_scale)
+        self.case("ProcessScopeAndFilterParity", self.c_process_scope)
         self.case("HighFanoutProcessBounds", self.c_high_fanout)
         self.case("ConcurrentAppendAndRestartPrefix", self.c_concurrent_and_restart)
         self.case("QueryNeverProbesOrLoads", self.c_no_probe)
@@ -881,15 +883,77 @@ class ContractSuite(object):
             codes = _admit(client, [case])
             if codes != ["invalid_request"]:
                 raise CheckFailure("refusal_%s:%s" % (name, codes))
+        # Endpoint invariants: the declared primary endpoint must be one of the
+        # v1 domain and must be the operation's own last completed
+        # marked_text/panel_update call completion. Healthy contrasts stay
+        # valid; every unsupported or unsupported-by-calls endpoint stays
+        # visible as invalid with an explicit reason; an out-of-domain endpoint
+        # is refused at admission.
+        healthy = [
+            frontend_timing_object(
+                30, "act-panel", operation="panel_contrast",
+                entry=1000, endpoint_ticks=4000, numer=1, denom=1,
+                endpoint="panel_update",
+                update_calls=[
+                    {"endpoint": "marked_text", "ticks": 3000},
+                    {"endpoint": "panel_update", "ticks": 4000},
+                ],
+            ),
+            frontend_timing_object(
+                31, "act-marked", operation="marked_contrast",
+                entry=1000, endpoint_ticks=3000, numer=1, denom=1,
+                endpoint="marked_text",
+                update_calls=[{"endpoint": "marked_text", "ticks": 3000}],
+            ),
+        ]
+        codes = _admit(client, healthy)
+        if any(code != "admitted" for code in codes):
+            raise CheckFailure("endpoint_healthy")
+        unsupported_calls = [
+            frontend_timing_object(
+                32, "act-nocall", operation="endpoint_controls",
+                entry=1000, endpoint_ticks=2000, numer=1, denom=1, duration=1000,
+                endpoint="panel_update", update_calls=[],
+            ),
+            frontend_timing_object(
+                33, "act-notcompleted", operation="endpoint_controls",
+                entry=1000, endpoint_ticks=2000, numer=1, denom=1, duration=1000,
+                endpoint="panel_update",
+                update_calls=[{"endpoint": "panel_update", "ticks": 3000}],
+            ),
+            frontend_timing_object(
+                34, "act-notlast", operation="endpoint_controls",
+                entry=1000, endpoint_ticks=2000, numer=1, denom=1, duration=1000,
+                endpoint="panel_update",
+                update_calls=[
+                    {"endpoint": "marked_text", "ticks": 5000},
+                    {"endpoint": "panel_update", "ticks": 2000},
+                ],
+            ),
+            frontend_timing_object(
+                35, "act-unavailcalls", operation="endpoint_controls",
+                entry=1, endpoint_ticks=2, numer=1, denom=1, duration=1,
+                endpoint="unavailable",
+                update_calls=[{"endpoint": "marked_text", "ticks": 2}],
+            ),
+        ]
+        codes = _admit(client, unsupported_calls)
+        if any(code != "admitted" for code in codes):
+            raise CheckFailure("endpoint_controls_admission")
+        bogus = frontend_timing_object(36, "act-bogus", endpoint="bogus")
+        codes = _admit(client, [bogus])
+        if codes != ["invalid_request"]:
+            raise CheckFailure("bogus_endpoint_refusal")
+        expected_rows = 10 + len(healthy) + len(unsupported_calls)
         # A valid standalone frontend interval with no backend phases is kept.
-        if not await_durable(client, 6):
+        if not await_durable(client, expected_rows):
             raise CheckFailure("durable")
         timeline = row_by(client, "timeline", page_size=50)
         timing_rows = [
             row for row in timeline["observations"] if row.get("observation_kind") == "provenance"
         ]
         valid = [row for row in timing_rows if (row.get("frontend_timing") or {}).get("validity") == "valid"]
-        if len(valid) != 5:
+        if len(valid) != 7:
             raise CheckFailure("valid_samples:%d" % len(valid))
         key_valid = [row for row in valid if (row["frontend_timing"] or {}).get("operation") == "key_update"]
         if len(key_valid) != 4:
@@ -917,11 +981,53 @@ class ContractSuite(object):
         for row in invalid_rows:
             if (row["frontend_timing"] or {}).get("duration_ns") is not None:
                 raise CheckFailure("invalid_has_duration")
+        endpoint_invalid = {
+            (row["frontend_timing"] or {}).get("unknown_reason"): row
+            for row in invalid_rows
+            if (row["frontend_timing"] or {}).get("operation") == "endpoint_controls"
+        }
+        for reason in (
+            "missing_primary_completion_call",
+            "primary_endpoint_not_completed_call",
+            "primary_endpoint_not_last_completed_call",
+            "endpoint_unavailable_with_completed_calls",
+        ):
+            if reason not in endpoint_invalid:
+                raise CheckFailure("endpoint_reason:" + reason)
+        for operation in ("panel_contrast", "marked_contrast"):
+            if not any(
+                (row["frontend_timing"] or {}).get("operation") == operation
+                for row in valid
+            ):
+                raise CheckFailure("endpoint_contrast:" + operation)
+        # The overview's valid-timing numerator agrees with the timing view's
+        # canonical valid samples for the same snapshot/filter/unit; invalid,
+        # unknown and unavailable samples stay visible in their own buckets.
+        overview = _body(client.query("overview"))
+        totals = overview["stages"]["totals"]
+        unknown_rows = [
+            row
+            for row in timing_rows
+            if (row.get("frontend_timing") or {}).get("validity") == "unknown"
+        ]
+        if totals["frontend_timing_valid"] != len(valid):
+            raise CheckFailure("overview_valid_numerator")
+        if totals["frontend_timing_invalid"] != len(invalid_rows):
+            raise CheckFailure("overview_invalid_numerator")
+        if totals["frontend_timing_unknown"] != len(unknown_rows):
+            raise CheckFailure("overview_unknown_numerator")
+        if totals["frontend_timing_actions"] != len(timing_rows):
+            raise CheckFailure("overview_actions_numerator")
+        if sum(bucket["valid_samples"] for bucket in timing) != len(valid):
+            raise CheckFailure("timing_view_valid_total")
         # Absent backend phases do not remove the frontend total.
         if any(row.get("daemon_stage") for row in timing_rows):
             raise CheckFailure("backend_mixed")
         content_free(json.dumps(timing_rows), "timing_rows")
-        return {"note": "valid=5"}
+        return {
+            "note": "valid=%d invalid=%d unknown=%d"
+            % (len(valid), len(invalid_rows), len(unknown_rows))
+        }
 
     # -- C4 overview --------------------------------------------------------
     def c_overview_honest(self):
@@ -964,16 +1070,42 @@ class ContractSuite(object):
                 "eligibility": "excluded",
             }
         )
+        # Mixed frontend timing validity: the numerator must count only the
+        # canonical valid sample; invalid and unknown samples stay visible in
+        # their own buckets and never count as valid.
+        timing_valid = frontend_timing_object(
+            30, "act-ov-valid", entry=1000, endpoint_ticks=3000, numer=1, denom=1
+        )
+        timing_invalid = frontend_timing_object(
+            31, "act-ov-invalid", entry=500, endpoint_ticks=400, numer=1, denom=1, duration=1
+        )
+        timing_unknown = frontend_timing_object(
+            32, "act-ov-unknown", endpoint="unavailable",
+            entry=1, endpoint_ticks=2, numer=1, denom=1, duration=1, update_calls=[],
+        )
+        population.extend([timing_valid, timing_invalid, timing_unknown])
         codes = _admit(client, population)
         if any(code not in ("admitted", "duplicate") for code in codes):
             raise CheckFailure("admission:" + ",".join(codes))
         if codes.count("duplicate") != 1:
             raise CheckFailure("duplicate_retry_not_idempotent")
-        if not await_durable(client, 15):
+        if not await_durable(client, 18):
             raise CheckFailure("durable")
         first = _body(client.query("overview"))
-        if first["population"]["observations"] != 15:
+        if first["population"]["observations"] != 18:
             raise CheckFailure("population:%s" % first["population"]["observations"])
+        timing_totals = first["stages"]["totals"]
+        if timing_totals["frontend_timing_valid"] != 1:
+            raise CheckFailure("valid_numerator:%s" % timing_totals["frontend_timing_valid"])
+        if timing_totals["frontend_timing_invalid"] != 1:
+            raise CheckFailure("invalid_numerator")
+        if timing_totals["frontend_timing_unknown"] != 1:
+            raise CheckFailure("unknown_numerator")
+        if timing_totals["frontend_timing_actions"] != 3:
+            raise CheckFailure("timing_actions")
+        timing_view = _body(client.query("timing"))
+        if sum(bucket["valid_samples"] for bucket in timing_view["operations"]) != 1:
+            raise CheckFailure("timing_view_numerator")
         # The duplicate retry never became a durable row, so the eligible
         # population holds one unit per capture identity; the retry evidence
         # is the admission result, not a second row.
@@ -1228,6 +1360,161 @@ class ContractSuite(object):
             raise CheckFailure("large_iteration")
         self.report_extra["scale"] = results
         return {"note": "256+4096 complete iteration"}
+
+    # -- C5b process scope and filter parity -------------------------------
+    def c_process_scope(self):
+        """Supported process filters must scope actual rows everywhere.
+
+        Two processes, two source instances and mixed timing validity: the
+        timeline, the overview counts and the timing distributions must all
+        report the same filtered population, keep `filters_applied` truthful,
+        pin it into cursors, and refuse a filter value that cannot name a
+        stored observation.
+        """
+        client, root, _sock = self.collector("process-scope")
+        observations = []
+        sequence = 0
+        for process, source in (("p-a", "ps-a"), ("p-b", "ps-b")):
+            for index in range(4):
+                sequence += 1
+                observations.append(
+                    frame(
+                        "frontend_update",
+                        sequence,
+                        source=source,
+                        process=process,
+                        update_id="u-%s-%d" % (process, index),
+                        kind="commit_attempt",
+                    )
+                )
+        # p-a carries one valid and one invalid timing sample; p-b carries one
+        # unknown (unavailable) sample.
+        observations.append(
+            frontend_timing_object(101, "act-a-valid", entry=1000, endpoint_ticks=3000, numer=1, denom=1)
+        )
+        observations[-1].update({"source_instance_id": "ps-a", "process_id": "p-a"})
+        observations.append(
+            frontend_timing_object(102, "act-a-invalid", entry=500, endpoint_ticks=400, numer=1, denom=1, duration=1)
+        )
+        observations[-1].update({"source_instance_id": "ps-a", "process_id": "p-a"})
+        observations.append(
+            frontend_timing_object(103, "act-b-unknown", endpoint="unavailable", update_calls=[], duration=1, entry=1, endpoint_ticks=2)
+        )
+        observations[-1].update({"source_instance_id": "ps-b", "process_id": "p-b"})
+        codes = _admit(client, observations)
+        if any(code != "admitted" for code in codes):
+            raise CheckFailure("admission:" + ",".join(codes))
+        if not await_durable(client, len(observations)):
+            raise CheckFailure("durable")
+        total_population = _body(client.query("overview"))["population"]["observations"]
+        if total_population != len(observations):
+            raise CheckFailure("unfiltered_population")
+        expected_counts = {
+            process: sum(1 for item in observations if item.get("process_id") == process)
+            for process in ("p-a", "p-b")
+        }
+        # Per-process timeline scope, hand counted.
+        for process in ("p-a", "p-b"):
+            rows = _body(client.query("timeline", page_size=50, process_id=process))
+            for row in rows["observations"]:
+                if row.get("process_id") != process:
+                    raise CheckFailure("timeline_process_leak:" + process)
+            expected = expected_counts[process]
+            if rows["returned"] != expected:
+                raise CheckFailure("timeline_process_count:%s" % process)
+            if rows.get("filters_applied", {}).get("process_id") != process:
+                raise CheckFailure("timeline_process_echo:" + process)
+            overview = _body(client.query("overview", process_id=process))
+            if overview["population"]["observations"] != expected:
+                raise CheckFailure("overview_process_count:%s" % process)
+            if overview["filters_applied"].get("process_id") != process:
+                raise CheckFailure("overview_process_echo:" + process)
+            timing = _body(client.query("timing", process_id=process))
+            valid = sum(
+                bucket["valid_samples"] for bucket in timing["operations"]
+            )
+            invalid = sum(
+                bucket["invalid_samples"] for bucket in timing["operations"]
+            )
+            unknown = sum(
+                bucket["unknown_samples"] for bucket in timing["operations"]
+            )
+            expected_valid = 1 if process == "p-a" else 0
+            expected_invalid = 1 if process == "p-a" else 0
+            expected_unknown = 1 if process == "p-b" else 0
+            if (valid, invalid, unknown) != (
+                expected_valid,
+                expected_invalid,
+                expected_unknown,
+            ):
+                raise CheckFailure("timing_process_distribution:%s" % process)
+            if overview["stages"]["totals"]["frontend_timing_valid"] != expected_valid:
+                raise CheckFailure("overview_process_timing_valid:%s" % process)
+            if overview["stages"]["totals"]["frontend_timing_invalid"] != expected_invalid:
+                raise CheckFailure("overview_process_timing_invalid:%s" % process)
+            if overview["stages"]["totals"]["frontend_timing_unknown"] != expected_unknown:
+                raise CheckFailure("overview_process_timing_unknown:%s" % process)
+        # Combined source and process scope narrows further and stays truthful.
+        combined = _body(
+            client.query("overview", process_id="p-a", source_instance_id="ps-b")
+        )
+        if combined["population"]["observations"] != 0:
+            raise CheckFailure("combined_scope")
+        combined = _body(
+            client.query("overview", process_id="p-a", source_instance_id="ps-a")
+        )
+        if combined["population"]["observations"] != expected_counts["p-a"]:
+            raise CheckFailure("combined_scope_positive")
+        # The legacy process view is process-scoped and refuses a request
+        # without a usable process filter.
+        legacy = _body(client.query("process", process_id="p-a", page_size=50))
+        if legacy["returned"] != expected_counts["p-a"]:
+            raise CheckFailure("legacy_process_count")
+        for row in legacy["observations"]:
+            if row.get("process_id") != "p-a":
+                raise CheckFailure("legacy_process_leak")
+        expect_error(client, "invalid_request", "process", page_size=10)
+        expect_error(client, "invalid_request", "timeline", process_id="bad group")
+        # An empty-string filter is an omitted filter, not a real one.
+        empty = _body(client.query("overview", process_id=""))
+        if empty["population"]["observations"] != total_population:
+            raise CheckFailure("empty_filter")
+        if "process_id" in empty["filters_applied"]:
+            raise CheckFailure("empty_filter_echo")
+        # A pinned cursor keeps the process scope across new publications and
+        # labels its nested timing block with the snapshot watermark.
+        snapshot = _body(client.query("overview", process_id="p-a"))
+        token = snapshot["cursor_token"]
+        snapshot_seq = snapshot["as_of_durable_seq"]
+        if "process_id" not in snapshot["filters_applied"]:
+            raise CheckFailure("snapshot_filter_echo")
+        # A different process filter cannot reuse this token.
+        expect_error(client, "invalid_request", "overview", process_id="p-b", cursor_token=token)
+        _admit(
+            client,
+            [
+                frame("frontend_update", 900 + index, process="p-a", update_id="u-new-%d" % index)
+                for index in range(3)
+            ]
+            + [
+                frame("frontend_update", 950 + index, source="ps-b", process="p-b", update_id="u-bnew-%d" % index)
+                for index in range(3)
+            ],
+        )
+        if not await_durable(client, snapshot_seq + 6):
+            raise CheckFailure("late_append")
+        pinned = _body(client.query("overview", process_id="p-a", cursor_token=token))
+        if pinned["as_of_durable_seq"] != snapshot_seq:
+            raise CheckFailure("pinned_watermark")
+        if pinned["population"]["observations"] != expected_counts["p-a"]:
+            raise CheckFailure("pinned_population")
+        if pinned["timing"]["as_of_durable_seq"] != snapshot_seq:
+            raise CheckFailure("nested_timing_snapshot_label")
+        for row in pinned["timing"].get("rows") or []:
+            if (row.get("durable_seq") or 0) > snapshot_seq:
+                raise CheckFailure("nested_timing_leak")
+        content_free(json.dumps(pinned), "process_scope")
+        return {"note": "process scope, filter parity, pinned cursor"}
 
     # -- C6 high fanout -----------------------------------------------------
     def c_high_fanout(self):
@@ -1654,6 +1941,16 @@ class ContractSuite(object):
             )
         if summary["daemon_requests"] < 1:
             raise CheckFailure("daemon_request_rows")
+        # The real chain's valid-timing numerator agrees across the overview,
+        # the timing view and the persisted valid rows for the same scope.
+        overview = _body(client.query("overview"))
+        chain_totals = overview["stages"]["totals"]
+        timing_view = _body(client.query("timing"))
+        timing_valid = sum(bucket["valid_samples"] for bucket in timing_view["operations"])
+        if chain_totals["frontend_timing_valid"] != timing_valid:
+            raise CheckFailure("chain_numerator_disagreement")
+        if timing_valid != summary["timing_rows"]:
+            raise CheckFailure("chain_valid_rows")
         self.report_extra["frontend"] = {
             "frontend_head": head,
             "frontend_tree": tree,
