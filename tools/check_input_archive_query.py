@@ -40,6 +40,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from archive import Client  # noqa: E402
+from archive.interface import encode_frame  # noqa: E402
 from archive.querying import (  # noqa: E402
     QUERY_VERSION,
     decode_cursor,
@@ -53,11 +54,13 @@ REQUIRED_CASES = (
     "SupportedFilterRefusals",
     "FinalReviewBoundaryControls",
     "ChoiceProjectionStages",
+    "UnidentifiedChoiceGroups",
     "TimingNumericFixtures",
     "OverviewHonestCounts",
     "Scale256And4096",
     "ProcessScopeAndFilterParity",
     "HighFanoutProcessBounds",
+    "QueryByteBoundScope",
     "ConcurrentAppendAndRestartPrefix",
     "QueryNeverProbesOrLoads",
     "FrontendTimingRealChain",
@@ -468,11 +471,13 @@ class ContractSuite(object):
         self.case("SupportedFilterRefusals", self.c_filter_refusals)
         self.case("FinalReviewBoundaryControls", self.c_final_review_controls)
         self.case("ChoiceProjectionStages", self.c_choice_projection)
+        self.case("UnidentifiedChoiceGroups", self.c_unidentified_choice_groups)
         self.case("TimingNumericFixtures", self.c_timing_numeric)
         self.case("OverviewHonestCounts", self.c_overview_honest)
         self.case("Scale256And4096", self.c_scale)
         self.case("ProcessScopeAndFilterParity", self.c_process_scope)
         self.case("HighFanoutProcessBounds", self.c_high_fanout)
+        self.case("QueryByteBoundScope", self.c_query_byte_bound_scope)
         self.case("ConcurrentAppendAndRestartPrefix", self.c_concurrent_and_restart)
         self.case("QueryNeverProbesOrLoads", self.c_no_probe)
         self.case("FrontendTimingRealChain", self.c_frontend_chain)
@@ -600,7 +605,10 @@ class ContractSuite(object):
 
     def c_filter_refusals(self):
         client, _root, sock = self.collector("filter-refusals")
-        _admit(client, [frame("commit_attempt", 1), plugin_frame(2, group_id="g1"), plugin_frame(3, group_id="g2")])
+        # Identified groups (window and group) keep the choice filter control
+        # meaningful; unidentified fallback has its own case.
+        _admit(client, [frame("commit_attempt", 1), plugin_frame(2, window_id="w1", group_id="g1"),
+                        plugin_frame(3, window_id="w2", group_id="g2")])
         if not await_durable(client, 3):
             raise CheckFailure("filter_durable")
         views = ("overview", "timing", "timeline", "process", "losses", "choice")
@@ -1021,6 +1029,133 @@ class ContractSuite(object):
             raise CheckFailure("whole_window_refused")
         content_free(json.dumps(body), "choice")
         return {"note": "groups=5"}
+
+    def c_unidentified_choice_groups(self):
+        """Missing or partial scoped identity never merges into an eligible group."""
+        client, _root, sock = self.collector("choice-identity")
+        complete = dict(
+            coverage="complete",
+            coverage_basis="captured_group_members_and_target",
+            target_membership="present",
+            captured_candidate_count=3,
+            group_member_count=3,
+            submission="explicit",
+        )
+        observations = [
+            # Missing both scoped IDs: one complete and one emission.
+            plugin_frame(1, process="p-ug-one", **complete),
+            plugin_frame(2, process="p-ug-one", stage="emission", apply_state="applied"),
+            # Missing both scoped IDs: two complete observations.
+            plugin_frame(3, process="p-ug-two", **complete),
+            plugin_frame(4, process="p-ug-two", **complete),
+            # Partial identity on the grouping edge: window only, group only.
+            plugin_frame(5, process="p-ug-partial", window_id="win-p", **complete),
+            plugin_frame(6, process="p-ug-partial", window_id="win-p", stage="commit", submission="default"),
+            plugin_frame(7, process="p-ug-partial", group_id="grp-p", **complete),
+            plugin_frame(8, process="p-ug-partial", group_id="grp-p", **complete),
+            # A healthy identified group beside an unidentified complete observation.
+            plugin_frame(9, process="p-ug-healthy", window_id="win-h", group_id="grp-h", **complete),
+            plugin_frame(10, process="p-ug-healthy", window_id="win-h", group_id="grp-h",
+                         stage="emission", apply_state="applied"),
+            plugin_frame(11, process="p-ug-healthy", **complete),
+        ]
+        if _admit(client, observations) != ["admitted"] * len(observations):
+            raise CheckFailure("identity_admission")
+        if not await_durable(client, len(observations)):
+            raise CheckFailure("identity_durable")
+        expected = {
+            "p-ug-one": [["window_id", "group_id"]] * 2,
+            "p-ug-two": [["window_id", "group_id"]] * 2,
+            "p-ug-partial": [["group_id"], ["group_id"], ["window_id"], ["window_id"]],
+            "p-ug-healthy": [["window_id", "group_id"]],
+        }
+        bodies = {}
+        for process, missing in expected.items():
+            body = row_by(client, "choice", process_id=process)
+            bodies[process] = body
+            groups = body.get("groups") or []
+            if any(group.get("window_id") is None or group.get("group_id") is None for group in groups):
+                raise CheckFailure("unidentified_group_merged:" + process)
+            if any(group.get("group_identity", {}).get("status") != "scoped" for group in groups):
+                raise CheckFailure("group_identity_status:" + process)
+            loose = body.get("unidentified_observations")
+            if not isinstance(loose, list) or body.get("unidentified_observations_total") != len(missing):
+                raise CheckFailure("unidentified_visibility:" + process)
+            if [entry["group_identity"]["missing"] for entry in loose] != missing:
+                raise CheckFailure("unidentified_missing_fields:" + process)
+            if len({entry["durable_seq"] for entry in loose}) != len(loose):
+                raise CheckFailure("unidentified_not_per_observation:" + process)
+            for entry in loose:
+                identity = entry["group_identity"]
+                status = "missing" if len(identity["missing"]) == 2 else "partial"
+                if identity["status"] != status or entry["observations"] != 1:
+                    raise CheckFailure("unidentified_identity_status:" + process)
+                if (
+                    entry["evidence_permitted"]
+                    or entry["coverage_claim_accepted"]
+                    or entry["completeness"]["complete"]
+                    or entry["member_durable_seqs"]
+                    or entry["evidence_not_permitted_reason"] != "scoped_group_identity_required"
+                ):
+                    raise CheckFailure("unidentified_eligible:" + process)
+            if _count_rows(client, process_id=process) != len(missing) + (2 if process == "p-ug-healthy" else 0):
+                raise CheckFailure("ordinary_visibility:" + process)
+        if bodies["p-ug-one"]["groups"] or bodies["p-ug-two"]["groups"] or bodies["p-ug-partial"]["groups"]:
+            raise CheckFailure("unidentified_grouped")
+        healthy = bodies["p-ug-healthy"]["groups"]
+        if [group["group_id"] for group in healthy] != ["grp-h"]:
+            raise CheckFailure("healthy_group_set")
+        group = healthy[0]
+        if (
+            not group["evidence_permitted"]
+            or not group["coverage_claim_accepted"]
+            or group["observations"] != 2
+            or group["apply_state"] != "applied"
+            or len(group["member_durable_seqs"]) != 1
+        ):
+            raise CheckFailure("healthy_group_semantics")
+        if bodies["p-ug-healthy"]["unidentified_observations"][0]["durable_seq"] in group["member_durable_seqs"]:
+            raise CheckFailure("healthy_group_borrowed_evidence")
+        # The group filter keeps its exact-group meaning: partial identity naming
+        # the group stays a visible, ineligible per-observation entry.
+        filtered = row_by(client, "choice", process_id="p-ug-partial", group_id="grp-p")
+        if filtered["groups"] or [entry["group_id"] for entry in filtered["unidentified_observations"]] != ["grp-p"] * 2:
+            raise CheckFailure("partial_group_filter")
+        if any(entry["evidence_permitted"] for entry in filtered["unidentified_observations"]):
+            raise CheckFailure("partial_group_filter_eligible")
+        # CLI and Interface agree on the same projection (the CLI JSON drops the
+        # `groups` key under the existing content-key rule).
+        cli = json.loads(run_cli_json(sock, "--json", "query", "choice", "--process-id", "p-ug-two"))
+        for field in ("unidentified_observations", "unidentified_observations_total",
+                      "as_of_durable_seq", "cursor_token"):
+            if cli["body"].get(field) != bodies["p-ug-two"].get(field):
+                raise CheckFailure("identity_cli_parity:" + field)
+        # The fallback has its own bound and never crowds out identified groups.
+        bounded, _root, _sock = self.collector("choice-identity-bound", query_choice_groups_max=2)
+        crowd = [plugin_frame(1, process="p-ug-bound", window_id="win-b", group_id="grp-b", **complete)]
+        crowd += [plugin_frame(seq, process="p-ug-bound", **complete) for seq in range(2, 7)]
+        if _admit(bounded, crowd) != ["admitted"] * len(crowd) or not await_durable(bounded, len(crowd)):
+            raise CheckFailure("identity_bound_admission")
+        body = row_by(bounded, "choice", process_id="p-ug-bound")
+        if [group["group_id"] for group in body["groups"]] != ["grp-b"] or body["groups_truncated"]:
+            raise CheckFailure("identity_bound_crowding")
+        if (
+            body["unidentified_observations_total"] != 5
+            or len(body["unidentified_observations"]) != 2
+            or not body["unidentified_observations_truncated"]
+            or body["unidentified_observations_truncation_reason"] != "choice_group_bound"
+        ):
+            raise CheckFailure("identity_bound")
+        content_free(json.dumps(bodies), "choice_identity")
+        self.report_extra["unidentified_choice_groups"] = {
+            "missing_both_one_complete": 2,
+            "missing_both_two_complete": 2,
+            "partial_identity": 4,
+            "healthy_identified_groups": 1,
+            "evidence_permitted_unidentified": 0,
+            "bound_total_returned": [5, 2],
+        }
+        return {"note": "missing/partial identity per-observation, ineligible; healthy group intact"}
 
     # -- C3 timing ----------------------------------------------------------
     def c_timing_numeric(self):
@@ -1869,6 +2004,114 @@ class ContractSuite(object):
             raise CheckFailure("time_filter_echo")
         return {"note": "page_bound=25; snapshot pinned; filters scoped"}
 
+    def c_query_byte_bound_scope(self):
+        """`query_page_bytes_max` bounds the page views, never startup or management."""
+        bulk = [frame("commit_attempt", seq, update_id="u-bb-%d" % seq) for seq in range(1, 113)]
+        bulk += [
+            plugin_frame(
+                index,
+                window_id="win-bb-%d" % index,
+                group_id="grp-bb-%d" % index,
+                coverage="complete",
+                coverage_basis="captured_group_members_and_target",
+                target_membership="present",
+                captured_candidate_count=2,
+                group_member_count=2,
+            )
+            for index in range(1, 9)
+        ]
+        bounded_views = (
+            ("overview", {}),
+            ("timing", {}),
+            ("timeline", {"page_size": 50}),
+            ("choice", {"process_id": "p-q192"}),
+            ("process", {"process_id": "p-q192", "page_size": 50}),
+            ("losses", {}),
+        )
+        management = ("status", "admit_batch", "checkpoint", "set_policy_pause", "set_policy_resume",
+                      "query_status", "query_daemon")
+        control = {}
+        sizes = {}
+        for limit in (None, 128, 256, 512, 1024):
+            label = "default" if limit is None else str(limit)
+            limits = {"batch_size": len(bulk)}
+            if limit is not None:
+                limits["query_page_bytes_max"] = limit
+            # The actual CLI start confirms its owner through `status`.
+            client, root, sock = self.collector("bytes-" + label, **limits)
+            measured = {}
+
+            def ok(name, response):
+                if not response.get("ok"):
+                    raise CheckFailure("management_bounded:%s:%s:%s" % (
+                        label, name, (response.get("error") or {}).get("code")))
+                measured[name] = len(encode_frame(response))
+                return response.get("body") or {}
+
+            ok("status", client.status())
+            admitted = ok("admit_batch", client.call("admit_batch", {"observations": bulk}))
+            if admitted.get("codes") != ["admitted"] * len(bulk) or admitted.get("durable") is not False:
+                raise CheckFailure("bulk_admission:" + label)
+            if not await_durable(client, len(bulk)):
+                raise CheckFailure("bulk_durable:" + label)
+            ok("checkpoint", client.checkpoint())
+            revision = ok("status", client.status())["desired_revision"]
+            ok("set_policy_pause", client.set_policy("paused", revision))
+            ok("set_policy_resume", client.set_policy("enabled", revision + 1))
+            ok("query_status", client.query("status"))
+            ok("query_daemon", client.query("daemon"))
+            # The same management surface through the CLI and TUI Adapters.
+            fixture = os.path.join(root, "cli-admit.json")
+            with open(fixture, "w") as handle:
+                json.dump({"observations": [frame("commit_attempt", seq) for seq in (1, 2, 3)]}, handle)
+            for argv in (("status",), ("checkpoint",), ("policy", "pause"), ("policy", "resume"),
+                         ("query", "status"), ("query", "daemon"),
+                         ("admit", "--fixture", fixture, "--source-instance-id", "ps-bb-cli")):
+                parsed = json.loads(run_cli_json(sock, "--json", *argv))
+                if not parsed.get("ok"):
+                    raise CheckFailure("cli_management_bounded:%s:%s" % (label, argv[0]))
+            if not parsed["body"]["codes"].get("admitted"):
+                raise CheckFailure("cli_admit:" + label)
+            screen = run_tui(sock, ["pause", "resume", "quit"])
+            if screen.count("SCREEN control") != 2 or "desired_policy=paused" not in screen or "code=" in screen:
+                raise CheckFailure("tui_management_bounded:" + label)
+            # Bounded page views: oversized refused with the declared code,
+            # smaller pages delivered; a refusal keeps its own code. Pages
+            # within 256 bytes of the bound may land on either side.
+            for view, kwargs in bounded_views:
+                response = client.query(view, **kwargs)
+                if limit is None:
+                    ok("view_" + view, response)
+                    control[view] = measured["view_" + view]
+                    continue
+                if response.get("ok"):
+                    if len(encode_frame(response)) > limit + 64 or control[view] > limit + 64 + 256:
+                        raise CheckFailure("page_bound_missing:%s:%s" % (label, view))
+                elif response["error"]["code"] != "page_bytes_bound" or control[view] < limit + 64 - 256:
+                    raise CheckFailure("page_bound_code:%s:%s" % (label, view))
+            expect_error(client, "invalid_request", "timeline", group_id="g1")
+            private = client.query("process", process_id="p-q192", private_detail=True, page_size=50)
+            if not private.get("ok") or not private.get("content_included"):
+                raise CheckFailure("private_detail_bounded:" + label)
+            sizes[label] = measured
+            stop_collector(root, sock)
+        for view in ("overview", "timeline", "choice", "process"):
+            if control[view] <= 1024 + 64:
+                raise CheckFailure("page_view_control_too_small:" + view)
+        for label in ("128", "256", "512", "1024"):
+            for name in ("status", "admit_batch", "checkpoint", "set_policy_pause", "set_policy_resume",
+                         "query_status"):
+                if sizes[label][name] <= int(label) + 64:
+                    raise CheckFailure("management_control_too_small:%s:%s" % (label, name))
+        self.report_extra["query_byte_bound_scope"] = {
+            "limits": [128, 256, 512, 1024],
+            "management_ok": list(management) + ["cli", "tui_policy"],
+            "management_frame_bytes": sizes,
+            "default_page_view_frame_bytes": control,
+            "bounded_views": [view for view, _kwargs in bounded_views],
+        }
+        return {"note": "startup/status/policy/checkpoint/admit at 128-1024; page views page_bytes_bound"}
+
     # -- C7 concurrent append and restart -----------------------------------
     def c_concurrent_and_restart(self):
         client, root, sock = self.collector("concurrent")
@@ -2177,6 +2420,30 @@ class ContractSuite(object):
             raise CheckFailure("chain_numerator_disagreement")
         if timing_valid != summary["timing_rows"]:
             raise CheckFailure("chain_valid_rows")
+        # The real chain's choice projection: only complete scoped identity
+        # forms a group; window-only plugin rows (for example cancellation or
+        # a default commit) stay visible per observation and ineligible.
+        choice = {"processes": 0, "groups": 0, "evidence_permitted_groups": 0,
+                  "grouped_observations": 0, "unidentified_observations": 0,
+                  "unidentified_evidence_permitted": 0}
+        for process, counts in sorted(summary["choice_rows"].items()):
+            body = _body(client.query("choice", process_id=process))
+            grouped = sum(group["observations"] for group in body["groups"])
+            if body["unidentified_observations_total"] != counts["unidentified"]:
+                raise CheckFailure("chain_choice_unidentified")
+            if not body["groups_truncated"] and grouped != counts["identified"]:
+                raise CheckFailure("chain_choice_grouped")
+            if any(group["group_identity"]["status"] != "scoped" for group in body["groups"]):
+                raise CheckFailure("chain_choice_merged")
+            choice["processes"] += 1
+            choice["groups"] += len(body["groups"])
+            choice["evidence_permitted_groups"] += sum(1 for group in body["groups"] if group["evidence_permitted"])
+            choice["grouped_observations"] += grouped
+            choice["unidentified_observations"] += body["unidentified_observations_total"]
+            choice["unidentified_evidence_permitted"] += sum(
+                1 for entry in body["unidentified_observations"] if entry["evidence_permitted"])
+        if choice["groups"] < 1 or choice["unidentified_evidence_permitted"]:
+            raise CheckFailure("chain_choice_projection")
         self.report_extra["frontend"] = {
             "frontend_head": head,
             "frontend_tree": tree,
@@ -2190,6 +2457,7 @@ class ContractSuite(object):
             "plugin_rows": summary["plugin_rows"],
             "plugin_stages": summary["plugin_stages"],
             "daemon_request_rows": summary["daemon_requests"],
+            "choice_projection": choice,
             "exchange_success": summary["issued_succeeded"],
             "exchange_fallback": summary["issued_failed"],
             "scenario_reports": sorted(scenario_reports),
@@ -2215,6 +2483,7 @@ class ContractSuite(object):
             "issued_failed": 0,
             "daemon_requests": 0,
             "plugin_stages": {},
+            "choice_rows": {},
         }
         cursor = ""
         for _ in range(200):
@@ -2224,6 +2493,11 @@ class ContractSuite(object):
                 break
             for row in rows:
                 relations = row.get("relations") or {}
+                if "plugin_stage" in row and row.get("process_id") is not None:
+                    counts = summary["choice_rows"].setdefault(
+                        row["process_id"], {"identified": 0, "unidentified": 0})
+                    scoped = all(row.get(name) is not None for name in ("source_instance_id", "window_id", "group_id"))
+                    counts["identified" if scoped else "unidentified"] += 1
                 if row.get("observation_kind") == "plugin_observation":
                     summary["plugin_rows"] += 1
                     stage = row.get("plugin_stage")

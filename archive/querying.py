@@ -13,8 +13,10 @@ Bound semantics (input-archive-query-v1), additive to input-archive-v1:
 - A cursor is an opaque token naming a filter set and the snapshot it continued.
   It cannot silently cross a different filter set, an unknown snapshot or an
   unpublished position; those are explicit errors.
-- Page size is bounded by ``page_size_max`` and the encoded response body by
-  ``query_page_bytes_max``.
+- Page size is bounded by ``page_size_max`` and the encoded response of a
+  successful non-private page of a bounded view by ``query_page_bytes_max``;
+  management/control responses and the status/daemon state reads are not
+  pages.
 - Private text is only ever returned for view ``process`` with
   ``private_detail`` true.
 - A new out-of-order record can resolve a relation at a later prefix; a
@@ -40,6 +42,7 @@ FRONTEND_TIMING_VERSION = 1
 # evidence of intent, not of a numeric sample.
 CHOICE_PROJECTION_VERSION = 1
 CHOICE_COMPLETE_BASIS = "captured_group_members_and_target"
+CHOICE_IDENTITY_BASIS = "source_instance_window_group"
 PERCENTILE_METHOD = "nearest_rank_ceil_p_n_first_observed_value"
 PERCENTILE_FIELD = "percentiles.nearest_rank_ceil_p_n_first_observed_value"
 
@@ -1490,20 +1493,147 @@ def _coverage_accepted(plugin):
     return captured == members
 
 
+def _choice_entry(row, window_id, group_id, missing):
+    if not missing:
+        identity = {"status": "scoped", "basis": CHOICE_IDENTITY_BASIS, "missing": []}
+        scope = "captured_rerank_group_span_and_category"
+    else:
+        identity = {
+            "status": "missing" if window_id is None and group_id is None else "partial",
+            "basis": None,
+            "missing": missing,
+        }
+        scope = "single_observation_without_scoped_group_identity"
+    return {
+        "source_instance_id": row.get("source_instance_id"),
+        "process_id": row.get("process_id"),
+        "window_id": window_id,
+        "group_id": group_id,
+        "group_identity": identity,
+        "stages": {},
+        "observations": 0,
+        "plan_identity": None,
+        "lm_request_state": "unknown",
+        "lm_request_ids": [],
+        "apply_state": "unknown",
+        "submission": "unknown",
+        "target_membership": "unknown",
+        "coverage": "unknown",
+        "coverage_basis": None,
+        "coverage_claim_accepted": False,
+        "captured_candidate_count": None,
+        "group_member_count": None,
+        "member_durable_seqs": [],
+        "member_evidence_truncated": False,
+        "retracted": False,
+        "request_outcome": "unknown",
+        "association_status": None,
+        "completeness": {
+            "complete": False,
+            "basis": None,
+            "why": "no_captured_group_members_and_target_evidence",
+        },
+        "scope": scope,
+        "content_included": False,
+    }
+
+
+def _accumulate_choice(rollup, row, plugin, limits):
+    identified = not rollup["group_identity"]["missing"]
+    rollup["observations"] += 1
+    stage = plugin.get("plugin_stage")
+    rollup["stages"][stage] = rollup["stages"].get(stage, 0) + 1
+    if plugin.get("plan_identity") is not None:
+        rollup["plan_identity"] = plugin.get("plan_identity")
+    state = plugin.get("lm_request_state")
+    if state in ("issued_succeeded", "issued_failed"):
+        rollup["lm_request_state"] = state
+    elif state is not None and rollup["lm_request_state"] == "unknown":
+        rollup["lm_request_state"] = state
+    if plugin.get("lm_request_id") and plugin.get("lm_request_id") not in rollup["lm_request_ids"]:
+        rollup["lm_request_ids"].append(plugin.get("lm_request_id"))
+    if plugin.get("apply_state") not in (None, "not_applicable", "unknown"):
+        rollup["apply_state"] = plugin.get("apply_state")
+    if plugin.get("submission") not in (None, "not_applicable", "unknown"):
+        rollup["submission"] = plugin.get("submission")
+    if plugin.get("target_membership") not in (None, "unknown"):
+        rollup["target_membership"] = plugin.get("target_membership")
+    if plugin.get("coverage") not in (None, "unknown"):
+        rollup["coverage"] = plugin.get("coverage")
+        rollup["coverage_basis"] = plugin.get("coverage_basis")
+        # Only an identified group can accept a coverage claim: without a
+        # scoped group identity there is no captured group to be complete.
+        if identified and _coverage_accepted(plugin):
+            rollup["coverage_claim_accepted"] = True
+            rollup["captured_candidate_count"] = plugin.get("captured_candidate_count")
+            rollup["group_member_count"] = plugin.get("group_member_count")
+            if len(rollup["member_durable_seqs"]) < limits["query_group_members_max"]:
+                rollup["member_durable_seqs"].append(row.get("durable_seq"))
+            else:
+                rollup["member_evidence_truncated"] = True
+        elif plugin.get("coverage") == "complete" and plugin.get("truncated") is True:
+            rollup["completeness"]["why"] = "truncated_window_not_group_complete"
+    if stage == "commit":
+        rollup["request_outcome"] = "engine_commit_observed"
+    elif stage == "cancellation":
+        rollup["request_outcome"] = "cancelled"
+    elif stage == "retraction":
+        rollup["retracted"] = True
+    if plugin.get("association_role") not in (None, "absent"):
+        rollup["association_status"] = plugin.get("association_role")
+
+
+def _finish_choice(rollup):
+    identified = not rollup["group_identity"]["missing"]
+    accepted = identified and rollup["coverage_claim_accepted"]
+    if not identified:
+        why = "scoped_group_identity_unavailable"
+    elif accepted:
+        why = "captured_group_members_and_target_with_consistent_counts"
+    else:
+        why = rollup["completeness"]["why"]
+    rollup["completeness"] = {
+        "complete": accepted,
+        "basis": CHOICE_COMPLETE_BASIS if accepted else None,
+        "why": why,
+    }
+    evidence_permitted = accepted and rollup["target_membership"] in ("present", "absent")
+    rollup["evidence_permitted"] = evidence_permitted
+    if evidence_permitted:
+        reason = None
+    elif not identified:
+        reason = "scoped_group_identity_required"
+    else:
+        reason = "complete_captured_group_members_and_target_evidence_required"
+    rollup["evidence_not_permitted_reason"] = reason
+    rollup["human_correctness_proof"] = False
+    rollup["application_proof"] = False
+    rollup["ranking_benefit"] = False
+    return rollup
+
+
 def choice_group_rollup(rows, process_id, limits, group_id=None):
     """Per captured rerank group projection for one process.
 
-    A group is (span AND category, source/window/group identity). Stage
-    evidence stays per stage; completeness is only accepted with captured
-    group members and target evidence with consistent counts. An explicit
-    committed preference is not human correctness; a default submission is
-    weak; cancelled, retracted, raw, unavailable and unknown outcomes never
-    become default positive ranking labels; unselected is not negative.
+    A group is (span AND category, source/window/group identity). Only an
+    observation with the complete scoped identity (source instance, window and
+    group) joins a group; an observation missing any of them is never merged
+    by its absent keys. It stays visible as its own per-observation entry with
+    explicit missing/partial identity, no accepted coverage and no
+    `evidence_permitted`. Stage evidence stays per stage; completeness is only
+    accepted with captured group members and target evidence with consistent
+    counts. An explicit committed preference is not human correctness; a
+    default submission is weak; cancelled, retracted, raw, unavailable and
+    unknown outcomes never become default positive ranking labels; unselected
+    is not negative.
     """
+    bound = limits["query_choice_groups_max"]
     groups = {}
     order = []
     truncated = False
     truncation_reason = None
+    unidentified = []
+    unidentified_total = 0
     for row in rows:
         plugin = row.get("plugin")
         if not isinstance(plugin, dict):
@@ -1514,122 +1644,53 @@ def choice_group_rollup(rows, process_id, limits, group_id=None):
             continue
         window_id = plugin.get("window_id")
         row_group_id = plugin.get("group_id")
+        missing = [
+            name
+            for name, value in (
+                ("source_instance_id", row.get("source_instance_id")),
+                ("window_id", window_id),
+                ("group_id", row_group_id),
+            )
+            if value is None
+        ]
+        if missing:
+            unidentified_total += 1
+            if len(unidentified) >= bound:
+                continue
+            entry = _choice_entry(row, window_id, row_group_id, missing)
+            entry["durable_seq"] = row.get("durable_seq")
+            _accumulate_choice(entry, row, plugin, limits)
+            unidentified.append(_finish_choice(entry))
+            continue
         key = (row.get("source_instance_id"), window_id, row_group_id)
         rollup = groups.get(key)
         if rollup is None:
-            if len(groups) >= limits["query_choice_groups_max"]:
+            if len(groups) >= bound:
                 truncated = True
                 truncation_reason = "choice_group_bound"
                 continue
-            rollup = {
-                "source_instance_id": row.get("source_instance_id"),
-                "process_id": row.get("process_id"),
-                "window_id": window_id,
-                "group_id": row_group_id,
-                "stages": {},
-                "observations": 0,
-                "plan_identity": None,
-                "lm_request_state": "unknown",
-                "lm_request_ids": [],
-                "apply_state": "unknown",
-                "submission": "unknown",
-                "target_membership": "unknown",
-                "coverage": "unknown",
-                "coverage_basis": None,
-                "coverage_claim_accepted": False,
-                "captured_candidate_count": None,
-                "group_member_count": None,
-                "member_durable_seqs": [],
-                "member_evidence_truncated": False,
-                "retracted": False,
-                "request_outcome": "unknown",
-                "association_status": None,
-                "completeness": {
-                    "complete": False,
-                    "basis": None,
-                    "why": "no_captured_group_members_and_target_evidence",
-                },
-                "scope": "captured_rerank_group_span_and_category",
-                "content_included": False,
-            }
+            rollup = _choice_entry(row, window_id, row_group_id, missing)
             groups[key] = rollup
             order.append(key)
-        rollup["observations"] += 1
-        stage = plugin.get("plugin_stage")
-        rollup["stages"][stage] = rollup["stages"].get(stage, 0) + 1
-        if plugin.get("plan_identity") is not None:
-            rollup["plan_identity"] = plugin.get("plan_identity")
-        state = plugin.get("lm_request_state")
-        if state in ("issued_succeeded", "issued_failed"):
-            rollup["lm_request_state"] = state
-        elif state is not None and rollup["lm_request_state"] == "unknown":
-            rollup["lm_request_state"] = state
-        if plugin.get("lm_request_id") and plugin.get("lm_request_id") not in rollup["lm_request_ids"]:
-            rollup["lm_request_ids"].append(plugin.get("lm_request_id"))
-        if plugin.get("apply_state") not in (None, "not_applicable", "unknown"):
-            rollup["apply_state"] = plugin.get("apply_state")
-        if plugin.get("submission") not in (None, "not_applicable", "unknown"):
-            rollup["submission"] = plugin.get("submission")
-        if plugin.get("target_membership") not in (None, "unknown"):
-            rollup["target_membership"] = plugin.get("target_membership")
-        if plugin.get("coverage") not in (None, "unknown"):
-            rollup["coverage"] = plugin.get("coverage")
-            rollup["coverage_basis"] = plugin.get("coverage_basis")
-            if _coverage_accepted(plugin):
-                rollup["coverage_claim_accepted"] = True
-                rollup["captured_candidate_count"] = plugin.get("captured_candidate_count")
-                rollup["group_member_count"] = plugin.get("group_member_count")
-                if len(rollup["member_durable_seqs"]) < limits["query_group_members_max"]:
-                    rollup["member_durable_seqs"].append(row.get("durable_seq"))
-                else:
-                    rollup["member_evidence_truncated"] = True
-            elif plugin.get("coverage") == "complete" and plugin.get("truncated") is True:
-                rollup["completeness"]["why"] = "truncated_window_not_group_complete"
-        if stage == "commit":
-            rollup["request_outcome"] = "engine_commit_observed"
-        elif stage == "cancellation":
-            rollup["request_outcome"] = "cancelled"
-        elif stage == "retraction":
-            rollup["retracted"] = True
-        if plugin.get("association_role") not in (None, "absent"):
-            rollup["association_status"] = plugin.get("association_role")
-    rollups = []
-    for key in order:
-        rollup = groups[key]
-        rollup["completeness"] = {
-            "complete": rollup["coverage_claim_accepted"],
-            "basis": (
-                CHOICE_COMPLETE_BASIS if rollup["coverage_claim_accepted"] else None
-            ),
-            "why": (
-                "captured_group_members_and_target_with_consistent_counts"
-                if rollup["coverage_claim_accepted"]
-                else rollup["completeness"]["why"]
-            ),
-        }
-        evidence_permitted = (
-            rollup["completeness"]["complete"]
-            and rollup["target_membership"] in ("present", "absent")
-        )
-        rollup["evidence_permitted"] = evidence_permitted
-        rollup["evidence_not_permitted_reason"] = (
-            None
-            if evidence_permitted
-            else "complete_captured_group_members_and_target_evidence_required"
-        )
-        rollup["human_correctness_proof"] = False
-        rollup["application_proof"] = False
-        rollup["ranking_benefit"] = False
-        rollups.append(rollup)
+        _accumulate_choice(rollup, row, plugin, limits)
+    rollups = [_finish_choice(groups[key]) for key in order]
+    unidentified_truncated = unidentified_total > len(unidentified)
     return {
         "projection_version": CHOICE_PROJECTION_VERSION,
         "scope": "captured_rerank_group_span_and_category",
+        "identity_rule": "scoped_source_window_group_required",
         "group_id_filter": group_id,
         "groups": rollups,
         "groups_total": len(rollups),
         "groups_truncated": truncated,
         "groups_truncation_reason": truncation_reason,
-        "groups_limit": limits["query_choice_groups_max"],
+        "groups_limit": bound,
+        "unidentified_observations": unidentified,
+        "unidentified_observations_total": unidentified_total,
+        "unidentified_observations_truncated": unidentified_truncated,
+        "unidentified_observations_truncation_reason": (
+            "choice_group_bound" if unidentified_truncated else None
+        ),
         "no_whole_window_flag": True,
         "candidate_count_shortcut": False,
         "label_rules": {

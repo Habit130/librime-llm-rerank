@@ -217,6 +217,19 @@ _PLUGIN_TOKENS = (
     "referenced_update_id",
     "referenced_segment_id",
 )
+# Query views whose response is a page or projection bounded by
+# `query_page_bytes_max`. The `status`/`daemon` query views are fixed-shape
+# state reads (as before the versioned query surface) and, like every
+# management/control operation, are bounded only by the frame limit.
+_PAGE_BOUNDED_VIEWS = frozenset({"overview", "timing", "choice", "timeline", "process", "losses"})
+
+
+def _page_bounded(request):
+    """Whether the request asks for a page of a bounded query view."""
+    if request.get("op") != "query":
+        return False
+    body = request.get("body")
+    return isinstance(body, dict) and body.get("view") in _PAGE_BOUNDED_VIEWS
 
 
 def _hash(semantic):
@@ -1061,21 +1074,30 @@ class Collector(object):
                 if request is None:
                     return
                 response = self._dispatch(request)
+                page_bounded = _page_bounded(request)
             except Exception:
                 sys.stderr.write("code=malformed_frame\n")
                 response = failure("unknown", "", "malformed_frame")
-            self._send(conn, response)
+                page_bounded = False
+            self._send(conn, response, page_bounded)
         finally:
             conn.close()
 
-    def _send(self, conn, response):
+    def _send(self, conn, response, page_bounded=False):
         try:
             frame = encode_frame(response, self.limits["max_frame_bytes"])
-            if not response.get("content_included", False) and len(frame) > self.limits["query_page_bytes_max"] + 64:
-                # A non-private response that exceeds the declared page byte
-                # bound is refused instead of silently delivering an oversized
-                # page; private deliberate detail is opted-in content and is
-                # only bounded by the frame limit.
+            if (
+                page_bounded
+                and response.get("ok") is True
+                and not response.get("content_included", False)
+                and len(frame) > self.limits["query_page_bytes_max"] + 64
+            ):
+                # A non-private page of a bounded query view that exceeds the
+                # declared page byte bound is refused instead of silently
+                # delivering an oversized page. Management/control responses,
+                # the status/daemon state reads and refusals are not pages;
+                # private deliberate detail is opted-in content. All of them
+                # are only bounded by the frame limit.
                 response = failure(
                     response.get("op", "unknown"),
                     response.get("request_id", ""),

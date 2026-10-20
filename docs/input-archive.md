@@ -312,10 +312,19 @@ returned even when the unfiltered projection would truncate first).
 (`overview`, `timing`, `timeline`, `process`, `losses`); it is never echoed as
 an applied but inert filter.
 
-Bounds. `page_size_max` (default 50) bounds a page; the encoded non-private
-response body is refused with `page_bytes_bound` above `query_page_bytes_max`
-(default 1 MiB) instead of silently delivering an oversized page. Deliberate
-private detail is bounded by `max_frame_bytes`. Expansion bounds are
+Bounds. `page_size_max` (default 50) bounds a page; a successful non-private
+page of a bounded query view (`op=query` with view `overview`, `timing`,
+`choice`, `timeline`, `process` or `losses`) is refused with `page_bytes_bound`
+when its encoded response exceeds `query_page_bytes_max` (default 1 MiB)
+instead of silently delivering an oversized page. The bound never applies to
+startup or management/control responses (`status`, `set_policy`,
+`checkpoint`, `admit_batch`, `policy_observe`, `shutdown` and the top-level
+`overview` snapshot op), to the fixed-shape `status`/`daemon` query state
+reads, or to refusals: a refusal keeps its own code. Any accepted positive
+`query_page_bytes_max` (including 128) therefore starts the collector and
+keeps those operations working; it only limits pages. Deliberate private
+detail and every unbounded response are bounded by `max_frame_bytes`.
+Expansion bounds are
 `query_timing_rows_max` (4096), `query_choice_groups_max` (64),
 `query_group_members_max` (256) and `query_high_fanout_updates_max` (512).
 The high-fanout bound caps the rendered owner evidence of a reused token: the
@@ -490,7 +499,25 @@ inferred from timing, PID, text or arrival order.
 `choice` projects per captured rerank group (span AND category, source/window/
 group identity) with captured member evidence, coverage basis, target
 membership, request/stage evidence, submission provenance, eligibility and
-explicit reasons. Completeness is accepted only with
+explicit reasons. Only a plugin observation with the complete scoped identity
+(source instance, `window_id` and `group_id`; `identity_rule` is
+`scoped_source_window_group_required`) joins a group, whose
+`group_identity.status` is `scoped`. An observation missing any of them is
+never merged by its absent keys: it is listed in `unidentified_observations`
+as its own per-observation entry (`durable_seq`, observed IDs,
+`group_identity.status` `missing` when both window and group are absent,
+otherwise `partial`, and the `missing` field names) with
+`coverage_claim_accepted=false`, no member evidence, completeness
+`scoped_group_identity_unavailable` and `evidence_permitted=false` with
+`evidence_not_permitted_reason=scoped_group_identity_required`; it never
+borrows another observation's coverage. `unidentified_observations_total`
+counts every such observation; the list has its own
+`query_choice_groups_max` bound (`unidentified_observations_truncated`,
+reason `choice_group_bound`) and never crowds identified groups out of
+`groups`. A `group_id` filter matches the observed group value in both lists.
+The CLI JSON omits the `groups` key under the existing content-key rule and
+renders the same `unidentified_observations`, cursor and snapshot fields.
+Completeness is accepted only with
 `captured_group_members_and_target` basis, equal positive captured/member
 counts, target `present`/`absent` and no truncated-window marker; a
 whole-window flag, a candidate-count shortcut, a legacy complete boolean or a

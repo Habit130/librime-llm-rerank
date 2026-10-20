@@ -24,7 +24,9 @@ DEFAULTS = {
     "connect_timeout_ms": 1000,
     "management_timeout_ms": 5000,
     # Query-layer bounds (input-archive-query-v1). The page byte bound is
-    # checked on the encoded response body before the frame limit; the
+    # checked on the encoded response of a successful non-private page of a
+    # bounded query view, before the frame limit; startup, management/control
+    # responses, status/daemon state reads and refusals are not pages. The
     # expansion bounds cap deliberate detail expansion, never create a
     # stronger than declared claim, and are engineering choices, not a RAM
     # ceiling.
