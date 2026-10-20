@@ -520,6 +520,7 @@ class RelationContext(object):
         self.owner_evidence_max = owner_evidence_max
         if join_state is not None:
             self.updates = dict(join_state["updates"])
+            self.update_witnesses = dict(join_state["update_witnesses"])
             self.update_owners = {
                 key: set(value) for key, value in join_state["update_owners"].items()
             }
@@ -543,6 +544,7 @@ class RelationContext(object):
             }
             return
         self.updates = {}
+        self.update_witnesses = {}
         self.update_owners = {}
         self.process_sources = {}
         self.commit_owners = {}
@@ -560,6 +562,8 @@ class RelationContext(object):
                 update = row.get("update_id")
                 if isinstance(update, str):
                     self.updates[update] = min(self.updates.get(update, seq), seq)
+                    owner = (row.get("source_instance_id"), row.get("process_id"))
+                    self.update_witnesses.setdefault((update, owner), seq)
                     self.update_owners.setdefault(update, set()).add(
                         (row.get("source_instance_id"), row.get("process_id"))
                     )
@@ -739,7 +743,15 @@ class RelationContext(object):
                 "no_owned_update_token_to_resolve",
                 evidence,
             )
-        witness = self.updates.get(update)
+        declared_source = reference.get("source_instance_id")
+        declared_process = reference.get("process_id")
+        # A full recorded owner disambiguates token reuse. The first witness
+        # of the unscoped token is not evidence against a later exact owner.
+        witness = self.update_witnesses.get(
+            (update, (declared_source, declared_process))
+        )
+        if witness is None:
+            witness = self.updates.get(update)
         if witness is None:
             return self.relation(
                 "association",
@@ -750,8 +762,6 @@ class RelationContext(object):
         witness_row = self.by_seq.get(witness)
         witness_source = witness_row.get("source_instance_id") if witness_row else None
         witness_process = witness_row.get("process_id") if witness_row else None
-        declared_source = reference.get("source_instance_id")
-        declared_process = reference.get("process_id")
         evidence["witness_durable_seq"] = witness
         if declared_source is not None and declared_source != witness_source:
             return self.relation(
@@ -1220,9 +1230,12 @@ def producer_freshness(state, index_rows, now_wall_ms, freshness_window_ms):
     publication_age_basis = "no_durable_observation_at_prefix"
     if last_observation is not None:
         observed = (last_observation.get("clocks") or {}).get("observation_time")
-        if isinstance(observed, (int, float)) and not isinstance(observed, bool):
+        if (isinstance(observed, (int, float)) and not isinstance(observed, bool)
+                and not (isinstance(observed, float) and not math.isfinite(observed))):
             publication_age_ms = max(0, int(now_wall_ms - observed))
             publication_age_basis = "client_supplied_observation_time"
+        elif isinstance(observed, float) and not math.isfinite(observed):
+            publication_age_basis = "durable_observation_has_nonfinite_client_observation_time"
         else:
             publication_age_basis = "durable_observation_has_no_client_observation_time"
     pending = state.get("received_unpublished", 0)

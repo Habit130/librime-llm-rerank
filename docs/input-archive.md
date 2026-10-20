@@ -387,6 +387,10 @@ arrival order or a plan digest alone.
   `malformed`, `unknown_owner`). It is a snapshot of the frontend entry
   context: `proves_current_frontend_result` stays false and `frontend_terminal`
   stays `unknown`; a valid reference asserts owned references only.
+  When an update token has multiple owners, an exact declared source/process
+  pair resolves against that owner's first witness at this prefix, not the
+  first unscoped token witness. A different owner's earlier record is not
+  evidence that the exact recorded relation is stale.
 - `request_identity` and `plan_identity` associate an issued plugin exchange
   with daemon observations by the native request id (`linked`, `unmatched`,
   `ambiguous`, `conflicting`, `not_issued`). A plan digest that several
@@ -426,6 +430,10 @@ prefix, `received_unpublished` is the pending admission figure, and passive
 reads (`daemon` view, `overview`, `timing`, `choice`) never query health or
 score, never import MLX or load a model, and never extend model activity. There
 is no periodic forced probe.
+Non-finite stored observation times do not yield an age: overview reports
+`last_observation_age_ms: null` with
+`publication_age_basis: durable_observation_has_nonfinite_client_observation_time`.
+This query projection leaves the original observation unchanged.
 
 ### Frontend timing and choice projection
 

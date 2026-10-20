@@ -1896,6 +1896,7 @@ class Collector(object):
         state = self._join_state
         snapshot = {
             "updates": {key: seq for key, seq in state["updates"].items() if seq <= watermark},
+            "update_witnesses": {},
             "request_rows": {},
         }
         for key, witnesses in state["request_rows"].items():
@@ -1909,6 +1910,9 @@ class Collector(object):
                 visible = {owner for owner, seq in witnesses.items() if seq <= watermark}
                 if visible:
                     snapshot[name][key] = visible
+                if name == "update_owners":
+                    for owner in visible:
+                        snapshot["update_witnesses"][(key, owner)] = witnesses[owner]
         return snapshot
 
     def _published_rows(self, state=None):
@@ -2083,7 +2087,7 @@ class Collector(object):
             process_id = body.get("process_id")
             if safe_token(process_id) is None:
                 return failure(op, request_id, "invalid_request")
-            group_id = body.get("group_id")
+            group_id = filters["group_id"]
             if group_id is not None and safe_token(group_id) is None:
                 return failure(op, request_id, "invalid_request")
             response = choice_group_rollup(rows, process_id, self.limits, group_id)

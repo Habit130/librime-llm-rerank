@@ -51,6 +51,7 @@ REQUIRED_CASES = (
     "PrefixBoundSemanticRelations",
     "TimingLabelTypes",
     "SupportedFilterRefusals",
+    "FinalReviewBoundaryControls",
     "ChoiceProjectionStages",
     "TimingNumericFixtures",
     "OverviewHonestCounts",
@@ -465,6 +466,7 @@ class ContractSuite(object):
         self.case("PrefixBoundSemanticRelations", self.c_prefix_relations)
         self.case("TimingLabelTypes", self.c_timing_label_types)
         self.case("SupportedFilterRefusals", self.c_filter_refusals)
+        self.case("FinalReviewBoundaryControls", self.c_final_review_controls)
         self.case("ChoiceProjectionStages", self.c_choice_projection)
         self.case("TimingNumericFixtures", self.c_timing_numeric)
         self.case("OverviewHonestCounts", self.c_overview_honest)
@@ -640,6 +642,49 @@ class ContractSuite(object):
         self.report_extra["filter_refusals"] = {"nonfinite_interface_and_cli": count,
             "nonchoice_group_views": 5, "finite_controls_and_cursor_compatibility": 6}
         return {"note": "36 nonfinite Interface/CLI controls; 5 inert-group refusals; finite/cursor controls"}
+
+    def c_final_review_controls(self):
+        client, _root, sock = self.collector("review-controls")
+        initial = [frame("start", 1, source="owner-a", process="process-a", kind="start", update_id="u-collision"),
+                   plugin_frame(2, association_role="engine_entry_context", association_read="claimed_valid",
+                                referenced_source_id="owner-b", referenced_process_id="process-b", referenced_update_id="u-collision")]
+        if _admit(client, initial) != ["admitted"] * 2 or not await_durable(client, 2):
+            raise CheckFailure("review_initial")
+        before = row_by(client, "timeline")
+        if relation_status(before["observations"], 2, "association") != "stale":
+            raise CheckFailure("review_stale_control")
+        owner = frame("start", 3, source="owner-b", process="process-b", kind="start", update_id="u-collision")
+        if _admit(client, [owner]) != ["admitted"] or not await_durable(client, 3):
+            raise CheckFailure("review_owner_admission")
+        newer = row_by(client, "timeline")
+        association = newer["observations"][1]["relations"]["association"]
+        if association["status"] != "valid" or association["evidence"]["witness_durable_seq"] != 3:
+            raise CheckFailure("review_exact_scoped_owner")
+        if row_by(client, "timeline", cursor_token=before["cursor_token"]) != before:
+            raise CheckFailure("review_scoped_owner_snapshot")
+        omitted = row_by(client, "choice", process_id="p-q192")
+        if row_by(client, "choice", process_id="p-q192", group_id="") != omitted:
+            raise CheckFailure("review_empty_choice_omission")
+        empty_cli = json.loads(run_cli_json(sock, "--json", "query", "choice", "--process-id", "p-q192", "--group-id="))
+        if not empty_cli.get("ok") or empty_cli["body"]["cursor_token"] != omitted["cursor_token"]:
+            raise CheckFailure("review_empty_choice_cli")
+        for seq, value in enumerate((float("nan"), float("inf"), float("-inf")), 4):
+            item = frame("commit_attempt", seq, clocks={"observation_time": value})
+            if _admit(client, [item]) != ["admitted"] or not await_durable(client, seq):
+                raise CheckFailure("review_timestamp_admission")
+            overview = row_by(client, "overview")
+            freshness = overview["freshness"]
+            if freshness["last_observation_age_ms"] is not None or freshness["publication_age_basis"] != "durable_observation_has_nonfinite_client_observation_time":
+                raise CheckFailure("review_timestamp_unknown")
+            wire = run_cli_json(sock, "--json", "query", "overview")
+            parsed = json.loads(wire, parse_constant=lambda token: (_ for _ in ()).throw(CheckFailure("review_nonstandard_json:" + token)))
+            if not parsed.get("ok"):
+                raise CheckFailure("review_timestamp_cli")
+        self.report_extra["final_review_controls"] = {
+            "exact_scoped_witness": 3, "old_token_unchanged": True,
+            "empty_choice_group_omitted": True, "nonfinite_timestamp_unknown_controls": 3,
+        }
+        return {"note": "exact scoped owner resolves only at later prefix; empty group omission; nonfinite age unavailable"}
 
     # -- C1 identity relations ---------------------------------------------
     def c_identity_relations(self):
