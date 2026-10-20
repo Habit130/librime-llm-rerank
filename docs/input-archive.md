@@ -293,10 +293,14 @@ Filters: available observed time (`since_ms`/`until_ms`), source instance,
 process, segment, observation kind and observed outcome state. An unavailable
 field is reported unknown, never invented: a row whose observation time is
 missing does not match a time filter, a filter value outside the safe token
-alphabet is refused with `invalid_request`, and an empty-string filter is an
-omitted filter (never a value that matches nothing). A filter naming a field
+alphabet is refused with `invalid_request`. Empty strings on text filters
+(`process_id`, `source_instance_id`, `segment_id`, `observation_kind`, `state`,
+`application`, `group_id`) mean omission, not a value matching nothing.
+Time bounds require numeric values (not bool, empty strings, NaN or ±Infinity);
+non-finite bounds are refused before comparison, fingerprinting or echo, so
+responses contain no non-standard JSON numeric tokens. A filter naming a field
 this archive never observes (application metadata) is refused rather than
-silently matching nothing. Every filter applies to actual rows before any
+silently matching nothing. Every supported row filter applies before any
 aggregation or pagination: `overview`, `timing`, `timeline` and `choice` count
 and page only the filtered rows, including the `process_id` scope in the
 legacy views; the response echoes `filters_applied`, and the fingerprint binds
@@ -304,6 +308,9 @@ the same scope into the cursor. The `process` view is process-scoped and
 refuses a request without a usable process filter. `choice` also accepts
 `group_id`, which projects exactly that captured group (so a requested group is
 returned even when the unfiltered projection would truncate first).
+`group_id` is refused with `invalid_request` on all non-choice data views
+(`overview`, `timing`, `timeline`, `process`, `losses`); it is never echoed as
+an applied but inert filter.
 
 Bounds. `page_size_max` (default 50) bounds a page; the encoded non-private
 response body is refused with `page_bytes_bound` above `query_page_bytes_max`
@@ -321,19 +328,40 @@ request/plan maps; a declared row width times rows for the derived estimate),
 plus per-request streaming over the published prefix; no query loads the whole
 payload history, re-derives the joins over the history, or holds the admission
 lock over a disk scan.
+Each distinct owner/plan edge retains its first durable witness sequence, not
+an unversioned membership bit. Prefix projection includes only edges with a
+witness at or below the watermark; update witnesses and daemon request-row
+lists are also prefix-filtered. Persistent relation state is O(E + U + R),
+where E is distinct owner/plan edges, U distinct update tokens and R request
+witnesses (each at most a constant multiple of durable rows N). Prefix
+projection does O(E + U + R) metadata work and temporary state; existing page
+selection/summary context does O(N) index-metadata work/state, without reading
+payloads except deliberate bounded private detail. No per-token or per-prefix
+map copies are retained, so cursor count adds no persistent relation state.
+The checker reports collector RSS before/after ingestion and after query
+iteration, plus total iteration time at 256/4096 rows; these are observed
+resource figures, not a total-RAM-independent or quiet-machine latency claim.
 
 Cursors. A `cursor_token` is an opaque `q1.` base64url token naming the view,
 the canonical filter set, the snapshot (`as_of_durable_seq`) and the collector
 epoch. It is rejected with `invalid_request` when it names a different view or
 filter set, and with `cursor_snapshot_unknown` when it names an unpublished
-position or a previous collector epoch (restart). A snapshot is immutable: the
-same token returns the same page while the epoch is unchanged, and a
+position or a previous collector epoch (restart). Snapshot data is immutable:
+the same token and pagination parameters return the same observations **and
+semantic relations** while the epoch is unchanged, and a
 continuation reads the token's own as-of prefix rather than whatever has been
 published since, and the response's nested blocks (for example the timing block
 nested in an overview) carry that same snapshot label. `next_cursor` is the last returned `durable_seq` and
 continuation repeats no record and omits none inside the snapshot. Append, a
 held publication or a restart cannot leak unpublished work: reads always see
 the durable prefix only, and `received_unpublished` stays a separate figure.
+For `overview`, `snapshot_scope` names the pinned population/inclusion/stage/
+timing/outcome/slice data. `response_time_state` explicitly identifies
+`quality`, `storage` and `freshness` as sampled at response time, not frozen by
+the token: live counters, policy, capacity, published/pending watermark and
+ages may advance. These mixed-state blocks are outside `snapshot_lifetime`;
+their observation-derived subcounts still use the declared prefix. The token
+does not freeze wall clocks, capacity or producer activity.
 
 ### Identity relations
 
@@ -408,6 +436,11 @@ non-integer timebase, a bounded-fold violation, a bad update-call or
 commit-call shape, or an unsupported version is refused at admission with
 `invalid_request` — as is a nonempty primary `endpoint` outside the v1 domain
 (`marked_text`, `panel_update`, `unavailable`): `unsupported_frontend_endpoint`.
+Declared `action`/`operation` must be strings, including when explicitly null:
+wrong types are refused (`timing_action_type`/`timing_operation_type` parser
+reasons, public admission code `invalid_request`). Absent optional labels
+retain the existing missing/unknown projection (missing operation goes to the
+`unknown` bucket); they are not coerced from supplied wrong-typed labels.
 A well-typed object is stored canonicalized and its value re-derived from
 `entry_ticks`, `endpoint_ticks` and the object's own timebase with
 overflow-safe integer math. A declared `duration_ns` is compared, not trusted:

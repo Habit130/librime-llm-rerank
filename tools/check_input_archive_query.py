@@ -48,6 +48,9 @@ from archive.querying import (  # noqa: E402
 
 REQUIRED_CASES = (
     "IdentityRelationsFixtures",
+    "PrefixBoundSemanticRelations",
+    "TimingLabelTypes",
+    "SupportedFilterRefusals",
     "ChoiceProjectionStages",
     "TimingNumericFixtures",
     "OverviewHonestCounts",
@@ -459,6 +462,9 @@ class ContractSuite(object):
 
     def _run_cases(self):
         self.case("IdentityRelationsFixtures", self.c_identity_relations)
+        self.case("PrefixBoundSemanticRelations", self.c_prefix_relations)
+        self.case("TimingLabelTypes", self.c_timing_label_types)
+        self.case("SupportedFilterRefusals", self.c_filter_refusals)
         self.case("ChoiceProjectionStages", self.c_choice_projection)
         self.case("TimingNumericFixtures", self.c_timing_numeric)
         self.case("OverviewHonestCounts", self.c_overview_honest)
@@ -470,6 +476,170 @@ class ContractSuite(object):
         self.case("FrontendTimingRealChain", self.c_frontend_chain)
         self.case("PrivacyCanaryAndAdapters", self.c_privacy_adapters)
         self.case("SourceBindingsAndReport", self.c_bindings)
+
+    def c_prefix_relations(self):
+        client, _root, _sock = self.collector("prefix-relations")
+        initial = [
+            frame("commit_attempt", 1, update_id="u-owned", parent_update_id="u-late",
+                  commit_id="c-owned", continuity_segment_id="s-owned"),
+            frame("loss", 2, kind="loss_notice", update_id="u-owned",
+                  parent_update_id="u-late", reason="unknown"),
+            plugin_frame(3, association_role="engine_entry_context", association_read="claimed_valid",
+                         referenced_source_id="ps-q192", referenced_process_id="p-q192",
+                         referenced_update_id="u-late", lm_request_state="issued_succeeded",
+                         lm_request_id="req-prefix", plan_identity="plan-prefix"),
+        ]
+        if _admit(client, initial) != ["admitted"] * len(initial) or not await_durable(client, 3):
+            raise CheckFailure("prefix_initial_admission")
+        filters = {"process_id": "p-q192", "page_size": 50}
+        before = {view: row_by(client, view, **filters) for view in ("timeline", "process", "losses")}
+        overview = row_by(client, "overview", process_id="p-q192")
+        if before["timeline"]["observations"][0]["parent_status"] != "missing":
+            raise CheckFailure("prefix_missing_control")
+        late = [
+            frame("input_change", 4, kind="input_change", update_id="u-late"),
+            frame("start", 5, source="ps-competing", kind="start", update_id="u-process"),
+            frame("start", 6, source="ps-owner", process="p-other", kind="start",
+                  update_id="u-owned", commit_id="c-owned", continuity_segment_id="s-owned"),
+            daemon_request(7, "req-prefix", "plan-prefix"),
+        ]
+        if _admit(client, late) != ["admitted"] * len(late) or not await_durable(client, 7):
+            raise CheckFailure("prefix_late_admission")
+        for view, original in before.items():
+            pinned = row_by(client, view, cursor_token=original["cursor_token"], **filters)
+            if pinned != original:
+                raise CheckFailure("prefix_semantic_rewrite:" + view)
+            newer = row_by(client, view, **filters)
+            if newer["as_of_durable_seq"] != 7:
+                raise CheckFailure("prefix_not_advanced:" + view)
+            old_rows = original["observations"]
+            new_rows = {row["durable_seq"]: row for row in newer["observations"]}
+            for old in old_rows:
+                if old["durable_seq"] == 3:
+                    if old["association_state"] == new_rows[3]["association_state"]:
+                        raise CheckFailure("association_not_resolved_later")
+                    if relation_status(newer["observations"], 3, "request_identity") != "linked":
+                        raise CheckFailure("request_not_linked_later")
+                else:
+                    now = new_rows[old["durable_seq"]]
+                    if now["parent_status"] != "present" or now["relations"]["parent_reference"]["status"] != "valid":
+                        raise CheckFailure("parent_not_resolved_later")
+                    if now["relations"]["update_identity"]["status"] != "conflicting":
+                        raise CheckFailure("owner_not_conflicting_later")
+                    if now["relations"]["process_identity"]["status"] != "conflicting":
+                        raise CheckFailure("process_not_conflicting_later")
+        # Request/plan edge maps must also exclude conflicts published after a token.
+        linked = row_by(client, "timeline", **filters)
+        _admit(client, [daemon_request(8, "req-prefix", "plan-other")])
+        if not await_durable(client, 8):
+            raise CheckFailure("prefix_conflict_durable")
+        if row_by(client, "timeline", cursor_token=linked["cursor_token"], **filters) != linked:
+            raise CheckFailure("prefix_request_rewrite")
+        if relation_status(row_by(client, "timeline", **filters)["observations"], 3, "request_identity") != "conflicting":
+            raise CheckFailure("request_conflict_not_visible_later")
+        live = row_by(client, "overview", process_id="p-q192", cursor_token=overview["cursor_token"])
+        for field in ("population", "stages", "timing", "outcomes", "inclusion"):
+            if live[field] != overview[field]:
+                raise CheckFailure("overview_pinned_data:" + field)
+        if live["response_time_state"]["fields"] != ["quality", "storage", "freshness"]:
+            raise CheckFailure("overview_live_scope")
+        if live["freshness"]["published_durable_seq"] != 8:
+            raise CheckFailure("overview_live_prefix")
+        self.report_extra["prefix_relations"] = {
+            "old_prefix": 3, "new_prefix": 7, "conflict_prefix": 8,
+            "immutable_views": list(before), "whole_rows_equal": True,
+            "later_parent_present": True, "later_owner_process_conflicting": True,
+            "later_association_request_resolved": True,
+            "live_overview_fields": live["response_time_state"]["fields"],
+        }
+        return {"note": "old-token entire rows/relations stable; later-prefix changes visible"}
+
+    def c_timing_label_types(self):
+        from archive.querying import canonical_frontend_timing
+        client, _root, _sock = self.collector("label-types")
+        observations = [frontend_timing_object(1, "valid-standalone")]
+        invalid = frontend_timing_object(2, "invalid-duration", duration=1)
+        unknown = frontend_timing_object(3, "unknown-call", endpoint="unavailable")
+        missing = frame("frontend_timing", 4, kind="provenance")
+        observations.extend([invalid, unknown, missing])
+        # Absent optional labels retain the existing unknown-operation bucket;
+        # a declared non-string (including explicit null) is never omission.
+        absent = frontend_timing_object(5, "absent-labels")
+        del absent["payload"]["frontend_timing"]["action"]
+        del absent["payload"]["frontend_timing"]["operation"]
+        observations.append(absent)
+        wrong = []
+        for name in ("action", "operation"):
+            for value in (123, True, None, [], {}):
+                item = frontend_timing_object(10 + len(wrong), "wrong-%d" % len(wrong))
+                item["payload"]["frontend_timing"][name] = value
+                parsed, reason = canonical_frontend_timing(item["payload"]["frontend_timing"])
+                if parsed is not None or reason != "timing_" + name + "_type":
+                    raise CheckFailure("timing_label_reason:" + name)
+                wrong.append(item)
+        # One public batch interleaves healthy and malformed objects.
+        mixed = observations[:2] + wrong + observations[2:]
+        expected = ["admitted"] * 2 + ["invalid_request"] * len(wrong) + ["admitted"] * 3
+        if _admit(client, mixed) != expected or not await_durable(client, 5):
+            raise CheckFailure("timing_label_mixed_admission")
+        timing = row_by(client, "timing")
+        totals = row_by(client, "overview")["stages"]["totals"]
+        actual = [sum(bucket[key] for bucket in timing["operations"])
+                  for key in ("valid_samples", "invalid_samples", "unknown_samples")]
+        if actual != [2, 1, 1] or timing["unavailable_total"] != 1:
+            raise CheckFailure("timing_label_buckets")
+        if [totals["frontend_timing_" + key] for key in ("valid", "invalid", "unknown", "unavailable")] != [2, 1, 1, 1]:
+            raise CheckFailure("timing_label_overview_agreement")
+        if totals["frontend_timing_actions"] != 5:
+            raise CheckFailure("timing_label_action_population")
+        self.report_extra["timing_label_types"] = {"refused": len(wrong), "admitted": 5,
+            "valid_invalid_unknown_unavailable": [2, 1, 1, 1], "overview_agrees": True}
+        return {"note": "10 wrong-type refusals, mixed timing/overview exact 2/1/1/1"}
+
+    def c_filter_refusals(self):
+        client, _root, sock = self.collector("filter-refusals")
+        _admit(client, [frame("commit_attempt", 1), plugin_frame(2, group_id="g1"), plugin_frame(3, group_id="g2")])
+        if not await_durable(client, 3):
+            raise CheckFailure("filter_durable")
+        views = ("overview", "timing", "timeline", "process", "losses", "choice")
+        count = 0
+        for view in views:
+            cli = ["--json", "query", view, "--process-id", "p-q192"]
+            healthy = row_by(client, view, process_id="p-q192", since_ms=0, until_ms=1770000000001)
+            row_by(client, view, process_id="p-q192", since_ms=0, until_ms=1770000000001,
+                   cursor_token=healthy["cursor_token"])
+            expect_error(client, "invalid_request", view, process_id="p-q192", since_ms=1,
+                         until_ms=1770000000001, cursor_token=healthy["cursor_token"])
+            strict = json.loads(run_cli_json(sock, *(cli + ["--since-ms", "0", "--until-ms", "1770000000001"])))
+            if not strict.get("ok"):
+                raise CheckFailure("finite_cli_control:" + view)
+            if view != "choice":
+                expect_error(client, "invalid_request", view, process_id="p-q192", group_id="g1")
+                refused = json.loads(run_cli_json(sock, *(cli + ["--group-id", "g1"])))
+                if refused.get("ok") or refused["error"]["code"] != "invalid_request":
+                    raise CheckFailure("group_cli_refusal:" + view)
+            else:
+                chosen = row_by(client, "choice", process_id="p-q192", group_id="g1")
+                chosen_cli = json.loads(run_cli_json(sock, *(cli + ["--group-id", "g1"])))
+                for field in ("filters_applied", "group_id_filter", "as_of_durable_seq", "cursor_token"):
+                    if chosen_cli["body"].get(field) != chosen.get(field):
+                        raise CheckFailure("choice_cli_group_parity:" + field)
+                if [group["group_id"] for group in chosen["groups"]] != ["g1"]:
+                    raise CheckFailure("choice_group_filter_control")
+                expect_error(client, "invalid_request", "choice", process_id="p-q192", group_id="g2",
+                             cursor_token=chosen["cursor_token"])
+            for bound in ("since_ms", "until_ms"):
+                for value, text in ((float("nan"), "NaN"), (float("inf"), "Infinity"), (float("-inf"), "-Infinity")):
+                    expect_error(client, "invalid_request", view, process_id="p-q192", **{bound: value})
+                    # '=' keeps negative infinity an argument value rather than a flag.
+                    wire = run_cli(sock, *(cli + ["--" + bound.replace("_", "-") + "=" + text]))
+                    parsed = json.loads(wire, parse_constant=lambda token: (_ for _ in ()).throw(CheckFailure("nonstandard_json:" + token)))
+                    if parsed.get("ok") or parsed["error"]["code"] != "invalid_request":
+                        raise CheckFailure("finite_cli_refusal:" + view)
+                    count += 1
+        self.report_extra["filter_refusals"] = {"nonfinite_interface_and_cli": count,
+            "nonchoice_group_views": 5, "finite_controls_and_cursor_compatibility": 6}
+        return {"note": "36 nonfinite Interface/CLI controls; 5 inert-group refusals; finite/cursor controls"}
 
     # -- C1 identity relations ---------------------------------------------
     def c_identity_relations(self):
@@ -1353,6 +1523,9 @@ class ContractSuite(object):
                 "rss_kb_before": before,
                 "rss_kb_after": after,
                 "rss_delta_kb": after - before,
+                "rss_kb_after_queries": rss_kb(pid),
+                "relation_state_bound": "O(E+U+R); first witness per edge; no persistent per-cursor copies",
+                "prefix_projection_work_bound": "O(N+E+U+R) metadata; no payload history scan",
                 "pages": len(page_sizes),
                 "returned_total": total,
             }

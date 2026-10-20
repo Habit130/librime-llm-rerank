@@ -967,7 +967,11 @@ class Collector(object):
         self._remember_join_state(seq, record)
 
     def _remember_join_state(self, seq, record):
-        """Maintain the incremental query join indexes for one durable row."""
+        """Maintain first-witness sequences for incremental relation edges.
+
+        One integer per distinct edge lets any prefix exclude later owners
+        without keeping a copy of the relation maps per cursor/publication.
+        """
         state = self._join_state
         kind = record.get("observation_kind")
         observer = kind in ("plugin_observation", "daemon_observation")
@@ -977,23 +981,23 @@ class Collector(object):
                 previous = state["updates"].get(update)
                 if previous is None or seq < previous:
                     state["updates"][update] = seq
-                state["update_owners"].setdefault(update, set()).add(
-                    (record.get("source_instance_id"), record.get("process_id"))
+                state["update_owners"].setdefault(update, {}).setdefault(
+                    (record.get("source_instance_id"), record.get("process_id")), seq
                 )
             process = record.get("process_id")
             if isinstance(process, str):
-                state["process_sources"].setdefault(process, set()).add(
-                    record.get("source_instance_id")
+                state["process_sources"].setdefault(process, {}).setdefault(
+                    record.get("source_instance_id"), seq
                 )
             commit = record.get("commit_id")
             if isinstance(commit, str):
-                state["commit_owners"].setdefault(commit, set()).add(
-                    (record.get("source_instance_id"), record.get("process_id"))
+                state["commit_owners"].setdefault(commit, {}).setdefault(
+                    (record.get("source_instance_id"), record.get("process_id")), seq
                 )
             segment = record.get("continuity_segment_id")
             if isinstance(segment, str):
-                state["segment_owners"].setdefault(segment, set()).add(
-                    (record.get("source_instance_id"), record.get("process_id"))
+                state["segment_owners"].setdefault(segment, {}).setdefault(
+                    (record.get("source_instance_id"), record.get("process_id")), seq
                 )
         daemon = record.get("daemon")
         if isinstance(daemon, dict) and daemon.get("daemon_stage") == "request":
@@ -1002,8 +1006,8 @@ class Collector(object):
                 state["request_rows"].setdefault(request_id, []).append(seq)
                 plan = daemon.get("plan_identity")
                 if isinstance(plan, str):
-                    state["plan_owners"].setdefault(plan, set()).add(request_id)
-                    state["request_plans"].setdefault(request_id, set()).add(plan)
+                    state["plan_owners"].setdefault(plan, {}).setdefault(request_id, seq)
+                    state["request_plans"].setdefault(request_id, {}).setdefault(plan, seq)
 
     def serve(self, on_ready=None):
         self._sock = bind_unix_socket(self.socket_path)
@@ -1883,33 +1887,29 @@ class Collector(object):
                 ],
             }
 
-    def _snapshot_join_state_locked(self):
-        """Copy the incremental join state. Caller holds the state lock."""
+    def _snapshot_join_state_locked(self, watermark):
+        """Project first-witness relation edges at a prefix under the state lock.
+
+        O(E + R) metadata work/state, where E is distinct edges and R daemon
+        request witnesses; no payload reads or retained per-cursor snapshots.
+        """
         state = self._join_state
-        return {
-            "updates": dict(state["updates"]),
-            "update_owners": {
-                key: set(value) for key, value in state["update_owners"].items()
-            },
-            "process_sources": {
-                key: set(value) for key, value in state["process_sources"].items()
-            },
-            "commit_owners": {
-                key: set(value) for key, value in state["commit_owners"].items()
-            },
-            "segment_owners": {
-                key: set(value) for key, value in state["segment_owners"].items()
-            },
-            "request_rows": {
-                key: list(value) for key, value in state["request_rows"].items()
-            },
-            "plan_owners": {
-                key: set(value) for key, value in state["plan_owners"].items()
-            },
-            "request_plans": {
-                key: set(value) for key, value in state["request_plans"].items()
-            },
+        snapshot = {
+            "updates": {key: seq for key, seq in state["updates"].items() if seq <= watermark},
+            "request_rows": {},
         }
+        for key, witnesses in state["request_rows"].items():
+            visible = [seq for seq in witnesses if seq <= watermark]
+            if visible:
+                snapshot["request_rows"][key] = visible
+        for name in ("update_owners", "process_sources", "commit_owners",
+                     "segment_owners", "plan_owners", "request_plans"):
+            snapshot[name] = {}
+            for key, witnesses in state[name].items():
+                visible = {owner for owner, seq in witnesses.items() if seq <= watermark}
+                if visible:
+                    snapshot[name][key] = visible
+        return snapshot
 
     def _published_rows(self, state=None):
         """Index rows at the published prefix, in durable_seq order.
@@ -1991,10 +1991,13 @@ class Collector(object):
             # The archive holds no application metadata; a filter naming it is
             # refused instead of silently matching nothing.
             return "invalid_request"
+        if body.get("group_id") not in (None, "") and body.get("view") != "choice":
+            return "invalid_request"
         for name in ("since_ms", "until_ms"):
             value = body.get(name)
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, (int, float))
+                or (isinstance(value, float) and not math.isfinite(value))
             ):
                 return "invalid_request"
         if (
@@ -2099,6 +2102,13 @@ class Collector(object):
         response["snapshot_lifetime"] = (
             "immutable_at_as_of_durable_seq_until_collector_epoch_changes"
         )
+        if view == "overview":
+            response["snapshot_scope"] = ["population", "inclusion", "stages", "timing", "outcomes", "slices"]
+            response["response_time_state"] = {
+                "fields": ["quality", "storage", "freshness"],
+                "basis": "sampled_at_response_time_not_pinned_by_cursor",
+                "sampled_at_wall_ms": now_wall_ms,
+            }
         return self._ok(op, request_id, response)
 
     def _query_legacy(self, op, request_id, body):
@@ -2131,13 +2141,17 @@ class Collector(object):
         epoch = state["collector_epoch"]
         private = body.get("private_detail") is True and view == "process"
         with self._lock:
-            index = list(self._index)
-            update_ids = set(self._update_ids)
-            process_kinds = {key: set(value) for key, value in self._process_kinds.items()}
-            join_state = self._snapshot_join_state_locked()
-        published = [
-            entry for entry in index if entry.get("durable_seq", 0) <= watermark
-        ]
+            published = [entry for entry in self._index if entry.get("durable_seq", 0) <= watermark]
+            join_state = self._snapshot_join_state_locked(watermark)
+        # Legacy summary fields and the plugin association projection must use
+        # the same prefix as the structured relations, never the live maps.
+        update_ids = set()
+        process_kinds = {}
+        for entry in published:
+            if isinstance(entry.get("update_id"), str):
+                update_ids.add(entry["update_id"])
+            if isinstance(entry.get("process_id"), str):
+                process_kinds.setdefault(entry["process_id"], set()).add(entry["observation_kind"])
         selected = []
         truncated = False
         for entry in published:
@@ -2156,7 +2170,7 @@ class Collector(object):
         )
         frontend_refs = set()
         frontend_processes = set()
-        for entry in index:
+        for entry in published:
             if entry.get("observation_kind") == "plugin_observation":
                 continue
             frontend_refs.add(

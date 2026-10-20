@@ -246,6 +246,9 @@ def canonical_frontend_timing(value):
     action_id = value.get("action_id")
     if not isinstance(action_id, str) or not action_id:
         return None, "timing_action_identity"
+    for name in ("action", "operation"):
+        if name in value and not isinstance(value[name], str):
+            return None, "timing_" + name + "_type"
     clock = value.get("clock")
     if not isinstance(clock, dict):
         return None, "timing_clock"
