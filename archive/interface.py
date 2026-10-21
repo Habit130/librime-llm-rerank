@@ -43,6 +43,9 @@ ERROR_MESSAGES = {
     "shutdown": "collector is shutting down",
     "unsupported_plugin_observation": "plugin observation version is not supported",
     "unsupported_daemon_observation": "daemon observation version is not supported",
+    "unsupported_query_version": "query interface version is not supported",
+    "cursor_snapshot_unknown": "cursor names a snapshot that is not available at this prefix",
+    "page_bytes_bound": "page response exceeds the configured byte bound",
 }
 
 CONTENT_KEYS = {

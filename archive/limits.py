@@ -23,6 +23,18 @@ DEFAULTS = {
     "batch_size": 64,
     "connect_timeout_ms": 1000,
     "management_timeout_ms": 5000,
+    # Query-layer bounds (input-archive-query-v1). The page byte bound is
+    # checked on the encoded response of a successful non-private page of a
+    # bounded query view, before the frame limit; startup, management/control
+    # responses, status/daemon state reads and refusals are not pages. The
+    # expansion bounds cap deliberate detail expansion, never create a
+    # stronger than declared claim, and are engineering choices, not a RAM
+    # ceiling.
+    "query_page_bytes_max": 1048576,
+    "query_timing_rows_max": 4096,
+    "query_group_members_max": 256,
+    "query_choice_groups_max": 64,
+    "query_high_fanout_updates_max": 512,
 }
 
 
@@ -53,6 +65,11 @@ def _validate(limits):
         "batch_size",
         "connect_timeout_ms",
         "management_timeout_ms",
+        "query_page_bytes_max",
+        "query_timing_rows_max",
+        "query_group_members_max",
+        "query_choice_groups_max",
+        "query_high_fanout_updates_max",
     )
     for key in positive_ints:
         value = limits[key]

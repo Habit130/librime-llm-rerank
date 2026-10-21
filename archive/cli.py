@@ -48,6 +48,11 @@ _COLLECTOR_FLAGS = (
     "batch_size",
     "connect_timeout_ms",
     "management_timeout_ms",
+    "query_page_bytes_max",
+    "query_timing_rows_max",
+    "query_group_members_max",
+    "query_choice_groups_max",
+    "query_high_fanout_updates_max",
 )
 
 
@@ -70,11 +75,32 @@ def main(argv=None):
     policy.add_argument("--expect-revision", type=int)
 
     query = sub.add_parser("query")
-    query.add_argument("view", choices=("overview", "timeline", "process", "losses", "status", "daemon"))
+    query.add_argument(
+        "view",
+        choices=(
+            "overview",
+            "timeline",
+            "process",
+            "choice",
+            "timing",
+            "losses",
+            "status",
+            "daemon",
+        ),
+    )
     query.add_argument("--process-id", default="")
+    query.add_argument("--group-id", default="")
     query.add_argument("--private-detail", action="store_true")
     query.add_argument("--page-size", type=int)
     query.add_argument("--cursor", default="")
+    query.add_argument("--cursor-token", default="")
+    query.add_argument("--observation-kind", default="")
+    query.add_argument("--source-instance-id", default="")
+    query.add_argument("--segment-id", default="")
+    query.add_argument("--since-ms", type=float)
+    query.add_argument("--until-ms", type=float)
+    query.add_argument("--application", default="")
+    query.add_argument("--state", default="")
 
     admit = sub.add_parser("admit")
     admit.add_argument("--fixture", required=True)
@@ -127,6 +153,11 @@ def _add_collector_flags(parser):
         "batch_size",
         "connect_timeout_ms",
         "management_timeout_ms",
+        "query_page_bytes_max",
+        "query_timing_rows_max",
+        "query_group_members_max",
+        "query_choice_groups_max",
+        "query_high_fanout_updates_max",
     ):
         parser.add_argument("--" + name.replace("_", "-"), dest=name, type=int)
     parser.add_argument("--warning-ratio", dest="warning_ratio", type=float)
@@ -359,8 +390,26 @@ def _query(args):
         kwargs["page_size"] = args.page_size
     if args.cursor:
         kwargs["cursor"] = int(args.cursor) if args.cursor.isdigit() else args.cursor
+    if args.cursor_token:
+        kwargs["cursor_token"] = args.cursor_token
     if args.process_id:
         kwargs["process_id"] = args.process_id
+    if args.group_id:
+        kwargs["group_id"] = args.group_id
+    if args.observation_kind:
+        kwargs["observation_kind"] = args.observation_kind
+    if args.source_instance_id:
+        kwargs["source_instance_id"] = args.source_instance_id
+    if args.segment_id:
+        kwargs["segment_id"] = args.segment_id
+    if args.since_ms is not None:
+        kwargs["since_ms"] = args.since_ms
+    if args.until_ms is not None:
+        kwargs["until_ms"] = args.until_ms
+    if args.application:
+        kwargs["application"] = args.application
+    if args.state:
+        kwargs["state"] = args.state
     if args.private_detail:
         kwargs["private_detail"] = True
     response = _client(args).query(args.view, **kwargs)

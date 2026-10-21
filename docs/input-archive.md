@@ -266,6 +266,301 @@ The `daemon` view is the passive last-observed daemon state; see "Daemon
 observation". It reads durable daemon observation summaries at the published
 watermark and never queries or probes the daemon.
 
+`overview`, `timeline`, `process`, `losses`, `timing` and `choice` share one
+versioned join/aggregate semantic layer, `input-archive-query-v1`; see the next
+section for its bounds, relations, denominators, timing and choice rules. The
+CLI and TUI call those views and do not import storage.
+
+## Query Interface (input-archive-query-v1)
+
+`input-archive-query-v1` is the additive semantic layer for the query surface.
+It is carried in the `body` of `input-archive-v1` responses; it is not a new
+frame version. Supported versions are exactly `input-archive-query-v1`; any
+other version in a cursor is `unsupported_query_version`. Views:
+
+| View | Read | Notes |
+| --- | --- | --- |
+| `overview` | published prefix | Honest counts, timing summary, storage, freshness |
+| `timeline` | pages | Bounded page of durable rows with relation reads |
+| `process` | pages | Deliberate process detail; the only private content view |
+| `choice` | full run, bounded | Per-group choice projection for one process |
+| `timing` | published prefix | Operation-separated frontend timing distributions |
+| `losses` | pages | Loss notices only |
+| `status` | collector state | The durable policy/capacity snapshot |
+| `daemon` | published prefix | Passive last-observed daemon state |
+
+Filters: available observed time (`since_ms`/`until_ms`), source instance,
+process, segment, observation kind and observed outcome state. An unavailable
+field is reported unknown, never invented: a row whose observation time is
+missing does not match a time filter, a filter value outside the safe token
+alphabet is refused with `invalid_request`. Empty strings on text filters
+(`process_id`, `source_instance_id`, `segment_id`, `observation_kind`, `state`,
+`application`, `group_id`) mean omission, not a value matching nothing.
+Time bounds require numeric values (not bool, empty strings, NaN or ±Infinity);
+non-finite bounds are refused before comparison, fingerprinting or echo, so
+responses contain no non-standard JSON numeric tokens. A filter naming a field
+this archive never observes (application metadata) is refused rather than
+silently matching nothing. Every supported row filter applies before any
+aggregation or pagination: `overview`, `timing`, `timeline` and `choice` count
+and page only the filtered rows, including the `process_id` scope in the
+legacy views; the response echoes `filters_applied`, and the fingerprint binds
+the same scope into the cursor. The `process` view is process-scoped and
+refuses a request without a usable process filter. `choice` also accepts
+`group_id`, which projects exactly that captured group (so a requested group is
+returned even when the unfiltered projection would truncate first).
+`group_id` is refused with `invalid_request` on all non-choice data views
+(`overview`, `timing`, `timeline`, `process`, `losses`); it is never echoed as
+an applied but inert filter.
+
+Bounds. `page_size_max` (default 50) bounds a page; a successful non-private
+page of a bounded query view (`op=query` with view `overview`, `timing`,
+`choice`, `timeline`, `process` or `losses`) is refused with `page_bytes_bound`
+when its encoded response exceeds `query_page_bytes_max` (default 1 MiB)
+instead of silently delivering an oversized page. The bound never applies to
+startup or management/control responses (`status`, `set_policy`,
+`checkpoint`, `admit_batch`, `policy_observe`, `shutdown` and the top-level
+`overview` snapshot op), to the fixed-shape `status`/`daemon` query state
+reads, or to refusals: a refusal keeps its own code. Any accepted positive
+`query_page_bytes_max` (including 128) therefore starts the collector and
+keeps those operations working; it only limits pages. Deliberate private
+detail and every unbounded response are bounded by `max_frame_bytes`.
+Expansion bounds are
+`query_timing_rows_max` (4096), `query_choice_groups_max` (64),
+`query_group_members_max` (256) and `query_high_fanout_updates_max` (512).
+The high-fanout bound caps the rendered owner evidence of a reused token: the
+response keeps the total count and sets `owners_truncated` with
+`owners_truncation_reason=query_high_fanout_updates_max`; the other bounds
+report their truncation reason per response (group bound, member evidence,
+timing rows). Join/aggregate state is a rebuildable bounded index maintained
+incrementally as rows are published (the identity-owner and daemon
+request/plan maps; a declared row width times rows for the derived estimate),
+plus per-request streaming over the published prefix; no query loads the whole
+payload history, re-derives the joins over the history, or holds the admission
+lock over a disk scan.
+Each distinct owner/plan edge retains its first durable witness sequence, not
+an unversioned membership bit. Prefix projection includes only edges with a
+witness at or below the watermark; update witnesses and daemon request-row
+lists are also prefix-filtered. Persistent relation state is O(E + U + R),
+where E is distinct owner/plan edges, U distinct update tokens and R request
+witnesses (each at most a constant multiple of durable rows N). Prefix
+projection does O(E + U + R) metadata work and temporary state; existing page
+selection/summary context does O(N) index-metadata work/state, without reading
+payloads except deliberate bounded private detail. No per-token or per-prefix
+map copies are retained, so cursor count adds no persistent relation state.
+The checker reports collector RSS before/after ingestion and after query
+iteration, plus total iteration time at 256/4096 rows; these are observed
+resource figures, not a total-RAM-independent or quiet-machine latency claim.
+
+Cursors. A `cursor_token` is an opaque `q1.` base64url token naming the view,
+the canonical filter set, the snapshot (`as_of_durable_seq`) and the collector
+epoch. It is rejected with `invalid_request` when it names a different view or
+filter set, and with `cursor_snapshot_unknown` when it names an unpublished
+position or a previous collector epoch (restart). Snapshot data is immutable:
+the same token and pagination parameters return the same observations **and
+semantic relations** while the epoch is unchanged, and a
+continuation reads the token's own as-of prefix rather than whatever has been
+published since, and the response's nested blocks (for example the timing block
+nested in an overview) carry that same snapshot label. `next_cursor` is the last returned `durable_seq` and
+continuation repeats no record and omits none inside the snapshot. Append, a
+held publication or a restart cannot leak unpublished work: reads always see
+the durable prefix only, and `received_unpublished` stays a separate figure.
+For `overview`, `snapshot_scope` names the pinned population/inclusion/stage/
+timing/outcome/slice data. `response_time_state` explicitly identifies
+`quality`, `storage` and `freshness` as sampled at response time, not frozen by
+the token: live counters, policy, capacity, published/pending watermark and
+ages may advance. These mixed-state blocks are outside `snapshot_lifetime`;
+their observation-derived subcounts still use the declared prefix. The token
+does not freeze wall clocks, capacity or producer activity.
+
+### Identity relations
+
+Every timeline/process row carries a `relations` object with an explicit
+status and basis, and a `relations_summary` count map. Statuses used:
+`valid`, `stale`, `unmatched`, `not_observed`, `absent`, `unknown`,
+`conflicting`, `ambiguous`, `unknown_owner`, `malformed`, `invalid`,
+`not_issued`, `linked`. Joins never use nearest time, text equality, PID,
+arrival order or a plan digest alone.
+
+- Capture identity is `source_instance_id` plus `source_local_sequence`. A
+  retry with the same pair and content is one observation, not two; the same
+  pair with different content is `identity_conflict` and does not replace the
+  original.
+- `parent_reference` resolves an absent/missing `parent_update_id` against
+  durable records at this prefix. An out-of-order record can resolve it at a
+  later prefix; an earlier snapshot is never rewritten, only re-read.
+- `process_identity`/`commit_identity`/`segment_identity` resolve exact tokens
+  scoped to their owner source. A token recorded under several owners keeps
+  its owners visible and is never silently merged.
+- `association` resolves the plugin's declared `engine_entry_context`
+  reference (`valid`, `stale`, `unmatched`, `absent`, `invalid`,
+  `malformed`, `unknown_owner`). It is a snapshot of the frontend entry
+  context: `proves_current_frontend_result` stays false and `frontend_terminal`
+  stays `unknown`; a valid reference asserts owned references only.
+  When an update token has multiple owners, an exact declared source/process
+  pair resolves against that owner's first witness at this prefix, not the
+  first unscoped token witness. A different owner's earlier record is not
+  evidence that the exact recorded relation is stale.
+- `request_identity` and `plan_identity` associate an issued plugin exchange
+  with daemon observations by the native request id (`linked`, `unmatched`,
+  `ambiguous`, `conflicting`, `not_issued`). A plan digest that several
+  requests claim, or daemon rows that disagree on one request's plan, stay
+  conflicting. Substituted or failed exchanges keep their issued request id.
+- Collector per-item admission acknowledgements are `durable:false`; a
+  post-admission eviction yields `known_dropped_units` and a continuity break,
+  which is not necessarily a loss-notice row, and no exact cause is claimed
+  for a missing reference. There is no reconstruction and no zero-loss
+  guarantee.
+
+### Stage, group and denominator semantics
+
+Computed scoring (daemon `scoring` outcome), plugin emission
+(applied/unchanged/fallback/no-request), frontend update-call completion and
+commit attempts (`observed_attempt`/`raw_finalized`/`cancelled`/
+`unavailable_client`/`unknown`) stay distinct. Successful daemon scoring alone
+proves none of plugin application, frontend presentation, host persistence or
+ranking benefit; `host_persistence_proof`, `application_proof` and
+`ranking_benefit` stay false. `applied` with `emission_matches_upstream: true`
+is an applied plan, not a benefit; order change is not correctness.
+
+The overview counts one unit per capture identity (source instance plus
+source-local sequence) and collapses same-identity retries; every other unit
+keeps its own bucket. Numerators and denominators are explicit per figure, and
+unknown sources remain in the eligible population rather than disappearing to
+improve a rate. Known drops, refusals, capacity stop, storage failure,
+identity conflicts, crash-tail state (`unknown` when the tail cannot be
+classified), discarded bytes, desired/effective policy and producer freshness
+are separate figures. Storage distinguishes managed archive/quarantine bytes
+from derived index bytes; growth is a rate only from two declared comparable
+samples with an elapsed interval, otherwise `growth: null` with a reason.
+
+Freshness is last-observed state with a source and basis, never current
+residency: producer freshness comes from the producer poll and the published
+prefix, `received_unpublished` is the pending admission figure, and passive
+reads (`daemon` view, `overview`, `timing`, `choice`) never query health or
+score, never import MLX or load a model, and never extend model activity. There
+is no periodic forced probe.
+Non-finite stored observation times do not yield an age: overview reports
+`last_observation_age_ms: null` with
+`publication_age_basis: durable_observation_has_nonfinite_client_observation_time`.
+This query projection leaves the original observation unchanged.
+
+### Frontend timing and choice projection
+
+A `provenance` row with `stage: frontend_timing` carries
+`payload.frontend_timing` version 1. The projection parses that actual
+declared schema: an object with an unknown key, a wrong-typed field, a
+non-integer timebase, a bounded-fold violation, a bad update-call or
+commit-call shape, or an unsupported version is refused at admission with
+`invalid_request` — as is a nonempty primary `endpoint` outside the v1 domain
+(`marked_text`, `panel_update`, `unavailable`): `unsupported_frontend_endpoint`.
+Declared `action`/`operation` must be strings, including when explicitly null:
+wrong types are refused (`timing_action_type`/`timing_operation_type` parser
+reasons, public admission code `invalid_request`). Absent optional labels
+retain the existing missing/unknown projection (missing operation goes to the
+`unknown` bucket); they are not coerced from supplied wrong-typed labels.
+A well-typed object is stored canonicalized and its value re-derived from
+`entry_ticks`, `endpoint_ticks` and the object's own timebase with
+overflow-safe integer math. A declared `duration_ns` is compared, not trusted:
+a mismatch, a non-monotone endpoint, a zero/negative/absent endpoint, an
+unrepresentable conversion or a declared `unavailable` endpoint yields
+`validity: invalid`/`unknown` with an explicit `unknown_reason`, never a zero
+latency. The declared primary endpoint must also be the operation's own last
+completed update call: a `marked_text`/`panel_update` endpoint with no
+completed call for that endpoint is invalid (`missing_primary_completion_call`),
+a tick value that is not that call's completion is
+`primary_endpoint_not_completed_call`, a later completed call than the declared
+one is `primary_endpoint_not_last_completed_call`, and an `unavailable`
+endpoint with completed calls is
+`endpoint_unavailable_with_completed_calls`. The primary figure is the
+operation-separated interval from the real action entry to the last
+`marked_text`/`panel_update` call completion; `commit_call` is a separate
+interval. A valid standalone frontend interval is retained when backend phases
+or association rows are absent, and association quality is disclosed
+separately. Percentiles use the documented
+`nearest_rank_ceil_p_n_first_observed_value` method over observed integer
+nanoseconds, with p50/p95/p99 when samples exist and a small-N disclosure
+below 20 samples; there is no SLA or statistical-adequacy claim. Overview
+counts the same canonical samples: `frontend_timing_valid` agrees with the
+timing view's valid samples for the same snapshot and filter, and
+`frontend_timing_invalid`/`frontend_timing_unknown`/`frontend_timing_unavailable`
+keep every other declared action visible in its own bucket (an action with no
+usable payload is `unavailable`). Old flat
+timing, #189 measurement scopes and backend daemon times are never mixed into
+this total. Available daemon scoring/load/unload durations keep their true
+scope (`scoring_ms` may include the load; no fabricated materialize/wait
+subphases, no summing overlapping durations), and the mach-absolute_time
+frontend clock, the daemon-relative millisecond clock and the wall event/
+observation clocks remain distinct: no cross-process clock subtraction invents
+a phase or an event-queue wait, and `event_queue_wait` stays `unknown`.
+Cold/hot/idle-resumption/application/input-size slices are reported as an
+explicit `not_observed` summary with those named unknown buckets; no slice is
+inferred from timing, PID, text or arrival order.
+
+`choice` projects per captured rerank group (span AND category, source/window/
+group identity) with captured member evidence, coverage basis, target
+membership, request/stage evidence, submission provenance, eligibility and
+explicit reasons. Only a plugin observation with the complete scoped identity
+(source instance, `window_id` and `group_id`; `identity_rule` is
+`scoped_source_window_group_required`) joins a group, whose
+`group_identity.status` is `scoped`. An observation missing any of them is
+never merged by its absent keys: it is listed in `unidentified_observations`
+as its own per-observation entry (`durable_seq`, observed IDs,
+`group_identity.status` `missing` when both window and group are absent,
+otherwise `partial`, and the `missing` field names) with
+`coverage_claim_accepted=false`, no member evidence, completeness
+`scoped_group_identity_unavailable` and `evidence_permitted=false` with
+`evidence_not_permitted_reason=scoped_group_identity_required`; it never
+borrows another observation's coverage. `unidentified_observations_total`
+counts every such observation; the list has its own
+`query_choice_groups_max` bound (`unidentified_observations_truncated`,
+reason `choice_group_bound`) and never crowds identified groups out of
+`groups`. A `group_id` filter matches the observed group value in both lists.
+The CLI JSON omits the `groups` key under the existing content-key rule and
+renders the same `unidentified_observations`, cursor and snapshot fields.
+Completeness is accepted only with
+`captured_group_members_and_target` basis, equal positive captured/member
+counts, target `present`/`absent` and no truncated-window marker; a
+whole-window flag, a candidate-count shortcut, a legacy complete boolean or a
+truncated window is refused or reported as incomplete, never accepted.
+`evidence_permitted` marks groups a dataset step could consume. An explicit
+committed preference is not human correctness, a default submission is weak,
+cancelled/retracted/raw/unavailable/unknown outcomes never become default
+positive labels, and unselected is not negative. This delivery writes no
+annotation, dataset, partitioner, freeze or training step.
+
+### Query reproduction
+
+From the plugin checkout, with an isolated `make librime` in the Squirrel build
+host and an own source export staged at
+`$HOST/librime/plugins/llm-rerank`-style path (`librime/plugins/llm-rerank`):
+
+```sh
+"$PYTHON" tools/check_input_archive_query.py --self-test --root "$RUNTIME/q-self"
+"$PYTHON" tools/check_input_archive_query.py --suite contract \
+  --frontend "$HOST" --native-build "$HOST/librime/build" \
+  --root "$RUNTIME/query/run" --report "$EVIDENCE/query.json"
+```
+
+Use a short runtime root: the accepted frontend and the fixture daemon connect
+and bind with the full socket path, and the collector requires its socket
+inside its own archive root, so a root whose fixture socket paths exceed the
+macOS `sun_path` bound is refused with `socket_path_too_long_for_frontend`
+rather than worked around.
+
+The contract suite drives the versioned Interface over a genuine collector with
+invented fixtures at the 256 and 4096 observation scales, then compiles the
+read-only accepted Squirrel frontend against the source-built librime and the
+final plugin source export, runs the production controller/plugin chain and a
+model-free fixture daemon request handler, and inspects the shared Interface
+outcomes and persisted frontend timing rows. The fixture daemon answers with a
+deterministic in-process scorer: that proves association and handler transport,
+never actual MLX phases or model performance. `--self-test` is supplementary;
+a skipped required case fails. The historical frontend timing checker at
+`$HOST/scripts/check-input-archive-frontend-timing.py` keeps its own pinned
+backend and result; this suite does not relabel it, edit it or treat it as
+current-backend evidence.
+
+
 ### Errors
 
 Error objects are `{code, message, retryable, content_included: false}`.
@@ -385,6 +680,11 @@ DEFAULT max_frame_bytes=4194304
 DEFAULT batch_size=64
 DEFAULT connect_timeout_ms=1000
 DEFAULT management_timeout_ms=5000
+DEFAULT query_page_bytes_max=1048576
+DEFAULT query_timing_rows_max=4096
+DEFAULT query_group_members_max=256
+DEFAULT query_choice_groups_max=64
+DEFAULT query_high_fanout_updates_max=512
 
 ## Diagnostic holds
 
@@ -586,6 +886,12 @@ build host:
 `--self-test` requires an explicit fresh root. It does not fall back to an
 older attempt directory. The contract suite derives its native workspace from
 the root's parent, so keep that parent separate from the self-test leaf.
+
+The native `llm_rerank_test` fixture asserts its own workspace socket-path
+bound (`< 104` characters for `lm.sock`), so a build tree under a long host
+path must run it with a short owned workspace, for example
+`LLM_RERANK_ARCHIVE_WORKSPACE=<short-runtime>/native make -C librime test`.
+That is an environment requirement of the fixture, not a skipped case.
 
 The checker is an orchestration entry, not a replacement plugin. It binds the
 built dylib and source, runs the registered native observation cases, and
