@@ -19,6 +19,8 @@ class TuiSession(object):
         self.stdin = stdin
         self.stdout = stdout
         self.stopped = False
+        self.annotation_page = None
+        self.annotation_selection = None
 
     def run(self):
         self._overview()
@@ -38,7 +40,9 @@ class TuiSession(object):
             return
         parts = line.split()
         command = parts[0]
-        if command == "overview":
+        if command.startswith("annotation"):
+            self._annotation_command(parts)
+        elif command == "overview":
             self._overview()
         elif command == "timeline":
             self._timeline()
@@ -54,6 +58,56 @@ class TuiSession(object):
             self.stopped = True
         else:
             self.stdout.write("SCREEN error\ncode=invalid_request\ncontent_included=false\n")
+
+    def _annotation_command(self, parts):
+        from archive.annotation_adapter import read_private_json, render
+        from archive.interface import InterfaceError, failure
+        from archive.safety import UnsafeRoot
+
+        private = False
+        try:
+            command = parts[0]
+            if command == "annotations" and len(parts) in (1, 3):
+                kwargs = {}
+                if len(parts) == 3:
+                    kwargs = {"as_of_durable_seq": int(parts[1]), "annotation_revision": int(parts[2])}
+                response = self.client.annotations(**kwargs)
+                self.annotation_page = response["body"] if response.get("ok") else None
+                self.annotation_selection = None
+            elif command == "annotation-next" and len(parts) == 1 and self.annotation_page and self.annotation_page.get("next_cursor"):
+                response = self.client.annotations(cursor_token=self.annotation_page["next_cursor"])
+                self.annotation_page = response["body"] if response.get("ok") else None
+                self.annotation_selection = None
+            elif command == "annotation-select" and len(parts) == 2 and self.annotation_page:
+                seq = int(parts[1])
+                matches = [row for row in self.annotation_page["observations"] if row["source_reference"]["durable_seq"] == seq]
+                if len(matches) != 1:
+                    raise InterfaceError("not_found")
+                self.annotation_selection = matches[0]["source_reference"]
+                response = self.client.annotations(source_reference=self.annotation_selection, as_of_durable_seq=self.annotation_page["as_of_durable_seq"], annotation_revision=self.annotation_page["annotation_revision"])
+            elif command == "annotation-private" and len(parts) == 1 and self.annotation_selection and self.annotation_page:
+                private = True
+                response = self.client.annotations(source_reference=self.annotation_selection, as_of_durable_seq=self.annotation_page["as_of_durable_seq"], annotation_revision=self.annotation_page["annotation_revision"], private_detail=True)
+            elif command == "annotation-edit" and len(parts) == 4 and self.annotation_selection:
+                kind, operation, revision = parts[1:]
+                if kind not in ("confirm", "correct", "exclude", "experience"):
+                    raise InterfaceError("invalid_request")
+                value = {}
+                expected = int(revision)
+                if kind != "confirm":
+                    self.stdout.write("private_json_value_required=true\n")
+                    self.stdout.flush()
+                    value = read_private_json(self.stdin)
+                response = self.client.annotate(self.annotation_selection, kind, value, expected, operation)
+                # Keep the selected pinned page unchanged. Neither success nor
+                # stale failure automatically turns it into a new human edit.
+            else:
+                raise InterfaceError("invalid_request")
+        except (ValueError, InterfaceError, UnsafeRoot) as exc:
+            response = failure("annotation", "", getattr(exc, "code", "invalid_request"))
+        self.stdout.write("SCREEN annotations\n")
+        self.stdout.write(render(response, private))
+        self.stdout.flush()
 
     def _overview(self):
         # The overview screen is an Adapter over the shared Interface: the

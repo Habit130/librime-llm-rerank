@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import secrets
 import select
@@ -56,8 +57,15 @@ _COLLECTOR_FLAGS = (
 )
 
 
+class ContentSafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse's default diagnostics echo bad values (including private
+        # values mistakenly supplied on argv). Never reflect them.
+        self.exit(2, "code=invalid_request\ncontent_included=false\n")
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Input-archive CLI adapter")
+    parser = ContentSafeParser(description="Input-archive CLI adapter")
     parser.add_argument("--socket", default="")
     parser.add_argument("--root", default="")
     parser.add_argument("--json", action="store_true")
@@ -111,7 +119,22 @@ def main(argv=None):
     sub.add_parser("checkpoint")
     sub.add_parser("status")
     sub.add_parser("tui")
+    ann = sub.add_parser("annotations")
+    ann.add_argument("action", choices=("list", "show", "confirm", "correct", "exclude", "experience"))
+    ann.add_argument("--input-file", default="-")
+    ann.add_argument("--expect-revision", type=int)
+    ann.add_argument("--operation-id")
+    ann.add_argument("--revision", type=int)
+    ann.add_argument("--prefix", type=int)
+    ann.add_argument("--page-size", type=int)
+    ann.add_argument("--cursor-token", default="")
+    ann.add_argument("--private-detail", action="store_true")
     args = parser.parse_args(argv)
+    if args.command in ("annotations", "tui") and (not math.isfinite(args.timeout) or args.timeout <= 0):
+        sys.stderr.write("code=invalid_request\ncontent_included=false\n")
+        return 2
+    if args.command == "annotations":
+        return _annotations(args)
     if args.command == "collector" and args.collector_command == "start":
         return _start(args)
     if args.command == "collector" and args.collector_command == "stop":
@@ -414,6 +437,38 @@ def _query(args):
         kwargs["private_detail"] = True
     response = _client(args).query(args.view, **kwargs)
     return _print(args, response, private=args.private_detail and args.view == "process")
+
+
+def _annotations(args):
+    from archive.annotation_adapter import read_private_json, render
+
+    try:
+        client = _client(args)
+        if args.action in ("list", "show"):
+            kwargs = {"private_detail": args.private_detail}
+            for name, value in (("annotation_revision", args.revision), ("as_of_durable_seq", args.prefix), ("page_size", args.page_size)):
+                if value is not None:
+                    kwargs[name] = value
+            if args.cursor_token:
+                kwargs["cursor_token"] = args.cursor_token
+            if args.action == "show":
+                value = read_private_json(sys.stdin, args.input_file)
+                if set(value) != {"source_reference"}:
+                    raise InterfaceError("invalid_request")
+                kwargs.update(value)
+            response = client.annotations(**kwargs)
+        else:
+            if args.expect_revision is None or args.operation_id is None or args.private_detail or args.revision is not None or args.prefix is not None or args.cursor_token or args.page_size is not None:
+                raise InterfaceError("invalid_request")
+            value = read_private_json(sys.stdin, args.input_file)
+            if set(value) - {"source_reference", "value"} or "source_reference" not in value:
+                raise InterfaceError("invalid_request")
+            response = client.annotate(value["source_reference"], args.action, value.get("value", {}), args.expect_revision, args.operation_id)
+        sys.stdout.write(render(response, private=args.private_detail))
+        return 0 if response.get("ok") else 1
+    except (InterfaceError, UnsafeRoot) as exc:
+        sys.stderr.write("code=%s\ncontent_included=false\n" % exc.code)
+        return 2
 
 
 def _admit(args):
