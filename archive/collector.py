@@ -38,6 +38,7 @@ from archive.interface import (
     readiness_line,
 )
 from archive.limits import resolve
+from archive import annotations
 from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
 from archive.querying import (
     QUERY_VERSION,
@@ -695,6 +696,9 @@ class Collector(object):
         self._policy = {}
         self._sock = None
         self._publication = None
+        self._annotations = annotations.AnnotationStore(root)
+        self._annotation_sources = {}
+        self._annotation_groups = {}
 
     def prepare(self):
         ensure_private_dir(self.root)
@@ -707,6 +711,7 @@ class Collector(object):
             self._load_state()
             self._prepare_files()
             self._rebuild_index()
+            self._annotations.prepare()
             self._persist_state()
         except BaseException:
             # Ownership precedes every managed read and mutation, so a refused
@@ -732,6 +737,9 @@ class Collector(object):
             self.state_path,
             self.policy_path,
             self.pid_path,
+            self._annotations.identity_path,
+            self._annotations.manifest_path,
+            self._annotations.journal_path,
             self.socket_path,
             os.path.join(self.root, "collector.out"),
             os.path.join(self.root, "collector.err"),
@@ -914,6 +922,8 @@ class Collector(object):
         self._update_ids = set()
         self._process_kinds = {}
         self._join_state = _fresh_join_state()
+        self._annotation_sources = {}
+        self._annotation_groups = {}
         if not os.path.exists(self.observations_path):
             return
         offset_limit = int(self._state.get("durable_offset", 0))
@@ -944,6 +954,7 @@ class Collector(object):
         self._index.append(
             {
                 "durable_seq": seq,
+                "record_digest": annotations.digest(record),
                 "offset": offset,
                 "length": length,
                 "process_id": process_id,
@@ -978,6 +989,12 @@ class Collector(object):
         if isinstance(process_id, str) and isinstance(kind, str):
             self._process_kinds.setdefault(process_id, set()).add(kind)
         self._remember_join_state(seq, record)
+        source_key = (record.get("source_instance_id"), record.get("source_local_sequence"))
+        self._annotation_sources.setdefault(source_key, []).append(self._index[-1])
+        plugin = record.get("plugin") or {}
+        if plugin.get("window_id") and plugin.get("group_id"):
+            group_key = (record.get("source_instance_id"), record.get("process_id"), plugin["window_id"], plugin["group_id"])
+            self._annotation_groups.setdefault(group_key, []).append(self._index[-1])
 
     def _remember_join_state(self, seq, record):
         """Maintain first-witness sequences for incremental relation edges.
@@ -1116,9 +1133,28 @@ class Collector(object):
         if request.get("envelope_version") != ENVELOPE_VERSION:
             return failure(op, request_id, "unsupported_version")
         content = request.get("content_version", CONTENT_VERSION)
-        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy"}:
+        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query"}:
             return failure(op, request_id, "unsupported_version")
         body = request.get("body") if isinstance(request.get("body"), dict) else {}
+        if op in {"annotation_edit", "annotation_query"}:
+            try:
+                if op == "annotation_edit":
+                    result = self._annotations.mutate(body, self._annotation_source)
+                else:
+                    result = self._annotation_query(body)
+                response = self._ok(op, request_id, result)
+                private = result.get("content_included", False)
+                response["body"]["content_included"] = private
+                response["content_included"] = private
+                if op == "annotation_query" and len(encode_frame(response)) > min(annotations.PAGE_BYTES, self.limits["query_page_bytes_max"]):
+                    return failure(op, request_id, "page_bytes_bound")
+                return response
+            except InterfaceError as exc:
+                return failure(op, request_id, exc.code)
+            except UnsafeRoot:
+                return failure(op, request_id, "unsafe_root")
+            except (OSError, ValueError, TypeError, KeyError):
+                return failure(op, request_id, "annotation_state_invalid")
         if op == "status" or op == "overview":
             return self._ok(op, request_id, self.snapshot())
         if op == "policy_observe":
@@ -2449,6 +2485,116 @@ class Collector(object):
         if isinstance(timing, dict):
             return timing, None
         return None, "timing_payload_absent"
+
+    def _annotation_source(self, reference, prefix=None):
+        """Validate a single published record outside the admission lock."""
+        self._annotations._reference_shape(reference)
+        with self._lock:
+            limit = self._state["durable_seq"] if prefix is None else prefix
+            matches = self._annotation_sources.get((reference["source_instance_id"], reference["source_local_sequence"]), ())
+            visible = []
+            for entry in matches:
+                if entry["durable_seq"] > limit:
+                    break
+                visible.append(entry)
+                if len(visible) == 2:
+                    break
+        if not visible:
+            raise InterfaceError("not_found")
+        if len(visible) != 1:
+            raise InterfaceError("annotation_source_mismatch")
+        entry = visible[0]
+        if reference["durable_seq"] != entry["durable_seq"] or reference["record_digest"] != entry["record_digest"]:
+            raise InterfaceError("annotation_source_mismatch")
+        fd = open_nofollow(self.observations_path, os.O_RDONLY)
+        with os.fdopen(fd, "rb") as handle:
+            handle.seek(entry["offset"])
+            raw = handle.read(entry["length"])
+        try:
+            record = json.loads(raw)
+            if annotations.digest(record) != entry["record_digest"]:
+                raise ValueError()
+            semantic = {key: value for key, value in record.items() if key not in {"record_version", "durable_seq", "content_hash", "identity", "host_persistence", "host_persistence_proof"}}
+            if record.get("identity") != [reference["source_instance_id"], reference["source_local_sequence"]] or _hash(semantic) != record.get("content_hash"):
+                raise ValueError()
+        except (ValueError, TypeError, UnicodeError):
+            raise InterfaceError("annotation_source_mismatch")
+        plugin = entry.get("plugin") or {}
+        group_key = (entry.get("source_instance_id"), entry.get("process_id"), plugin.get("window_id"), plugin.get("group_id"))
+        with self._lock:
+            group_index = self._annotation_groups.get(group_key, ())
+            group_bound = self.limits["query_group_members_max"]
+            group_rows = [row for row in group_index[:group_bound + 1] if row["durable_seq"] <= limit]
+        choice = None
+        if group_rows and len(group_rows) <= group_bound:
+            projection = choice_group_rollup(group_rows, entry.get("process_id"), self.limits, plugin.get("group_id"))
+            groups = projection.get("groups") or []
+            if len(groups) == 1:
+                choice = groups[0]
+        return {"record": record, "reference": reference, "observed_target": annotations.observed_target(record), "choice": choice}
+
+    def _annotation_query(self, body):
+        allowed = {"annotation_version", "source_reference", "as_of_durable_seq", "annotation_revision", "page_size", "cursor_token", "private_detail", "archive_id"}
+        if set(body) - allowed or type(body.get("private_detail", False)) is not bool:
+            raise InterfaceError("invalid_request")
+        if body.get("annotation_version") != annotations.ANNOTATION_VERSION:
+            raise InterfaceError("unsupported_annotation_version")
+        store = self._annotations
+        with store.lock:
+            store._healthy()
+            if body.get("archive_id", store.archive_id) != store.archive_id:
+                raise InterfaceError("annotation_foreign_archive")
+            with self._lock:
+                current_prefix = self._state["durable_seq"]
+            prefix = body.get("as_of_durable_seq", current_prefix)
+            revision = body.get("annotation_revision", store.revision)
+            page_size, error = self._paged_limits(body)
+            if error:
+                raise InterfaceError(error)
+            private = body.get("private_detail", False)
+            exact = body.get("source_reference")
+            after = 0
+            token = body.get("cursor_token")
+            if token:
+                decoded = annotations.decode_cursor(token)
+                if not isinstance(decoded, dict) or set(decoded) != {"archive_id", "prefix", "revision", "after", "private"} or exact is not None or type(decoded["private"]) is not bool or decoded["private"] != private:
+                    raise InterfaceError("invalid_request")
+                if decoded["archive_id"] != store.archive_id:
+                    raise InterfaceError("annotation_foreign_archive")
+                if "as_of_durable_seq" in body and prefix != decoded["prefix"] or "annotation_revision" in body and revision != decoded["revision"]:
+                    raise InterfaceError("annotation_revision_unknown")
+                prefix, revision, after = decoded["prefix"], decoded["revision"], decoded["after"]
+            if not annotations.integer(prefix) or not annotations.integer(revision) or not annotations.integer(after) or prefix > current_prefix or revision > store.revision or after > prefix:
+                raise InterfaceError("annotation_revision_unknown")
+            refs = []
+            more = False
+            if exact is not None:
+                refs = [exact]
+            else:
+                # Existing metadata index is append ordered. Seek by durable
+                # sequence without allocating/copying all source history.
+                with self._lock:
+                    lo, hi = 0, len(self._index)
+                    while lo < hi:
+                        mid = (lo + hi) // 2
+                        if self._index[mid]["durable_seq"] <= after:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    start = lo
+                    for entry in self._index[start:start + page_size + 1]:
+                        if entry["durable_seq"] > prefix:
+                            break
+                        if len(refs) == page_size:
+                            more = True
+                            break
+                        refs.append({"archive_id": store.archive_id, "source_instance_id": entry["source_instance_id"], "source_local_sequence": entry["source_local_sequence"], "durable_seq": entry["durable_seq"], "record_digest": entry["record_digest"]})
+            rows = []
+            for ref in refs:
+                source = self._annotation_source(ref, prefix)
+                rows.append(annotations.evidence(source, store.effective(ref, revision), private))
+            cursor = annotations.encode_cursor({"archive_id": store.archive_id, "prefix": prefix, "revision": revision, "after": refs[-1]["durable_seq"], "private": private}) if more else None
+            return {"annotation_version": annotations.ANNOTATION_VERSION, "archive_id": store.archive_id, "as_of_durable_seq": prefix, "annotation_revision": revision, "ordering": ORDERING, "observations": rows, "next_cursor": cursor, "page_size_max": self.limits["page_size_max"], "annotation_page_bytes_max": min(annotations.PAGE_BYTES, self.limits["query_page_bytes_max"]), "content_included": private}
 
     def _read_payload(self, entry):
         with open(self.observations_path, "rb") as handle:

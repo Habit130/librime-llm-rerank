@@ -46,9 +46,22 @@ ERROR_MESSAGES = {
     "unsupported_query_version": "query interface version is not supported",
     "cursor_snapshot_unknown": "cursor names a snapshot that is not available at this prefix",
     "page_bytes_bound": "page response exceeds the configured byte bound",
+    "unsupported_annotation_version": "annotation interface version is not supported",
+    "annotation_state_invalid": "annotation state is malformed, incompatible or unavailable",
+    "annotation_foreign_archive": "source reference names a different archive",
+    "annotation_source_mismatch": "durable source identity or content does not match",
+    "annotation_target_unavailable": "source has no concrete unambiguous observed target",
+    "annotation_stale_revision": "annotation revision changed; deliberate edit required",
+    "annotation_operation_conflict": "operation identity was reused with different semantics",
+    "annotation_revision_unknown": "annotation snapshot revision or source prefix is unknown",
+    "annotation_input_bound": "annotation input exceeds the documented bound",
 }
 
 CONTENT_KEYS = {
+    "private_values",
+    "effective_target",
+    "observed_target",
+    "experience_note",
     "payload",
     "text",
     "composition",
@@ -344,6 +357,16 @@ class Client(object):
 
     def checkpoint(self):
         return self.call("checkpoint")
+
+    def annotations(self, **kwargs):
+        from archive.annotations import ANNOTATION_VERSION
+
+        return self.call("annotation_query", {"annotation_version": ANNOTATION_VERSION, **kwargs})
+
+    def annotate(self, source_reference, kind, value, expected_revision, operation_id):
+        from archive.annotations import ANNOTATION_VERSION
+
+        return self.call("annotation_edit", {"annotation_version": ANNOTATION_VERSION, "source_reference": source_reference, "kind": kind, "value": value, "expected_revision": expected_revision, "operation_id": operation_id})
 
     def shutdown(self):
         return self.call("shutdown")

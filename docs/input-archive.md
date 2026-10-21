@@ -61,9 +61,10 @@ of that root; a duplicate start on an owned root exits `1` with
 `code=collector_already_running` on stderr. The ownership, readiness, and
 reclaim rules are in "Ownership and lifecycle".
 
-Capture starts disabled. A merge does not enable capture. This slice does not
-certify frontend latency, ranking benefit, annotation, export, or the five-view
-TUI.
+Capture starts disabled. A merge does not enable capture. The foundation does
+not certify frontend latency or ranking benefit. Versioned human annotations
+are the separate additive surface documented below; export and the five-view
+TUI remain outside this delivery.
 
 ## Ownership and lifecycle
 
@@ -1099,3 +1100,226 @@ check started:
 This slice does not certify frontend pixels, host persistence, ranking
 benefit, plugin cost, latency percentiles or five-view completeness. **Merge
 never enables capture.**
+
+## Versioned human annotations (AC-193-v1)
+
+`input-archive-annotations-v1` is an additive management Interface, not a
+source observation, recording-policy revision, training label generator or
+dataset job. The existing envelope remains `input-archive-v1`, version 1.
+Use `Client.annotations(**read)` / `annotation_query` and
+`Client.annotate(reference, kind, value, expected_revision, operation_id)` /
+`annotation_edit`. Both CLI and the minimal Annotation TUI call these same
+operations and never open the store or implement their own eligibility joins.
+
+### Exact identity and reads
+
+The collector creates a random stable `archive_id` in owner-only
+`annotation-identity.json`. It is independent of paths, PID and collector
+epoch. A source reference returned on every annotation row has exactly
+`archive_id`, `source_instance_id`, `source_local_sequence`, `durable_seq`, and
+`record_digest` (SHA-256 of the canonical complete durable observation record).
+The source must be in the published observation prefix, be uniquely addressed
+by the capture pair, and match its full recorded digest. Missing/unpublished
+sources fail `not_found`; a different archive fails `annotation_foreign_archive`;
+an ambiguous capture identity, wrong durable sequence or changed content fails
+`annotation_source_mismatch`. There are no text/time/nearest-record matches.
+Only additive identity metadata is initialized; no legacy migration/backfill
+or raw observation rewrite is performed.
+
+Read parameters are `annotation_version`, optional `archive_id`,
+`source_reference` (exact detail), `as_of_durable_seq`, `annotation_revision`,
+`page_size`, `cursor_token`, and boolean `private_detail`. Unspecified prefix
+and revision select the latest published pair **once for that request**. The
+response explicitly returns `archive_id`, `as_of_durable_seq`, and
+`annotation_revision`. Supply that pair deliberately to reproduce it after
+later capture, edits or collector restart. Previously published revisions are
+retained without garbage collection. Unknown, negative, boolean, too-large
+revisions or prefixes fail `annotation_revision_unknown`, never read latest.
+
+Listing includes all durable sources (also unannotated sources), ordered by
+`durable_seq`. Exact reads require the whole source reference. Each row exposes
+`kind_revisions`, observed kind/outcome/submission, effective target provenance,
+human revision, exclusion/reason/revision and bounded experience metadata.
+Only explicit `private_detail=true` adds `private_values.effective_target`,
+`observed_target`, and `experience_note`. Metadata requests never return them.
+The response's `content_included` states this opt-in, including an empty page;
+errors are always content-free. Unavailable evidence stays unavailable.
+
+`next_cursor` is an opaque `a1.` continuation naming archive, source prefix,
+annotation revision, position and private-detail mode. Continuation need not
+repeat the pair; if repeated it must match. Cross-root, incompatible pair/mode,
+unknown position or malformed cursors fail explicitly. Changing annotation
+state never changes a source-only #192 query or converts a #192 cursor into
+an annotation snapshot. #192 cursors retain their existing epoch semantics.
+
+### Four human operations and provenance
+
+Edits require exactly `annotation_version`, `source_reference`, `kind`,
+`value`, `expected_revision`, and `operation_id` (optional `value` defaults to
+`{}`). All carry explicit `provenance=human` in retained journal evidence.
+
+| Kind | Value | Meaning |
+| --- | --- | --- |
+| `confirm` | `{}` | Review the concrete observed target. Only `commit_attempt.payload.text` or plugin commit `payload.text` supplies a target; no host/composition/unselected-text inference. Missing, empty, unsupported or oversized targets fail `annotation_target_unavailable`. |
+| `correct` | `{"text": ...}` | Explicit replacement, independent of originally observed text. New corrections supersede effective target at newer revisions; old text and every earlier revision remain. |
+| `exclude` | `{"reason": "private"\|"sensitive"\|"unrepresentative"\|"other"}` | Monotonic training exclusion (`excluded=true`); not deletion, pause, unlearning or a dataset transformation. No unexclude operation in v1. |
+| `experience` | `{"kind": ..., "value": ..., "note": ...}` | Subjective judgement: kind `input_difficulty`, `candidate_issue`, `unexpected_behavior` or `other`; severity `minor`, `major` or `blocking`; optional private note defaults empty. Not target correctness, measured latency or ranking benefit. Latest experience supersedes effective experience only. |
+
+The newer of confirm/correct controls effective target: `human_reviewed` or
+`human_corrected`. Without either, a concrete observed target is
+`observed_explicit_preference`, `observed_default_weak`, or
+`observed_submission_unknown`; absent target is `unavailable`. None claims
+objective correctness or proves host persistence. Cancellation, replacement,
+retraction, raw finalization, unavailable/unknown outcomes and unselected
+candidates do not automatically acquire targets or positive/negative labels.
+A deliberate correction can describe such a source without rewriting its
+outcome or fabricating membership in any captured competition.
+
+The downstream #194 reader receives effective target/provenance/exclusion at
+one pinned pair, with no consumer-side join. `language_material` states
+evidence availability, exclusion and `admission=not_decided`.
+`ranking_evaluation` separately reports the existing shared #192 scoped choice
+projection. Eligibility additionally requires an observed engine commit, no
+retraction/exclusion, complete captured-group evidence, observed membership
+`present`, and an effective target identical to that observed target. An
+outside-group correction never invents membership or completeness;
+`corrected_target_membership=not_asserted`. Missing/oversized group history
+stays ineligible. This conservative v1 projection does not search private
+candidate text to admit a correction, transform a corpus, or certify ranking
+gain. All objective-correctness, host-persistence and ranking-benefit proof
+flags remain false.
+
+### Revision, idempotency, publication and recovery
+
+One total annotation revision order per archive starts at zero; every new
+published operation increments it by one, independently of capture/policy.
+The expected revision must equal the current annotation revision. Two clients
+at one expected revision cannot both win; loser receives
+`annotation_stale_revision` without mutation. Neither Adapter refreshes or
+retries a stale human decision automatically.
+
+`operation_id` is a nonempty <=128-character safe token (ASCII letters, digits,
+`_.:-`). It identifies the exact semantic operation, including source, kind,
+normalized value, explicit human provenance **and expected revision**. Exact
+replay returns the original `annotation_revision`, `replayed=true`,
+`current_annotation_revision` and `durable=true`, even after later edits or
+restart. Changing content or expected revision with that ID fails
+`annotation_operation_conflict`; make a new ID for a new deliberate decision.
+The original success response has `replayed=false`. It contains no target/note
+or operation-content echo.
+
+The collector holds its existing lifetime ownership lock over all annotation
+storage. `annotations.jsonl` is an append-only revision journal with chain and
+semantic hashes; `annotation-state.json` publishes exact byte offset,
+revision and chain under the same archive ID. A mutation serializes under a
+dedicated management lock: write complete row, fsync journal, atomically
+replace and fsync the manifest and directory, update lightweight indexes,
+then acknowledge durable success. Disk/annotation I/O is never on a producer
+input path or under the admission lock. Annotation operations work with
+capture off/paused and cannot change recording policy or legacy recording.
+
+A pre-publication failure exposes no new revision; an unpublished tail is
+truncated on restart. Published-but-lost-reply retries return that same
+operation once. Uncertain write failures return `storage_failure` and poison
+the annotation instance until collector restart, rather than roll a possibly
+published result backwards. Queries then fail `annotation_state_invalid`, not
+success/empty. Startup streams/validates the published journal, chain and
+manifest; missing, malformed, truncated or incompatible persisted state is
+`annotation_state_invalid`, never reset to empty. Interrupted first-time
+initialization is likewise refused. Managed annotation artifacts must be
+owner-owned, mode 0600, regular and single-link; alias/non-private artifacts
+fail `unsafe_root` before following or rewriting targets. The root remains
+0700. This is the existing personal-account threat model, not protection
+against malicious same-account replacement of the complete archive.
+
+### Bounds and work
+
+- Replacement/observed target: <=8192 UTF-8 bytes, nonempty. Note: <=2048
+  UTF-8 bytes, possibly empty. Invalid strings/types fail `invalid_request`;
+  oversized private values fail `annotation_input_bound`.
+- Private input JSON: one bounded line on stdin/interactive stream, or a
+  <=131072-byte validated private regular file. No private text is required in
+  argv. Symlinked parent/file, hardlink, non-owner or group/other-readable
+  files are refused. Interactive TTY echo is disabled while reading values.
+- Page size defaults to the existing limit (20), maximum 50 by default, using
+  existing configured page limits. Bad sizes fail `invalid_request` or
+  `page_bound`. Both ordinary **and private** annotation query responses are
+  bounded by min(1048576, `query_page_bytes_max`) encoded frame bytes. Oversize
+  responses fail `page_bytes_bound` (reduce page size); no partial success or
+  silent truncation. Mutation acknowledgements are not pages.
+- Journal row <=131072 bytes, request/frame limits unchanged. Revisions and
+  positions are nonnegative integer values <=2^63-1. Unknown protocol versions
+  fail `unsupported_annotation_version`; malformed requests use fixed errors.
+- Startup: O(R) streamed journal validation, O(R) resident offset/hash/revision
+  and idempotency metadata for R revisions, no retained private history.
+  Source indexes add O(S) metadata to the existing source index. Journal disk
+  use grows O(R); annotation history is separate from observation-capacity
+  accounting and is not garbage-collected in this contract.
+- Listing seeks the existing durable source index in O(log S) and copies at
+  most page_size+1 entries. Each row reads one bounded source record and at
+  most four journal rows, with O(log H) revision lookup per kind for H edits of
+  that source. Group projection reuses shared #192 semantics with at most
+  `query_group_members_max` metadata witnesses (default 256); larger groups
+  remain ineligible. No payload-history scan or full-copy cursor.
+- The checker reports finite 256/4096 operations, complete pinned iteration,
+  a 256-revision single source, resource samples, actual runtime/source hashes
+  and failure/restart/Adapter controls. RSS samples and checker tracemalloc
+  are measurements, **not a total-RAM, latency or zero-loss guarantee**.
+
+### CLI and minimal Annotation TUI
+
+No default live root and no service enablement. Examples assume an already
+running collector at `$SOCKET`; private JSON files must be owner-only.
+
+```sh
+# Metadata only: use a returned source_reference verbatim, never guess text.
+"$PYTHON" -m archive.cli --socket "$SOCKET" annotations list --page-size 20
+# reference.json: {"source_reference": <exact returned reference>}
+"$PYTHON" -m archive.cli --socket "$SOCKET" annotations show \
+  --input-file "$PRIVATE/reference.json" --prefix 10 --revision 3
+# edit.json: {"source_reference": <reference>, "value": {"text": <private text>}}
+"$PYTHON" -m archive.cli --socket "$SOCKET" annotations correct \
+  --input-file "$PRIVATE/edit.json" --expect-revision 3 --operation-id decision-4
+# confirm/exclude/experience have the same flags and their value shapes above.
+# Explicit private read only; terminal controls are rendered as JSON escapes.
+"$PYTHON" -m archive.cli --socket "$SOCKET" annotations show \
+  --input-file "$PRIVATE/reference.json" --prefix 10 --revision 4 --private-detail
+```
+
+Omit `--input-file` (or use `-`) to read one JSON line from stdin. Ordinary
+and private Annotation output is structurally identical JSON, including error,
+provenance, revision and durable outcome; the `--json` global flag is optional
+for this surface. Bad arguments never echo supplied values. Private content
+is absent from ordinary stdout/stderr, diagnostics and reports. Private
+opt-in output is not suitable for public logs or issue comments.
+
+In the existing line-oriented TUI:
+
+- `annotations` lists a fresh pinned page; `annotations PREFIX REVISION` reads
+  an explicit pair. `annotation-next` continues it.
+- `annotation-select DURABLE_SEQ` selects an exact source reference from the
+  displayed page (not arbitrary text or an unstated root).
+- `annotation-edit KIND OPERATION_ID EXPECTED_REVISION` edits the selection.
+  For correct/exclude/experience the next line is private JSON **value only**;
+  confirm requires no extra line. The prompt does not echo supplied content.
+- `annotation-private` deliberately reads the selected row at the displayed
+  pair. Edits do not silently refresh that pair; issue `annotations` to read
+  latest deliberately. Stale edits, missing selection, invalid values and
+  disconnected collectors display explicit errors, not success/empty.
+- `quit`/EOF leaves collector and capture policy unchanged.
+
+Reproduction (invented private fixtures only, fresh roots):
+
+```sh
+"$PYTHON" tools/check_input_archive_annotations.py --self-test
+"$PYTHON" tools/check_input_archive_annotations.py --suite contract \
+  --root "$PRIVATE/fresh-annotation-run" --report "$PRIVATE/annotations.json"
+```
+
+The suite drives real collector subprocesses, shared Interface, CLI and TUI;
+faults are injected in its owned launcher (before publication, disk error,
+crash boundaries and published/lost reply), not in production producers.
+Required cases never skip; no model, network scorer, health probe, host document,
+live input method or real deployment is used. Dataset jobs/freezes/partitions,
+backup/delete/restore, legacy migration, general TUI redesign, frontend capture,
+ranking/scoring and training remain deferred. **Merge never enables capture.**
