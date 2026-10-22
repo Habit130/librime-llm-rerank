@@ -1322,4 +1322,233 @@ crash boundaries and published/lost reply), not in production producers.
 Required cases never skip; no model, network scorer, health probe, host document,
 live input method or real deployment is used. Dataset jobs/freezes/partitions,
 backup/delete/restore, legacy migration, general TUI redesign, frontend capture,
-ranking/scoring and training remain deferred. **Merge never enables capture.**
+ranking/scoring and training remain deferred by that annotation slice. Dataset
+work below is additive; the annotation restrictions above are unchanged.
+**Merge never enables capture.**
+
+## Immutable two-view dataset freezes (AC-194-v1)
+
+The shared `input-archive-datasets-v1` Interface adds the `dataset` operation.
+CLI and Datasets TUI are rendering/input Adapters only. No model, tokenizer,
+training, health/score request, deployment or capture enablement occurs. Legacy
+fact/trace/SQLite exports are never implicit inputs.
+
+### Snapshot, identity and temporal partition
+
+`snapshot` returns an explicit pair: archive identity, first durable sequence
+(inclusive), published durable prefix (inclusive), retained annotation revision,
+canonical source-reference/content digest, content v1, current query version and
+annotation version. The digest is computed from bounded metadata pages and is
+required on create: an old pair cannot silently bind changed source after restart.
+Source content identity follows #193 canonical record digests, not JSON whitespace.
+Preview may select the
+current pair; create requires the **complete explicit pair**. A retry never
+substitutes a new prefix/revision. Each source reference includes archive ID,
+source incarnation/local sequence, durable sequence and record digest. Raw
+observations and annotation history are not rewritten. Text equality never
+deduplicates independent captures; admission retries retain foundation identity
+deduplication/conflict behavior.
+
+Partition rule `whole-segment-durable-interval-v1` orders by published durable
+sequence, not wall time and not a claimed causal relation between producers.
+Segments are scoped `(source_instance_id, continuity_segment_id)` and processes
+are scoped `(source_instance_id, process_id)`. A segment requires observed
+process starts and terminal outcomes, no observed loss/unknown/gap, and a later
+different segment on the same source-local sequence chain to be treated as
+closed. Reappearance of an already closed segment is uncertain. The last/open,
+missing-ID, discontinuous or incomplete segment is explicitly ineligible.
+
+Every segment/process occupies its whole observed durable interval. Overlapping
+intervals merge; actual recorded frontend-update and shared request-link
+dependencies add intervals too. This prevents interleaved sources or later
+transformations crossing a split. Legal cuts stop before the earliest uncertain
+segment: this deliberately conservative rule may make otherwise large inputs
+unusable. Unknown continuity never becomes fabricated singleton segments.
+
+Among legal pairs of strict cuts, minimize the integer L1 deviation of cumulative
+source counts from 80% and 90%; ties choose the earliest durable pair. A suffix
+minimum makes cut selection linear after interval sorting. No legal pair yields
+`unusable`, with the source map retained as `unassigned`, not corrupt source or a
+forced random split. Both views inherit the exact same map **before filtering**.
+An oversized segment is never split to improve ratios. All source units,
+including unknown/excluded/unadmitted units, remain in `partition.jsonl`.
+
+The manifest reports source/view exported-row counts, partition proportions,
+normal-commit populations, eligible/ineligible choice populations, overlapping
+reason incidences and label provenance. The denominator for source proportions
+is all selected durable observations; each view's denominator is its own exported
+rows. Eligibility has its own count, not an implied property of a nonempty file.
+Cross-partition equal-target overlap counts distinct SHA-256 hashes of exact UTF-8
+effective targets appearing in multiple partitions; genuine repeated text stays.
+Source-identity overlap is zero by construction and semantic verification checks
+the regenerated map, not only checksums. No statistical adequacy or untouched
+prospective-confirmation claim follows from any ratio or historical test file.
+
+### Views and exclusions
+
+- `corpus.jsonl`: admitted normal frontend commit attempts and engine commits,
+  explicitly distinguished by observation scope (neither proves host persistence).
+  Independent source captures are not equated by their text. Original/effective
+  targets, human revision and human-reviewed/corrected, observed-explicit,
+  default-weak or unknown-submission provenance stay distinct. Cancel/raw/
+  unavailable/unknown outcomes are not positive material. Shared observed group
+  retraction/exclusion is honored. There is no fixed tokenizer, prompt format,
+  candidate count or 64-character corpus window.
+- Context is an exact reference to **one** earlier admitted commit whose owned
+  update is the recorded parent, in the same observed segment and partition.
+  Absence of such evidence means unavailable context, not inferred adjacency or
+  a reconstructed host document. Exclusion/inadmissibility of that parent excludes
+  the dependent example, rather than copying its target as usable context.
+- `choice.jsonl`: observed engine-commit choice examples, including explicitly
+  ineligible examples/reasons. It preserves the shared #192 group projection and
+  actual structured competition/emission/commit payloads, input, span, category,
+  captured member indexes, Merge Order and Emission Order. Structured membership,
+  span/category, counts, permutations and original target must agree.
+  Missing/ill-typed span/category/input/member text/Merge Order or non-integer
+  order indexes cannot serve as complete structured competition. Boolean indexes
+  are not integers. Captured group `plan_complete` must be explicitly true, in
+  addition to (never instead of) the shared group-members-and-target coverage basis.
+  Conflicting member identities, absent fields, unknown/truncated competition, default weak
+  labels, retraction/exclusion and outside/changed human targets are not ranking
+  evidence. Unselected candidates receive no invented negative labels.
+- Actual observed native request/plan relations use `RelationContext`, not a plan,
+  text/time/PID join. Linked daemon request identity/model/policy/window metadata
+  is preserved with its source reference. Actual model input remains unknown when
+  capture does not provide it; captured preceding text is not relabeled as the
+  effective scoring request or reconstructed from display strings.
+- Excluding any member of a scoped competition removes the dependent choice
+  example. Structured payloads contain the whole captured window, so exclusion
+  propagates to sibling groups in that same owned process/window too; a group
+  never re-exports an excluded sibling's candidates from a shared payload.
+  Captured preceding text has no complete source-reference vector; if
+  any exclusion exists at the pinned revision, an example containing such
+  unattributed preceding text is omitted with an explicit dependency reason.
+  This is conservative exclusion, not a text-equality heuristic. No excluded raw
+  evidence is altered. Unknown/ineligible and excluded populations stay separate.
+
+### Jobs, managed artifacts and immutable publication
+
+Managed writes are fixed paths under the validated private archive's `datasets/`
+root, never arbitrary supplied export destinations. Dataset roots are 0700;
+regular artifacts are owner-owned 0600/single-link. Symlinked components, unsafe
+owners/modes, aliases, hardlinks and synchronized destinations fail closed.
+The personal-account threat model above remains (not protection against complete
+malicious same-account replacement). No real private history is read by tests.
+
+One background dataset job runs at a time; another request gets `dataset_busy`.
+Its ID is a hash of archive and bounded operation identity. Persisted request,
+progress and lifecycle states are `pending`, `running`, `succeeded`, `failed`,
+`cancelled`, `unknown`. An acknowledged request is **not a completed freeze**.
+The source/rule/code request digest excludes the operation name: identical pinned
+input/rules produces identical artifact streams even under a new operation ID.
+Reusing one operation with a different pair/rules refuses without rebinding or
+overwriting any successful bytes. Identical retries resolve the original job,
+including its failed/unknown outcome; a deliberate new operation is needed for
+a new attempt. There is no automatic background retry or capture-policy change.
+
+Each job reserves/registers three JSONL views/maps plus `manifest.json`, their
+owner-relative fixed paths, source identity/range/revision dependencies, sizes,
+SHA-256 checksums and lifecycle. The checksummed partition artifact is the exact
+source-reference dependency map; the manifest binds source-content identity and
+all versions/rules/code identity, counts/reasons/boundaries/overlap. The durable
+`job.json` success descriptor is the single publication/registration marker,
+written only after every complete artifact and its directory have been fsynced.
+There is no interval in which a published successful freeze lacks its registry.
+Corrupt/unsafe dataset state is isolated to dataset errors on collector restart;
+it does not make otherwise valid source capture depend on repairing a freeze.
+
+Failed/cancelled copies are retained and marked incomplete/not-created, not hidden
+as successful output. A crash before publication becomes `unknown` on restart;
+a complete published marker recovers the immutable result. An interruption
+before request acknowledgement is an explicitly unacknowledged unknown orphan,
+not an empty/successful request. It cannot be rebound by retry. Any uncertain
+late publication durability remains unknown until restart. No cleanup, backup,
+delete, restore, unlearning or automatic retraining is implemented; this registry
+is input to future lifecycle work, not authority for it.
+
+Cancellation is explicit and supported before publication; after publication it
+is refused. EOF/closing a TUI only detaches the observer and leaves the collector,
+job and recording policy alone. A completed freeze is never regenerated by
+verify, renamed over a previous success, or silently upgraded on append/restart.
+
+### Verification, current exclusions and errors
+
+`verify` is model-free **semantic** verification: manifest/version/identity,
+safe fixed relative paths, registry/dependencies, sizes/checksums and regenerated
+partition/provenance/admission streams bound to the exact source/annotation pair.
+Recomputation hashes streams without creating new private copies or repairing
+the freeze. Missing source is `dataset_source_unavailable`; corrupt/tampered
+state is `dataset_corrupt`; unsupported source/tool versions/code identity are
+`dataset_incompatible`; bounds are `dataset_bound`. Foreign/stale annotation
+references retain their established errors. `unusable` is legal data, not a
+verification failure. Artifact-integrity-only success is not exposed.
+
+Status/list/preview compute current-policy compatibility separately from frozen
+bytes. Any new archive exclusion conservatively invalidates default candidacy,
+including possible unknown captured-context dependencies outside the selected
+range. Exclusion drift during a compatibility scan yields unknown/not-default,
+never false current consistency. Missing/changed source similarly prevents a
+default-candidate claim. Old frozen targets/manifests remain untouched; regenerate
+under a new deliberate operation/revision. No claim of model unlearning follows.
+
+### Bounds, privacy and commands
+
+Per selected input: at most 65,536 payload-free source metadata entries, O(S)
+scoped interval/identity/hash metadata, sorted interval work O(S log S), two
+streamed source passes, at most 64 reference entries per page, one source payload
+of at most 131,072 stored bytes (larger legal captures refuse with `dataset_bound`)
+plus a configured bounded captured-window expansion (default 256 observations,
+using the existing group-member bound) and at most 8 MiB per
+output line. Group expansion beyond its bound is explicitly ineligible and the
+freeze outcome is `bounded_unusable`, never a truncated complete dataset.
+More source rows fail `dataset_bound`. There are at most 1,024 owned jobs;
+listing pages at most 64 descriptors; private pages at most four rows and 1 MiB
+response content (also subject to the existing Interface frame/page bound).
+Cursor-like positions store no payload/history copies. Disk scans, whole jobs
+and TUI waits never hold the collector admission lock. Query/annotation group
+bounds are unchanged. Source/annotation metadata and disk growth are **not** a
+total-RAM or retention bound; finite 256/4096 high-fanout work samples are not a
+quiet-machine latency guarantee.
+
+Ordinary output/errors/status are aggregate/content-free. Private detail is a
+separate explicit operation, JSON/terminal-escaped; test-partition detail is
+hidden unless separately opted in. No target text is required in process argv.
+Use the bounded owner-only private file/stdin input helper for a snapshot.
+There is no default live root or automatic collector start:
+
+```sh
+"$PYTHON" -m archive --socket "$SOCKET" datasets snapshot
+"$PYTHON" -m archive --socket "$SOCKET" datasets preview
+# pair.json contains ONLY the returned snapshot object, not the response wrapper.
+"$PYTHON" -m archive --socket "$SOCKET" datasets create \
+  --operation-id deliberate-freeze-1 --input-file "$PRIVATE/pair.json"
+"$PYTHON" -m archive --socket "$SOCKET" datasets list
+"$PYTHON" -m archive --socket "$SOCKET" datasets status --job-id "$JOB"
+"$PYTHON" -m archive --socket "$SOCKET" datasets verify --job-id "$JOB"
+"$PYTHON" -m archive --socket "$SOCKET" datasets cancel --job-id "$JOB"
+"$PYTHON" -m archive --socket "$SOCKET" datasets private --job-id "$JOB" \
+  --artifact corpus.jsonl --page-size 1 --private-detail
+# --include-test is a separate deliberate private-test access opt-in.
+```
+
+TUI commands: `datasets`, `dataset-preview`, `dataset-create OPERATION_ID`
+(uses the preview's pinned pair), `dataset-status JOB`, `dataset-verify JOB`,
+`dataset-cancel JOB`, and `dataset-private JOB ARTIFACT [include-test]`.
+Every command exposes the actual pending/running/failure state, not success on
+request save; errors do not echo hostile supplied values. No five-view redesign.
+
+```sh
+"$PYTHON" tools/check_input_archive_datasets.py --self-test
+"$PYTHON" tools/check_input_archive_datasets.py --suite contract \
+  --root "$PRIVATE/fresh-datasets-run" --report "$PRIVATE/datasets.json"
+```
+
+The checker uses genuine collector/Interface/CLI/TUI, invented Simplified-Chinese
+fixtures, model/network tripwires, pinned append/restart, whole-segment controls,
+two-view provenance, exclusions, deterministic bytes, tamper/unsafe references,
+publication crashes/disk faults, cancellation/detach and finite 256/4096 resource/
+work controls. Required cases never skip; helper self-tests supplement them.
+Reports bind source/rules/runtime and retained private artifacts without text.
+Baseline source-built native/model-free/foundation/plugin/passive-daemon/query/
+annotation gates remain required. Only the inherited absent-model skips apply.
+**Merge never enables capture.**

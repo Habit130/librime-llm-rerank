@@ -129,12 +129,24 @@ def main(argv=None):
     ann.add_argument("--page-size", type=int)
     ann.add_argument("--cursor-token", default="")
     ann.add_argument("--private-detail", action="store_true")
+    datasets = sub.add_parser("datasets")
+    datasets.add_argument("action", choices=("snapshot", "preview", "create", "list", "status", "verify", "cancel", "private"))
+    datasets.add_argument("--job-id")
+    datasets.add_argument("--operation-id")
+    datasets.add_argument("--input-file")
+    datasets.add_argument("--after", type=int, default=0)
+    datasets.add_argument("--page-size", type=int, default=20)
+    datasets.add_argument("--artifact", choices=("partition.jsonl", "corpus.jsonl", "choice.jsonl"))
+    datasets.add_argument("--private-detail", action="store_true")
+    datasets.add_argument("--include-test", action="store_true")
     args = parser.parse_args(argv)
-    if args.command in ("annotations", "tui") and (not math.isfinite(args.timeout) or args.timeout <= 0):
+    if args.command in ("annotations", "tui", "datasets") and (not math.isfinite(args.timeout) or args.timeout <= 0):
         sys.stderr.write("code=invalid_request\ncontent_included=false\n")
         return 2
     if args.command == "annotations":
         return _annotations(args)
+    if args.command == "datasets":
+        return _datasets(args)
     if args.command == "collector" and args.collector_command == "start":
         return _start(args)
     if args.command == "collector" and args.collector_command == "stop":
@@ -153,6 +165,29 @@ def main(argv=None):
         return _tui(args)
     parser.print_help(sys.stderr)
     return 2
+
+
+def _datasets(args):
+    from archive.annotation_adapter import read_private_json
+    from archive.dataset_adapter import render
+    from archive.interface import failure
+    try:
+        kwargs = {}
+        if args.input_file:
+            kwargs["snapshot"] = read_private_json(stream=sys.stdin, path=args.input_file)
+        if args.action == "create":
+            kwargs["operation_id"] = args.operation_id
+        if args.action in ("status", "verify", "cancel", "private"):
+            kwargs["job_id"] = args.job_id
+        if args.action in ("list", "private"):
+            kwargs.update(after=args.after, page_size=args.page_size)
+        if args.action == "private":
+            kwargs.update(artifact=args.artifact, private_detail=args.private_detail, include_test=args.include_test)
+        response = _client(args).datasets(args.action, **kwargs)
+    except (OSError, ValueError, InterfaceError, UnsafeRoot) as exc:
+        response = failure("dataset", "", getattr(exc, "code", "invalid_request"))
+    sys.stdout.write(render(response, args.private_detail))
+    return 0 if response.get("ok") else 2
 
 
 def _add_collector_flags(parser):
