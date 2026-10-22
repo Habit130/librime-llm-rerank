@@ -39,6 +39,7 @@ from archive.interface import (
 )
 from archive.limits import resolve
 from archive import annotations
+from archive.datasets import DatasetStore
 from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
 from archive.querying import (
     QUERY_VERSION,
@@ -699,6 +700,9 @@ class Collector(object):
         self._annotations = annotations.AnnotationStore(root)
         self._annotation_sources = {}
         self._annotation_groups = {}
+        self._dataset_windows = {}
+
+        self._datasets = DatasetStore(self)
 
     def prepare(self):
         ensure_private_dir(self.root)
@@ -712,6 +716,7 @@ class Collector(object):
             self._prepare_files()
             self._rebuild_index()
             self._annotations.prepare()
+            self._datasets.prepare()
             self._persist_state()
         except BaseException:
             # Ownership precedes every managed read and mutation, so a refused
@@ -924,6 +929,7 @@ class Collector(object):
         self._join_state = _fresh_join_state()
         self._annotation_sources = {}
         self._annotation_groups = {}
+        self._dataset_windows = {}
         if not os.path.exists(self.observations_path):
             return
         offset_limit = int(self._state.get("durable_offset", 0))
@@ -992,6 +998,9 @@ class Collector(object):
         source_key = (record.get("source_instance_id"), record.get("source_local_sequence"))
         self._annotation_sources.setdefault(source_key, []).append(self._index[-1])
         plugin = record.get("plugin") or {}
+        if plugin.get("window_id"):
+            window_key = (record.get("source_instance_id"), record.get("process_id"), plugin["window_id"])
+            self._dataset_windows.setdefault(window_key, []).append(self._index[-1])
         if plugin.get("window_id") and plugin.get("group_id"):
             group_key = (record.get("source_instance_id"), record.get("process_id"), plugin["window_id"], plugin["group_id"])
             self._annotation_groups.setdefault(group_key, []).append(self._index[-1])
@@ -1133,9 +1142,25 @@ class Collector(object):
         if request.get("envelope_version") != ENVELOPE_VERSION:
             return failure(op, request_id, "unsupported_version")
         content = request.get("content_version", CONTENT_VERSION)
-        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query"}:
+        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query", "dataset"}:
             return failure(op, request_id, "unsupported_version")
         body = request.get("body") if isinstance(request.get("body"), dict) else {}
+        if op == "dataset":
+            try:
+                result = self._datasets.call(body)
+                response = self._ok(op, request_id, result)
+                private = result.get("content_included", False)
+                response["content_included"] = private
+                response["body"]["content_included"] = private
+                if len(encode_frame(response)) > self.limits["query_page_bytes_max"]:
+                    return failure(op, request_id, "page_bytes_bound")
+                return response
+            except InterfaceError as exc:
+                return failure(op, request_id, exc.code)
+            except UnsafeRoot:
+                return failure(op, request_id, "unsafe_root")
+            except (OSError, ValueError, TypeError, KeyError):
+                return failure(op, request_id, "dataset_corrupt")
         if op in {"annotation_edit", "annotation_query"}:
             try:
                 if op == "annotation_edit":
@@ -2486,7 +2511,7 @@ class Collector(object):
             return timing, None
         return None, "timing_payload_absent"
 
-    def _annotation_source(self, reference, prefix=None):
+    def _annotation_source(self, reference, prefix=None, include_choice=True):
         """Validate a single published record outside the admission lock."""
         self._annotations._reference_shape(reference)
         with self._lock:
@@ -2519,6 +2544,8 @@ class Collector(object):
                 raise ValueError()
         except (ValueError, TypeError, UnicodeError):
             raise InterfaceError("annotation_source_mismatch")
+        if not include_choice:
+            return {"record": record, "reference": reference, "observed_target": annotations.observed_target(record), "choice": None}
         plugin = entry.get("plugin") or {}
         group_key = (entry.get("source_instance_id"), entry.get("process_id"), plugin.get("window_id"), plugin.get("group_id"))
         with self._lock:
@@ -2532,6 +2559,45 @@ class Collector(object):
             if len(groups) == 1:
                 choice = groups[0]
         return {"record": record, "reference": reference, "observed_target": annotations.observed_target(record), "choice": choice}
+
+    def _dataset_refs(self, after, prefix, size):
+        """Copy one metadata page; never scan payloads under admission lock."""
+        with self._lock:
+            if prefix > self._state["durable_seq"]:
+                raise InterfaceError("dataset_source_unavailable")
+            lo, hi = 0, len(self._index)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if self._index[mid]["durable_seq"] <= after:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return [self._dataset_reference(entry) for entry in self._index[lo:lo + size]
+                    if entry["durable_seq"] <= prefix]
+
+    def _dataset_reference(self, entry):
+        return {"archive_id": self._annotations.archive_id, "source_instance_id": entry["source_instance_id"],
+                "source_local_sequence": entry["source_local_sequence"], "durable_seq": entry["durable_seq"],
+                "record_digest": entry["record_digest"]}
+
+    def _dataset_source(self, reference, prefix, record_bytes_max, include_choice=True):
+        with self._lock:
+            entries = self._annotation_sources.get((reference["source_instance_id"], reference["source_local_sequence"]), ())
+            for entry in entries[:2]:
+                if entry["durable_seq"] <= prefix and entry["length"] > record_bytes_max:
+                    raise InterfaceError("dataset_bound")
+        return self._annotation_source(reference, prefix, include_choice=include_choice)
+
+    def _dataset_window_refs(self, record, prefix):
+        plugin = record.get("plugin") or {}
+        if not plugin.get("window_id"):
+            return None
+        key = (record["source_instance_id"], record.get("process_id"), plugin["window_id"])
+        with self._lock:
+            rows = self._dataset_windows.get(key, ())
+            limit = self.limits["query_group_members_max"]
+            refs = [self._dataset_reference(entry) for entry in rows[:limit + 1] if entry["durable_seq"] <= prefix]
+            return refs if len(refs) <= limit else None
 
     def _annotation_query(self, body):
         allowed = {"annotation_version", "source_reference", "as_of_durable_seq", "annotation_revision", "page_size", "cursor_token", "private_detail", "archive_id"}

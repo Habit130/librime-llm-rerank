@@ -21,6 +21,7 @@ class TuiSession(object):
         self.stopped = False
         self.annotation_page = None
         self.annotation_selection = None
+        self.dataset_snapshot = None
 
     def run(self):
         self._overview()
@@ -40,7 +41,9 @@ class TuiSession(object):
             return
         parts = line.split()
         command = parts[0]
-        if command.startswith("annotation"):
+        if command.startswith("dataset"):
+            self._dataset_command(parts)
+        elif command.startswith("annotation"):
             self._annotation_command(parts)
         elif command == "overview":
             self._overview()
@@ -58,6 +61,35 @@ class TuiSession(object):
             self.stopped = True
         else:
             self.stdout.write("SCREEN error\ncode=invalid_request\ncontent_included=false\n")
+
+    def _dataset_command(self, parts):
+        from archive.dataset_adapter import render
+        from archive.interface import InterfaceError, failure
+        private = False
+        try:
+            command = parts[0]
+            if command == "datasets" and len(parts) == 1:
+                response = self.client.datasets("list")
+            elif command == "dataset-preview" and len(parts) == 1:
+                response = self.client.datasets("preview")
+                if response.get("ok"):
+                    self.dataset_snapshot = response["body"]["source"]
+            elif command == "dataset-create" and len(parts) == 2 and self.dataset_snapshot:
+                response = self.client.datasets("create", operation_id=parts[1], snapshot=self.dataset_snapshot)
+            elif command in ("dataset-status", "dataset-verify", "dataset-cancel") and len(parts) == 2:
+                response = self.client.datasets(command.split("-")[1], job_id=parts[1])
+            elif command == "dataset-private" and len(parts) in (3, 4):
+                if len(parts) == 4 and parts[3] != "include-test":
+                    raise InterfaceError("invalid_request")
+                private = True
+                response = self.client.datasets("private", job_id=parts[1], artifact=parts[2], private_detail=True, include_test=len(parts) == 4, page_size=1)
+            else:
+                raise InterfaceError("invalid_request")
+        except (ValueError, InterfaceError) as exc:
+            response = failure("dataset", "", getattr(exc, "code", "invalid_request"))
+        self.stdout.write("SCREEN datasets\n")
+        self.stdout.write(render(response, private))
+        self.stdout.flush()
 
     def _annotation_command(self, parts):
         from archive.annotation_adapter import read_private_json, render

@@ -55,6 +55,14 @@ ERROR_MESSAGES = {
     "annotation_operation_conflict": "operation identity was reused with different semantics",
     "annotation_revision_unknown": "annotation snapshot revision or source prefix is unknown",
     "annotation_input_bound": "annotation input exceeds the documented bound",
+    "dataset_incompatible": "dataset version is not supported",
+    "dataset_corrupt": "dataset identity or content is inconsistent",
+    "dataset_source_unavailable": "pinned dataset source is unavailable",
+    "dataset_bound": "dataset exceeds the declared bound",
+    "dataset_operation_conflict": "dataset operation identity has different semantics",
+    "dataset_busy": "a dataset job is already running",
+    "dataset_already_published": "published immutable dataset cannot be cancelled",
+    "dataset_not_published": "dataset is not a published successful freeze",
 }
 
 CONTENT_KEYS = {
@@ -343,6 +351,10 @@ class Client(object):
 
     def status(self):
         return self.call("status")
+
+    def datasets(self, action, **kwargs):
+        from archive.datasets import VERSION
+        return self.call("dataset", {"dataset_version": VERSION, "action": action, **kwargs})
 
     def query(self, view, **kwargs):
         body = {"view": view}
