@@ -1403,8 +1403,12 @@ prospective-confirmation claim follows from any ratio or historical test file.
   ineligible examples/reasons. It preserves the shared #192 group projection and
   actual structured competition/emission/commit payloads, input, span, category,
   captured member indexes, Merge Order and Emission Order. Structured membership,
-  span/category, counts, permutations and original target must agree; conflicting
-  member identities, absent fields, unknown/truncated competition, default weak
+  span/category, counts, permutations and original target must agree.
+  Missing/ill-typed span/category/input/member text/Merge Order or non-integer
+  order indexes cannot serve as complete structured competition. Boolean indexes
+  are not integers. Captured group `plan_complete` must be explicitly true, in
+  addition to (never instead of) the shared group-members-and-target coverage basis.
+  Conflicting member identities, absent fields, unknown/truncated competition, default weak
   labels, retraction/exclusion and outside/changed human targets are not ranking
   evidence. Unselected candidates receive no invented negative labels.
 - Actual observed native request/plan relations use `RelationContext`, not a plan,

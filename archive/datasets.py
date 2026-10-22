@@ -36,6 +36,15 @@ def sha(value):
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+def known_text(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= SOURCE_LINE
+    except UnicodeError:
+        return False
+
+
 def check_dir(path):
     validate_root(str(path))
     st = os.lstat(path)
@@ -608,15 +617,22 @@ class DatasetStore:
             if not isinstance(payload, dict): continue
             candidates, groups = payload.get("candidates"), payload.get("groups")
             if not isinstance(candidates, list) or not isinstance(groups, list): continue
+            if not known_text(payload.get("input")): continue
             for group in groups:
                 if not isinstance(group, dict) or group.get("identity") != plugin.get("group_id"): continue
+                if (type(group.get("start")) is not int or type(group.get("end")) is not int
+                        or not 0 <= group["start"] <= group["end"] or not known_text(group.get("category"))
+                        or group.get("plan_complete") is not True): continue
                 indexes = group.get("member_indexes")
                 if not isinstance(indexes, list) or not indexes or any(type(i) is not int or i < 0 or i >= len(candidates) for i in indexes) or len(set(indexes)) != len(indexes): continue
                 members = [candidates[i] for i in indexes]
                 if any(not isinstance(m, dict) or (m.get("start"), m.get("end"), m.get("category")) != (group.get("start"), group.get("end"), group.get("category")) for m in members): continue
+                if any(type(m.get("start")) is not int or type(m.get("end")) is not int
+                       or not known_text(m.get("text")) or type(m.get("merge_order")) is not int
+                       or m["merge_order"] < 0 for m in members): continue
                 if len(indexes) != plugin.get("group_member_count"): continue
                 if private_target(source) not in [m.get("text") for m in members]: continue
-                if not all(isinstance(payload.get(name), list) and sorted(payload[name]) == list(range(len(candidates))) for name in ("upstream_order", "emission_order")): continue
+                if not all(isinstance(payload.get(name), list) and all(type(i) is int for i in payload[name]) and sorted(payload[name]) == list(range(len(candidates))) for name in ("upstream_order", "emission_order")): continue
                 complete.append(sha({"members": [{k: m.get(k) for k in ("text", "start", "end", "category", "merge_order")} for m in members], "span": [group.get("start"), group.get("end")], "category": group.get("category")}))
         if not complete: reasons.append("structured_members_orders_target_unavailable")
         if len(set(complete)) > 1: reasons.append("conflicting_structured_members")

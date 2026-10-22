@@ -270,12 +270,18 @@ def choice(f):
     corrected=artifact_rows(f,third,"choice.jsonl")
     require(all(not x["eligible"] for x in corrected),"outside_correction_eligible")
     controls=[]
-    for label in ("missing","mixed_span_category","truncated","target_absent","retracted","cancelled","conflicting","sibling_excluded","context_excluded"):
+    for label in ("missing","partial_identity","missing_member_text","missing_merge_order","malformed_orders","mixed_span_category","truncated","target_absent","retracted","cancelled","conflicting","sibling_excluded","context_excluded"):
         fixture=Fixture(f.root/label)
         try:
             captured=json.loads(json.dumps(payload))
             common=dict(continuity_segment_id="ps0",window_id="window",group_id="group",coverage="complete",coverage_basis="captured_group_members_and_target",target_membership="present",captured_candidate_count=2,group_member_count=2,payload=captured)
             if label=="missing": common["payload"]={"text":TEXT}
+            if label=="partial_identity":
+                for item in [captured["groups"][0],*captured["candidates"]]:
+                    for field in ("start","end","category"): item.pop(field)
+            if label=="missing_member_text": captured["candidates"][1]["text"]=None
+            if label=="missing_merge_order": captured["candidates"][1].pop("merge_order")
+            if label=="malformed_orders": captured["upstream_order"]=[False,1]
             if label=="mixed_span_category": captured["candidates"][1]["category"]="completion"
             if label=="truncated": common.update(coverage="incomplete",coverage_basis="unspecified",target_membership="unknown",truncated=True)
             if label=="target_absent": common["target_membership"]="absent"
