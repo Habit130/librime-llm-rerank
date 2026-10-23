@@ -147,6 +147,14 @@ default training candidate. Failed cleanup remains a registered residual with
 revision survive restore and restart. A fresh continuity boundary follows restore;
 no paused/refused/unknown interval is backfilled.
 
+Historical crash-tail/loss/discard metadata is separately reported as bounded
+`management.restored_source_quality` (at most 128 point summaries), not replaced
+with the new collector's clean/current-tail label. Cleanup retries recheck each
+confirmed old file's exact size/checksum; a later different file at that name is
+left untouched and reported `changed_replacement_refused`. After cutover, use the
+compatible collector for this namespace: downgrading to a collector that ignores
+the serving/fence authority is unsupported and must not be used to bypass fences.
+
 Historical archive/source/observation IDs remain original. Query cursors still bind
 collector epoch. After restore, content query/annotation/edit/dataset requests must
 also explicitly bind `serving_generation`; absent/stale bindings refuse rather than

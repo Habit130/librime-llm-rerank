@@ -712,6 +712,7 @@ class Collector(object):
         self._maintenance_unavailable = False
         self._management = Management(self)
         self._historical_dataset_ids = set()
+        self._restored_source_quality = []
 
     def prepare(self):
         if os.path.lexists(self.root):
@@ -901,6 +902,7 @@ class Collector(object):
             "admission_refused_units": 0,
             "discarded_quarantine_bytes": 0,
             "management_namespace": (self._management.authority.value or {}).get("namespace"),
+            "restored_source_quality": self._restored_source_quality,
         }
 
     def _reconcile_file(self, path, watermark):

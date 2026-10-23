@@ -20,6 +20,9 @@ PAGE = 32
 
 
 def directory(path):
+    raw = os.fspath(path)
+    if not os.path.isabs(raw) or os.path.normpath(raw) != raw:
+        raise UnsafeRoot("management_root_alias")
     path = Path(path)
     validate_root(str(path))
     st = path.lstat()

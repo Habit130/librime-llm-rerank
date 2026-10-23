@@ -474,6 +474,13 @@ def faults(root, native):
             results[phase] = {"exit": exit_code, "job": job or retry["job_id"], "retry_state": retry["state"],
                               "durable_seq": current["durable_seq"], "generation": current["management"]["serving_generation"],
                               "primary_child_log": str(f.log)}
+            if phase == "before_backup_commit":
+                require(current["crash_tail"] == "unknown", "genuine_crash_quality_fixture")
+                historical, _ = f.backup("post-crash-source")
+                f.restore(historical, operation="restore-crash-quality")
+                source_quality = body(f.client.status())["management"]["restored_source_quality"]
+                require(source_quality[-1]["crash_tail"] == "unknown", "historical_unknown_quality_lost")
+                results[phase]["restored_source_crash_tail"] = source_quality[-1]["crash_tail"]
     # Real short-write and fsync/cleanup failure controls are contained to owned
     # fixture I/O, with no product/global fault switch exposed to Adapters.
     with fixture(root.parent / (root.name + "disk")) as f:
@@ -498,6 +505,13 @@ def faults(root, native):
         f.collector._management.hook = lambda phase: (_ for _ in ()).throw(OSError("cleanup_fault")) if phase == "before_cleanup" else None
         restore, status = f.restore(backup, "discard-replaced-current", "cleanup-fault")
         require(status["cleanup"] == "incomplete_registered_residuals", "cleanup_lie")
+        changed = f.root / "observations.jsonl"
+        changed.write_bytes("虚构后来替换的内容".encode())
+        changed_hash = hashlib.sha256(changed.read_bytes()).hexdigest()
+        f.restart()
+        require(changed.exists() and hashlib.sha256(changed.read_bytes()).hexdigest() == changed_hash, "cleanup_retry_deleted_changed_file")
+        registry = f.m("registry", job_id=restore)
+        require(any(item["state"] == "changed_replacement_refused" for item in registry["registry"]), "changed_replacement_not_reported")
         results["disk"] = {"short_write": result, "cleanup": status["cleanup"], "job": restore}
     for index, phase in enumerate(("staging_fsync", "authority_fsync")):
         with fixture(root.parent / (root.name + "sync" + str(index))) as f:

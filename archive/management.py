@@ -16,7 +16,7 @@ import threading
 
 from archive import annotations, datasets
 from archive.interface import CONTENT_VERSION, ERROR_MESSAGES, InterfaceError, canonical_bytes
-from archive.management_authority import Authority, VERSION
+from archive.management_authority import Authority, VERSION, quality_history
 from archive import management_io as io
 from archive.querying import QUERY_VERSION
 from archive.safety import UnsafeRoot, safe_token
@@ -152,7 +152,7 @@ class Management:
             if not isinstance(item, dict) or set(item) != {"owner", "path", "role", "state", "size", "sha256", "dependencies"} or item["owner"] != job_id:
                 raise InterfaceError("management_corrupt")
             io.relative(item["path"])
-            if (item["role"], item["dependencies"]) != expected[item["path"]] or item["state"] not in ("reserved", "published", "incomplete", "not_created", "active_initial_snapshot_checksum", "retained", "replaced_pending_discard", "discarded", "retained_source_unavailable"):
+            if (item["role"], item["dependencies"]) != expected[item["path"]] or item["state"] not in ("reserved", "published", "incomplete", "not_created", "active_initial_snapshot_checksum", "retained", "replaced_pending_discard", "discarded", "retained_source_unavailable", "changed_replacement_refused"):
                 raise InterfaceError("management_corrupt")
             if item["size"] is not None and (type(item["size"]) is not int or not 0 <= item["size"] <= io.MAX_BYTES):
                 raise InterfaceError("management_corrupt")
@@ -252,6 +252,7 @@ class Management:
                 "counts": {"observations": state["durable_seq"], "annotation_revisions": annotation["revision"],
                            "datasets": sum(j["state"] == "succeeded" for _, j in jobs), "files": len(files),
                            "bytes": sum(f["size"] for f in files), "quarantine_bytes": state["quarantine_bytes"]}}
+        quality_history(plan)
         # Recheck after disk scans. No mixed frontier is accepted as a preview.
         with c._content_gate:
             current, current_annotation, current_revision, current_jobs = self._frontier()
@@ -329,13 +330,16 @@ class Management:
             return {**self.summary(job), "replayed": False, "acknowledgement": "durable_request_not_completion"}
 
     def summary(self, job):
+        restore = (job.get("request") or {}).get("kind") == "restore"
+        frontiers = {"restored_frontier": job["request"]["plan"]["backup_plan"]["frontier"],
+                     "replaced_frontier": job["request"]["plan"]["current_plan"]["frontier"]} if restore else {}
         return {"management_version": VERSION, "job_id": job["job_id"], "kind": (job.get("request") or {}).get("kind"),
                 "state": "unknown" if job["job_id"] in self.uncertain else job["state"],
                 "phase": job["phase"], "reason": job["reason"], "request_digest": job["request_digest"],
                 "progress_bytes": job["progress_bytes"], "progress_files": job["progress_files"],
                 "cleanup": job["cleanup"], "registry_count": len(job["registry"]),
                 "irreversible": job["state"] == "succeeded" or job["job_id"] in self.authority.value["committed"],
-                "producer_availability": self.authority.summary(), "content_included": False}
+                "producer_availability": self.authority.summary(), **frontiers, "content_included": False}
 
     def _paths(self, path, name):
         parts = io.relative(name)
@@ -452,6 +456,7 @@ class Management:
     def _verify_content(self, target, plan):
         if plan.get("version") != VERSION or plan.get("content_version") != CONTENT_VERSION or plan.get("query_version") != QUERY_VERSION or plan.get("annotation_version") != annotations.ANNOTATION_VERSION or plan.get("dataset_version") != datasets.VERSION or plan.get("code_identity") != code_identity():
             raise InterfaceError("management_unsupported")
+        quality_history(plan)  # preflight validates historical metadata before switch
         files = plan.get("files")
         if not isinstance(files, list) or len(files) > io.MAX_FILES or len({f["path"] for f in files}) != len(files):
             raise InterfaceError("management_bound")
@@ -629,6 +634,10 @@ class Management:
                 path = old / name
                 if os.path.lexists(path):
                     io.regular(path)
+                    entry = next(item for item in job["registry"] if item["path"] == "replaced/" + name)
+                    if io.measure(path) != {"size": entry["size"], "sha256": entry["sha256"]}:
+                        entry["state"] = "changed_replacement_refused"
+                        raise UnsafeRoot("confirmed_replacement_changed")
                     os.unlink(path)
                     io.sync(old)
                 for entry in job["registry"]:

@@ -1064,6 +1064,12 @@ class ContractSuite(object):
         if _scan_root_for(main["root"], ["genuine-refusal-191"]):
             raise CheckFailure("refused_content_persisted")
         _enable_capture(main["client"])
+        # The synthetic direct source now participates via v2 registration and
+        # explicitly acknowledges the resume reply it just received. The real
+        # daemon producer still has to perform its independent current poll.
+        revision = _body(main["client"].status())["desired_revision"]
+        _body(main["client"].call("policy_observe", {
+            "source_instance_id": refused_frame["source_instance_id"], "observed_revision": revision}))
         _await_producer_effective(main["client"])
         admitted_frame = _frame("request", 101)
         admitted_frame["payload"] = {

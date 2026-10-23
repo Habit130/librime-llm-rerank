@@ -14,6 +14,30 @@ from archive.safety import safe_token
 VERSION = "input-archive-management-v1"
 MAX_SOURCES = 8192
 MAX_AUTHORITY_BYTES = 2 * 1048576
+QUALITY_FIELDS = ("crash_tail", "discarded_unpublished_bytes", "discarded_quarantine_bytes",
+                  "known_dropped_units", "storage_failed_units", "capacity_refused_units",
+                  "identity_conflicts", "admission_refused_units")
+
+
+def quality_history(plan):
+    """Bounded historical quality, distinct from the current collector's tail."""
+    state, frontier = plan["generated"]["state.json"], plan["frontier"]
+    if any(type(state.get(key)) is not bool for key in ("clean_stop", "capacity_stop", "storage_failure")):
+        raise InterfaceError("management_corrupt")
+    prior = state.get("restored_source_quality", [])
+    if not isinstance(prior, list) or len(prior) >= 128:
+        raise InterfaceError("management_bound")
+    record = {"archive_id": frontier["archive_id"], "durable_seq": frontier["durable_seq"],
+              "annotation_revision": frontier["annotation_revision"], "source_serving_generation": frontier["serving_generation"],
+              **{key: state[key] for key in QUALITY_FIELDS}}
+    keys = {"archive_id", "durable_seq", "annotation_revision", "source_serving_generation", *QUALITY_FIELDS}
+    for item in [*prior, record]:
+        if not isinstance(item, dict) or set(item) != keys or item["crash_tail"] not in ("none", "unknown"):
+            raise InterfaceError("management_corrupt")
+        identifier(item["archive_id"], 32)
+        if any(type(item[key]) is not int or item[key] < 0 for key in keys - {"archive_id", "crash_tail"}):
+            raise InterfaceError("management_corrupt")
+    return [*prior, record]
 
 
 class Authority:
@@ -102,10 +126,12 @@ class Authority:
         c._annotations = AnnotationStore(str(content))
         c._datasets.root = content / "datasets"
         c._historical_dataset_ids = set()
+        c._restored_source_quality = []
         if serving is not None:
             manifest = read_json(content / "manifest.json")
             if manifest.get("version") != VERSION:
                 raise InterfaceError("management_unsupported")
+            c._restored_source_quality = quality_history(manifest["plan"])
             files = manifest["plan"]["files"]
             if not isinstance(files, list) or len(files) > 8192:
                 raise InterfaceError("management_bound")
@@ -195,6 +221,7 @@ class Authority:
                 "authority_available": not self.failed, "registered_sources": len(value["sources"]),
                 "fenced_sources": fenced, "source_bound": MAX_SOURCES,
                 "authority_bytes_bound": MAX_AUTHORITY_BYTES,
+                "restored_source_quality": self.collector._restored_source_quality,
                 "producer_recreation_required": bool(fenced),
                 "capture_recovery": "producer_recreation_new_source_identity_required" if fenced else "current_registration_required"}
 
