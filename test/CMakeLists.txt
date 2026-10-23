@@ -53,4 +53,14 @@ if(NOT (WIN32 AND BUILD_SHARED_LIBS))
   add_test(NAME llm_rerank_test
     COMMAND llm_rerank_test
     WORKING_DIRECTORY ${EXECUTABLE_OUTPUT_PATH})
+
+  # Interactive finite management-contract driver using the production native
+  # producer. No alternate serializer, source format or input-path behavior.
+  add_executable(llm_rerank_management_producer_probe
+    management_producer_probe.cc
+    $<TARGET_OBJECTS:rime-llm-rerank-objs>)
+  target_link_libraries(llm_rerank_management_producer_probe ${rime_library} sqlite3)
+  if(BUILD_SHARED_LIBS)
+    target_compile_definitions(llm_rerank_management_producer_probe PRIVATE RIME_IMPORTS)
+  endif()
 endif()

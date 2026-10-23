@@ -31,7 +31,7 @@ DAEMON_DIR = os.path.join(REPO, "daemon")
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from archive import Client  # noqa: E402
+from archive_fixture_client import RegisteredFixtureClient as Client  # noqa: E402
 from archive.interface import strip_content  # noqa: E402
 from archive.safety import safe_token  # noqa: E402
 

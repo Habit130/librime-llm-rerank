@@ -26,7 +26,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from archive import Client, Producer  # noqa: E402
+from archive import Producer  # noqa: E402
+from archive_fixture_client import RegisteredFixtureClient as Client  # noqa: E402
 from archive.collector import Collector  # noqa: E402
 from archive.interface import (  # noqa: E402
     INTERFACE_VERSION,
@@ -169,16 +170,21 @@ def _oversize_boundary_trial():
     canonical semantic size with the collector's own prepare path, then drives
     the real `_accept_one` refusal branch twice: once on the exact boundary
     fixture, and once on a fixture shrunk well inside the limit as a control.
-    Never starts a collector and never writes storage.
+    Uses a fresh private collector root and supported policy registration. Does
+    not start publication or reuse another test's archive.
     """
-    trial = object.__new__(Collector)
-    trial.limits = dict(DEFAULTS)
-    trial._lock = threading.Lock()
-    trial._cv = threading.Condition(trial._lock)
-    trial._policy = {"revision": 1, "desired": "enabled"}
-    trial._queue = []
-    trial._queue_bytes = 0
-    trial._identities = {}
+    parent = os.path.join(REPO, ".local-work")
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    root = tempfile.mkdtemp(prefix="foundation-boundary-", dir=parent)
+    trial = Collector(root, os.path.join(root, "collector.sock"), dict(DEFAULTS))
+    trial.prepare()
+    def dispatch(op, body):
+        response = trial._dispatch({"interface_version": INTERFACE_VERSION, "envelope_version": 1,
+                                    "content_version": 1, "op": op, "body": body})
+        if not response.get("ok"):
+            raise CheckFailure("boundary_registration_failed")
+    dispatch("set_policy", {"desired": "enabled", "expected_revision": 0})
+    dispatch("policy_observe", {"source_instance_id": "self-test-oversize", "observed_revision": 1})
 
     def run(units):
         trial._state = Collector._fresh_state(trial, "none", [])
@@ -195,13 +201,16 @@ def _oversize_boundary_trial():
             refused_units = trial._state["admission_refused_units"]
         return budget[0], canonical, code, refused_units
 
-    raw, canonical, code, refused_units = run(OVERSIZE_UNITS)
-    accounted = code == "event_too_large" and refused_units == 1
-    # Control: a fixture well inside the limit must not be refused at all, so the
-    # boundary trial above cannot pass by refusing everything.
-    _raw_small, _canon_small, small_code, small_refused = run(64)
-    unrefused_inside_limit = small_code != "event_too_large" and small_refused == 0
-    return raw, canonical, accounted, unrefused_inside_limit
+    try:
+        raw, canonical, code, refused_units = run(OVERSIZE_UNITS)
+        accounted = code == "event_too_large" and refused_units == 1
+        # A control must really admit after supported registration, not merely
+        # return some new unrelated refusal instead of event_too_large.
+        _raw_small, _canon_small, small_code, small_refused = run(64)
+        unrefused_inside_limit = small_code == "admitted" and small_refused == 0
+        return raw, canonical, accounted, unrefused_inside_limit
+    finally:
+        trial.release_ownership()
 
 
 def contains_marker(text, marker):

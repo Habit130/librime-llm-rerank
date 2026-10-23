@@ -309,6 +309,7 @@ class AnnotationStore:
 
     def effective(self, ref, revision):
         """Caller holds store lock; <=4 single-row reads, O(log H) per kind."""
+        from archive.management_io import open_read
         found = {}
         for kind in KINDS:
             history = self.history.get((ref["source_instance_id"], ref["source_local_sequence"], kind), [])
@@ -316,8 +317,9 @@ class AnnotationStore:
             if position < 0:
                 continue
             rev, offset, length, row_hash = history[position]
-            fd = open_nofollow(self.journal_path, os.O_RDONLY)
-            with os.fdopen(fd, "rb") as handle:
+            # Semantic backup verification shares this projection. Reads must
+            # not invoke the legacy open helper's permission-repair fchmod.
+            with open_read(self.journal_path) as handle:
                 handle.seek(offset)
                 raw = handle.read(length)
             try:

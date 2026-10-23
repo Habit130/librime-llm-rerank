@@ -39,7 +39,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
-from archive import Client  # noqa: E402
+from archive_fixture_client import RegisteredFixtureClient as Client  # noqa: E402
 from archive.interface import encode_frame  # noqa: E402
 from archive.querying import (  # noqa: E402
     QUERY_VERSION,
