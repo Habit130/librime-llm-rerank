@@ -367,6 +367,27 @@ def retention(root, native):
             finally: module.shutil.disk_usage = disk_usage
             error(f.client.management("restore_confirm", operation_id="missing-choice", plan=preview, confirm=True), "invalid_request")
             require(before == hashes(f.root), "preflight_changed_target")
+            if index == 0:
+                entered, release = threading.Event(), threading.Event()
+                read_payload = f.collector._read_payload
+                def held_read(entry):
+                    entered.set(); release.wait(20)
+                    return read_payload(entry)
+                f.collector._read_payload = held_read
+                query_outcome = []
+                reader = threading.Thread(target=lambda: query_outcome.append(f.client.query("process", process_id="process-1", private_detail=True).get("ok")))
+                reader.start()
+                try:
+                    require(entered.wait(5), "genuine_reader_not_held")
+                    refused_job = f.m("restore_confirm", operation_id="held-reader", plan=preview, retention=choice, confirm=True)["job_id"]
+                    refused_status = f.job(refused_job, "failed")
+                    require(refused_status["reason"] == "management_busy", "restore_did_not_refuse_held_reader")
+                    require(before == hashes(f.root), "held_reader_switch_changed_target")
+                finally:
+                    release.set(); reader.join(10)
+                    f.collector._read_payload = read_payload
+                require(query_outcome == [True], "held_reader_did_not_finish_old_state")
+                preview = f.m("restore_preview", job_id=backup)["plan"]
             f.seed(2, source="unconfirmed-later")
             error(f.client.management("restore_confirm", operation_id="stale", plan=preview, retention=choice, confirm=True), "management_stale")
             require(body(f.client.status())["durable_seq"] == 8, "unconfirmed_append_swept")

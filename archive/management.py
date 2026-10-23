@@ -40,7 +40,7 @@ EXCLUDED = {
 
 def code_identity():
     return io.digest({name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                      for name in ("management.py", "management_authority.py", "management_io.py",
+                      for name in ("management.py", "management_authority.py", "management_io.py", "management_gate.py",
                                    "collector.py", "annotations.py", "datasets.py", "querying.py", "interface.py")})
 
 
@@ -180,6 +180,12 @@ class Management:
         return state, annotation, policy_revision, jobs
 
     def preview(self, ignore_job=None):
+        # A shared lease protects the live paths for the entire streaming scan,
+        # without serializing normal readers, edits or producer registration.
+        with self.c._content_gate:
+            return self._preview(ignore_job)
+
+    def _preview(self, ignore_job=None):
         c = self.c
         if self.active is not None and self.active != ignore_job:
             raise InterfaceError("management_busy")
@@ -551,7 +557,7 @@ class Management:
         c = self.c
         # All content readers/writers use this gate. Producer admission does not
         # acquire it: it sees a bounded refusal under the short state lock.
-        if not c._content_gate.acquire(False):
+        if not c._content_gate.begin_transition():
             raise InterfaceError("management_busy")
         policy_locked = publication_locked = False
         try:
@@ -607,7 +613,7 @@ class Management:
                 c._publication_mutex.release()
             if policy_locked:
                 c._policy_lock.release()
-            c._content_gate.release()
+            c._content_gate.end_transition()
 
     def cleanup(self, job):
         if (job.get("request") or {}).get("kind") != "restore" or job["job_id"] not in self.authority.value["committed"]:

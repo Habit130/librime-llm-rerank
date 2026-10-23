@@ -127,6 +127,12 @@ before the switch and the confirmed frontier is rechecked under the shared
 reader/writer/registration/publication transition gate. Input-path admission never
 waits for that gate; it is boundedly refused during the switch.
 
+Ordinary queries, annotation edits, dataset requests and source registration use
+shared content leases, retaining their normal concurrency and store-local CAS
+errors. Only restoration requests a non-waiting exclusive lease. A held genuine
+reader/edit makes that restore busy; normal concurrent edits do not become
+management-busy merely because another ordinary request is in flight.
+
 The sole irreversible restore point is the fsynced atomic `management/control.json`
 serving-pointer, generation and permanent source-fence commit. Its owner namespace
 is anchored outside replaced content in `management-namespace.json` and the current

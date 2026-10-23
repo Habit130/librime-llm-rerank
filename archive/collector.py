@@ -41,6 +41,7 @@ from archive.limits import resolve
 from archive import annotations
 from archive.datasets import DatasetStore
 from archive.management import Management
+from archive.management_gate import ContentGate
 from archive.management_io import directory as management_directory, regular as management_regular, open_read as management_open_read
 from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
 from archive.querying import (
@@ -706,7 +707,7 @@ class Collector(object):
 
         self._datasets = DatasetStore(self)
         self.content_root = root
-        self._content_gate = threading.RLock()
+        self._content_gate = ContentGate()
         self._publication_mutex = threading.Lock()
         self._transition = False
         self._maintenance_unavailable = False

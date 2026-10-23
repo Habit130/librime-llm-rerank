@@ -152,8 +152,10 @@ class Authority:
                 raise InterfaceError("management_incomplete")
         observations = content / "observations.jsonl"
         if serving is None and os.path.lexists(observations) and observations.lstat().st_size:
-            if any(not os.path.lexists(content / name) for name in ("state.json", "annotation-identity.json", "annotation-state.json", "annotations.jsonl")):
+            if not os.path.lexists(content / "state.json"):
                 raise InterfaceError("management_incomplete")
+            if any(not os.path.lexists(content / name) for name in ("annotation-identity.json", "annotation-state.json", "annotations.jsonl")):
+                raise InterfaceError("annotation_state_invalid")
 
     def _write(self, value):
         from archive.interface import canonical_bytes
