@@ -332,7 +332,10 @@ class Client(object):
 
     def call(self, op, body=None, envelope_version=ENVELOPE_VERSION, content_version=CONTENT_VERSION, request_id=""):
         if op in {"query", "annotation_edit", "annotation_query", "dataset"} and self.serving_generation is not None:
-            body = {**(body or {}), "serving_generation": self.serving_generation}
+            body = dict(body or {})
+            # A caller's already-bound old request must remain stale. Explicit
+            # body bindings are never upgraded by a newer Client default.
+            body.setdefault("serving_generation", self.serving_generation)
         request = {
             "interface_version": INTERFACE_VERSION,
             "envelope_version": envelope_version,

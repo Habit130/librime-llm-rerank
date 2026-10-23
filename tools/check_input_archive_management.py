@@ -376,6 +376,7 @@ def retention(root, native):
             require(f.m("verify", job_id=backup)["verified"], "unrelated_backup_deleted")
             stale_client = Client(str(f.root / "collector.sock"))
             error(stale_client.annotations(), "management_stale")
+            error(f.client.annotations(serving_generation=0), "management_stale")
             error(stale_client.query("timeline", cursor_token=old_cursor, page_size=1), "management_stale")
             error(f.client.query("timeline", cursor_token=old_cursor, page_size=1), "cursor_snapshot_unknown")
             if choice == "retain-current": require(old == hashes(f.root), "retention_changed_old_bytes")
