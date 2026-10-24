@@ -8,6 +8,215 @@ or merge.
 CLI and TUI are Adapters. They call the Interface below and do not open
 observation storage.
 
+## Verified backup and explicit historical restore (#195)
+
+`input-archive-management-v1` is an additive collector-owned management Interface.
+It does not import models, score, alter the legacy fact domain, enable capture,
+restart producers or deploy an input method. The desired archive policy remains
+separate from management and producer availability. **Merge never enables capture.**
+
+### Source registration and the supported cutover
+
+The collector durably registers a safe source ID through the existing
+`policy_observe` Interface before returning a usable enabled policy. A direct
+unregistered `admit_batch` cannot register itself: each item is refused with the
+existing terminal `invalid_request` code understood by native producers. Sources
+already present in published history are inventoried at the initial cutover.
+Producer/source wire formats are unchanged. Direct synthetic clients must first
+call `policy_observe` for their actual `source_instance_id`; the contract-checker
+fixture client performs this explicit setup over the same Interface.
+
+Native and Python queues do not carry capture-time serving generation. A policy
+repoll alone cannot establish that delayed queued content was captured after a
+restore. Consequently **all pre-switch registered/known source IDs are permanently
+fenced at restore**. Admission, registration and the serving switch have one
+coherent ordering; accepted unpublished work makes restore busy, rather than
+being silently swept into the replacement. Fences survive policy resume, collector
+restart, repeated historical restoration and source-ID reuse. No fenced ID is
+evicted to make room. Source IDs not previously registered are not retrospectively
+classified using timestamps, PIDs or text; a new producer must establish the
+supported current registration boundary. This is not a same-account forgery
+defense.
+
+An already-running producer **cannot resume capture merely by polling/resuming**.
+Producer recreation with a genuinely new source identity and current registration
+is required. A fenced poll returns non-enabled `desired_policy=off` to the existing
+producer, `registration_code=source_recreation_required`, and the separately named
+`current_desired_policy`. The durable current off/paused/enabled policy and revision
+are not changed to hide the fence. Status counts fenced sources, marks their
+observations ineffective, and does not claim globally effective enabled capture.
+Management CLI/TUI disclose the recreation requirement; no automatic input-method,
+plugin, daemon or service restart is performed.
+
+### Snapshot scope and private layout
+
+`backup preview` is `Client.management("preview")`. Its content-free plan binds
+the historical archive identity, published durable sequence/byte prefix, retained
+annotation revision/chain, dataset frontier, current serving generation, collector
+epoch, policy revision, versions/code identity, relative file names, sizes and
+SHA-256 checksums. It includes published observations, published quarantine bytes,
+quality/incompleteness state, annotation identity and complete retained history,
+and successful registered dataset job/manifest/output bytes and dependencies.
+Incomplete dataset content copies are explicitly inventoried as excluded with
+their lifecycle, bytes and integrity. No partial/failed/cancelled dataset is promoted.
+This is a published-new-archive backup, not a full filesystem/domain backup.
+
+Excluded: unpublished queue/crash tails, locks/sockets/PIDs/logs, derived caches,
+legacy facts/semantic state/traces/old datasets, models/tokenizers/unrelated files,
+and other management backup/retained payloads. There is no recursive backup of
+backups. Current capture policy and non-rollback registration/fence authority are
+not historical restore payloads. A busy publisher, unpublished tail, incompatible
+dependency, advancing frontier or over-bound inventory yields an explicit refusal.
+Later append is never silently added to an already confirmed plan. Long scans,
+copy and verification use bounded buffers outside the admission lock.
+
+All management roots are beneath the validated private owner root:
+`management/jobs/<hashed-operation-id>/backup/` for immutable successful backups;
+`.../restored/` for a distinct mutable restored serving incarnation. Directories
+are `0700`; files are regular, single-link owner `0600` files. Supplied plans never
+resolve arbitrary paths: the collector recomputes their entire supported plan
+before mutation. Symlinks, hardlinks, unsafe ancestors/cloud roots, foreign modes,
+FIFOs/sockets/devices and manifest escapes are refused before opening/mutation.
+Verify never chmods or repairs an input. Private plaintext is not a sandbox against
+same-account compromise, and backup artifacts are not public report attachments.
+
+### Jobs, semantic verification and immutable retry
+
+`management create` acknowledges a fsynced request descriptor, **not completion**.
+IDs hash the owner namespace and operation ID; request digests bind the plan and
+explicit restore choice. Identical retries return the existing durable result;
+conflicting reuse refuses without overwrite. Pending/running/succeeded/failed/
+cancelled/unknown, actual copied bytes/files, irreversible phase and cleanup are
+separate fields. List and registry are paginated. Closing/detaching CLI/TUI does
+not cancel or repeat a job. Explicit cancellation is supported before commit;
+after commit it is refused (`management_committed`). Interrupted precommit jobs
+recover as unknown/incomplete, not successful artifacts, and remain registered.
+
+Each new content file is reserved in `job.json` before creation. Backup success is
+the fsynced atomic descriptor publishing the complete immutable file/dependency
+registry. Staging, partial, cancelled and retained/replaced copies keep their own
+honest lifecycle. Registry `replaced/...` references are owner-relative to the
+descriptor's explicitly recorded `old_content` root, not an arbitrary alias.
+An active restored copy's initial checksum is labeled
+`active_initial_snapshot_checksum`; it is not a claim that later capture leaves a
+mutable serving file byte-identical. Lineage is input for #196, not deletion authority.
+
+Verify reads only the selected registered backup: exact manifest/versions/code,
+safe file set/checksums, publication sequence/offset, original archive identity,
+annotation chain/source references, and recomputed dataset source/annotation/
+partition/admission/output semantics. Its original live source may be absent.
+It never substitutes today's source, normalizes bytes or loads a model. Empty is
+legal. Unsupported, corrupt/tampered, unavailable, incomplete and bounded outcomes
+are not successful semantic availability. Compatibility is exact, including the
+dataset tool's existing code identity; older incompatible code is reported, not
+upgraded by assertion or migrated. SHA-256 is deterministic for the exact pinned
+file bytes. A plan/content identity additionally binds its versions and snapshot
+metadata; it is not a text-only hash invariant across collector epochs. Operation
+IDs/job status/progress are outside immutable backup contents. A changed registry
+frontier is a different declared snapshot, even when raw observation bytes match.
+
+### Restore confirmation, retention and recovery
+
+`restore_preview` fully verifies the selected backup and binds the current target
+frontier, serving incarnation, desired policy revision and managed inventory.
+`restore_confirm` requires that complete plan, `confirm=true` and exactly one of
+`retain-current` or `discard-replaced-current`. No default choice, automatic hidden
+backup, merge or unconfirmed-later-input overwrite exists. Bad/capacity/busy/stale
+preflight leaves current content/policy/binding intact. The staged copy is validated
+before the switch and the confirmed frontier is rechecked under the shared
+reader/writer/registration/publication transition gate. Input-path admission never
+waits for that gate; it is boundedly refused during the switch.
+
+Ordinary queries, annotation edits, dataset requests and source registration use
+shared content leases, retaining their normal concurrency and store-local CAS
+errors. Only restoration requests a non-waiting exclusive lease. A held genuine
+reader/edit makes that restore busy; normal concurrent edits do not become
+management-busy merely because another ordinary request is in flight.
+
+The sole irreversible restore point is the fsynced atomic `management/control.json`
+serving-pointer, generation and permanent source-fence commit. Its owner namespace
+is anchored outside replaced content in `management-namespace.json` and the current
+policy metadata. Missing/corrupt/incompatible authority cannot become an empty
+successful namespace. Crash before commit preserves complete old serving content;
+after commit restart loads the complete staged generation and resolves that same
+operation, not a second restore or rollback. Ambiguous fsync/load failures report
+unavailable/unknown until restart; shutdown does not publish an old in-memory state
+over a possibly switched generation. No discarded state is resurrected.
+
+Retain-current registers the exact old bytes in place: ownership transfers, with
+no hidden second plaintext copy. Discard authorizes only the six confirmed replaced
+new-archive core files. Independent dataset bytes, backup payloads, policy, authority,
+unrelated files and directories are not deleted. Retained dataset copies whose
+source was discarded are explicitly source-unavailable; they do not become a new
+default training candidate. Failed cleanup remains a registered residual with
+`incomplete_registered_residuals`, not falsely gone. Desired off/paused policy and
+revision survive restore and restart. A fresh continuity boundary follows restore;
+no paused/refused/unknown interval is backfilled.
+
+Historical crash-tail/loss/discard metadata is separately reported as bounded
+`management.restored_source_quality` (at most 128 point summaries), not replaced
+with the new collector's clean/current-tail label. Cleanup retries recheck each
+confirmed old file's exact size/checksum; a later different file at that name is
+left untouched and reported `changed_replacement_refused`. After cutover, use the
+compatible collector for this namespace: downgrading to a collector that ignores
+the serving/fence authority is unsupported and must not be used to bypass fences.
+
+Historical archive/source/observation IDs remain original. Query cursors still bind
+collector epoch. After restore, content query/annotation/edit/dataset requests must
+also explicitly bind `serving_generation`; absent/stale bindings refuse rather than
+retarget old edits to reused IDs. `Client.serving_generation` and CLI global
+`--serving-generation N` supply that non-producer binding. TUI explicit Overview
+refresh clears stale selections on a generation change; restore acknowledgement
+does not implicitly refresh an old edit selection.
+
+### Management commands and finite bounds
+
+```sh
+"$PYTHON" -m archive.cli --socket "$SOCKET" management preview
+# Save the bounded content-free preview response to an owner-only private plan
+# file, or feed it through stdin. No private text is required in process argv.
+"$PYTHON" -m archive.cli --socket "$SOCKET" management create \
+  --operation-id example-backup --input-file "$PLAN"
+"$PYTHON" -m archive.cli --socket "$SOCKET" management status --job-id "$JOB"
+"$PYTHON" -m archive.cli --socket "$SOCKET" management verify --job-id "$JOB"
+"$PYTHON" -m archive.cli --socket "$SOCKET" management restore-preview --job-id "$JOB"
+"$PYTHON" -m archive.cli --socket "$SOCKET" management restore-confirm \
+  --operation-id example-restore --input-file "$RESTORE_PLAN" \
+  --retention retain-current --confirm
+```
+
+Other actions: `list`, `registry`, `cancel`, `availability`. The minimal line TUI
+supports `management`, `backups`, `backup-preview`, `backup-create OP`,
+`management-status/verify/cancel/registry JOB`, `restore-preview JOB`, and
+`restore-confirm OP retain-current|discard-replaced-current confirm`. It stores
+only bounded metadata plans, never a second text archive. All errors/statuses
+are content-free and terminal-escaped; deliberate existing private detail remains
+explicit and bounded.
+
+Bounds: 64 KiB copy buffer; 8 MiB descriptor; 2 GiB total planned copy bytes;
+8192 files; 128 management jobs; 32 metadata rows/page; 65,536 observations and
+65,536 annotation revisions per snapshot; 8192 non-evicting source registrations/
+fences and 2 MiB authority bytes. Existing dataset item/group bounds still apply.
+Transport frames remain bounded by the existing Interface. Exhaustion is an explicit
+refusal, never truncation, fence recycling or a free-space deletion job. The checker
+reports actual 256/4096 mixed-source copied bytes, processed files, fanout and elapsed
+work; fixed copy-buffer bounds are not total-RAM independence or latency certification.
+
+```sh
+"$PYTHON" tools/check_input_archive_management.py --self-test
+MGMT195_NATIVE_BUILD="$HOST/librime/build" "$PYTHON" \
+  tools/check_input_archive_management.py --suite contract \
+  --root "$RUNTIME/management/run" --report "$EVIDENCE/management.json"
+```
+
+The real source-built `llm_rerank_management_producer_probe` links the production
+native producer object and uses only its existing diagnostic queue controls.
+Old delayed commit/receipt-dependent payloads, repoll, restored persisted absence,
+fresh recreated producers, both retention paths, restart/faults, private Adapters
+and bounds are finite controls, not alternate producers or stronger losslessness
+claims. Keep unique command/log/report paths, including failed/partial probes.
+Never overwrite prior evidence or claim missing historical log bodies were retained.
+
 ## Engineering choices
 
 | Choice | Decision |

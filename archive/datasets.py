@@ -641,8 +641,9 @@ class DatasetStore:
                 "request_identity": plugin.get("lm_request_id"), "plan_identity": plugin.get("plan_identity"),
                 "model_identity": None, "policy_identity": None}, reasons
 
-    def current(self, manifest):
+    def current(self, manifest, job_id=None):
         pair = manifest["source"]
+        restored_historical = job_id in getattr(self.collector, "_historical_dataset_ids", set())
         try:
             if manifest.get("code_identity") != code_identity():
                 return {"current_policy_consistent": None, "default_training_candidate": False, "tool_compatibility": "incompatible"}
@@ -663,7 +664,8 @@ class DatasetStore:
             return {"current_annotation_revision": revision, "exclusion_conflicts": conflicts,
                     "exclusion_conflict_rule": "conservative_any_new_archive_exclusion_including_unknown_context_dependencies",
                     "current_policy_consistent": conflicts == 0,
-                    "default_training_candidate": conflicts == 0 and manifest["outcome"] == "usable"}
+                    "default_training_candidate": not restored_historical and conflicts == 0 and manifest["outcome"] == "usable",
+                    **({"historical_restored_freeze": True, "default_candidacy_reason": "historical_restore_is_not_a_new_training_freeze"} if restored_historical else {})}
         except (InterfaceError, OSError, UnsafeRoot):
             return {"current_policy_consistent": None, "default_training_candidate": False, "source_compatibility": "unavailable"}
 
@@ -767,7 +769,7 @@ class DatasetStore:
                     if self.file_digest(self.path(job_id) / item["path"]) != (item["size"], item["sha256"]):
                         raise InterfaceError("dataset_corrupt")
                 result.update({"outcome": manifest["outcome"], "counts": manifest["counts"],
-                               "current": self.current(manifest), "manifest_identity": sha(manifest)})
+                                "current": self.current(manifest, job_id), "manifest_identity": sha(manifest)})
             return result
 
     def run(self, job_id):
@@ -907,7 +909,7 @@ class DatasetStore:
         if manifest != expected:
             raise InterfaceError("dataset_corrupt")
         return {"verification": "semantic_source_annotation_partition_admission_and_artifacts", "verified": True,
-                "outcome": manifest["outcome"], "manifest_identity": sha(manifest), "current": self.current(manifest)}
+                "outcome": manifest["outcome"], "manifest_identity": sha(manifest), "current": self.current(manifest, job_id)}
 
     def private(self, body):
         if body.get("private_detail") is not True or type(body.get("include_test", False)) is not bool or body.get("artifact") not in FILES:

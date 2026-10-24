@@ -40,6 +40,9 @@ from archive.interface import (
 from archive.limits import resolve
 from archive import annotations
 from archive.datasets import DatasetStore
+from archive.management import Management
+from archive.management_gate import ContentGate
+from archive.management_io import directory as management_directory, regular as management_regular, open_read as management_open_read
 from archive.ownership import LOCK_NAME, OwnerLock, OwnershipRefused
 from archive.querying import (
     QUERY_VERSION,
@@ -703,20 +706,35 @@ class Collector(object):
         self._dataset_windows = {}
 
         self._datasets = DatasetStore(self)
+        self.content_root = root
+        self._content_gate = ContentGate()
+        self._publication_mutex = threading.Lock()
+        self._transition = False
+        self._maintenance_unavailable = False
+        self._management = Management(self)
+        self._historical_dataset_ids = set()
+        self._restored_source_quality = []
 
     def prepare(self):
-        ensure_private_dir(self.root)
+        if os.path.lexists(self.root):
+            management_directory(self.root)
+        else:
+            ensure_private_dir(self.root)
         self._validate_socket()
         self._refuse_managed_aliases()
         self.acquire_ownership()
         try:
             self._reject_foreign_collector()
+            if os.path.lexists(self.policy_path):
+                management_regular(self.policy_path)
             self._load_policy()
+            self._management.authority.prepare()
             self._load_state()
             self._prepare_files()
             self._rebuild_index()
             self._annotations.prepare()
             self._datasets.prepare()
+            self._management.prepare()
             self._persist_state()
         except BaseException:
             # Ownership precedes every managed read and mutation, so a refused
@@ -750,6 +768,10 @@ class Collector(object):
             os.path.join(self.root, "collector.err"),
         ):
             reject_alias(path)
+        for path in (self.observations_path, self.quarantine_path, self.state_path, self.policy_path,
+                     self._annotations.identity_path, self._annotations.manifest_path, self._annotations.journal_path):
+            if os.path.lexists(path):
+                management_regular(path)
 
     def _validate_socket(self):
         if os.path.dirname(self.socket_path) != self.root:
@@ -880,6 +902,8 @@ class Collector(object):
             "quarantine_bytes": 0,
             "admission_refused_units": 0,
             "discarded_quarantine_bytes": 0,
+            "management_namespace": (self._management.authority.value or {}).get("namespace"),
+            "restored_source_quality": self._restored_source_quality,
         }
 
     def _reconcile_file(self, path, watermark):
@@ -1069,6 +1093,13 @@ class Collector(object):
             except OSError:
                 break
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+        # An explicit collector shutdown is distinct from detaching an Adapter.
+        # Do not let final checkpoint/clean-stop race a still-switching worker.
+        management_thread = self._management.thread
+        if management_thread is not None and management_thread.is_alive():
+            management_thread.join(self.limits["management_timeout_ms"] / 1000.0)
+            if management_thread.is_alive():
+                self._maintenance_unavailable = True
         self._final_checkpoint()
         self._mark_clean()
         try:
@@ -1135,6 +1166,21 @@ class Collector(object):
             sys.stderr.write("code=malformed_frame\n")
 
     def _dispatch(self, request):
+        # Content transitions cannot race a query/edit or dataset publication
+        # request. Admission/policy/status never wait on this management gate.
+        op = request.get("op")
+        gated = op in {"query", "annotation_edit", "annotation_query", "dataset"}
+        if self._maintenance_unavailable and op not in {"status", "overview", "shutdown", "policy_observe"}:
+            return failure(op, request.get("request_id", ""), "management_authority_unavailable")
+        if gated and not self._content_gate.acquire(False):
+            return failure(op, request.get("request_id", ""), "management_busy")
+        try:
+            return self._dispatch_inner(request)
+        finally:
+            if gated:
+                self._content_gate.release()
+
+    def _dispatch_inner(self, request):
         op = request.get("op") if isinstance(request.get("op"), str) else "unknown"
         request_id = request.get("request_id") if isinstance(request.get("request_id"), str) else ""
         if request.get("interface_version") != INTERFACE_VERSION:
@@ -1142,9 +1188,29 @@ class Collector(object):
         if request.get("envelope_version") != ENVELOPE_VERSION:
             return failure(op, request_id, "unsupported_version")
         content = request.get("content_version", CONTENT_VERSION)
-        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query", "dataset"}:
+        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query", "dataset", "management"}:
             return failure(op, request_id, "unsupported_version")
         body = request.get("body") if isinstance(request.get("body"), dict) else {}
+        if op == "management":
+            request_id = ""  # never reflect hostile/private supplied correlation values
+            try:
+                return self._ok(op, request_id, self._management.call(body))
+            except InterfaceError as exc:
+                return failure(op, request_id, exc.code)
+            except UnsafeRoot:
+                return failure(op, request_id, "unsafe_root")
+            except FileNotFoundError:
+                return failure(op, request_id, "management_unavailable")
+            except (OSError, ValueError, TypeError, KeyError):
+                return failure(op, request_id, "management_corrupt")
+        if op in {"query", "annotation_edit", "annotation_query", "dataset"}:
+            generation = self._management.authority.value["generation"]
+            # Versioned cursors already bind collector_epoch. Noncursor edits/
+            # annotation/dataset requests must explicitly bind the new serving
+            # incarnation after a restore; old references never retarget silently.
+            supplied = body.pop("serving_generation", None)
+            if generation and (type(supplied) is not int or supplied != generation):
+                return failure(op, request_id, "management_stale")
         if op == "dataset":
             try:
                 result = self._datasets.call(body)
@@ -1223,7 +1289,7 @@ class Collector(object):
             for source_id, observed in self._producers.items():
                 age_ms = int((now - observed["seen"]) * 1000)
                 is_fresh = age_ms <= self.limits["freshness_window_ms"]
-                matches = observed["revision"] is not None and observed["revision"] == self._policy["revision"]
+                matches = observed["revision"] is not None and observed["revision"] == self._policy["revision"] and self._management.authority.allowed(source_id)
                 if not is_fresh or not matches:
                     stale += 1
                 elif is_fresh and matches:
@@ -1238,7 +1304,9 @@ class Collector(object):
                     }
                 )
             desired = self._policy["desired"]
-            if self._state["storage_failure"]:
+            if self._transition or self._maintenance_unavailable or self._management.authority.failed:
+                collector_effective = "management_unavailable"
+            elif self._state["storage_failure"]:
                 collector_effective = "storage_failure"
             elif self._state["capacity_stop"]:
                 collector_effective = "capacity_stop"
@@ -1296,6 +1364,7 @@ class Collector(object):
                 "publication_hold": self._publication_hold_active,
                 "publication_phase_hold": self._phase_hold_active,
                 "control_hold": self._control_hold_active,
+                "management": self._management.authority.summary(),
                 "content_included": False,
             }
 
@@ -1303,6 +1372,18 @@ class Collector(object):
         source_id = body.get("source_instance_id")
         if safe_token(source_id) is None:
             return self.snapshot()
+        if self._maintenance_unavailable or not self._content_gate.acquire(False):
+            return {"desired_policy": "off", "current_desired_policy": self._policy["desired"],
+                    "desired_revision": self._policy["revision"], "collector_effective": "management_unavailable",
+                    "registration_code": "management_busy", "content_included": False}
+        try:
+            allowed = self._management.authority.register(source_id)
+            registration_code = "registered" if allowed else self._management.authority.refusal(source_id)
+        except (OSError, UnsafeRoot, InterfaceError) as exc:
+            allowed = False
+            registration_code = getattr(exc, "code", "storage_failure")
+        finally:
+            self._content_gate.release()
         with self._lock:
             declared = body.get("observed_revision")
             if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
@@ -1312,7 +1393,11 @@ class Collector(object):
                 "seen": time.monotonic(),
             }
         return {
-            "desired_policy": self._policy["desired"],
+            "desired_policy": self._policy["desired"] if allowed else "off",
+            "current_desired_policy": self._policy["desired"],
+            "registration_code": registration_code,
+            "producer_recreation_required": registration_code == "source_recreation_required",
+            "serving_generation": self._management.authority.value["generation"],
             "desired_revision": self._policy["revision"],
             "collector_effective": self.snapshot()["collector_effective"],
             "freshness_window_ms": self.limits["freshness_window_ms"],
@@ -1344,6 +1429,7 @@ class Collector(object):
                     "scope": "input_archive_only",
                     "legacy_selection_recording": "separately_configured_may_continue",
                     "legacy_switch_changed": False,
+                    "management_namespace": self._management.authority.value["namespace"],
                 }
             try:
                 atomic_write(self.policy_path, canonical_bytes(policy) + b"\n")
@@ -1401,6 +1487,12 @@ class Collector(object):
                 self._state["admission_refused_units"] = self._state.get("admission_refused_units", 0) + 1
             return "event_too_large"
         with self._lock:
+            if self._transition or self._maintenance_unavailable or self._management.authority.failed:
+                return "storage_failure"
+            if not self._management.authority.allowed(prepared["semantic"]["source_instance_id"]):
+                # Existing native result parsers know invalid_request as a
+                # terminal per-item refusal; do not invent semantic admission.
+                return "invalid_request"
             if self._state["storage_failure"]:
                 return "storage_failure"
             if self._state["capacity_stop"]:
@@ -1598,6 +1690,10 @@ class Collector(object):
             return batch, waiters
 
     def _publish(self, batch):
+        with self._publication_mutex:
+            return self._publish_inner(batch)
+
+    def _publish_inner(self, batch):
         observation_lines = []
         quarantine_lines = []
         metas = []
@@ -1740,6 +1836,8 @@ class Collector(object):
         return self.snapshot()
 
     def _final_checkpoint(self):
+        if self._maintenance_unavailable or self._management.authority.failed:
+            return
         if self._publication is None:
             return
         with self._cv:
@@ -1748,6 +1846,8 @@ class Collector(object):
         self._publication.join(timeout=2.0)
 
     def _mark_clean(self):
+        if self._maintenance_unavailable or self._management.authority.failed:
+            return
         # A timed-out join is not ownership transfer: the publisher may still
         # be writing a watermark. Never race it with a stale shutdown snapshot.
         if self._publication is not None and self._publication.is_alive():
@@ -2663,7 +2763,7 @@ class Collector(object):
             return {"annotation_version": annotations.ANNOTATION_VERSION, "archive_id": store.archive_id, "as_of_durable_seq": prefix, "annotation_revision": revision, "ordering": ORDERING, "observations": rows, "next_cursor": cursor, "page_size_max": self.limits["page_size_max"], "annotation_page_bytes_max": min(annotations.PAGE_BYTES, self.limits["query_page_bytes_max"]), "content_included": private}
 
     def _read_payload(self, entry):
-        with open(self.observations_path, "rb") as handle:
+        with management_open_read(self.observations_path) as handle:
             handle.seek(entry["offset"])
             line = handle.read(entry["length"])
         try:

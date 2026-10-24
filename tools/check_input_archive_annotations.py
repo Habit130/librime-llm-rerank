@@ -26,7 +26,8 @@ import tracemalloc
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from archive.annotations import (ANNOTATION_VERSION, LINE_BYTES, NOTE_BYTES, TEXT_BYTES, normalize_edit)
-from archive.interface import Client, InterfaceError, strip_content
+from archive.interface import InterfaceError, strip_content
+from archive_fixture_client import RegisteredFixtureClient as Client
 from archive.safety import assert_private_tree, atomic_write
 from archive.tui import TuiSession
 from check_input_archive_query import frame, plugin_frame, _admit

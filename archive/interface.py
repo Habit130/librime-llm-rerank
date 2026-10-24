@@ -63,6 +63,21 @@ ERROR_MESSAGES = {
     "dataset_busy": "a dataset job is already running",
     "dataset_already_published": "published immutable dataset cannot be cancelled",
     "dataset_not_published": "dataset is not a published successful freeze",
+    "management_unsupported": "management snapshot or authority version is unsupported",
+    "management_corrupt": "management identity or semantic content is inconsistent",
+    "management_tampered": "registered content checksum does not match",
+    "management_incomplete": "management content is incomplete or unpublished",
+    "management_unavailable": "registered management content is unavailable",
+    "management_authority_unavailable": "persistent serving and source authority is unavailable",
+    "management_bound": "management work exceeds a declared bound",
+    "management_busy": "archive management transition or publication is busy",
+    "management_stale": "confirmed source or target frontier has changed",
+    "management_operation_conflict": "management operation identity has different semantics",
+    "management_committed": "irreversibly committed work cannot be cancelled",
+    "management_cancelled": "management work was cancelled before commit",
+    "management_capacity": "management staging capacity is insufficient",
+    "source_recreation_required": "producer recreation with a new source identity is required",
+    "source_unregistered": "source must observe current policy before admission",
 }
 
 CONTENT_KEYS = {
@@ -309,12 +324,18 @@ class Client(object):
         if not isinstance(socket_path, str) or not socket_path:
             raise InterfaceError("invalid_request")
         self.socket_path = socket_path
+        self.serving_generation = None
         self.sndbuf = sndbuf
         self.timeout = (
             DEFAULTS["management_timeout_ms"] / 1000.0 if timeout is None else timeout
         )
 
     def call(self, op, body=None, envelope_version=ENVELOPE_VERSION, content_version=CONTENT_VERSION, request_id=""):
+        if op in {"query", "annotation_edit", "annotation_query", "dataset"} and self.serving_generation is not None:
+            body = dict(body or {})
+            # A caller's already-bound old request must remain stale. Explicit
+            # body bindings are never upgraded by a newer Client default.
+            body.setdefault("serving_generation", self.serving_generation)
         request = {
             "interface_version": INTERFACE_VERSION,
             "envelope_version": envelope_version,
@@ -355,6 +376,9 @@ class Client(object):
     def datasets(self, action, **kwargs):
         from archive.datasets import VERSION
         return self.call("dataset", {"dataset_version": VERSION, "action": action, **kwargs})
+
+    def management(self, action, **kwargs):
+        return self.call("management", {"management_version": "input-archive-management-v1", "action": action, **kwargs})
 
     def query(self, view, **kwargs):
         body = {"view": view}

@@ -22,6 +22,8 @@ class TuiSession(object):
         self.annotation_page = None
         self.annotation_selection = None
         self.dataset_snapshot = None
+        self.management_backup_plan = None
+        self.management_restore_plan = None
 
     def run(self):
         self._overview()
@@ -41,7 +43,9 @@ class TuiSession(object):
             return
         parts = line.split()
         command = parts[0]
-        if command.startswith("dataset"):
+        if command.startswith("management") or command.startswith("backup") or command.startswith("restore"):
+            self._management_command(parts)
+        elif command.startswith("dataset"):
             self._dataset_command(parts)
         elif command.startswith("annotation"):
             self._annotation_command(parts)
@@ -61,6 +65,39 @@ class TuiSession(object):
             self.stopped = True
         else:
             self.stdout.write("SCREEN error\ncode=invalid_request\ncontent_included=false\n")
+
+    def _management_command(self, parts):
+        from archive.annotation_adapter import render
+        from archive.interface import InterfaceError, failure
+        try:
+            command = parts[0]
+            if command == "management" and len(parts) == 1:
+                response = self.client.management("availability")
+            elif command == "backup-preview" and len(parts) == 1:
+                response = self.client.management("preview")
+                self.management_backup_plan = response.get("body", {}).get("plan") if response.get("ok") else None
+            elif command == "backup-create" and len(parts) == 2 and self.management_backup_plan:
+                response = self.client.management("create", plan=self.management_backup_plan, operation_id=parts[1])
+            elif command == "backups" and len(parts) == 1:
+                response = self.client.management("list")
+            elif command == "restore-preview" and len(parts) == 2:
+                response = self.client.management("restore_preview", job_id=parts[1])
+                self.management_restore_plan = response.get("body", {}).get("plan") if response.get("ok") else None
+            elif command == "restore-confirm" and len(parts) == 4 and parts[3] == "confirm" and self.management_restore_plan:
+                response = self.client.management("restore_confirm", plan=self.management_restore_plan,
+                                                  operation_id=parts[1], retention=parts[2], confirm=True)
+                # This is acknowledgement, not completion; do not refresh old
+                # query/edit bindings or discard pinned selections implicitly.
+            elif command in ("management-status", "management-verify", "management-cancel", "management-registry") and len(parts) == 2:
+                response = self.client.management(command.split("-")[1], job_id=parts[1])
+            else:
+                raise InterfaceError("invalid_request")
+        except (ValueError, InterfaceError) as exc:
+            response = failure("management", "", getattr(exc, "code", "invalid_request"))
+        self.stdout.write("SCREEN management\n")
+        self.stdout.write(render(response))
+        self.stdout.write("capture_recovery=producer_recreation_new_source_identity_required_after_restore\n")
+        self.stdout.flush()
 
     def _dataset_command(self, parts):
         from archive.dataset_adapter import render
@@ -147,6 +184,10 @@ class TuiSession(object):
         # supplies the durable policy/capacity keys the screen has always
         # shown. Neither opens storage; neither probes the daemon.
         status = self.client.status()
+        generation = status.get("body", {}).get("management", {}).get("serving_generation")
+        if generation != getattr(self.client, "serving_generation", None):
+            self.annotation_page = self.annotation_selection = self.dataset_snapshot = None
+            self.client.serving_generation = generation
         overview = self.client.query("overview")
         self.stdout.write("SCREEN overview\n")
         self.stdout.write("interface_version=%s\n" % INTERFACE_VERSION)

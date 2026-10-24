@@ -70,6 +70,7 @@ def main(argv=None):
     parser.add_argument("--root", default="")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--serving-generation", type=int)
     sub = parser.add_subparsers(dest="command")
 
     collector = sub.add_parser("collector")
@@ -139,14 +140,25 @@ def main(argv=None):
     datasets.add_argument("--artifact", choices=("partition.jsonl", "corpus.jsonl", "choice.jsonl"))
     datasets.add_argument("--private-detail", action="store_true")
     datasets.add_argument("--include-test", action="store_true")
+    management = sub.add_parser("management")
+    management.add_argument("action", choices=("preview", "create", "list", "status", "verify", "restore-preview", "restore-confirm", "cancel", "registry", "availability"))
+    management.add_argument("--job-id")
+    management.add_argument("--operation-id")
+    management.add_argument("--input-file", default="-")
+    management.add_argument("--retention", choices=("retain-current", "discard-replaced-current"))
+    management.add_argument("--confirm", action="store_true")
+    management.add_argument("--after", type=int, default=0)
+    management.add_argument("--page-size", type=int, default=20)
     args = parser.parse_args(argv)
-    if args.command in ("annotations", "tui", "datasets") and (not math.isfinite(args.timeout) or args.timeout <= 0):
+    if args.command in ("annotations", "tui", "datasets", "management") and (not math.isfinite(args.timeout) or args.timeout <= 0):
         sys.stderr.write("code=invalid_request\ncontent_included=false\n")
         return 2
     if args.command == "annotations":
         return _annotations(args)
     if args.command == "datasets":
         return _datasets(args)
+    if args.command == "management":
+        return _management(args)
     if args.command == "collector" and args.collector_command == "start":
         return _start(args)
     if args.command == "collector" and args.collector_command == "stop":
@@ -165,6 +177,29 @@ def main(argv=None):
         return _tui(args)
     parser.print_help(sys.stderr)
     return 2
+
+
+def _management(args):
+    from archive.annotation_adapter import read_private_json, render
+    from archive.interface import failure
+    try:
+        action = args.action.replace("-", "_")
+        kwargs = {}
+        if action in ("create", "restore_confirm"):
+            value = read_private_json(sys.stdin, args.input_file, bound=4 * 1048576)
+            # Accept a preview response or its plan object; no filesystem logic.
+            kwargs.update(plan=value.get("body", value).get("plan", value), operation_id=args.operation_id)
+        if action == "restore_confirm":
+            kwargs.update(retention=args.retention, confirm=args.confirm)
+        if action in ("status", "verify", "restore_preview", "cancel", "registry"):
+            kwargs["job_id"] = args.job_id
+        if action in ("list", "registry"):
+            kwargs.update(after=args.after, page_size=args.page_size)
+        response = _client(args).management(action, **kwargs)
+    except (OSError, ValueError, InterfaceError, UnsafeRoot) as exc:
+        response = failure("management", "", getattr(exc, "code", "invalid_request"))
+    sys.stdout.write(render(response))
+    return 0 if response.get("ok") else 2
 
 
 def _datasets(args):
@@ -561,7 +596,9 @@ def _client(args):
     if not args.socket:
         sys.stderr.write("code=invalid_request\n")
         raise SystemExit(2)
-    return Client(args.socket, timeout=args.timeout)
+    client = Client(args.socket, timeout=args.timeout)
+    client.serving_generation = args.serving_generation
+    return client
 
 
 def _print(args, response, private=False):

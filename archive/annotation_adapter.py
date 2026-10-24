@@ -10,7 +10,7 @@ from archive.interface import InterfaceError
 from archive.safety import UnsafeRoot, _assert_existing_chain, escape_terminal_data
 
 
-def read_private_json(stream=None, path=None):
+def read_private_json(stream=None, path=None, bound=LINE_BYTES):
     """No supplied content enters argv or diagnostics; refuse aliased files."""
     fd = None
     old = None
@@ -27,7 +27,7 @@ def read_private_json(stream=None, path=None):
                 raise UnsafeRoot("private_input")
             with os.fdopen(fd, "rb") as handle:
                 fd = None
-                raw = handle.read(LINE_BYTES + 1)
+                raw = handle.read(bound + 1)
         else:
             if stream is None:
                 raise InterfaceError("invalid_request")
@@ -38,8 +38,8 @@ def read_private_json(stream=None, path=None):
                 hidden[3] &= ~termios.ECHO
                 termios.tcsetattr(fd_num, termios.TCSANOW, hidden)
             # One JSON line permits the TUI stream to continue after the value.
-            raw = stream.readline(LINE_BYTES + 1)
-        if len(raw) > LINE_BYTES or isinstance(raw, str) and len(raw.encode("utf-8")) > LINE_BYTES:
+            raw = stream.readline(bound + 1)
+        if len(raw) > bound or isinstance(raw, str) and len(raw.encode("utf-8")) > bound:
             raise InterfaceError("annotation_input_bound")
         value = json.loads(raw)
         if not isinstance(value, dict):
