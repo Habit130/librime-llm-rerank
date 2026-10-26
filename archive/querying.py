@@ -1156,6 +1156,7 @@ def quality_denominators(rows, state):
         ),
         "continuity_broken": bool(state.get("continuity_break_reasons")),
         "continuity_break_reasons": list(state.get("continuity_break_reasons") or []),
+        "confirmed_deletion_gap_count": state.get("confirmed_deletion_gap_count", 0),
         "policy": {
             "desired": state.get("desired_policy"),
             "desired_revision": state.get("desired_revision"),

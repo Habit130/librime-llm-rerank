@@ -124,6 +124,8 @@ class Authority:
         c.state_path = str(content / "state.json")
         from archive.annotations import AnnotationStore
         c._annotations = AnnotationStore(str(content))
+        if hasattr(c, "_deletion") and c._deletion.authority.value is not None:
+            c._annotations.pruning_authority = c._deletion.authority.value["bridges"]
         c._datasets.root = content / "datasets"
         c._historical_dataset_ids = set()
         c._restored_source_quality = []

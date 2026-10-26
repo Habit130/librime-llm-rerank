@@ -267,21 +267,34 @@ class DatasetStore:
             if pair["as_of_durable_seq"] - pair["first_durable_seq"] + 1 > MAX_SOURCES:
                 raise InterfaceError("dataset_bound")
         content = hashlib.sha256()
-        after = pair["first_durable_seq"] - 1
-        while after < pair["as_of_durable_seq"]:
-            refs = c._dataset_refs(after, pair["as_of_durable_seq"], PAGE)
-            if not refs:
-                raise InterfaceError("dataset_source_unavailable")
-            for ref in refs:
-                if ref["durable_seq"] != after + 1:
-                    raise InterfaceError("dataset_corrupt")
-                content.update(canonical_bytes({"reference": ref}) + b"\n")
-                after = ref["durable_seq"]
+        for ref in self.references(pair):
+            content.update(canonical_bytes({"reference": ref}) + b"\n")
         identity = content.hexdigest()
         if "source_content_identity" in body and body["source_content_identity"] != identity:
             raise InterfaceError("annotation_source_mismatch")
         pair["source_content_identity"] = identity
         return pair
+
+    def references(self, pair):
+        """Page original identities; only authorized deletion holes may be skipped."""
+        c = self.collector
+        after = pair["first_durable_seq"] - 1
+        gaps = c._state.get("deletion_gaps", {})
+        while after < pair["as_of_durable_seq"]:
+            refs = c._dataset_refs(after, pair["as_of_durable_seq"], PAGE)
+            end = refs[-1]["durable_seq"] if refs else pair["as_of_durable_seq"]
+            for ref in refs:
+                seq = ref["durable_seq"]
+                if seq <= after or str(seq) in gaps:
+                    raise InterfaceError("dataset_corrupt")
+                if any(str(missing) not in gaps for missing in range(after + 1, seq)):
+                    raise InterfaceError("dataset_source_unavailable")
+                yield ref
+                after = seq
+            if not refs:
+                if any(str(missing) not in gaps for missing in range(after + 1, end + 1)):
+                    raise InterfaceError("dataset_source_unavailable")
+                after = end
 
     def sources(self, pair, choices=True):
         """At most PAGE reference metadata, one record, bounded shared group projection."""
@@ -290,22 +303,14 @@ class DatasetStore:
             check_file(c.observations_path)
         except FileNotFoundError:
             raise InterfaceError("dataset_source_unavailable")
-        after = pair["first_durable_seq"] - 1
-        while after < pair["as_of_durable_seq"]:
-            refs = c._dataset_refs(after, pair["as_of_durable_seq"], PAGE)
-            if not refs:
-                raise InterfaceError("dataset_source_unavailable")
-            for ref in refs:
-                if ref["durable_seq"] != after + 1:
-                    raise InterfaceError("dataset_corrupt")
-                source = c._dataset_source(ref, pair["as_of_durable_seq"], SOURCE_LINE, include_choice=choices)
-                if type(source["record"].get("record_version")) is not int or source["record"]["record_version"] != 1:
-                    raise InterfaceError("dataset_incompatible")
-                with c._annotations.lock:
-                    c._annotations._healthy()
-                    edits = c._annotations.effective(ref, pair["annotation_revision"])
-                yield source, annotations.evidence(source, edits, True)
-                after = ref["durable_seq"]
+        for ref in self.references(pair):
+            source = c._dataset_source(ref, pair["as_of_durable_seq"], SOURCE_LINE, include_choice=choices)
+            if type(source["record"].get("record_version")) is not int or source["record"]["record_version"] != 1:
+                raise InterfaceError("dataset_incompatible")
+            with c._annotations.lock:
+                c._annotations._healthy()
+                edits = c._annotations.effective(ref, pair["annotation_revision"])
+            yield source, annotations.evidence(source, edits, True)
 
     def inspect(self, pair, emit=None, progress=None):
         """One shared source map, before either view's admission filter.
@@ -417,17 +422,18 @@ class DatasetStore:
                                if not s["closed"] or s["bad"] or any(not processes[p]["start"] or not processes[p]["terminal"] or len(processes[p]["segments"]) != 1 for p in s["processes"])), default=pair["as_of_durable_seq"] + 1)
         cuts = [end for _, end in merged[:-1] if end < uncertain_first]
         n, first = len(metadata), pair["first_durable_seq"]
+        positions = {row["reference"]["durable_seq"]: i + 1 for i, row in enumerate(metadata)}
         # Minimize L1 deviation of cumulative .8/.9 targets with strict cuts;
         # ties resolve to the earliest durable pair. Linear suffix minimum.
         best, boundary = None, None
         suffix = []
         for cut in reversed(cuts):
-            candidate = (abs(10 * (cut - first + 1) - 9 * n), cut)
+            candidate = (abs(10 * positions[cut] - 9 * n), cut)
             suffix.append(min(candidate, suffix[-1]) if suffix else candidate)
         suffix.reverse()
         for i, a in enumerate(cuts[:-1]):
             cost, b = suffix[i + 1]
-            candidate = (abs(10 * (a - first + 1) - 8 * n) + cost, a, b)
+            candidate = (abs(10 * positions[a] - 8 * n) + cost, a, b)
             if best is None or candidate < best:
                 best, boundary = candidate, (a, b)
         membership = {}
@@ -714,6 +720,12 @@ class DatasetStore:
         raise InterfaceError("invalid_request")
 
     def create(self, body):
+        with self.collector._operation_lock:
+            if self.collector._deletion.active is not None:
+                raise InterfaceError("management_busy")
+            return self._create_locked(body)
+
+    def _create_locked(self, body):
         if safe_token(body.get("operation_id")) is None or not isinstance(body.get("snapshot"), dict):
             raise InterfaceError("invalid_request")
         pair = self.snapshot(body["snapshot"])
