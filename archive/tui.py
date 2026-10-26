@@ -24,6 +24,7 @@ class TuiSession(object):
         self.dataset_snapshot = None
         self.management_backup_plan = None
         self.management_restore_plan = None
+        self.deletion_preview = None
 
     def run(self):
         self._overview()
@@ -43,7 +44,9 @@ class TuiSession(object):
             return
         parts = line.split()
         command = parts[0]
-        if command.startswith("management") or command.startswith("backup") or command.startswith("restore"):
+        if command.startswith("deletion"):
+            self._deletion_command(parts)
+        elif command.startswith("management") or command.startswith("backup") or command.startswith("restore"):
             self._management_command(parts)
         elif command.startswith("dataset"):
             self._dataset_command(parts)
@@ -65,6 +68,42 @@ class TuiSession(object):
             self.stopped = True
         else:
             self.stdout.write("SCREEN error\ncode=invalid_request\ncontent_included=false\n")
+
+    def _deletion_command(self, parts):
+        from archive.annotation_adapter import read_private_json, render
+        from archive.interface import InterfaceError, failure
+        from archive.safety import UnsafeRoot
+        try:
+            command = parts[0]
+            if command == "deletion" and len(parts) == 1:
+                response = self.client.deletion("availability")
+            elif command == "deletion-preview" and len(parts) == 1:
+                if self.annotation_selection:
+                    selection = {"references": [self.annotation_selection]}
+                else:
+                    self.stdout.write("exact_selection_json_required=true\n")
+                    self.stdout.flush()
+                    selection = read_private_json(self.stdin, bound=4 * 1048576)
+                response = self.client.deletion("preview", selection=selection)
+                self.deletion_preview = response.get("body") if response.get("ok") else None
+            elif command == "deletion-confirm" and len(parts) == 5 and parts[3:] == ["accept-collateral", "confirm"] and self.deletion_preview:
+                response = self.client.deletion("confirm", plan=self.deletion_preview["plan"],
+                                                plan_identity=parts[2], operation_id=parts[1],
+                                                confirm=True, accept_collateral=True)
+            elif command == "deletions" and len(parts) == 1:
+                response = self.client.deletion("list")
+            elif command in ("deletion-status", "deletion-progress", "deletion-result", "deletion-cancel", "deletion-registry") and len(parts) == 2:
+                response = self.client.deletion(command.split("-")[1], job_id=parts[1])
+            else:
+                raise InterfaceError("invalid_request")
+        except (OSError, ValueError, InterfaceError, UnsafeRoot) as exc:
+            response = failure("deletion", "", getattr(exc, "code", "invalid_request"))
+        self.stdout.write("SCREEN management-deletion\n")
+        self.stdout.write(render(response))
+        self.stdout.write("acknowledgement_is_not_completion=true\n")
+        self.stdout.write("irreversible_point=durable_removal_authority_commit\n")
+        self.stdout.write("archive_only_not_all_domain_erasure=true\n")
+        self.stdout.flush()
 
     def _management_command(self, parts):
         from archive.annotation_adapter import render
@@ -187,6 +226,7 @@ class TuiSession(object):
         generation = status.get("body", {}).get("management", {}).get("serving_generation")
         if generation != getattr(self.client, "serving_generation", None):
             self.annotation_page = self.annotation_selection = self.dataset_snapshot = None
+            self.deletion_preview = None
             self.client.serving_generation = generation
         overview = self.client.query("overview")
         self.stdout.write("SCREEN overview\n")

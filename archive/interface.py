@@ -22,6 +22,17 @@ SUPPORTED_SCHEMA = "luna_pinyin"
 ORDERING = "durable_seq_ascending"
 
 ERROR_MESSAGES = {
+    "deletion_authority_unavailable": "persistent removal authority is unavailable",
+    "deletion_unsupported": "unsupported deletion metadata version",
+    "deletion_bound": "deletion inventory or authority bound exceeded",
+    "deletion_operation_conflict": "deletion operation identity conflicts",
+    "deletion_stale": "deletion plan no longer matches current state",
+    "deletion_unknown_lineage": "registered copy lineage or integrity is unavailable",
+    "deletion_interrupted": "deletion preparation was interrupted before removal authority commit",
+    "deletion_cancelled": "deletion cancelled before irreversible removal authority commit",
+    "deletion_committed": "irreversible deletion has started; cancellation is refused",
+    "deletion_removed": "managed payload was explicitly removed by confirmed deletion",
+    "deletion_residual": "confirmed deletion has unresolved managed residues",
     "unsupported_version": "envelope or content version is not supported",
     "unsupported_schema": "schema is not a supported input-process interpretation",
     "malformed_frame": "frame is malformed",
@@ -379,6 +390,12 @@ class Client(object):
 
     def management(self, action, **kwargs):
         return self.call("management", {"management_version": "input-archive-management-v1", "action": action, **kwargs})
+
+    def deletion(self, action, **kwargs):
+        if action == "preview" and isinstance(kwargs.get("selection"), dict):
+            kwargs["selection"] = dict(kwargs["selection"])
+            kwargs["selection"].setdefault("serving_generation", self.serving_generation if self.serving_generation is not None else 0)
+        return self.call("deletion", {"deletion_version": "input-archive-deletion-v1", "action": action, **kwargs})
 
     def query(self, view, **kwargs):
         body = {"view": view}

@@ -129,7 +129,7 @@ waits for that gate; it is boundedly refused during the switch.
 
 Ordinary queries, annotation edits, dataset requests and source registration use
 shared content leases, retaining their normal concurrency and store-local CAS
-errors. Only restoration requests a non-waiting exclusive lease. A held genuine
+errors. Restoration and confirmed deletion request a non-waiting exclusive lease. A held genuine
 reader/edit makes that restore busy; normal concurrent edits do not become
 management-busy merely because another ordinary request is in flight.
 
@@ -1761,3 +1761,137 @@ Reports bind source/rules/runtime and retained private artifacts without text.
 Baseline source-built native/model-free/foundation/plugin/passive-daemon/query/
 annotation gates remain required. Only the inherited absent-model skips apply.
 **Merge never enables capture.**
+# Confirmed input-data deletion (AC-196-v1)
+
+Deletion is a collector-owned, archive-only management operation. It does not
+enable capture, clear legacy facts or semantic memory, unlearn a model, or erase
+external copies, system backups, APFS/SSD history or all process memory. Current
+desired capture policy/revision and permanent source-registration/restore fences
+remain outside deletion and historical restore. No service is restarted.
+
+## Select, preview, confirm
+
+Use the shared `deletion` Interface (`input-archive-deletion-v1`). `preview` accepts
+an explicit nonempty `references` list or a `range` with exact `first`/`last`
+references, plus the current `serving_generation`. A reference includes archive,
+source instance, source-local sequence, durable sequence and record digest.
+Unavailable, foreign, mismatching and stale references refuse. Duplicate references
+in a selection refuse; retries of one capture never create independent records.
+Equal text from independently captured observations is not a dependency.
+
+Preview is read-only, including file modes. It returns the exact selected and
+collateral references, annotation revisions, registered artifact lifecycles,
+owner-relative paths, checksums/inode bindings, byte/unit counts and excluded
+domains. Explicit recorded update/window/parent relations close the raw selection.
+Every whole-artifact loss includes its unselected content and is listed separately.
+The returned `plan_identity` hashes the complete versioned plan. `confirm` requires
+that exact plan/digest, an `operation_id`, `confirm=true` and
+`accept_collateral=true`. A supplied plan never grants filesystem authority: the
+collector recomputes it. Append/edit/policy/registry changes cause stale/busy refusal;
+there is no broadened retry or automatic delete-all.
+
+The minimal CLI is an Adapter, for example:
+
+```sh
+python -m archive.cli --socket "$SOCKET" deletion preview --input-file "$SELECTION"
+python -m archive.cli --socket "$SOCKET" deletion confirm \
+  --operation-id explicit-operation --plan-identity "$DIGEST" \
+  --confirm --accept-collateral --input-file "$PREVIEW"
+python -m archive.cli --socket "$SOCKET" deletion status --job-id "$JOB"
+python -m archive.cli --socket "$SOCKET" deletion progress --job-id "$JOB"
+python -m archive.cli --socket "$SOCKET" deletion result --job-id "$JOB"
+python -m archive.cli --socket "$SOCKET" deletion registry --job-id "$JOB"
+python -m archive.cli --socket "$SOCKET" deletion cancel --job-id "$JOB"
+```
+
+Selection/preview inputs are private JSON files or stdin, never private text in
+argv. TUI `deletion-preview` uses the current exact annotation selection or reads
+one selection JSON line. `deletion-confirm OP DIGEST accept-collateral confirm`
+confirms that preview. `deletions`, `deletion-status/progress/result/registry/cancel
+JOB` expose the same jobs. Closing the page only detaches. Ordinary screens,
+errors, plans and reports are content-free; existing explicit bounded private
+detail remains terminal-escaped. Preview/confirmation never create a backup.
+
+## Registered copies and compatibility
+
+The inventory traverses current, restored and registered retired source owners,
+their dataset registries (including incomplete jobs), management backup/restore
+registries and prior deletion staging. It does not discover arbitrary directories.
+Membership is verified against actual capture-reference vectors and frozen raw
+checksums. Archive/sequence prefixes alone are never lineage across restores.
+Complete dataset partition maps bind the ordered vector through
+`source_content_identity`; incomplete maps need a matching registered full source.
+Older-code datasets use structural registry/integrity evidence only: erasure does
+not make them semantically compatible or fix the accepted older-code backup limit.
+
+Affected immutable backups/datasets are removed whole, not edited or regenerated.
+Affected retired raw cores are removed whole with explicit collateral disclosure;
+unrelated retired cores and backups remain byte-identical. Current canonical
+observations and annotations are rewritten to survivor-only staging. Surviving
+original rows/digests/order are unchanged; sequences and annotation revisions are
+never reused or renumbered. Content-free authorized gap/chain bridges permit sparse
+dataset/backup/restore consumers without fabricating continuity. A new collector
+epoch invalidates old cursors. Deleted source/edit/private references and artifacts
+are unavailable. Source counts and partition ratios count actual survivors.
+
+Missing/ambiguous/tampered lineage refuses rather than silently omitting copies.
+Nonempty quarantine and surviving captured preceding text without a complete
+source-reference vector are unknown lineage. A parent token or equal text does
+not prove complete context ancestry. Unsupported/unknown copies cannot be treated
+as erased or safe restore sources.
+
+## Transaction, cancellation and recovery
+
+Phases are acknowledgement, survivor preparation, prepared, irreversible removal
+authority commit, exact-bound path removal, registry publication and cleanup.
+Acknowledgement is durable acceptance, not completion. Jobs report
+pending/running/succeeded/failed/cancelled/unknown, real processed bytes/records/
+files and removed/pending/unknown paths plus residual staging. Repeating an
+operation with the same digest returns its original job; conflicting reuse refuses.
+
+Before the authority commit, explicit cancellation leaves canonical data intact;
+any partial survivor-only staging remains registered and visible. After the commit,
+cancellation refuses: rollback cannot restore erased content. Preparation streams
+only the original bound file length and revalidates the entire plan before commit.
+No selected-text rollback copy is made. Every irreversible leaf is rechecked for
+private owner, type, single link, path and checksum/inode or transaction binding.
+Changed replacements are not erased under an old plan.
+
+The permanent content-free removal authority is outside restored content and is
+anchored in the current policy. Delayed deleted-capture retries refuse after restart
+and historical restore; fresh captures from the same unfenced source remain
+supported. Corrupt/missing/unsupported/exhausted authority fails closed. Committed
+interrupted jobs finish or refuse before ordinary serving; partial cleanup is never
+successful erasure. Readers see a coherent view or unavailable response. Backup,
+restore and dataset creation serialize with deletion. Empty checkpoints also use
+the publication mutex, so they cannot overwrite an in-progress deletion state.
+Producer admission never waits on that maintenance mutex. Refused input is not
+backfilled; deletion/continuity gaps remain explicit.
+
+## Bounds and reproduction
+
+Bounds: 8,192 selected/expanded references; 65,536 observations per source;
+131,072-byte source line; 65,536-byte file-copy buffer; 64-reference dataset pages;
+8,192 inventory files / 32,768 edges / 2 GiB inventoried bytes; eight closure rounds;
+262,144 lineage metadata entries / 2,097,152 streamed lineage rows; 128 deletion
+jobs; 65,536 removal identities and annotation bridges / 8 MiB authority document.
+Plans must also fit the 4 MiB Interface frame and 8 MiB private document limits.
+Exhaustion refuses, never truncates scope or evicts removal identities. These are
+finite work/buffer limits, not total-RAM or quiet-latency guarantees.
+
+`tools/check_input_archive_deletion.py --self-test` is supplementary. The contract
+suite requires fresh invented roots and a source-built native producer probe:
+
+```sh
+MGMT195_NATIVE_BUILD="$HOST/librime/build" "$PYTHON" \
+  tools/check_input_archive_deletion.py --suite contract \
+  --root "$RUNTIME/deletion/run" --report "$EVIDENCE/deletion.json"
+```
+
+The suite exercises real Interface/CLI/TUI/file state, actual accepted-base-created
+datasets, incomplete/retired copies, original-reference survivors, native/Python
+delayed captures, 256/4096 mixed inventories with large connected collateral groups,
+real process exits and short-write/fsync/unlink/permission fault seams. Reports bind
+source hashes, arguments, runtime, artifact identities and actual survivor bytes.
+Use the issue's complete ordered final-head stages 0–5 in addition to this suite;
+no single checker, inherited unit result or missing Codex result is acceptance.
