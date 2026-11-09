@@ -6,8 +6,11 @@ with a language model conditioned on the preceding text of the current session.
 Developed for the Squirrel (鼠鬚管) fork at
 [Habit130/squirrel](https://github.com/Habit130/squirrel). The design spec is
 [issue #16](https://github.com/Habit130/squirrel/issues/16); implementation
-tickets are issues #17–#22 in that repository. **Issues and progress tracking
-live in `Habit130/squirrel`, not here** — this repo receives code PRs only.
+tickets are issues #17–#22 in that repository. New issues and progress tracking
+for this repository live in
+[Habit130/librime-llm-rerank](https://github.com/Habit130/librime-llm-rerank/issues);
+the Squirrel issues remain historical design references. Agent workflow is
+defined in `AGENTS.md` and `docs/agents/`.
 
 ## Install
 
