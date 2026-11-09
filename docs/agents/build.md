@@ -1,6 +1,7 @@
 # Build and verification
 
-Repository-owned commands and evidence from governance Initialize, issue #96,
+Repository-owned commands and historical evidence from the initial v1 inspection
+for governance Initialize, issue #96,
 against `e95f50a42769f1895636b6c4380f1dd5e300a2dc`. Commands ran in disposable
 worktrees of a separate clone, not the original checkout or live Rime data.
 Failing commands below are recorded facts, not waivers or changes to the product
@@ -89,7 +90,8 @@ test filtering, code repair or CI change was used to turn a failure green.
 ## Native host build prerequisites — not verified in this run
 
 The plugin is built by a host librime tree, not as a standalone CMake project.
-From the Squirrel root the inherited command is:
+**Always build with `make librime` from the Squirrel root; never plain `make`.**
+The required host command is:
 
 ```sh
 export BOOST_ROOT=/opt/homebrew/opt/boost
@@ -97,10 +99,10 @@ export MACOSX_DEPLOYMENT_TARGET=13.0
 make librime
 ```
 
-Plain `make` may skip plugin changes because Squirrel only checks whether its
-librime dylib exists. After first adding the plugin, `make -C librime release`
-reconfigures the plugin glob without wiping vendored dependency build
-directories. Confirm the plugin dylib in `lib/rime-plugins/` and
+Squirrel's plain `make` only checks whether its librime dylib exists, so it can
+skip plugin changes. After first adding the plugin, `make -C librime release`
+reconfigures the plugin glob. **Do not wipe `librime/deps/*/build`.** Confirm the
+plugin dylib in `lib/rime-plugins/` and
 `librime/build/lib/rime-plugins/`. Run the plugin-owned `llm_rerank_test` with
 `BUILD_TEST=ON`, not librime's unlinked `rime_test`. Prediction e2e additionally
 needs the pinned sibling predict plugin and `build_predict`.
@@ -132,3 +134,29 @@ No workflow uses a custom Actions secret. GitHub provides the automatic
 `GITHUB_TOKEN` / `github.token`; no credential provisioning or secret write is
 needed for this delivery. Only habit writes Actions secrets, as `AGENTS.md`
 specifies.
+
+## Initialize v2 verification and merged-commit smoke
+
+Issue #96 predetermines this local smoke because there is no default-branch
+product build/test job. From an isolated checkout of the exact commit merging
+PR #97, run:
+
+```sh
+/usr/bin/python3 /Users/habit/.agents/skills/govern-repository/scripts/govern.py compare --worktree .
+bash -n .github/governance/owner.sh
+python3 -m unittest discover -s eval -p 'test_*.py'
+```
+
+Prerequisites: the installed released-v2 generator in OpenCode or Claude Code,
+Bash, and a Python environment able to run complete eval discovery. The
+historical runtime and dependency preparation above provide the baseline;
+record the actual runtime for each run. Success requires version 2 with empty
+comparison differences, successful shell syntax validation and complete eval
+discovery with no failures/errors, accounting for any conditional skips under
+the authoritative model-free runbook. A failed or unavailable command leaves
+Initialize incomplete. Record results against the actual merge SHA on #96.
+
+This is governance/eval smoke, not native-build, model, deployment or capture
+certification. PR verification and Merge watch are not merged-commit product
+evidence; Release dispatch is not a substitute. The preceding v1 command
+inventory remains historical evidence, not proof of this v2 head or its merge.
