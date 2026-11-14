@@ -149,8 +149,18 @@ def main(argv=None):
     management.add_argument("--confirm", action="store_true")
     management.add_argument("--after", type=int, default=0)
     management.add_argument("--page-size", type=int, default=20)
+    deletion = sub.add_parser("deletion")
+    deletion.add_argument("action", choices=("preview", "confirm", "list", "status", "progress", "result", "cancel", "registry", "availability"))
+    deletion.add_argument("--job-id")
+    deletion.add_argument("--operation-id")
+    deletion.add_argument("--plan-identity")
+    deletion.add_argument("--input-file", default="-")
+    deletion.add_argument("--confirm", action="store_true")
+    deletion.add_argument("--accept-collateral", action="store_true")
+    deletion.add_argument("--after", type=int, default=0)
+    deletion.add_argument("--page-size", type=int, default=20)
     args = parser.parse_args(argv)
-    if args.command in ("annotations", "tui", "datasets", "management") and (not math.isfinite(args.timeout) or args.timeout <= 0):
+    if args.command in ("annotations", "tui", "datasets", "management", "deletion") and (not math.isfinite(args.timeout) or args.timeout <= 0):
         sys.stderr.write("code=invalid_request\ncontent_included=false\n")
         return 2
     if args.command == "annotations":
@@ -159,6 +169,8 @@ def main(argv=None):
         return _datasets(args)
     if args.command == "management":
         return _management(args)
+    if args.command == "deletion":
+        return _deletion(args)
     if args.command == "collector" and args.collector_command == "start":
         return _start(args)
     if args.command == "collector" and args.collector_command == "stop":
@@ -177,6 +189,31 @@ def main(argv=None):
         return _tui(args)
     parser.print_help(sys.stderr)
     return 2
+
+
+def _deletion(args):
+    from archive.annotation_adapter import read_private_json, render
+    from archive.interface import failure
+    try:
+        kwargs = {}
+        if args.action in ("preview", "confirm"):
+            value = read_private_json(sys.stdin, args.input_file, bound=4 * 1048576)
+            value = value.get("body", value)
+            if args.action == "preview":
+                kwargs["selection"] = value.get("selection", value)
+            else:
+                kwargs.update(plan=value.get("plan", value), plan_identity=args.plan_identity,
+                              operation_id=args.operation_id, confirm=args.confirm,
+                              accept_collateral=args.accept_collateral)
+        if args.action in ("status", "progress", "result", "cancel", "registry"):
+            kwargs["job_id"] = args.job_id
+        if args.action in ("list", "registry"):
+            kwargs.update(after=args.after, page_size=args.page_size)
+        response = _client(args).deletion(args.action, **kwargs)
+    except (OSError, ValueError, InterfaceError, UnsafeRoot) as exc:
+        response = failure("deletion", "", getattr(exc, "code", "invalid_request"))
+    sys.stdout.write(render(response))
+    return 0 if response.get("ok") else 2
 
 
 def _management(args):

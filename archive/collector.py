@@ -712,6 +712,9 @@ class Collector(object):
         self._transition = False
         self._maintenance_unavailable = False
         self._management = Management(self)
+        from archive.deletion import Deletion
+        self._deletion = Deletion(self)
+        self._operation_lock = threading.RLock()
         self._historical_dataset_ids = set()
         self._restored_source_quality = []
 
@@ -729,6 +732,7 @@ class Collector(object):
                 management_regular(self.policy_path)
             self._load_policy()
             self._management.authority.prepare()
+            self._deletion.prepare()
             self._load_state()
             self._prepare_files()
             self._rebuild_index()
@@ -830,6 +834,8 @@ class Collector(object):
         self._loaded_existing_state = True
         previous = json.loads(self._read_nofollow(self.state_path))
         reasons = ["collector_start"]
+        if previous.get("deletion_gaps"):
+            reasons.append("confirmed_input_deletion")
         crash_tail = "none"
         discarded = 0
         quarantine_discarded = 0
@@ -864,6 +870,8 @@ class Collector(object):
             "quarantine_bytes",
             "admission_refused_units",
             "max_published_seq",
+            "deletion_namespace",
+            "deletion_gaps",
         ):
             if key in previous:
                 self._state[key] = previous[key]
@@ -903,6 +911,8 @@ class Collector(object):
             "admission_refused_units": 0,
             "discarded_quarantine_bytes": 0,
             "management_namespace": (self._management.authority.value or {}).get("namespace"),
+            "deletion_namespace": (self._deletion.authority.value or {}).get("namespace"),
+            "deletion_gaps": {},
             "restored_source_quality": self._restored_source_quality,
         }
 
@@ -1095,11 +1105,11 @@ class Collector(object):
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
         # An explicit collector shutdown is distinct from detaching an Adapter.
         # Do not let final checkpoint/clean-stop race a still-switching worker.
-        management_thread = self._management.thread
-        if management_thread is not None and management_thread.is_alive():
-            management_thread.join(self.limits["management_timeout_ms"] / 1000.0)
-            if management_thread.is_alive():
-                self._maintenance_unavailable = True
+        for management_thread in (self._management.thread, self._deletion.thread):
+            if management_thread is not None and management_thread.is_alive():
+                management_thread.join(self.limits["management_timeout_ms"] / 1000.0)
+                if management_thread.is_alive():
+                    self._maintenance_unavailable = True
         self._final_checkpoint()
         self._mark_clean()
         try:
@@ -1170,7 +1180,7 @@ class Collector(object):
         # request. Admission/policy/status never wait on this management gate.
         op = request.get("op")
         gated = op in {"query", "annotation_edit", "annotation_query", "dataset"}
-        if self._maintenance_unavailable and op not in {"status", "overview", "shutdown", "policy_observe"}:
+        if (self._maintenance_unavailable or self._deletion.authority.failed) and op not in {"status", "overview", "shutdown", "policy_observe", "deletion"}:
             return failure(op, request.get("request_id", ""), "management_authority_unavailable")
         if gated and not self._content_gate.acquire(False):
             return failure(op, request.get("request_id", ""), "management_busy")
@@ -1188,9 +1198,18 @@ class Collector(object):
         if request.get("envelope_version") != ENVELOPE_VERSION:
             return failure(op, request_id, "unsupported_version")
         content = request.get("content_version", CONTENT_VERSION)
-        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query", "dataset", "management"}:
+        if content != CONTENT_VERSION and op in {"admit_batch", "query", "set_policy", "annotation_edit", "annotation_query", "dataset", "management", "deletion"}:
             return failure(op, request_id, "unsupported_version")
         body = request.get("body") if isinstance(request.get("body"), dict) else {}
+        if op == "deletion":
+            try:
+                return self._ok(op, "", self._deletion.call(body))
+            except InterfaceError as exc:
+                return failure(op, "", exc.code)
+            except UnsafeRoot:
+                return failure(op, "", "unsafe_root")
+            except (OSError, ValueError, TypeError, KeyError):
+                return failure(op, "", "deletion_authority_unavailable")
         if op == "management":
             request_id = ""  # never reflect hostile/private supplied correlation values
             try:
@@ -1304,7 +1323,7 @@ class Collector(object):
                     }
                 )
             desired = self._policy["desired"]
-            if self._transition or self._maintenance_unavailable or self._management.authority.failed:
+            if self._transition or self._maintenance_unavailable or self._management.authority.failed or self._deletion.authority.failed:
                 collector_effective = "management_unavailable"
             elif self._state["storage_failure"]:
                 collector_effective = "storage_failure"
@@ -1331,6 +1350,7 @@ class Collector(object):
                 "owner_pid": self._owner_pid,
                 "continuity_broken": True,
                 "continuity_break_reasons": list(self._state["continuity_break_reasons"]),
+                "confirmed_deletion_gap_count": len(self._state.get("deletion_gaps", {})),
                 "globally_effective": globally,
                 "scope": "input_archive_only",
                 "legacy_selection_recording": "separately_configured_may_continue",
@@ -1365,6 +1385,9 @@ class Collector(object):
                 "publication_phase_hold": self._phase_hold_active,
                 "control_hold": self._control_hold_active,
                 "management": self._management.authority.summary(),
+                "deletion": {**self._deletion.authority.summary(),
+                             "serving_gap_count": len(self._state.get("deletion_gaps", {})),
+                             "history_complete": not bool(self._state.get("deletion_gaps"))},
                 "content_included": False,
             }
 
@@ -1372,7 +1395,7 @@ class Collector(object):
         source_id = body.get("source_instance_id")
         if safe_token(source_id) is None:
             return self.snapshot()
-        if self._maintenance_unavailable or not self._content_gate.acquire(False):
+        if self._maintenance_unavailable or self._deletion.authority.failed or not self._content_gate.acquire(False):
             return {"desired_policy": "off", "current_desired_policy": self._policy["desired"],
                     "desired_revision": self._policy["revision"], "collector_effective": "management_unavailable",
                     "registration_code": "management_busy", "content_included": False}
@@ -1430,6 +1453,7 @@ class Collector(object):
                     "legacy_selection_recording": "separately_configured_may_continue",
                     "legacy_switch_changed": False,
                     "management_namespace": self._management.authority.value["namespace"],
+                    "deletion_namespace": self._deletion.authority.value["namespace"],
                 }
             try:
                 atomic_write(self.policy_path, canonical_bytes(policy) + b"\n")
@@ -1487,7 +1511,7 @@ class Collector(object):
                 self._state["admission_refused_units"] = self._state.get("admission_refused_units", 0) + 1
             return "event_too_large"
         with self._lock:
-            if self._transition or self._maintenance_unavailable or self._management.authority.failed:
+            if self._transition or self._maintenance_unavailable or self._management.authority.failed or self._deletion.authority.failed:
                 return "storage_failure"
             if not self._management.authority.allowed(prepared["semantic"]["source_instance_id"]):
                 # Existing native result parsers know invalid_request as a
@@ -1501,6 +1525,12 @@ class Collector(object):
             if prepared["kind"] not in _CONTENT_FREE_KINDS and self._policy["desired"] != "enabled":
                 return "capture_disabled"
             identity = prepared["identity"]
+            if identity is not None:
+                try:
+                    if self._deletion.authority.removed(*identity):
+                        return "invalid_request"
+                except InterfaceError:
+                    return "storage_failure"
             if identity is not None:
                 previous = self._identities.get(identity)
                 if previous == prepared["content_hash"]:
@@ -1657,7 +1687,12 @@ class Collector(object):
                 if batch:
                     self._publish(batch)
                 elif waiters:
-                    self._persist_state()
+                    # Empty checkpoints also write the serving state. Serialize
+                    # with maintenance just like payload publication; after a
+                    # failed irreversible job they must not overwrite its state.
+                    with self._publication_mutex:
+                        if not self._maintenance_unavailable:
+                            self._persist_state()
             finally:
                 for waiter in waiters:
                     waiter.set()
@@ -1836,7 +1871,7 @@ class Collector(object):
         return self.snapshot()
 
     def _final_checkpoint(self):
-        if self._maintenance_unavailable or self._management.authority.failed:
+        if self._maintenance_unavailable or self._management.authority.failed or self._deletion.authority.failed:
             return
         if self._publication is None:
             return
@@ -1846,7 +1881,7 @@ class Collector(object):
         self._publication.join(timeout=2.0)
 
     def _mark_clean(self):
-        if self._maintenance_unavailable or self._management.authority.failed:
+        if self._maintenance_unavailable or self._management.authority.failed or self._deletion.authority.failed:
             return
         # A timed-out join is not ownership transfer: the publisher may still
         # be writing a watermark. Never race it with a stale shutdown snapshot.
@@ -2068,6 +2103,7 @@ class Collector(object):
                 "producer_observations": [
                     dict(observed) for observed in self._producers.values()
                 ],
+                "confirmed_deletion_gap_count": len(self._state.get("deletion_gaps", {})),
             }
 
     def _snapshot_join_state_locked(self, watermark):

@@ -41,6 +41,7 @@ EXCLUDED = {
 def code_identity():
     return io.digest({name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
                       for name in ("management.py", "management_authority.py", "management_io.py", "management_gate.py",
+                                   "deletion.py", "deletion_authority.py", "deletion_inventory.py", "deletion_plan.py", "deletion_lineage.py",
                                    "collector.py", "annotations.py", "datasets.py", "querying.py", "interface.py")})
 
 
@@ -68,6 +69,8 @@ class Management:
                 # The irreversible marker wins over a lost final status reply.
                 job.update(state="succeeded", phase="committed", reason=None)
                 for entry in job["registry"]:
+                    if entry["state"] == "discarded":
+                        continue
                     if entry["role"] == "staging":
                         entry["state"] = "active_initial_snapshot_checksum"
                     elif entry["role"] == "retained_current":
@@ -203,6 +206,7 @@ class Management:
         if state["durable_seq"] > MAX_OBSERVATIONS or annotation["revision"] > MAX_ANNOTATIONS:
             raise InterfaceError("management_bound")
         state.pop("management_namespace", None)
+        state.pop("deletion_namespace", None)
         generated = {
             "state.json": {**state, "clean_stop": True},
             "annotation-state.json": annotation,
@@ -255,7 +259,7 @@ class Management:
                 "generated": generated, "retention_files": retention_files,
                 "exclusions": EXCLUDED, "excluded_dataset_copies": excluded_datasets,
                 "excluded_managed_copies": managed,
-                "counts": {"observations": state["durable_seq"], "annotation_revisions": annotation["revision"],
+                "counts": {"observations": len(c._index), "annotation_revisions": annotation["revision"],
                            "datasets": sum(j["state"] == "succeeded" for _, j in jobs), "files": len(files),
                            "bytes": sum(f["size"] for f in files), "quarantine_bytes": state["quarantine_bytes"]}}
         quality_history(plan)
@@ -282,6 +286,12 @@ class Management:
                 "size": expected["size"], "sha256": expected["sha256"], "dependencies": dependency}
 
     def _request_job(self, body, kind):
+        with self.c._operation_lock:
+            if self.c._deletion.active is not None:
+                raise InterfaceError("management_busy")
+            return self._request_job_locked(body, kind)
+
+    def _request_job_locked(self, body, kind):
         if self.c._stop:
             raise InterfaceError("shutdown")
         operation = body.get("operation_id")
@@ -487,12 +497,22 @@ class Management:
         proxy = Collector(str(target), str(target / "unused.sock"), self.c.limits, auto_checkpoint=False)
         proxy._state = io.read_json(target / "state.json")
         store = proxy._annotations
+        store.pruning_authority = self.c._deletion.authority.value["bridges"]
         identity = io.read_json(target / "annotation-identity.json")
         manifest = io.read_json(target / "annotation-state.json")
         if identity != {"version": annotations.ANNOTATION_VERSION, "archive_id": plan["frontier"]["archive_id"]}:
             raise InterfaceError("management_corrupt")
         store.archive_id = identity["archive_id"]
-        count, identities = 0, set()
+        count, identities, previous_seq = 0, set(), 0
+        gaps = proxy._state.get("deletion_gaps", {})
+        if not isinstance(gaps, dict) or len(gaps) > MAX_OBSERVATIONS:
+            raise InterfaceError("management_corrupt")
+        for seq, key in gaps.items():
+            if not isinstance(seq, str) or not seq.isascii() or not seq.isdecimal() or str(int(seq)) != seq:
+                raise InterfaceError("management_corrupt")
+            entry = self.c._deletion.authority.value["captures"].get(key)
+            if entry is None or entry["archive_id"] != identity["archive_id"] or entry["durable_seq"] != int(seq) or not 1 <= int(seq) <= plan["frontier"]["durable_seq"]:
+                raise InterfaceError("management_corrupt")
         with io.open_read(target / "observations.jsonl") as stream:
             while True:
                 offset = stream.tell()
@@ -505,8 +525,11 @@ class Management:
                 row = json.loads(raw)
                 if row.get("record_version") != 1 or type(row["record_version"]) is not int:
                     raise InterfaceError("management_unsupported")
-                if row.get("durable_seq") != count or safe_token(row.get("source_instance_id")) is None or not annotations.integer(row.get("source_local_sequence")):
+                if type(row.get("durable_seq")) is not int or not previous_seq < row["durable_seq"] <= plan["frontier"]["durable_seq"] or str(row["durable_seq"]) in gaps or safe_token(row.get("source_instance_id")) is None or not annotations.integer(row.get("source_local_sequence")):
                     raise InterfaceError("management_corrupt")
+                previous_seq = row["durable_seq"]
+                if self.c._deletion.authority.removed(row["source_instance_id"], row["source_local_sequence"]):
+                    raise InterfaceError("deletion_removed")
                 key = (row["source_instance_id"], row["source_local_sequence"])
                 if key in identities and row["observation_kind"] != "loss_notice":
                     raise InterfaceError("management_corrupt")
@@ -517,8 +540,9 @@ class Management:
                     raise InterfaceError("management_corrupt")
                 proxy._remember(row, offset, len(raw))
             offset = stream.tell()
-        if count != plan["frontier"]["durable_seq"] or offset != proxy._state["durable_offset"] or offset != proxy._state["durable_bytes"] or count != proxy._state["durable_seq"]:
+        if count + len(gaps) != plan["frontier"]["durable_seq"] or offset != proxy._state["durable_offset"] or offset != proxy._state["durable_bytes"] or plan["frontier"]["durable_seq"] != proxy._state["durable_seq"]:
             raise InterfaceError("management_corrupt")
+        store.configure_pruning(manifest)
         with io.open_read(target / "annotations.jsonl") as stream:
             while True:
                 offset = stream.tell()
@@ -528,10 +552,12 @@ class Management:
                 if len(raw) > annotations.LINE_BYTES or not raw.endswith(b"\n") or store.revision >= MAX_ANNOTATIONS:
                     raise InterfaceError("management_bound")
                 row = json.loads(raw)
+                store.skip_pruned()
                 store._validate_row(row)
-                proxy._annotation_source(row["semantic"]["source_reference"], count, include_choice=False)
+                proxy._annotation_source(row["semantic"]["source_reference"], plan["frontier"]["durable_seq"], include_choice=False)
                 store._remember(row, offset, len(raw))
             store.offset = stream.tell()
+        store.skip_pruned()
         if store._manifest() != manifest or store.revision != plan["frontier"]["annotation_revision"] or store.chain != plan["frontier"]["annotation_chain"]:
             raise InterfaceError("management_corrupt")
         if io.regular(target / "quarantine.jsonl").st_size != proxy._state["quarantine_bytes"]:

@@ -103,6 +103,12 @@ class AnnotationStore:
         self.offset = 0
         self.chain = ZERO
         self.archive_id = None
+        # Only a collector-validated, non-rollback authority may supply these
+        # content-free chain bridges. Original survivor rows are never rehashed
+        # or renumbered. Old unpruned journals retain exactly their v1 behavior.
+        self.pruning_authority = {}
+        self.pruned = {}
+        self.pruned_operations = set()
 
     def _check_path(self, path):
         if not os.path.lexists(path):
@@ -143,11 +149,12 @@ class AnnotationStore:
             if not isinstance(archive_id, str) or len(archive_id) != 32 or any(ch not in "0123456789abcdef" for ch in archive_id):
                 raise ValueError()
             self.archive_id = archive_id
-            state = self._read_json(self.manifest_path)
-            if set(state) != {"version", "archive_id", "revision", "offset", "chain"} or state["version"] != ANNOTATION_VERSION or state["archive_id"] != self.archive_id:
+            state = self._read_json(self.manifest_path, bound=8 * 1048576)
+            if set(state) not in ({"version", "archive_id", "revision", "offset", "chain"}, {"version", "archive_id", "revision", "offset", "chain", "pruned"}) or state["version"] != ANNOTATION_VERSION or state["archive_id"] != self.archive_id:
                 raise ValueError()
             if not integer(state["revision"]) or not integer(state["offset"]):
                 raise ValueError()
+            self.configure_pruning(state)
             fd = open_nofollow(self.journal_path, os.O_RDWR)
             with os.fdopen(fd, "r+b") as handle:
                 while handle.tell() < state["offset"]:
@@ -156,8 +163,10 @@ class AnnotationStore:
                     if len(raw) > LINE_BYTES or not raw.endswith(b"\n") or handle.tell() > state["offset"]:
                         raise ValueError()
                     row = json.loads(raw)
+                    self.skip_pruned()
                     self._validate_row(row)
                     self._remember(row, offset, len(raw))
+                self.skip_pruned()
                 if self.revision != state["revision"] or self.chain != state["chain"] or handle.tell() != state["offset"]:
                     raise ValueError()
                 if os.fstat(handle.fileno()).st_size < state["offset"]:
@@ -171,7 +180,33 @@ class AnnotationStore:
             raise InterfaceError("annotation_state_invalid")
 
     def _manifest(self):
-        return {"version": ANNOTATION_VERSION, "archive_id": self.archive_id, "revision": self.revision, "offset": self.offset, "chain": self.chain}
+        result = {"version": ANNOTATION_VERSION, "archive_id": self.archive_id, "revision": self.revision, "offset": self.offset, "chain": self.chain}
+        if self.pruned:
+            result["pruned"] = [digest({field: bridge[field] for field in ("archive_id", "revision", "chain")}) for _, bridge in sorted(self.pruned.items())]
+        return result
+
+    def configure_pruning(self, manifest):
+        ids = manifest.get("pruned", [])
+        if not isinstance(ids, list) or len(ids) > 65536 or len(set(ids)) != len(ids):
+            raise ValueError()
+        self.pruned = {}
+        self.pruned_operations = set()
+        for key in ids:
+            bridge = self.pruning_authority.get(key)
+            if bridge is None or bridge["archive_id"] != self.archive_id or bridge["revision"] > manifest["revision"] or bridge["revision"] in self.pruned:
+                raise ValueError()
+            self.pruned[bridge["revision"]] = bridge
+        if ids != [digest({field: bridge[field] for field in ("archive_id", "revision", "chain")}) for _, bridge in sorted(self.pruned.items())]:
+            raise ValueError()
+
+    def skip_pruned(self):
+        while self.revision + 1 in self.pruned:
+            bridge = self.pruned[self.revision + 1]
+            if bridge["previous"] != self.chain:
+                raise ValueError()
+            self.revision = bridge["revision"]
+            self.chain = bridge["chain"]
+            self.pruned_operations.add(bridge["operation_digest"])
 
     def _validate_row(self, row):
         if not isinstance(row, dict) or set(row) != {"version", "archive_id", "revision", "operation_id", "semantic", "semantic_hash", "previous", "chain"}:
@@ -238,6 +273,8 @@ class AnnotationStore:
                 raise InterfaceError("annotation_target_unavailable")
             semantic = {"source_reference": ref, "kind": kind, "value": value, "provenance": "human", "expected_revision": body["expected_revision"]}
             semantic_hash = digest(semantic)
+            if digest({"operation_id": body["operation_id"]}) in self.pruned_operations:
+                raise InterfaceError("annotation_operation_conflict")
             prior = self.operations.get(body["operation_id"])
             if prior is not None:
                 if prior[0] != semantic_hash:
@@ -252,7 +289,7 @@ class AnnotationStore:
             raw = canonical_bytes(row) + b"\n"
             try:
                 self._append(raw)
-                state = {"version": ANNOTATION_VERSION, "archive_id": self.archive_id, "revision": row["revision"], "offset": self.offset + len(raw), "chain": row["chain"]}
+                state = {**self._manifest(), "revision": row["revision"], "offset": self.offset + len(raw), "chain": row["chain"]}
                 self._publish(state)
             except (OSError, UnsafeRoot):
                 self.failed = True
